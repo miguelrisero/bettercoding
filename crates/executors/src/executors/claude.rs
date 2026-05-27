@@ -56,13 +56,51 @@ use crate::{
     stdout_dup::create_stdout_pipe_writer,
 };
 
-const SUPPRESSED_STDERR_PATTERNS: &[&str] = &["[WARN] Fast mode requires the native binary"];
+const SUPPRESSED_STDERR_PATTERNS: &[&str] = &[
+    "[WARN] Fast mode requires the native binary",
+    // The bundled Claude CLI dumps its own control-protocol internals to stderr
+    // when its process is torn down while a hook or permission request is still
+    // in flight (e.g. the user stops a turn, or a stop races the end-of-turn
+    // Stop hook's git check). These are benign teardown races — surfacing them
+    // floods the conversation with minified CLI source and a "Stream closed"
+    // stack trace the user can do nothing about. Filter the recognizable lines.
+    "Error in hook callback",
+    "error: Stream closed",
+    // Stack frames in the dump reference the bundled CLI runtime path.
+    "/$bunfs/",
+];
+
+/// Whether a Claude CLI stderr line is known benign noise that should not be
+/// surfaced as an error entry. Covers the verbatim [`SUPPRESSED_STDERR_PATTERNS`]
+/// plus the minified source frames the CLI prints with a `"<lineno> | "` prefix
+/// as part of its control-protocol teardown dump.
+fn is_suppressed_stderr_line(line: &str) -> bool {
+    if SUPPRESSED_STDERR_PATTERNS
+        .iter()
+        .any(|pattern| line.contains(pattern))
+    {
+        return true;
+    }
+    is_minified_source_frame(line)
+}
+
+/// Recognize a minified-source frame like ``9560 | `)}`` — a leading run of
+/// digits followed by `" | "`. The bundled CLI emits these when printing
+/// internal source context, never as actionable output. A legitimate error
+/// summary line has no such prefix and is preserved.
+fn is_minified_source_frame(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let digits_end = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    digits_end > 0 && trimmed[digits_end..].starts_with(" | ")
+}
 
 fn base_command(claude_code_router: bool) -> &'static str {
     if claude_code_router {
         "npx -y @musistudio/claude-code-router@1.0.66 code"
     } else {
-        "npx -y @anthropic-ai/claude-code@2.1.119"
+        "npx -y @anthropic-ai/claude-code@2.1.152"
     }
 }
 
@@ -85,11 +123,7 @@ fn normalize_claude_stderr_logs(
             .time_gap(Duration::from_secs(2))
             .index_provider(entry_index_provider)
             .transform_lines(Box::new(|lines: &mut Vec<String>| {
-                lines.retain(|line| {
-                    !SUPPRESSED_STDERR_PATTERNS
-                        .iter()
-                        .any(|pattern| line.contains(pattern))
-                });
+                lines.retain(|line| !is_suppressed_stderr_line(line));
             }))
             .build();
 
@@ -1054,6 +1088,7 @@ impl ClaudeLogProcessor {
                 // TODO: Add proper ToolResult support to NormalizedEntry when the type system supports it
                 None
             }
+            ClaudeContentItem::Unknown => None,
         }
     }
 
@@ -1454,6 +1489,7 @@ impl ClaudeLogProcessor {
                             }
                         }
                         ClaudeContentItem::ToolResult { .. } => {}
+                        ClaudeContentItem::Unknown => {}
                     }
                 }
             }
@@ -2441,6 +2477,11 @@ pub enum ClaudeContentItem {
         content: serde_json::Value,
         is_error: Option<bool>,
     },
+    /// Any content-block type we don't model yet (e.g. a new block type added
+    /// by a newer Claude CLI). Captured so one unknown block can't fail the
+    /// whole message parse and drop its sibling text/tool content.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -2776,6 +2817,78 @@ mod tests {
     fn normalize(json: &ClaudeJson, worktree: &str) -> Vec<NormalizedEntry> {
         let mut processor = ClaudeLogProcessor::new();
         normalize_helper(&mut processor, json, worktree)
+    }
+
+    #[test]
+    fn suppresses_claude_cli_teardown_dump() {
+        // The benign control-protocol teardown dump the bundled CLI prints when
+        // killed mid-request: a hook-callback header carrying minified source,
+        // standalone minified frames, "Stream closed", and stack frames into the
+        // bundled runtime. All should be filtered from surfaced stderr.
+        let dump = [
+            "Error in hook callback STOP_GIT_CHECK_CALLBACK_ID: 9559 | ${H.map((q)=>q.description)}",
+            "9560 | `)}",
+            "9561 | Re-create them if still needed.",
+            "error: Stream closed",
+            "      at sendRequest (/$bunfs/root/src/entrypoints/cli.js:9564:133)",
+            "      at <anonymous> (/$bunfs/root/src/entrypoints/cli.js:8954:2026)",
+        ];
+        for line in dump {
+            assert!(
+                is_suppressed_stderr_line(line),
+                "expected suppression of: {line}"
+            );
+        }
+        // The pre-existing Fast mode warning stays suppressed.
+        assert!(is_suppressed_stderr_line(
+            "[WARN] Fast mode requires the native binary"
+        ));
+    }
+
+    #[test]
+    fn preserves_actionable_stderr_lines() {
+        // Real, actionable errors and unrelated stack frames must still surface.
+        for line in [
+            "Error: ENOENT: no such file or directory, open '/tmp/x'",
+            "thread 'main' panicked at src/main.rs:10:5",
+            "warning: unused variable `x`",
+            "123 apples and 4 oranges", // leading digits but not a "<n> | " frame
+            "at processTicksAndRejections (node:internal/process/task_queues:95:5)",
+            "",
+        ] {
+            assert!(
+                !is_suppressed_stderr_line(line),
+                "did not expect suppression of: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn minified_source_frame_detection() {
+        assert!(is_minified_source_frame("9560 | `)}"));
+        assert!(is_minified_source_frame("  42 | const x = 1;"));
+        assert!(!is_minified_source_frame("9560 |no space"));
+        assert!(!is_minified_source_frame("| 9560"));
+        assert!(!is_minified_source_frame("hello | world"));
+        assert!(!is_minified_source_frame("9560"));
+    }
+
+    #[test]
+    fn unknown_content_block_does_not_drop_sibling_content() {
+        // A new content-block type must not fail the whole message parse — the
+        // sibling assistant text must still be normalized. Without the catch-all
+        // on ClaudeContentItem the entire message degraded to a raw fallback and
+        // the text was lost.
+        let assistant_json = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"},{"type":"brand_new_block","data":123}]}}"#;
+        let parsed: ClaudeJson = serde_json::from_str(assistant_json).unwrap();
+        let entries = normalize(&parsed, "");
+        assert!(
+            entries.iter().any(|e| matches!(
+                e.entry_type,
+                NormalizedEntryType::AssistantMessage
+            ) && e.content == "hello"),
+            "expected assistant text to survive an unknown sibling block; got {entries:?}"
+        );
     }
 
     #[test]

@@ -82,6 +82,11 @@ pub enum ControlRequestType {
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_use_id: Option<String>,
     },
+    /// A control-request subtype we don't model yet (e.g. one added by a newer
+    /// Claude CLI). Captured so the message still parses; the read loop replies
+    /// with an error response so the CLI doesn't hang waiting for one.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Result of permission check
@@ -224,5 +229,64 @@ impl PermissionMode {
 impl std::fmt::Display for PermissionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_control_cancel_request() {
+        let msg: CLIMessage =
+            serde_json::from_str(r#"{"type":"control_cancel_request","request_id":"abc"}"#).unwrap();
+        assert!(matches!(
+            msg,
+            CLIMessage::ControlCancelRequest { request_id } if request_id == "abc"
+        ));
+    }
+
+    #[test]
+    fn unknown_message_type_falls_back_to_other() {
+        // Unknown top-level message types must parse into `Other` so the read
+        // loop ignores them rather than erroring.
+        let msg: CLIMessage =
+            serde_json::from_str(r#"{"type":"brand_new_event","foo":1}"#).unwrap();
+        assert!(matches!(msg, CLIMessage::Other(_)));
+    }
+
+    #[test]
+    fn parses_hook_callback_control_request() {
+        let msg: CLIMessage = serde_json::from_str(
+            r#"{"type":"control_request","request_id":"r1","request":{"subtype":"hook_callback","callback_id":"STOP_GIT_CHECK_CALLBACK_ID","input":{}}}"#,
+        )
+        .unwrap();
+        match msg {
+            CLIMessage::ControlRequest {
+                request_id,
+                request,
+            } => {
+                assert_eq!(request_id, "r1");
+                assert!(matches!(request, ControlRequestType::HookCallback { .. }));
+            }
+            other => panic!("expected control_request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_control_request_subtype_parses_to_unknown() {
+        // A control_request whose subtype we don't model must still parse (into
+        // ControlRequestType::Unknown) so the read loop can reply with an error
+        // instead of the message failing to parse and the CLI hanging.
+        let msg: CLIMessage = serde_json::from_str(
+            r#"{"type":"control_request","request_id":"r2","request":{"subtype":"brand_new_subtype","foo":1}}"#,
+        )
+        .unwrap();
+        match msg {
+            CLIMessage::ControlRequest { request, .. } => {
+                assert!(matches!(request, ControlRequestType::Unknown));
+            }
+            other => panic!("expected control_request, got {other:?}"),
+        }
     }
 }
