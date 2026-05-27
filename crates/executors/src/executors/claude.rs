@@ -81,7 +81,7 @@ fn is_suppressed_stderr_line(line: &str) -> bool {
     {
         return true;
     }
-    is_minified_source_frame(line)
+    is_minified_source_frame(line) || is_js_stack_frame(line)
 }
 
 /// Recognize a minified-source frame like ``9560 | `)}`` — a leading run of
@@ -94,6 +94,15 @@ fn is_minified_source_frame(line: &str) -> bool {
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(trimmed.len());
     digits_end > 0 && trimmed[digits_end..].starts_with(" | ")
+}
+
+/// Recognize a JS/bun stack frame like `at sendRequest (…cli.js:9564:133)` or
+/// the fileless `at next (1:11)` that accompany the teardown dump — a trimmed
+/// line that starts with `at ` and ends with `)`. The error *summary* line that
+/// precedes a stack trace has no such shape, so it is still surfaced.
+fn is_js_stack_frame(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("at ") && trimmed.ends_with(')')
 }
 
 fn base_command(claude_code_router: bool) -> &'static str {
@@ -2832,6 +2841,7 @@ mod tests {
             "error: Stream closed",
             "      at sendRequest (/$bunfs/root/src/entrypoints/cli.js:9564:133)",
             "      at <anonymous> (/$bunfs/root/src/entrypoints/cli.js:8954:2026)",
+            "      at next (1:11)", // fileless stack frame (no /$bunfs/ path)
         ];
         for line in dump {
             assert!(
@@ -2853,7 +2863,7 @@ mod tests {
             "thread 'main' panicked at src/main.rs:10:5",
             "warning: unused variable `x`",
             "123 apples and 4 oranges", // leading digits but not a "<n> | " frame
-            "at processTicksAndRejections (node:internal/process/task_queues:95:5)",
+            "at startup the server bound to port 8080", // starts "at " but not a frame
             "",
         ] {
             assert!(
@@ -2874,6 +2884,22 @@ mod tests {
     }
 
     #[test]
+    fn js_stack_frame_detection() {
+        assert!(is_js_stack_frame("      at next (1:11)"));
+        assert!(is_js_stack_frame(
+            "      at sendRequest (/$bunfs/root/src/entrypoints/cli.js:9564:133)"
+        ));
+        assert!(is_js_stack_frame(
+            "at processTicksAndRejections (node:internal/process/task_queues:95:5)"
+        ));
+        assert!(!is_js_stack_frame(
+            "at startup the server bound to port 8080"
+        ));
+        assert!(!is_js_stack_frame("Error: something failed"));
+        assert!(!is_js_stack_frame("flatten(a, b)"));
+    }
+
+    #[test]
     fn unknown_content_block_does_not_drop_sibling_content() {
         // A new content-block type must not fail the whole message parse — the
         // sibling assistant text must still be normalized. Without the catch-all
@@ -2883,10 +2909,10 @@ mod tests {
         let parsed: ClaudeJson = serde_json::from_str(assistant_json).unwrap();
         let entries = normalize(&parsed, "");
         assert!(
-            entries.iter().any(|e| matches!(
-                e.entry_type,
-                NormalizedEntryType::AssistantMessage
-            ) && e.content == "hello"),
+            entries.iter().any(
+                |e| matches!(e.entry_type, NormalizedEntryType::AssistantMessage)
+                    && e.content == "hello"
+            ),
             "expected assistant text to survive an unknown sibling block; got {entries:?}"
         );
     }

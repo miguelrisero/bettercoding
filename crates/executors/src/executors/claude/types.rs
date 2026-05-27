@@ -239,7 +239,8 @@ mod tests {
     #[test]
     fn parses_control_cancel_request() {
         let msg: CLIMessage =
-            serde_json::from_str(r#"{"type":"control_cancel_request","request_id":"abc"}"#).unwrap();
+            serde_json::from_str(r#"{"type":"control_cancel_request","request_id":"abc"}"#)
+                .unwrap();
         assert!(matches!(
             msg,
             CLIMessage::ControlCancelRequest { request_id } if request_id == "abc"
