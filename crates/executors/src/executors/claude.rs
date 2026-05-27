@@ -105,6 +105,38 @@ fn is_js_stack_frame(line: &str) -> bool {
     trimmed.starts_with("at ") && trimmed.ends_with(')')
 }
 
+/// Stateful stderr filter that drops the bundled CLI's teardown dump.
+///
+/// Per-line matching alone is not enough: the dump's minified frames are a
+/// single enormous source line (e.g. `9564 | …`) that arrives across several
+/// read chunks. The log buffer splits only on `\n`, so once we drop the matched
+/// *partial* (prefix-bearing) fragment, the next chunk's continuation arrives as
+/// a new line **without** the `<lineno> | ` prefix and would slip through. We
+/// therefore remember when a dropped line had no trailing newline and keep
+/// swallowing until the continuation's line completes.
+#[derive(Default)]
+struct TeardownNoiseFilter {
+    /// True while the previous dropped line was an unterminated (no `\n`)
+    /// suppressed line whose continuation is still to come.
+    mid_suppressed_line: bool,
+}
+
+impl TeardownNoiseFilter {
+    /// Drop teardown-dump lines (and their cross-chunk continuations) in place.
+    fn retain(&mut self, lines: &mut Vec<String>) {
+        lines.retain(|line| {
+            let suppress = self.mid_suppressed_line || is_suppressed_stderr_line(line);
+            if suppress {
+                // An unterminated suppressed line continues in a later chunk.
+                self.mid_suppressed_line = !line.ends_with('\n');
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
 fn base_command(claude_code_router: bool) -> &'static str {
     if claude_code_router {
         "npx -y @musistudio/claude-code-router@1.0.66 code"
@@ -131,8 +163,9 @@ fn normalize_claude_stderr_logs(
             })
             .time_gap(Duration::from_secs(2))
             .index_provider(entry_index_provider)
-            .transform_lines(Box::new(|lines: &mut Vec<String>| {
-                lines.retain(|line| !is_suppressed_stderr_line(line));
+            .transform_lines(Box::new({
+                let mut filter = TeardownNoiseFilter::default();
+                move |lines: &mut Vec<String>| filter.retain(lines)
             }))
             .build();
 
@@ -2897,6 +2930,58 @@ mod tests {
         ));
         assert!(!is_js_stack_frame("Error: something failed"));
         assert!(!is_js_stack_frame("flatten(a, b)"));
+    }
+
+    #[test]
+    fn teardown_filter_swallows_dump_split_across_chunks() {
+        // The minified frame is one giant line arriving over several chunks. The
+        // first chunk carries the `<lineno> | ` prefix; later chunks don't.
+        let mut filter = TeardownNoiseFilter::default();
+
+        let mut chunk1 = vec!["9564 | `)}async sendRequest(H,$,q){".to_string()];
+        filter.retain(&mut chunk1);
+        assert!(chunk1.is_empty(), "prefixed partial should be dropped");
+
+        // Continuation arrives WITHOUT the prefix (this is the leak case).
+        let mut chunk2 = vec!["),Y.reject(new PA)};createCanUseTool(H){".to_string()];
+        filter.retain(&mut chunk2);
+        assert!(
+            chunk2.is_empty(),
+            "unprefixed continuation must be swallowed"
+        );
+
+        // Final continuation chunk completes the logical line with a newline.
+        let mut chunk3 = vec!["let D=...}\n".to_string()];
+        filter.retain(&mut chunk3);
+        assert!(
+            chunk3.is_empty(),
+            "completing continuation must be swallowed"
+        );
+
+        // Normal output after the dump is preserved again.
+        let mut chunk4 = vec!["Done building\n".to_string()];
+        filter.retain(&mut chunk4);
+        assert_eq!(chunk4, vec!["Done building\n".to_string()]);
+    }
+
+    #[test]
+    fn teardown_filter_preserves_surrounding_output() {
+        let mut filter = TeardownNoiseFilter::default();
+        let mut lines = vec![
+            "Compiling project\n".to_string(),
+            "error: Stream closed\n".to_string(),
+            "      at next (1:11)\n".to_string(),
+            "      at sendRequest (/$bunfs/root/src/entrypoints/cli.js:9564:133)\n".to_string(),
+            "Build finished\n".to_string(),
+        ];
+        filter.retain(&mut lines);
+        assert_eq!(
+            lines,
+            vec![
+                "Compiling project\n".to_string(),
+                "Build finished\n".to_string(),
+            ]
+        );
     }
 
     #[test]
