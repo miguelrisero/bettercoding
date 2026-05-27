@@ -90,7 +90,16 @@ impl ProtocolPeer {
                                 Ok(CLIMessage::Result(_)) => {
                                     break;
                                 }
-                                _ => {}
+                                Ok(CLIMessage::ControlCancelRequest { request_id }) => {
+                                    // Handlers run inline in this loop, so an in-flight
+                                    // one can't be interrupted; log instead of dropping.
+                                    tracing::debug!("control_cancel_request {request_id} ignored");
+                                }
+                                Ok(CLIMessage::ControlResponse { .. })
+                                | Ok(CLIMessage::Other(_)) => {}
+                                Err(e) => {
+                                    tracing::trace!("Ignoring non-control stdout line: {e}");
+                                }
                             }
                         }
                         Err(e) => {
@@ -160,6 +169,15 @@ impl ProtocolPeer {
                             tracing::error!("Failed to send error response: {e2}");
                         }
                     }
+                }
+            }
+            ControlRequestType::Unknown => {
+                // A newer CLI sent a control-request subtype we don't model. Reply
+                // with an error so the CLI doesn't hang awaiting a response.
+                tracing::warn!("Unsupported control_request subtype ({request_id})");
+                let reason = "unsupported control request subtype".to_string();
+                if let Err(e) = self.send_error(request_id, reason).await {
+                    tracing::error!("Failed to send error response: {e}");
                 }
             }
         }

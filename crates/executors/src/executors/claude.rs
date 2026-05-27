@@ -56,13 +56,92 @@ use crate::{
     stdout_dup::create_stdout_pipe_writer,
 };
 
-const SUPPRESSED_STDERR_PATTERNS: &[&str] = &["[WARN] Fast mode requires the native binary"];
+const SUPPRESSED_STDERR_PATTERNS: &[&str] = &[
+    "[WARN] Fast mode requires the native binary",
+    // The bundled Claude CLI dumps its own control-protocol internals to stderr
+    // when its process is torn down while a hook or permission request is still
+    // in flight (e.g. the user stops a turn, or a stop races the end-of-turn
+    // Stop hook's git check). These are benign teardown races — surfacing them
+    // floods the conversation with minified CLI source and a "Stream closed"
+    // stack trace the user can do nothing about. Filter the recognizable lines.
+    "Error in hook callback",
+    "error: Stream closed",
+    // Stack frames in the dump reference the bundled CLI runtime path.
+    "/$bunfs/",
+];
+
+/// Whether a Claude CLI stderr line is known benign noise that should not be
+/// surfaced as an error entry. Covers the verbatim [`SUPPRESSED_STDERR_PATTERNS`]
+/// plus the minified source frames the CLI prints with a `"<lineno> | "` prefix
+/// as part of its control-protocol teardown dump.
+fn is_suppressed_stderr_line(line: &str) -> bool {
+    if SUPPRESSED_STDERR_PATTERNS
+        .iter()
+        .any(|pattern| line.contains(pattern))
+    {
+        return true;
+    }
+    is_minified_source_frame(line) || is_js_stack_frame(line)
+}
+
+/// Recognize a minified-source frame like ``9560 | `)}`` — a leading run of
+/// digits followed by `" | "`. The bundled CLI emits these when printing
+/// internal source context, never as actionable output. A legitimate error
+/// summary line has no such prefix and is preserved.
+fn is_minified_source_frame(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let digits_end = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    digits_end > 0 && trimmed[digits_end..].starts_with(" | ")
+}
+
+/// Recognize a JS/bun stack frame like `at sendRequest (…cli.js:9564:133)` or
+/// the fileless `at next (1:11)` that accompany the teardown dump — a trimmed
+/// line that starts with `at ` and ends with `)`. The error *summary* line that
+/// precedes a stack trace has no such shape, so it is still surfaced.
+fn is_js_stack_frame(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("at ") && trimmed.ends_with(')')
+}
+
+/// Stateful stderr filter that drops the bundled CLI's teardown dump.
+///
+/// Per-line matching alone is not enough: the dump's minified frames are a
+/// single enormous source line (e.g. `9564 | …`) that arrives across several
+/// read chunks. The log buffer splits only on `\n`, so once we drop the matched
+/// *partial* (prefix-bearing) fragment, the next chunk's continuation arrives as
+/// a new line **without** the `<lineno> | ` prefix and would slip through. We
+/// therefore remember when a dropped line had no trailing newline and keep
+/// swallowing until the continuation's line completes.
+#[derive(Default)]
+struct TeardownNoiseFilter {
+    /// True while the previous dropped line was an unterminated (no `\n`)
+    /// suppressed line whose continuation is still to come.
+    mid_suppressed_line: bool,
+}
+
+impl TeardownNoiseFilter {
+    /// Drop teardown-dump lines (and their cross-chunk continuations) in place.
+    fn retain(&mut self, lines: &mut Vec<String>) {
+        lines.retain(|line| {
+            let suppress = self.mid_suppressed_line || is_suppressed_stderr_line(line);
+            if suppress {
+                // An unterminated suppressed line continues in a later chunk.
+                self.mid_suppressed_line = !line.ends_with('\n');
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
 
 fn base_command(claude_code_router: bool) -> &'static str {
     if claude_code_router {
         "npx -y @musistudio/claude-code-router@1.0.66 code"
     } else {
-        "npx -y @anthropic-ai/claude-code@2.1.119"
+        "npx -y @anthropic-ai/claude-code@2.1.152"
     }
 }
 
@@ -84,12 +163,9 @@ fn normalize_claude_stderr_logs(
             })
             .time_gap(Duration::from_secs(2))
             .index_provider(entry_index_provider)
-            .transform_lines(Box::new(|lines: &mut Vec<String>| {
-                lines.retain(|line| {
-                    !SUPPRESSED_STDERR_PATTERNS
-                        .iter()
-                        .any(|pattern| line.contains(pattern))
-                });
+            .transform_lines(Box::new({
+                let mut filter = TeardownNoiseFilter::default();
+                move |lines: &mut Vec<String>| filter.retain(lines)
             }))
             .build();
 
@@ -1054,6 +1130,7 @@ impl ClaudeLogProcessor {
                 // TODO: Add proper ToolResult support to NormalizedEntry when the type system supports it
                 None
             }
+            ClaudeContentItem::Unknown => None,
         }
     }
 
@@ -1454,6 +1531,7 @@ impl ClaudeLogProcessor {
                             }
                         }
                         ClaudeContentItem::ToolResult { .. } => {}
+                        ClaudeContentItem::Unknown => {}
                     }
                 }
             }
@@ -2441,6 +2519,11 @@ pub enum ClaudeContentItem {
         content: serde_json::Value,
         is_error: Option<bool>,
     },
+    /// Any content-block type we don't model yet (e.g. a new block type added
+    /// by a newer Claude CLI). Captured so one unknown block can't fail the
+    /// whole message parse and drop its sibling text/tool content.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -2776,6 +2859,147 @@ mod tests {
     fn normalize(json: &ClaudeJson, worktree: &str) -> Vec<NormalizedEntry> {
         let mut processor = ClaudeLogProcessor::new();
         normalize_helper(&mut processor, json, worktree)
+    }
+
+    #[test]
+    fn suppresses_claude_cli_teardown_dump() {
+        // The benign control-protocol teardown dump the bundled CLI prints when
+        // killed mid-request: a hook-callback header carrying minified source,
+        // standalone minified frames, "Stream closed", and stack frames into the
+        // bundled runtime. All should be filtered from surfaced stderr.
+        let dump = [
+            "Error in hook callback STOP_GIT_CHECK_CALLBACK_ID: 9559 | ${H.map((q)=>q.description)}",
+            "9560 | `)}",
+            "9561 | Re-create them if still needed.",
+            "error: Stream closed",
+            "      at sendRequest (/$bunfs/root/src/entrypoints/cli.js:9564:133)",
+            "      at <anonymous> (/$bunfs/root/src/entrypoints/cli.js:8954:2026)",
+            "      at next (1:11)", // fileless stack frame (no /$bunfs/ path)
+        ];
+        for line in dump {
+            assert!(
+                is_suppressed_stderr_line(line),
+                "expected suppression of: {line}"
+            );
+        }
+        // The pre-existing Fast mode warning stays suppressed.
+        assert!(is_suppressed_stderr_line(
+            "[WARN] Fast mode requires the native binary"
+        ));
+    }
+
+    #[test]
+    fn preserves_actionable_stderr_lines() {
+        // Real, actionable errors and unrelated stack frames must still surface.
+        for line in [
+            "Error: ENOENT: no such file or directory, open '/tmp/x'",
+            "thread 'main' panicked at src/main.rs:10:5",
+            "warning: unused variable `x`",
+            "123 apples and 4 oranges", // leading digits but not a "<n> | " frame
+            "at startup the server bound to port 8080", // starts "at " but not a frame
+            "",
+        ] {
+            assert!(
+                !is_suppressed_stderr_line(line),
+                "did not expect suppression of: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn minified_source_frame_detection() {
+        assert!(is_minified_source_frame("9560 | `)}"));
+        assert!(is_minified_source_frame("  42 | const x = 1;"));
+        assert!(!is_minified_source_frame("9560 |no space"));
+        assert!(!is_minified_source_frame("| 9560"));
+        assert!(!is_minified_source_frame("hello | world"));
+        assert!(!is_minified_source_frame("9560"));
+    }
+
+    #[test]
+    fn js_stack_frame_detection() {
+        assert!(is_js_stack_frame("      at next (1:11)"));
+        assert!(is_js_stack_frame(
+            "      at sendRequest (/$bunfs/root/src/entrypoints/cli.js:9564:133)"
+        ));
+        assert!(is_js_stack_frame(
+            "at processTicksAndRejections (node:internal/process/task_queues:95:5)"
+        ));
+        assert!(!is_js_stack_frame(
+            "at startup the server bound to port 8080"
+        ));
+        assert!(!is_js_stack_frame("Error: something failed"));
+        assert!(!is_js_stack_frame("flatten(a, b)"));
+    }
+
+    #[test]
+    fn teardown_filter_swallows_dump_split_across_chunks() {
+        // The minified frame is one giant line arriving over several chunks. The
+        // first chunk carries the `<lineno> | ` prefix; later chunks don't.
+        let mut filter = TeardownNoiseFilter::default();
+
+        let mut chunk1 = vec!["9564 | `)}async sendRequest(H,$,q){".to_string()];
+        filter.retain(&mut chunk1);
+        assert!(chunk1.is_empty(), "prefixed partial should be dropped");
+
+        // Continuation arrives WITHOUT the prefix (this is the leak case).
+        let mut chunk2 = vec!["),Y.reject(new PA)};createCanUseTool(H){".to_string()];
+        filter.retain(&mut chunk2);
+        assert!(
+            chunk2.is_empty(),
+            "unprefixed continuation must be swallowed"
+        );
+
+        // Final continuation chunk completes the logical line with a newline.
+        let mut chunk3 = vec!["let D=...}\n".to_string()];
+        filter.retain(&mut chunk3);
+        assert!(
+            chunk3.is_empty(),
+            "completing continuation must be swallowed"
+        );
+
+        // Normal output after the dump is preserved again.
+        let mut chunk4 = vec!["Done building\n".to_string()];
+        filter.retain(&mut chunk4);
+        assert_eq!(chunk4, vec!["Done building\n".to_string()]);
+    }
+
+    #[test]
+    fn teardown_filter_preserves_surrounding_output() {
+        let mut filter = TeardownNoiseFilter::default();
+        let mut lines = vec![
+            "Compiling project\n".to_string(),
+            "error: Stream closed\n".to_string(),
+            "      at next (1:11)\n".to_string(),
+            "      at sendRequest (/$bunfs/root/src/entrypoints/cli.js:9564:133)\n".to_string(),
+            "Build finished\n".to_string(),
+        ];
+        filter.retain(&mut lines);
+        assert_eq!(
+            lines,
+            vec![
+                "Compiling project\n".to_string(),
+                "Build finished\n".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_content_block_does_not_drop_sibling_content() {
+        // A new content-block type must not fail the whole message parse — the
+        // sibling assistant text must still be normalized. Without the catch-all
+        // on ClaudeContentItem the entire message degraded to a raw fallback and
+        // the text was lost.
+        let assistant_json = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"},{"type":"brand_new_block","data":123}]}}"#;
+        let parsed: ClaudeJson = serde_json::from_str(assistant_json).unwrap();
+        let entries = normalize(&parsed, "");
+        assert!(
+            entries.iter().any(
+                |e| matches!(e.entry_type, NormalizedEntryType::AssistantMessage)
+                    && e.content == "hello"
+            ),
+            "expected assistant text to survive an unknown sibling block; got {entries:?}"
+        );
     }
 
     #[test]

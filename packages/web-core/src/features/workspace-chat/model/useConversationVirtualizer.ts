@@ -28,6 +28,7 @@ import {
 import {
   NEAR_BOTTOM_THRESHOLD_PX,
   isNearBottom,
+  shouldReleaseBottomLock,
 } from './conversation-scroll-commands';
 
 // TanStack Virtual's ScrollBehavior ('auto' | 'smooth' | 'instant') shadows
@@ -253,31 +254,41 @@ export function useConversationVirtualizer({
   }, [isBottomScrollCorrectionActive, scrollContainerRef]);
 
   const prevScrollTopRef = useRef(0);
+  const prevScrollHeightRef = useRef(0);
 
   useEffect(() => {
     const el = scrollContainerRef.current;
     if (!el) return;
 
     prevScrollTopRef.current = el.scrollTop;
+    prevScrollHeightRef.current = el.scrollHeight;
 
     const handleScroll = () => {
       const currentScrollTop = el.scrollTop;
+      const currentScrollHeight = el.scrollHeight;
 
-      // Release bottom lock on any user-initiated upward scroll.
-      // Guards prevent false positives from programmatic scroll sources:
-      // - smoothScrollDeadlineRef: set during scrollToBottom('smooth')
-      // - shouldSuppressSizeAdjustment: set during interaction anchor corrections
-      // - 5px threshold: filters input-resize micro-adjustments
+      // Release the bottom lock only on a genuine user scroll-up. The release
+      // decision is centralized in shouldReleaseBottomLock, which also ignores
+      // content-driven upward moves (shrinking scrollHeight from re-measured
+      // rows / browser clamps) — those would otherwise spuriously release the
+      // lock while history streams in and cause scroll oscillation.
       if (
-        bottomLockedRef.current &&
-        prevScrollTopRef.current - currentScrollTop > 5 &&
-        performance.now() > smoothScrollDeadlineRef.current &&
-        !shouldSuppressSizeAdjustment?.()
+        shouldReleaseBottomLock({
+          bottomLocked: bottomLockedRef.current,
+          prevScrollTop: prevScrollTopRef.current,
+          currentScrollTop,
+          prevScrollHeight: prevScrollHeightRef.current,
+          currentScrollHeight,
+          withinProgrammaticScroll:
+            performance.now() <= smoothScrollDeadlineRef.current,
+          sizeAdjustmentActive: shouldSuppressSizeAdjustment?.() ?? false,
+        })
       ) {
         bottomLockedRef.current = false;
       }
 
       prevScrollTopRef.current = currentScrollTop;
+      prevScrollHeightRef.current = currentScrollHeight;
       syncIsAtBottom();
     };
 
