@@ -212,6 +212,78 @@ export function isNearBottom(
 }
 
 // ---------------------------------------------------------------------------
+// Bottom-Lock Release
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimum upward `scrollTop` delta (px) that may count as a user scroll-up.
+ * Filters sub-pixel rounding and input-resize micro-adjustments.
+ */
+export const USER_SCROLL_UP_RELEASE_THRESHOLD_PX = 5;
+
+export interface BottomLockReleaseInput {
+  /** Whether the list is currently pinned to the bottom. */
+  readonly bottomLocked: boolean;
+  /** `scrollTop` recorded on the previous scroll event. */
+  readonly prevScrollTop: number;
+  /** `scrollTop` for the current scroll event. */
+  readonly currentScrollTop: number;
+  /** `scrollHeight` recorded on the previous scroll event. */
+  readonly prevScrollHeight: number;
+  /** `scrollHeight` for the current scroll event. */
+  readonly currentScrollHeight: number;
+  /** True while a programmatic (e.g. smooth) scroll we initiated is in flight. */
+  readonly withinProgrammaticScroll: boolean;
+  /** True while an interaction-anchor size correction is being applied. */
+  readonly sizeAdjustmentActive: boolean;
+}
+
+/**
+ * Decide whether a scroll event should release the bottom-lock.
+ *
+ * The lock means "keep the conversation pinned to the bottom as it grows." It
+ * must only be released by a genuine user scroll-up — never by our own
+ * programmatic scrolls, and never by content-driven `scrollTop` changes.
+ *
+ * The subtle case (root cause of load-time scroll oscillation): while history
+ * streams in, rows are re-measured smaller than their estimates, so
+ * `scrollHeight` shrinks and the browser clamps `scrollTop` downward (the
+ * bottom-lock re-pin does the same). Inspecting `scrollTop` alone, that is
+ * indistinguishable from a user scrolling up — so the lock would be released,
+ * the next batch would re-lock, and the view would oscillate until heights
+ * settle. We disambiguate by also inspecting `scrollHeight`: an upward move
+ * that coincides with shrinking content is content-driven, not a user gesture,
+ * so the lock stays engaged.
+ */
+export function shouldReleaseBottomLock(
+  input: BottomLockReleaseInput
+): boolean {
+  const {
+    bottomLocked,
+    prevScrollTop,
+    currentScrollTop,
+    prevScrollHeight,
+    currentScrollHeight,
+    withinProgrammaticScroll,
+    sizeAdjustmentActive,
+  } = input;
+
+  if (!bottomLocked) return false;
+  if (withinProgrammaticScroll) return false;
+  if (sizeAdjustmentActive) return false;
+
+  const movedUp =
+    prevScrollTop - currentScrollTop > USER_SCROLL_UP_RELEASE_THRESHOLD_PX;
+  if (!movedUp) return false;
+
+  // Content above the viewport shrinking (re-measure or browser clamp) moves
+  // scrollTop up with no user input. Only a stable-height upward move is a
+  // real gesture worth releasing the lock for.
+  const heightShrank = currentScrollHeight < prevScrollHeight - 1;
+  return !heightShrank;
+}
+
+// ---------------------------------------------------------------------------
 // Intent Equality (for deduplication)
 // ---------------------------------------------------------------------------
 
