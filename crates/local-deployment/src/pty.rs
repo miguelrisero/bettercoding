@@ -126,6 +126,13 @@ pub enum PtyError {
 struct PtySession {
     writer: Box<dyn Write + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
+    /// Kills the PTY child (tmux client / shell) on teardown. Required because
+    /// dropping the master does not close the reader thread's *cloned* reader,
+    /// so without an explicit kill the reader blocks on `read()` forever and
+    /// the child is never reaped on disconnect. For CLI mode this detaches the
+    /// tmux client (the session persists on the server); for a bare shell it
+    /// ends the ephemeral shell.
+    child_killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     _output_handle: thread::JoinHandle<()>,
     closed: bool,
 }
@@ -247,6 +254,9 @@ impl PtyService {
                 .spawn_command(cmd)
                 .map_err(|e| PtyError::CreateFailed(e.to_string()))?;
 
+            // Independent kill handle so close_session can unblock the reader.
+            let child_killer = child.clone_killer();
+
             let mut writer = pty_pair
                 .master
                 .take_writer()
@@ -287,16 +297,17 @@ impl PtyService {
                 let _ = child.wait();
             });
 
-            Ok::<_, PtyError>((pty_pair.master, writer, output_handle))
+            Ok::<_, PtyError>((pty_pair.master, writer, child_killer, output_handle))
         })
         .await
         .map_err(|e| PtyError::CreateFailed(e.to_string()))??;
 
-        let (master, writer, output_handle) = result;
+        let (master, writer, child_killer, output_handle) = result;
 
         let session = PtySession {
             writer,
             master,
+            child_killer,
             _output_handle: output_handle,
             closed: false,
         };
@@ -369,6 +380,12 @@ impl PtyService {
             .remove(&session_id)
         {
             session.closed = true;
+            // Kill the PTY child so the reader thread sees EOF, exits, and
+            // reaps it. Without this the reader blocks on its cloned reader
+            // forever (dropping the master here doesn't close that clone),
+            // leaking a thread + an unreaped child per disconnect. Harmless if
+            // the child already exited (natural EOF path).
+            let _ = session.child_killer.kill();
         }
         Ok(())
     }
