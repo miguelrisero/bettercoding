@@ -21,8 +21,8 @@ working alongside CLI mode.
 
 - `crates/local-deployment/src/pty.rs` — `PtyService::create_session(working_dir, cols, rows)`
   spawns `get_interactive_shell()` on a fresh PTY per WebSocket connection;
-  the session dies with the connection (`terminal.rs:165`). Sole caller:
-  `crates/server/src/routes/terminal.rs:104`.
+  the session dies with the connection (`terminal.rs::handle_terminal_ws`).
+  Sole caller: `terminal.rs::handle_terminal_ws`.
 - `crates/server/src/routes/terminal.rs` — `GET /api/terminal/ws?workspace_id&cols&rows`
   resolves the worktree dir from `workspace.container_ref`
   (+ `/<repo_name>` when the workspace has exactly one repo).

@@ -2,7 +2,10 @@ use std::{
     collections::HashMap,
     io::{Read, Write},
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
 };
 
@@ -133,6 +136,10 @@ struct PtySession {
     /// tmux client (the session persists on the server); for a bare shell it
     /// ends the ephemeral shell.
     child_killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    /// Set by the reader thread once it has reaped the child via `wait()`.
+    /// `close_session` checks this before signalling so it never targets a PID
+    /// that was already reaped (and possibly recycled) on the natural-exit path.
+    child_reaped: Arc<AtomicBool>,
     _output_handle: thread::JoinHandle<()>,
     closed: bool,
 }
@@ -256,6 +263,8 @@ impl PtyService {
 
             // Independent kill handle so close_session can unblock the reader.
             let child_killer = child.clone_killer();
+            let child_reaped = Arc::new(AtomicBool::new(false));
+            let child_reaped_reader = child_reaped.clone();
 
             let mut writer = pty_pair
                 .master
@@ -295,19 +304,28 @@ impl PtyService {
                 // unreaped PTY child leaves one zombie per disconnect until
                 // the server exits (observed live as a defunct tmux client).
                 let _ = child.wait();
+                // Mark reaped so close_session won't signal a freed/recycled PID.
+                child_reaped_reader.store(true, Ordering::Release);
             });
 
-            Ok::<_, PtyError>((pty_pair.master, writer, child_killer, output_handle))
+            Ok::<_, PtyError>((
+                pty_pair.master,
+                writer,
+                child_killer,
+                child_reaped,
+                output_handle,
+            ))
         })
         .await
         .map_err(|e| PtyError::CreateFailed(e.to_string()))??;
 
-        let (master, writer, child_killer, output_handle) = result;
+        let (master, writer, child_killer, child_reaped, output_handle) = result;
 
         let session = PtySession {
             writer,
             master,
             child_killer,
+            child_reaped,
             _output_handle: output_handle,
             closed: false,
         };
@@ -379,13 +397,17 @@ impl PtyService {
             .map_err(|_| PtyError::SessionClosed)?
             .remove(&session_id)
         {
-            session.closed = true;
-            // Kill the PTY child so the reader thread sees EOF, exits, and
+            // Kill the PTY child so a read-parked reader sees EOF, exits, and
             // reaps it. Without this the reader blocks on its cloned reader
             // forever (dropping the master here doesn't close that clone),
-            // leaking a thread + an unreaped child per disconnect. Harmless if
-            // the child already exited (natural EOF path).
-            let _ = session.child_killer.kill();
+            // leaking a thread + an unreaped child per disconnect. (A
+            // send-parked reader is instead released when the caller drops the
+            // output receiver after this returns.) Skip the signal if the
+            // reader already reaped on the natural-exit path, so we never
+            // SIGHUP a freed/recycled PID.
+            if !session.child_reaped.load(Ordering::Acquire) {
+                let _ = session.child_killer.kill();
+            }
         }
         Ok(())
     }
