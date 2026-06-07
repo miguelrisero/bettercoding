@@ -366,6 +366,15 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
                   callbacks.onData(decodeBase64(msg.data));
                 } else if (msg.type === 'exit' && callbacks) {
                   callbacks.onExit?.();
+                } else if (msg.type === 'error' && callbacks) {
+                  // Hard backend error (e.g. PTY creation failed). Surface it
+                  // in the terminal and stop the reconnect loop — retrying a
+                  // failed create_session forever just blinks silently.
+                  const state = reconnectStateRef.current.get(tabId);
+                  if (state) state.intentionallyClosed = true;
+                  callbacks.onData(
+                    `\r\n\x1b[31m${msg.message ?? 'terminal error'}\x1b[0m\r\n`
+                  );
                 }
               } catch {
                 // Ignore parse errors

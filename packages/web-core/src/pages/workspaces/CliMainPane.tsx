@@ -1,7 +1,9 @@
+import { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ChatsTeardropIcon } from '@phosphor-icons/react';
 
 import { XTermInstance } from '@/shared/components/XTermInstance';
+import { cliTabId, useTerminal } from '@/shared/hooks/useTerminal';
 
 interface CliMainPaneProps {
   workspaceId: string;
@@ -10,13 +12,20 @@ interface CliMainPaneProps {
 
 /**
  * Terminal-first main pane: hosts the workspace's persistent tmux-backed
- * interactive `claude` session. The tab id is stable per workspace so the
- * terminal instance and WebSocket survive navigation; the tmux session
- * itself survives disconnects and server restarts (see
- * docs/exec-plans/cli-mode-tmux.md).
+ * interactive `claude` session (see docs/exec-plans/cli-mode-tmux.md).
+ *
+ * Persistence lives in tmux, NOT in this client: on unmount (navigate away,
+ * back to chat) the WebSocket/xterm instance is torn down so hidden
+ * workspaces don't accumulate live sockets and server-side PTYs. Remounting
+ * reattaches the same tmux session with scrollback intact.
  */
 export function CliMainPane({ workspaceId, onBackToChat }: CliMainPaneProps) {
   const { t } = useTranslation('common');
+  const { closeTab } = useTerminal();
+
+  useEffect(() => {
+    return () => closeTab(workspaceId, cliTabId(workspaceId));
+  }, [workspaceId, closeTab]);
 
   return (
     <div className="h-full bg-secondary flex flex-col">
@@ -39,7 +48,7 @@ export function CliMainPane({ workspaceId, onBackToChat }: CliMainPaneProps) {
       </div>
       <div className="flex-1 min-h-0 border-t border-border">
         <XTermInstance
-          tabId={`cli-${workspaceId}`}
+          tabId={cliTabId(workspaceId)}
           workspaceId={workspaceId}
           isActive
           mode="cli"

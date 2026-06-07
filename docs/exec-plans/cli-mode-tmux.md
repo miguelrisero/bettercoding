@@ -37,7 +37,8 @@ working alongside CLI mode.
 
 1. `PtyService::create_session` gains a `command: PtyCommand` parameter:
    - `PtyCommand::Shell` — existing behavior (default; side terminal unchanged).
-   - `PtyCommand::TmuxCli { session_name, working_dir }` — spawn
+   - `PtyCommand::TmuxCli { session_name }` (working dir stays a
+     `create_session` parameter) — spawn
      `tmux new-session -A -s <session_name> -c <working_dir> <bootstrap>`
      on the PTY. `-A` = attach if the session exists, create otherwise —
      this is the whole reattach mechanism; reconnects attach, never respawn.
@@ -79,6 +80,22 @@ working alongside CLI mode.
 Note: `--session-id` does NOT pin interactive session UUIDs (verified against
 current docs) — cwd-keyed `--continue` is the resume mechanism.
 
+### Environment & secrets (intentional trade-off)
+
+The tmux server and the `claude` it runs inherit the backend process
+environment — identical to the existing bare-shell terminal, which already
+spawns an interactive shell with the same env in the same worktree. The new
+factor is **longevity**: the CLI tmux session can outlive a backend restart,
+so an inherited secret (e.g. `ANTHROPIC_API_KEY`) persists in a detached
+process until the workspace is deleted (`kill_cli_tmux_session`) or the socket
+server is killed. Mitigations applied: a **dedicated tmux socket**
+(`tmux -L vibe-kanban`) isolates our server from the user's personal tmux and
+makes the long-lived server unambiguously ours; cleanup is namespaced and
+exact-matched. A curated env allowlist was deliberately **not** applied — it
+risks breaking interactive subscription auth (which the feature depends on),
+and the exposure is local-only and equivalent to the pre-existing terminal.
+Per-secret scrubbing should ride the executor-profile integration (below).
+
 ### Out of scope (MVP)
 
 - Auto-resuming `claude --continue` inside the bootstrap (ambiguous on first
@@ -86,6 +103,12 @@ current docs) — cwd-keyed `--continue` is the resume mechanism.
 - Remote/cloud deployments (local-deployment only).
 - Multi-window tmux management, status-bar config, mouse-mode tuning.
 - Replacing the executor path — chat mode remains default and fully working.
+- **Startup orphan sweep** of `vk_` sessions whose workspace no longer exists
+  (e.g. after a backend crash mid-delete, or manual worktree removal). Bounded
+  today by per-delete cleanup + the dedicated socket (one `kill-server`
+  reclaims all); a periodic/startup reconciliation is a clean follow-up.
+- **Executor-profile integration** for the bootstrap (model/flags/alternate
+  agent, and per-secret env scrubbing) — see the `CLI_BOOTSTRAP` TODO.
 
 ## Test plan
 

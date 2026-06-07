@@ -28,8 +28,26 @@ pub enum PtyCommand {
 /// `claude` TUI when installed, then drop to a shell instead of ending the
 /// session (so a crashed/exited claude leaves a usable pane where
 /// `claude --continue` resumes the conversation). Ignored by `-A` attaches.
+///
+/// TODO(profile-integration): this hardcoded invocation must converge on the
+/// executor profile system (`ExecutorProfileId`) before growing any argument
+/// (model, flags, alternate agent CLIs) — do not bolt options onto
+/// `PtyCommand::TmuxCli` piecemeal.
 const CLI_BOOTSTRAP: &str =
     r#"command -v claude >/dev/null 2>&1 && claude; exec "${SHELL:-/bin/sh}""#;
+
+/// Bound on queued PTY output (chunks of up to 4KB). Full-screen TUI redraws
+/// are chatty; if the WebSocket consumer stalls (throttled background tab),
+/// the blocking send pauses the PTY reader instead of growing memory —
+/// natural terminal backpressure with a ~1MB worst case per session.
+const OUTPUT_CHANNEL_CAPACITY: usize = 256;
+
+/// Dedicated tmux socket for all VibeKanban CLI sessions. Isolating onto our
+/// own server (rather than the user's default tmux) means: our sessions never
+/// collide with or appear in the user's personal tmux; a single
+/// `tmux -L <socket> kill-server` can reclaim everything; and the long-lived
+/// server that inherits the backend environment is clearly ours, not shared.
+const CLI_TMUX_SOCKET: &str = "vibe-kanban";
 
 /// tmux session name for a workspace's CLI-mode terminal. The `vk_` namespace
 /// is ours: creation, attach, and cleanup only ever target these names.
@@ -47,7 +65,13 @@ pub async fn kill_cli_tmux_session(workspace_id: Uuid) {
     }
     let session_name = cli_tmux_session_name(workspace_id);
     match tokio::process::Command::new("tmux")
-        .args(["kill-session", "-t", &format!("={session_name}")])
+        .args([
+            "-L",
+            CLI_TMUX_SOCKET,
+            "kill-session",
+            "-t",
+            &format!("={session_name}"),
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -64,15 +88,26 @@ pub async fn kill_cli_tmux_session(workspace_id: Uuid) {
 fn tmux_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        std::process::Command::new("tmux")
+        let available = std::process::Command::new("tmux")
             .arg("-V")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .map(|status| status.success())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !available {
+            tracing::warn!(
+                "tmux not found on PATH; CLI mode terminals will degrade to ephemeral shells"
+            );
+        }
+        available
     })
 }
+
+/// Visible notice written into a CLI pane when tmux is unavailable, so the
+/// "persistent session" promise is never silently broken.
+const TMUX_MISSING_NOTICE: &[u8] =
+    b"\x1b[33m\xe2\x9a\xa0 tmux not found \xe2\x80\x94 running an ephemeral shell; this session will NOT survive disconnects.\x1b[0m\r\n";
 
 #[derive(Debug, Error)]
 pub enum PtyError {
@@ -113,9 +148,9 @@ impl PtyService {
         cols: u16,
         rows: u16,
         command: PtyCommand,
-    ) -> Result<(Uuid, mpsc::UnboundedReceiver<Vec<u8>>), PtyError> {
+    ) -> Result<(Uuid, mpsc::Receiver<Vec<u8>>), PtyError> {
         let session_id = Uuid::new_v4();
-        let (output_tx, output_rx) = mpsc::unbounded_channel();
+        let (output_tx, output_rx) = mpsc::channel(OUTPUT_CHANNEL_CAPACITY);
         let shell = get_interactive_shell().await;
 
         let result = tokio::task::spawn_blocking(move || {
@@ -139,10 +174,32 @@ impl PtyService {
                 _ => None,
             };
 
+            // Never silently break the persistence promise: if CLI mode was
+            // requested but tmux is absent, say so in the pane itself.
+            if matches!(&command, PtyCommand::TmuxCli { .. }) {
+                match &tmux_session {
+                    Some(session_name) => tracing::info!(
+                        "CLI terminal attaching tmux session {session_name} in {}",
+                        working_dir.display()
+                    ),
+                    None => {
+                        let _ = output_tx.blocking_send(TMUX_MISSING_NOTICE.to_vec());
+                    }
+                }
+            }
+
             let (mut cmd, shell_name) = if let Some(session_name) = &tmux_session {
                 let mut cmd = CommandBuilder::new("tmux");
+                // Dedicated socket isolates our sessions from the user's tmux.
+                cmd.arg("-L");
+                cmd.arg(CLI_TMUX_SOCKET);
                 cmd.arg("new-session");
+                // -A: attach if the session exists, else create.
+                // -D: detach any other client first, so one workspace pane has
+                //     a single owner — avoids two browser windows fighting the
+                //     same TUI and the "smallest client wins" resize churn.
                 cmd.arg("-A");
+                cmd.arg("-D");
                 cmd.arg("-s");
                 cmd.arg(session_name);
                 cmd.arg("-c");
@@ -208,19 +265,26 @@ impl PtyService {
                 .map_err(|e| PtyError::CreateFailed(e.to_string()))?;
 
             let output_handle = thread::spawn(move || {
+                let mut child = child;
                 let mut buf = [0u8; 4096];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            if output_tx.send(buf[..n].to_vec()).is_err() {
+                            // Blocking send: a stalled WebSocket consumer pauses
+                            // this reader (PTY backpressure) instead of queueing
+                            // unbounded TUI redraw output.
+                            if output_tx.blocking_send(buf[..n].to_vec()).is_err() {
                                 break;
                             }
                         }
                         Err(_) => break,
                     }
                 }
-                drop(child);
+                // Reap the child: dropping a Child does NOT wait(), and an
+                // unreaped PTY child leaves one zombie per disconnect until
+                // the server exits (observed live as a defunct tmux client).
+                let _ = child.wait();
             });
 
             Ok::<_, PtyError>((pty_pair.master, writer, output_handle))

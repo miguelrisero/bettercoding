@@ -127,9 +127,19 @@ export function XTermInstance({
 
   useEffect(() => {
     if (!resizeRef.current) return;
-    const observer = new ResizeObserver(fitTerminal);
+    // Debounce: a pane-divider drag fires dozens of observations per second,
+    // and each un-coalesced fit() becomes a WS resize frame + SIGWINCH +
+    // full TUI redraw. Trailing-edge 75ms keeps the final size exact.
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const observer = new ResizeObserver(() => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(fitTerminal, 75);
+    });
     observer.observe(resizeRef.current);
-    return () => observer.disconnect();
+    return () => {
+      if (timer) clearTimeout(timer);
+      observer.disconnect();
+    };
   }, [fitTerminal]);
 
   useEffect(() => {
