@@ -114,6 +114,7 @@ export const Pages: Record<StaticPageId, CommandBarPage> = {
         items: [
           { type: 'action', action: Actions.ToggleLeftSidebar },
           { type: 'action', action: Actions.ToggleLeftMainPanel },
+          { type: 'action', action: Actions.ToggleCliMode },
           { type: 'action', action: Actions.ToggleRightSidebar },
           { type: 'action', action: Actions.ToggleChangesMode },
           { type: 'action', action: Actions.ToggleLogsMode },

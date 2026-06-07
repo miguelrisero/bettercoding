@@ -47,15 +47,23 @@ export type ContextBarPosition =
   | 'bottom-left'
   | 'bottom-right';
 
+/**
+ * What the left-main (primary) pane shows: the conversation chat, or the
+ * persistent tmux-backed `claude` CLI terminal.
+ */
+export type MainPaneMode = 'chat' | 'cli';
+
 // Workspace-specific panel state
 export type WorkspacePanelState = {
   rightMainPanelMode: RightMainPanelMode | null;
   isLeftMainPanelVisible: boolean;
+  mainPaneMode: MainPaneMode;
 };
 
 const DEFAULT_WORKSPACE_PANEL_STATE: WorkspacePanelState = {
   rightMainPanelMode: null,
   isLeftMainPanelVisible: true,
+  mainPaneMode: 'chat',
 };
 
 // Kanban filter state
@@ -978,11 +986,22 @@ export function useWorkspacePanelState(workspaceId: string | undefined) {
   const setLeftSidebarVisible = useUiPreferencesStore(
     (s) => s.setLeftSidebarVisible
   );
+  const setWorkspacePanelState = useUiPreferencesStore(
+    (s) => s.setWorkspacePanelState
+  );
 
   // Memoized callbacks that include workspaceId
   const toggleRightMainPanelModeForWorkspace = useCallback(
     (mode: RightMainPanelMode) => toggleRightMainPanelMode(mode, workspaceId),
     [toggleRightMainPanelMode, workspaceId]
+  );
+
+  const setMainPaneModeForWorkspace = useCallback(
+    (mode: MainPaneMode) => {
+      if (!workspaceId) return;
+      setWorkspacePanelState(workspaceId, { mainPaneMode: mode });
+    },
+    [setWorkspacePanelState, workspaceId]
   );
 
   const setRightMainPanelModeForWorkspace = useCallback(
@@ -1000,6 +1019,8 @@ export function useWorkspacePanelState(workspaceId: string | undefined) {
     // Workspace-specific state
     rightMainPanelMode: wsState.rightMainPanelMode,
     isLeftMainPanelVisible: wsState.isLeftMainPanelVisible,
+    // `?? 'chat'` guards panel states persisted before mainPaneMode existed.
+    mainPaneMode: wsState.mainPaneMode ?? 'chat',
 
     // Global state (sidebars and terminal)
     isLeftSidebarVisible,
@@ -1010,6 +1031,7 @@ export function useWorkspacePanelState(workspaceId: string | undefined) {
     toggleRightMainPanelMode: toggleRightMainPanelModeForWorkspace,
     setRightMainPanelMode: setRightMainPanelModeForWorkspace,
     setLeftMainPanelVisible: setLeftMainPanelVisibleForWorkspace,
+    setMainPaneMode: setMainPaneModeForWorkspace,
 
     // Global actions
     setLeftSidebarVisible,

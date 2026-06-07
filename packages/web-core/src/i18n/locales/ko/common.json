@@ -1,4 +1,9 @@
 {
+  "cliMode": {
+    "title": "Claude CLI",
+    "persistentHint": "지속되는 tmux 세션",
+    "backToChat": "채팅으로 돌아가기"
+  },
   "editorNames": {
     "custom": "사용자 지정"
   },

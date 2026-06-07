@@ -617,6 +617,31 @@ export const Actions = {
     },
   },
 
+  ToggleCliMode: {
+    id: 'toggle-cli-mode',
+    label: 'Toggle CLI Mode',
+    icon: TerminalIcon,
+    shortcut: 'V T',
+    requiresTarget: ActionTargetType.NONE,
+    isVisible: (ctx) => !ctx.isCreateMode && ctx.layoutMode === 'workspaces',
+    isActive: (ctx) => ctx.mainPaneMode === 'cli',
+    getLabel: (ctx) =>
+      ctx.mainPaneMode === 'cli'
+        ? 'Exit CLI Mode (back to chat)'
+        : 'Enter CLI Mode (claude in terminal)',
+    execute: (ctx) => {
+      const workspaceId = ctx.currentWorkspaceId;
+      if (!workspaceId) return;
+      const store = useUiPreferencesStore.getState();
+      const mode = store.getWorkspacePanelState(workspaceId).mainPaneMode;
+      store.setWorkspacePanelState(workspaceId, {
+        mainPaneMode: (mode ?? 'chat') === 'cli' ? 'chat' : 'cli',
+        // The CLI pane lives in the left-main slot; make sure it's visible.
+        isLeftMainPanelVisible: true,
+      });
+    },
+  },
+
   ToggleRightSidebar: {
     id: 'toggle-right-sidebar',
     label: () =>

@@ -1,4 +1,9 @@
 {
+  "cliMode": {
+    "title": "Claude CLI",
+    "persistentHint": "持久 tmux 工作階段",
+    "backToChat": "返回聊天"
+  },
   "editorNames": {
     "custom": "自訂"
   },

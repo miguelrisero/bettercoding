@@ -13,6 +13,11 @@ interface XTermInstanceProps {
   workspaceId: string;
   isActive: boolean;
   onClose?: () => void;
+  /**
+   * Terminal backend mode. 'shell' (default) is a plain interactive shell;
+   * 'cli' attaches the workspace's persistent tmux-backed `claude` session.
+   */
+  mode?: 'shell' | 'cli';
 }
 
 export function XTermInstance({
@@ -20,6 +25,7 @@ export function XTermInstance({
   workspaceId,
   isActive,
   onClose,
+  mode = 'shell',
 }: XTermInstanceProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const resizeRef = useRef<HTMLDivElement>(null);
@@ -37,8 +43,9 @@ export function XTermInstance({
   const endpoint = useMemo(() => {
     const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
     const host = window.location.host;
-    return `${protocol}//${host}/api/terminal/ws?workspace_id=${workspaceId}&cols=${initialSizeRef.current.cols}&rows=${initialSizeRef.current.rows}`;
-  }, [workspaceId]);
+    const modeParam = mode === 'cli' ? '&mode=cli' : '';
+    return `${protocol}//${host}/api/terminal/ws?workspace_id=${workspaceId}&cols=${initialSizeRef.current.cols}&rows=${initialSizeRef.current.rows}${modeParam}`;
+  }, [workspaceId, mode]);
 
   const fitTerminal = useCallback(() => {
     fitAddonRef.current?.fit();
