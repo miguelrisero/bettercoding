@@ -9,6 +9,7 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use db::models::{workspace::Workspace, workspace_repo::WorkspaceRepo};
 use deployment::Deployment;
+use local_deployment::pty::{PtyCommand, cli_tmux_session_name};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -18,6 +19,16 @@ use crate::{
     middleware::signed_ws::{MaybeSignedWebSocket, SignedWsUpgrade},
 };
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalMode {
+    /// Plain interactive shell (default side terminal).
+    #[default]
+    Shell,
+    /// Persistent tmux-backed session running the interactive `claude` CLI.
+    Cli,
+}
+
 #[derive(Debug, Deserialize)]
 struct TerminalQuery {
     pub workspace_id: Uuid,
@@ -25,6 +36,8 @@ struct TerminalQuery {
     pub cols: u16,
     #[serde(default = "default_rows")]
     pub rows: u16,
+    #[serde(default)]
+    mode: TerminalMode,
 }
 
 fn default_cols() -> u16 {
@@ -87,8 +100,22 @@ async fn terminal_ws(
         }
     }
 
+    let command = match query.mode {
+        TerminalMode::Cli => PtyCommand::TmuxCli {
+            session_name: cli_tmux_session_name(query.workspace_id),
+        },
+        TerminalMode::Shell => PtyCommand::Shell,
+    };
+
     Ok(ws.on_upgrade(move |socket| {
-        handle_terminal_ws(socket, deployment, working_dir, query.cols, query.rows)
+        handle_terminal_ws(
+            socket,
+            deployment,
+            working_dir,
+            query.cols,
+            query.rows,
+            command,
+        )
     }))
 }
 
@@ -98,10 +125,11 @@ async fn handle_terminal_ws(
     working_dir: PathBuf,
     cols: u16,
     rows: u16,
+    command: PtyCommand,
 ) {
     let (session_id, mut output_rx) = match deployment
         .pty()
-        .create_session(working_dir, cols, rows)
+        .create_session(working_dir, cols, rows, command)
         .await
     {
         Ok(result) => result,
