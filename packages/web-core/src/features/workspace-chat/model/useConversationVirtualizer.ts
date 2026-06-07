@@ -42,6 +42,30 @@ type ScrollToOptionsBehavior = 'auto' | 'smooth';
 /** Number of items to render beyond the visible area in each direction. */
 const OVERSCAN = 8;
 
+/**
+ * How long after a direct user scroll input (wheel/touch/keyboard) the
+ * virtualizer's size-change scroll compensation stays suppressed.
+ *
+ * While history loads, freshly mounted rows re-measure away from their
+ * estimates and each above-viewport correction rewrites scroll position via
+ * `scrollToFn`. If the user is actively scrolling at that moment, those
+ * corrections fight the gesture (observed live: 84 forced scrollTo calls in
+ * 8s dragging the view ~2.6k px against the wheel). User input must win;
+ * anchoring resumes once the gesture pauses.
+ */
+const USER_SCROLL_INPUT_PRIORITY_MS = 400;
+
+/** Keys that scroll the conversation when it has focus. */
+const SCROLL_KEYS = new Set([
+  'ArrowUp',
+  'ArrowDown',
+  'PageUp',
+  'PageDown',
+  'Home',
+  'End',
+  ' ',
+]);
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -155,11 +179,48 @@ export function useConversationVirtualizer({
 }: ConversationVirtualizerOptions): ConversationVirtualizerResult {
   const bottomLockedRef = useRef(false);
   const smoothScrollDeadlineRef = useRef(0);
+  /** Timestamp of the last direct user scroll input (wheel/touch/keys). */
+  const lastUserScrollInputRef = useRef(0);
+  /**
+   * Live container width for size estimation. `clientWidth` reads 0 before
+   * layout, which makes every first-paint estimate wrong and inflates the
+   * re-measurement storm while history loads.
+   */
+  const containerWidthRef = useRef<number | null>(null);
 
   const isBottomScrollCorrectionActive = useCallback(
     () => bottomLockedRef.current,
     []
   );
+
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+
+    const markUserScroll = () => {
+      lastUserScrollInputRef.current = performance.now();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (SCROLL_KEYS.has(event.key)) markUserScroll();
+    };
+
+    el.addEventListener('wheel', markUserScroll, { passive: true });
+    el.addEventListener('touchmove', markUserScroll, { passive: true });
+    el.addEventListener('keydown', onKeyDown);
+
+    containerWidthRef.current = el.clientWidth || null;
+    const resizeObserver = new ResizeObserver(() => {
+      containerWidthRef.current = el.clientWidth || null;
+    });
+    resizeObserver.observe(el);
+
+    return () => {
+      el.removeEventListener('wheel', markUserScroll);
+      el.removeEventListener('touchmove', markUserScroll);
+      el.removeEventListener('keydown', onKeyDown);
+      resizeObserver.disconnect();
+    };
+  }, [scrollContainerRef]);
 
   // -------------------------------------------------------------------------
   // Virtualizer instance
@@ -171,7 +232,10 @@ export function useConversationVirtualizer({
     estimateSize: (index) => {
       const row = rows[index];
       if (!row) return SIZE_ESTIMATE_PX.medium;
-      const containerWidth = scrollContainerRef.current?.clientWidth ?? null;
+      const containerWidth =
+        containerWidthRef.current ??
+        scrollContainerRef.current?.clientWidth ??
+        null;
       return estimateSizeForRow(row, containerWidth);
     },
     getItemKey: (index) => {
@@ -209,9 +273,15 @@ export function useConversationVirtualizer({
         totalScrollableSize - (scrollOffset + viewportHeight);
       const isItemFullyAboveViewport = item.end <= scrollOffset;
       const isBottomLocked = bottomLockedRef.current;
+      // User input wins: never rewrite scroll position against an active
+      // gesture (see USER_SCROLL_INPUT_PRIORITY_MS).
+      const userScrollingRecently =
+        performance.now() - lastUserScrollInputRef.current <
+        USER_SCROLL_INPUT_PRIORITY_MS;
 
       const shouldAdjust =
         !isBottomLocked &&
+        !userScrollingRecently &&
         !shouldSuppressSizeAdjustment?.() &&
         isItemFullyAboveViewport &&
         remainingDistance > NEAR_BOTTOM_THRESHOLD_PX;
