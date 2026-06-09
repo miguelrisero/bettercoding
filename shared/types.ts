@@ -143,7 +143,14 @@ kanban_project_view_selections: { [key in string]?: JsonValue },
 /**
  * Kanban project view preferences (filters, toggles per project per view)
  */
-kanban_project_view_preferences: { [key in string]?: JsonValue }, };
+kanban_project_view_preferences: { [key in string]?: JsonValue }, 
+/**
+ * One-time "CLI mode is the default main pane" migration marker. Payloads
+ * without this flag predate the CLI-by-default rollout: on load the
+ * client flips every persisted workspace main pane to "cli" once, then
+ * stamps this true so later explicit "chat" choices stick.
+ */
+cli_default_applied: boolean | null, };
 
 export type ProjectRepoDefaultsData = { repos: Array<DraftWorkspaceRepo>, };
 

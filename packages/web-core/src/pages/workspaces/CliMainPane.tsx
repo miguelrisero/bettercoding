@@ -13,6 +13,14 @@ interface CliMainPaneProps {
    * terminal joins the exact chat shown in the UI (bidirectional handover).
    */
   sessionId?: string | null;
+  /**
+   * Whether this workspace's session list has settled. The terminal (and its
+   * WebSocket, which creates the tmux session server-side) is only mounted
+   * once this is true: the resume target is baked into the tmux session at
+   * creation, so connecting mid-load would hand the bootstrap a missing (or
+   * the previous workspace's) session id.
+   */
+  sessionsReady?: boolean;
 }
 
 /**
@@ -28,6 +36,7 @@ export function CliMainPane({
   workspaceId,
   onBackToChat,
   sessionId,
+  sessionsReady = true,
 }: CliMainPaneProps) {
   const { t } = useTranslation('common');
   const { closeTab } = useTerminal();
@@ -56,13 +65,15 @@ export function CliMainPane({
         </button>
       </div>
       <div className="flex-1 min-h-0 border-t border-border">
-        <XTermInstance
-          tabId={cliTabId(workspaceId)}
-          workspaceId={workspaceId}
-          isActive
-          mode="cli"
-          sessionId={sessionId ?? undefined}
-        />
+        {sessionsReady && (
+          <XTermInstance
+            tabId={cliTabId(workspaceId)}
+            workspaceId={workspaceId}
+            isActive
+            mode="cli"
+            sessionId={sessionId ?? undefined}
+          />
+        )}
       </div>
     </div>
   );

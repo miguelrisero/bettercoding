@@ -63,7 +63,9 @@ export type WorkspacePanelState = {
 const DEFAULT_WORKSPACE_PANEL_STATE: WorkspacePanelState = {
   rightMainPanelMode: null,
   isLeftMainPanelVisible: true,
-  mainPaneMode: 'chat',
+  // CLI mode (persistent tmux-backed claude) is the default main pane for
+  // every workspace; "Back to chat" switches a workspace back per-workspace.
+  mainPaneMode: 'cli',
 };
 
 // Kanban filter state
@@ -1019,8 +1021,9 @@ export function useWorkspacePanelState(workspaceId: string | undefined) {
     // Workspace-specific state
     rightMainPanelMode: wsState.rightMainPanelMode,
     isLeftMainPanelVisible: wsState.isLeftMainPanelVisible,
-    // `?? 'chat'` guards panel states persisted before mainPaneMode existed.
-    mainPaneMode: wsState.mainPaneMode ?? 'chat',
+    // `?? 'cli'` guards in-memory panel states created before mainPaneMode
+    // existed; CLI is the default main pane.
+    mainPaneMode: wsState.mainPaneMode ?? 'cli',
 
     // Global state (sidebars and terminal)
     isLeftSidebarVisible,

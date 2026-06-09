@@ -154,6 +154,12 @@ pub struct UiPreferencesData {
     /// Kanban project view preferences (filters, toggles per project per view)
     #[serde(default)]
     pub kanban_project_view_preferences: std::collections::HashMap<String, serde_json::Value>,
+    /// One-time "CLI mode is the default main pane" migration marker. Payloads
+    /// without this flag predate the CLI-by-default rollout: on load the
+    /// client flips every persisted workspace main pane to "cli" once, then
+    /// stamps this true so later explicit "chat" choices stick.
+    #[serde(default)]
+    pub cli_default_applied: Option<bool>,
 }
 
 /// Linked issue data for draft workspace scratch

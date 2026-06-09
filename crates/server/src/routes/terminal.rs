@@ -8,7 +8,8 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use db::models::{
-    coding_agent_turn::CodingAgentTurn, workspace::Workspace, workspace_repo::WorkspaceRepo,
+    coding_agent_turn::CodingAgentTurn, session::Session, workspace::Workspace,
+    workspace_repo::WorkspaceRepo,
 };
 use deployment::Deployment;
 use local_deployment::pty::{PtyCommand, cli_tmux_session_name};
@@ -88,45 +89,93 @@ async fn terminal_ws(
         ));
     }
 
-    let mut working_dir = base_dir.clone();
-    match WorkspaceRepo::find_repos_for_workspace(&deployment.db().pool, query.workspace_id).await {
-        Ok(repos) if repos.len() == 1 => {
-            let repo_dir = base_dir.join(&repos[0].name);
-            if repo_dir.exists() {
-                working_dir = repo_dir;
-            }
-        }
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!(
-                "Failed to resolve repos for workspace {}: {}",
-                attempt.id,
-                e
-            );
-        }
-    }
-
-    let command = match query.mode {
+    let (working_dir, command) = match query.mode {
         TerminalMode::Cli => {
-            // Resolve claude's session id for the selected uix chat so CLI mode
-            // resumes the exact conversation (handover). Falls back to
-            // --continue in the bootstrap when there's no prior turn.
-            let resume_session_id = match query.session_id {
-                Some(session_id) => {
-                    CodingAgentTurn::find_latest_session_info(&deployment.db().pool, session_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|info| info.session_id)
-                }
+            let pool = &deployment.db().pool;
+
+            // Resolve the uix session driving the handover. A mid-switch
+            // frontend can briefly send the PREVIOUS workspace's session id;
+            // honoring it would resume a foreign conversation (observed live
+            // as "No conversation found with session ID …" and the pane
+            // dropping to a bare shell), so any session that doesn't belong
+            // to this workspace is discarded in favor of the workspace's
+            // latest session.
+            let mut session = match query.session_id {
+                Some(session_id) => Session::find_by_id(pool, session_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|s| s.workspace_id == query.workspace_id),
                 None => None,
             };
-            PtyCommand::TmuxCli {
-                session_name: cli_tmux_session_name(query.workspace_id),
-                resume_session_id,
+            if session.is_none() {
+                session = Session::find_latest_by_workspace_id(pool, query.workspace_id)
+                    .await
+                    .ok()
+                    .flatten();
             }
+
+            // Run claude exactly where the coding agent runs: the workspace
+            // root plus the session's relative agent_working_dir (mirrors
+            // CodingAgentInitialRequest::effective_dir). claude keys
+            // conversation storage by cwd, so --resume/--continue only find
+            // the executor's transcript from that directory.
+            let mut dir = base_dir.clone();
+            if let Some(rel) = session
+                .as_ref()
+                .and_then(|s| s.agent_working_dir.as_deref())
+                .filter(|d| !d.is_empty())
+            {
+                let candidate = base_dir.join(rel);
+                if candidate.exists() {
+                    dir = candidate;
+                }
+            }
+
+            // Resolve claude's session id for the selected uix chat so CLI
+            // mode resumes the exact conversation (handover). Falls back to
+            // --continue in the bootstrap when there's no prior turn.
+            let resume_session_id = match &session {
+                Some(s) => CodingAgentTurn::find_latest_session_info(pool, s.id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|info| info.session_id),
+                None => None,
+            };
+
+            (
+                dir,
+                PtyCommand::TmuxCli {
+                    session_name: cli_tmux_session_name(query.workspace_id),
+                    resume_session_id,
+                },
+            )
         }
-        TerminalMode::Shell => PtyCommand::Shell,
+        // Side terminals open in the repo for single-repo workspaces — the
+        // most useful default for running project commands by hand.
+        TerminalMode::Shell => {
+            let mut dir = base_dir.clone();
+            match WorkspaceRepo::find_repos_for_workspace(&deployment.db().pool, query.workspace_id)
+                .await
+            {
+                Ok(repos) if repos.len() == 1 => {
+                    let repo_dir = base_dir.join(&repos[0].name);
+                    if repo_dir.exists() {
+                        dir = repo_dir;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to resolve repos for workspace {}: {}",
+                        attempt.id,
+                        e
+                    );
+                }
+            }
+            (dir, PtyCommand::Shell)
+        }
     };
 
     Ok(ws.on_upgrade(move |socket| {

@@ -161,7 +161,9 @@ pub enum PtyError {
 }
 
 struct PtySession {
-    writer: Box<dyn Write + Send>,
+    /// Per-session writer behind its own lock so a blocking PTY write never
+    /// holds up the global session registry (see `write`).
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     /// Kills the PTY child (tmux client / shell) on teardown. Required because
     /// dropping the master does not close the reader thread's *cloned* reader,
@@ -364,7 +366,7 @@ impl PtyService {
         let (master, writer, child_killer, child_reaped, output_handle) = result;
 
         let session = PtySession {
-            writer,
+            writer: Arc::new(Mutex::new(writer)),
             master,
             child_killer,
             child_reaped,
@@ -381,25 +383,37 @@ impl PtyService {
     }
 
     pub async fn write(&self, session_id: Uuid, data: &[u8]) -> Result<(), PtyError> {
-        let mut sessions = self
-            .sessions
+        // Clone the per-session writer handle under the registry lock, then
+        // do the PTY write OUTSIDE it. A PTY whose consumer stalls can block
+        // `write_all` indefinitely; holding the global registry lock across
+        // that would freeze every other terminal — including new attaches —
+        // with no errors anywhere. With the per-session lock, a wedged PTY
+        // only ever blocks its own session.
+        let writer = {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|e| PtyError::WriteFailed(e.to_string()))?;
+            let session = sessions
+                .get(&session_id)
+                .ok_or(PtyError::SessionNotFound(session_id))?;
+
+            if session.closed {
+                return Err(PtyError::SessionClosed);
+            }
+
+            session.writer.clone()
+        };
+
+        let mut writer = writer
             .lock()
             .map_err(|e| PtyError::WriteFailed(e.to_string()))?;
-        let session = sessions
-            .get_mut(&session_id)
-            .ok_or(PtyError::SessionNotFound(session_id))?;
 
-        if session.closed {
-            return Err(PtyError::SessionClosed);
-        }
-
-        session
-            .writer
+        writer
             .write_all(data)
             .map_err(|e| PtyError::WriteFailed(e.to_string()))?;
 
-        session
-            .writer
+        writer
             .flush()
             .map_err(|e| PtyError::WriteFailed(e.to_string()))?;
 
