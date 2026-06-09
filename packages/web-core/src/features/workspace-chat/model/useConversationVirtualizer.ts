@@ -203,6 +203,13 @@ export function useConversationVirtualizer({
   /** Timestamp of the last direct user scroll input (wheel/touch/keys). */
   const lastUserScrollInputRef = useRef(0);
   /**
+   * Direction of the last direct gesture. Used to decide when reading ends:
+   * only a downward gesture that reaches the bottom counts as "returned". A
+   * small chat early in load can leave the reader within the near-bottom band
+   * while still scrolling UP — that must not end the reading state.
+   */
+  const lastUserScrollDirRef = useRef<'up' | 'down'>('down');
+  /**
    * Live container width for size estimation. `clientWidth` reads 0 before
    * layout, which makes every first-paint estimate wrong and inflates the
    * re-measurement storm while history loads.
@@ -265,6 +272,7 @@ export function useConversationVirtualizer({
     // "at bottom" → no auto-relock).
     const markUserScroll = (movesAwayFromBottom: boolean) => {
       lastUserScrollInputRef.current = performance.now();
+      lastUserScrollDirRef.current = movesAwayFromBottom ? 'up' : 'down';
       if (movesAwayFromBottom) {
         userScrolledAwayRef.current = true;
         if (bottomLockedRef.current) {
@@ -274,9 +282,10 @@ export function useConversationVirtualizer({
       }
     };
     const onWheel = (event: WheelEvent) => markUserScroll(event.deltaY < 0);
-    // Touch direction isn't known cheaply here; the re-pin gate and scroll
-    // handler cover touch via their (now un-corrupted) scrollTop reads.
-    const onTouchMove = () => markUserScroll(false);
+    // Touch direction isn't known cheaply; keep the last wheel/key direction.
+    const onTouchMove = () => {
+      lastUserScrollInputRef.current = performance.now();
+    };
     const onKeyDown = (event: KeyboardEvent) => {
       if (SCROLL_KEYS.has(event.key)) {
         markUserScroll(SCROLL_UP_KEYS.has(event.key));
@@ -446,14 +455,15 @@ export function useConversationVirtualizer({
       }
 
       // The user returning to the bottom under their own power ends the reading
-      // state and re-arms follow-bottom. Requires recent direct input so a
-      // content-driven clamp (scrollHeight shrinking from a re-measure during a
-      // reading pause) can't masquerade as "user reached bottom" and re-pin
-      // them. Programmatic scrolls in flight are excluded too.
+      // state and re-arms follow-bottom. Requires a recent DOWNWARD gesture that
+      // reaches the bottom — scrolling up while merely near the bottom (small
+      // chat early in load) must not reset, and a content-driven clamp during a
+      // pause has no recent input. Programmatic scrolls in flight are excluded.
       if (
         userScrolledAwayRef.current &&
         !withinProgrammaticScroll &&
         isUserScrollInputRecent() &&
+        lastUserScrollDirRef.current === 'down' &&
         isNearBottom(currentScrollTop, el.clientHeight, currentScrollHeight)
       ) {
         userScrolledAwayRef.current = false;
@@ -527,6 +537,15 @@ export function useConversationVirtualizer({
           if (target >= 0 && Math.abs(target - el.scrollTop) > 0.5) {
             tagScrollWrite('viewport-anchor');
             el.scrollTop = target;
+            // If the browser clamped (target beyond the scroll range), the row
+            // could not be held — that surfaces as a visible jump. Diagnostic
+            // only; flags the case for follow-up if it shows in a real session.
+            if (Math.abs(el.scrollTop - target) > 1) {
+              scrollDebug('anchor:clamped', {
+                target: Math.round(target),
+                actual: Math.round(el.scrollTop),
+              });
+            }
           }
         }
       }
