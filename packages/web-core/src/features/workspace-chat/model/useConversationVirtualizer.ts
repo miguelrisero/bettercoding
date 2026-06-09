@@ -26,10 +26,14 @@ import {
   findPreviousUserMessageIndex,
 } from './conversation-row-model';
 import {
-  NEAR_BOTTOM_THRESHOLD_PX,
   isNearBottom,
   shouldReleaseBottomLock,
 } from './conversation-scroll-commands';
+import {
+  scrollDebug,
+  installScrollProbe,
+  tagScrollWrite,
+} from './conversation-scroll-debug';
 
 // TanStack Virtual's ScrollBehavior ('auto' | 'smooth' | 'instant') shadows
 // the DOM ScrollBehavior. Use a narrow type to avoid TS2322 mismatches.
@@ -65,6 +69,9 @@ const SCROLL_KEYS = new Set([
   'End',
   ' ',
 ]);
+
+/** Subset of SCROLL_KEYS that move the viewport up (away from the bottom). */
+const SCROLL_UP_KEYS = new Set(['ArrowUp', 'PageUp', 'Home']);
 
 // ---------------------------------------------------------------------------
 // Types
@@ -147,6 +154,20 @@ export interface ConversationVirtualizerResult {
   releaseBottomLock: () => void;
 
   /**
+   * Whether the user issued a direct scroll input (wheel/touch/keys) within
+   * the last `USER_SCROLL_INPUT_PRIORITY_MS`. Consumers use this to avoid
+   * hijacking an actively-reading user (e.g. a stale follow-bottom intent).
+   */
+  isUserScrollInputRecent: () => boolean;
+
+  /**
+   * Whether the user has scrolled up off the bottom and is reading history.
+   * Sticky until they return to the bottom themselves — while true, no
+   * auto-bottom intent should execute.
+   */
+  isUserScrolledAway: () => boolean;
+
+  /**
    * Look up the ConversationRow index for a given virtual item.
    * Since our virtualizer uses identity mapping (no lane reordering),
    * this is simply `virtualItem.index`.
@@ -182,31 +203,102 @@ export function useConversationVirtualizer({
   /** Timestamp of the last direct user scroll input (wheel/touch/keys). */
   const lastUserScrollInputRef = useRef(0);
   /**
+   * Direction of the last direct gesture. Used to decide when reading ends:
+   * only a downward gesture that reaches the bottom counts as "returned". A
+   * small chat early in load can leave the reader within the near-bottom band
+   * while still scrolling UP — that must not end the reading state.
+   */
+  const lastUserScrollDirRef = useRef<'up' | 'down'>('down');
+  /**
    * Live container width for size estimation. `clientWidth` reads 0 before
    * layout, which makes every first-paint estimate wrong and inflates the
    * re-measurement storm while history loads.
    */
   const containerWidthRef = useRef<number | null>(null);
 
+  /** Latest rows, readable from callbacks without re-subscribing. */
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+
+  /**
+   * The row pinned to a fixed screen position while the user reads history
+   * during load. `visualTop` is the row's top offset relative to the
+   * container's top (`rowStart - scrollTop`); holding it constant across
+   * re-measures and prepends keeps the content under the reader's eyes still.
+   */
+  const viewportAnchorRef = useRef<{
+    key: string | number;
+    index: number;
+    visualTop: number;
+  } | null>(null);
+
+  /**
+   * Sticky "the user is reading history, leave their scroll alone" state. Set
+   * the moment they scroll up off the bottom; cleared only when they return to
+   * the bottom themselves (or hit jump-to-bottom). While set, NOTHING
+   * auto-scrolls them — no re-pin, no follow-bottom — so a 30–60s history load
+   * can't yank them around. Unlike the transient 400ms input window, this
+   * survives reading pauses, which is exactly when the old code re-grabbed them.
+   */
+  const userScrolledAwayRef = useRef(false);
+
   const isBottomScrollCorrectionActive = useCallback(
     () => bottomLockedRef.current,
     []
   );
 
+  const isUserScrollInputRecent = useCallback(
+    () =>
+      performance.now() - lastUserScrollInputRef.current <
+      USER_SCROLL_INPUT_PRIORITY_MS,
+    []
+  );
+
+  const isUserScrolledAway = useCallback(() => userScrolledAwayRef.current, []);
+
   useEffect(() => {
     const el = scrollContainerRef.current;
     if (!el) return;
 
-    const markUserScroll = () => {
+    // A direct upward gesture is an unambiguous intent to leave the bottom, so
+    // release the bottom-lock straight from the input event. This is the one
+    // signal the load-time re-pin can't corrupt: wheel/key direction is read
+    // before any scroll write. Inferring the release from scrollTop deltas
+    // (shouldReleaseBottomLock) fails while history streams in, because the
+    // re-pin overwrites the very delta it would read — the user's upward wheel
+    // nets out as a downward move once we slam back to the bottom, so the fight
+    // only ends when loading stops. Releasing here breaks that cycle at its
+    // source and keeps checkIsAtBottom honest afterward (no re-pin → no false
+    // "at bottom" → no auto-relock).
+    const markUserScroll = (movesAwayFromBottom: boolean) => {
+      lastUserScrollInputRef.current = performance.now();
+      lastUserScrollDirRef.current = movesAwayFromBottom ? 'up' : 'down';
+      if (movesAwayFromBottom) {
+        userScrolledAwayRef.current = true;
+        if (bottomLockedRef.current) {
+          bottomLockedRef.current = false;
+          scrollDebug('release:user-up', { scrollTop: el.scrollTop });
+        }
+      }
+    };
+    const onWheel = (event: WheelEvent) => markUserScroll(event.deltaY < 0);
+    // Touch direction isn't known cheaply; keep the last wheel/key direction.
+    const onTouchMove = () => {
       lastUserScrollInputRef.current = performance.now();
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (SCROLL_KEYS.has(event.key)) markUserScroll();
+      if (SCROLL_KEYS.has(event.key)) {
+        markUserScroll(SCROLL_UP_KEYS.has(event.key));
+      }
     };
 
-    el.addEventListener('wheel', markUserScroll, { passive: true });
-    el.addEventListener('touchmove', markUserScroll, { passive: true });
+    el.addEventListener('wheel', onWheel, { passive: true });
+    el.addEventListener('touchmove', onTouchMove, { passive: true });
     el.addEventListener('keydown', onKeyDown);
+
+    // Diagnostics: capture every programmatic scroll write on the container so a
+    // real-world reproduction shows which writer fights the user.
+    const uninstallProbe = installScrollProbe(el);
 
     containerWidthRef.current = el.clientWidth || null;
     const resizeObserver = new ResizeObserver(() => {
@@ -215,10 +307,11 @@ export function useConversationVirtualizer({
     resizeObserver.observe(el);
 
     return () => {
-      el.removeEventListener('wheel', markUserScroll);
-      el.removeEventListener('touchmove', markUserScroll);
+      el.removeEventListener('wheel', onWheel);
+      el.removeEventListener('touchmove', onTouchMove);
       el.removeEventListener('keydown', onKeyDown);
       resizeObserver.disconnect();
+      uninstallProbe();
     };
   }, [scrollContainerRef]);
 
@@ -248,51 +341,49 @@ export function useConversationVirtualizer({
   });
 
   // -------------------------------------------------------------------------
-  // shouldAdjustScrollPositionOnItemSizeChange
+  // shouldAdjustScrollPositionOnItemSizeChange — DISABLED
   //
-  // Preserve the reader's position only when a row fully above the viewport
-  // changes size. Mid-list flicker happens when we compensate for rows that
-  // are still visible or below the viewport, because those corrections can
-  // move the render window and trigger another measurement pass.
+  // TanStack's built-in per-item compensation fires once for every row that
+  // re-measures above the viewport. While a long history streams in that is
+  // dozens of separate `scrollTo` nudges (measured live: 46 writes / ~900px of
+  // small, alternating corrections) — the user perceives them as the view
+  // "randomly scrolling up and down" until measurement settles. We replace it
+  // with a single synchronous viewport anchor (below) that holds one visible
+  // row at a fixed screen position across an entire render, so re-measures and
+  // prepends never move what the reader is looking at.
   // -------------------------------------------------------------------------
 
   useEffect(() => {
-    virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (
-      item,
-      _delta,
-      instance
-    ) => {
-      const scrollElement = scrollContainerRef.current;
-      const viewportHeight =
-        scrollElement?.clientHeight ?? instance.scrollRect?.height ?? 0;
-      const scrollOffset =
-        scrollElement?.scrollTop ?? instance.scrollOffset ?? 0;
-      const totalScrollableSize =
-        scrollElement?.scrollHeight ?? instance.getTotalSize();
-      const remainingDistance =
-        totalScrollableSize - (scrollOffset + viewportHeight);
-      const isItemFullyAboveViewport = item.end <= scrollOffset;
-      const isBottomLocked = bottomLockedRef.current;
-      // User input wins: never rewrite scroll position against an active
-      // gesture (see USER_SCROLL_INPUT_PRIORITY_MS).
-      const userScrollingRecently =
-        performance.now() - lastUserScrollInputRef.current <
-        USER_SCROLL_INPUT_PRIORITY_MS;
-
-      const shouldAdjust =
-        !isBottomLocked &&
-        !userScrollingRecently &&
-        !shouldSuppressSizeAdjustment?.() &&
-        isItemFullyAboveViewport &&
-        remainingDistance > NEAR_BOTTOM_THRESHOLD_PX;
-
-      return shouldAdjust;
-    };
-
+    virtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
     return () => {
       virtualizer.shouldAdjustScrollPositionOnItemSizeChange = undefined;
     };
-  }, [shouldSuppressSizeAdjustment, virtualizer]);
+  }, [virtualizer]);
+
+  // -------------------------------------------------------------------------
+  // Viewport anchoring (replaces TanStack's per-item compensation)
+  // -------------------------------------------------------------------------
+
+  /** Record the first visible row and where it sits, to restore after renders. */
+  const captureViewportAnchor = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el || bottomLockedRef.current) {
+      viewportAnchorRef.current = null;
+      return;
+    }
+    const scrollTop = el.scrollTop;
+    const items = virtualizer.getVirtualItems();
+    const first = items.find((item) => item.end > scrollTop) ?? items[0];
+    const row = first ? rowsRef.current[first.index] : undefined;
+    viewportAnchorRef.current =
+      first && row
+        ? {
+            key: row.semanticKey,
+            index: first.index,
+            visualTop: first.start - scrollTop,
+          }
+        : null;
+  }, [scrollContainerRef, virtualizer]);
 
   // -------------------------------------------------------------------------
   // Reactive isAtBottom state
@@ -342,6 +433,9 @@ export function useConversationVirtualizer({
       // content-driven upward moves (shrinking scrollHeight from re-measured
       // rows / browser clamps) — those would otherwise spuriously release the
       // lock while history streams in and cause scroll oscillation.
+      const withinProgrammaticScroll =
+        performance.now() <= smoothScrollDeadlineRef.current;
+
       if (
         shouldReleaseBottomLock({
           bottomLocked: bottomLockedRef.current,
@@ -349,17 +443,40 @@ export function useConversationVirtualizer({
           currentScrollTop,
           prevScrollHeight: prevScrollHeightRef.current,
           currentScrollHeight,
-          withinProgrammaticScroll:
-            performance.now() <= smoothScrollDeadlineRef.current,
+          withinProgrammaticScroll,
           sizeAdjustmentActive: shouldSuppressSizeAdjustment?.() ?? false,
         })
       ) {
         bottomLockedRef.current = false;
+        userScrolledAwayRef.current = true;
+        scrollDebug('release:scroll-heuristic', {
+          scrollTop: currentScrollTop,
+        });
+      }
+
+      // The user returning to the bottom under their own power ends the reading
+      // state and re-arms follow-bottom. Requires a recent DOWNWARD gesture that
+      // reaches the bottom — scrolling up while merely near the bottom (small
+      // chat early in load) must not reset, and a content-driven clamp during a
+      // pause has no recent input. Programmatic scrolls in flight are excluded.
+      if (
+        userScrolledAwayRef.current &&
+        !withinProgrammaticScroll &&
+        isUserScrollInputRecent() &&
+        lastUserScrollDirRef.current === 'down' &&
+        isNearBottom(currentScrollTop, el.clientHeight, currentScrollHeight)
+      ) {
+        userScrolledAwayRef.current = false;
+        bottomLockedRef.current = true;
+        scrollDebug('reading:end', { scrollTop: currentScrollTop });
       }
 
       prevScrollTopRef.current = currentScrollTop;
       prevScrollHeightRef.current = currentScrollHeight;
       syncIsAtBottom();
+      // Re-anchor to whatever the user just scrolled to, so the next render's
+      // restore holds this position.
+      captureViewportAnchor();
     };
 
     el.addEventListener('scroll', handleScroll, { passive: true });
@@ -368,7 +485,13 @@ export function useConversationVirtualizer({
     return () => {
       el.removeEventListener('scroll', handleScroll);
     };
-  }, [scrollContainerRef, shouldSuppressSizeAdjustment, syncIsAtBottom]);
+  }, [
+    scrollContainerRef,
+    shouldSuppressSizeAdjustment,
+    syncIsAtBottom,
+    captureViewportAnchor,
+    isUserScrollInputRecent,
+  ]);
 
   // -------------------------------------------------------------------------
   // Derived state
@@ -376,6 +499,69 @@ export function useConversationVirtualizer({
 
   const virtualItems = virtualizer.getVirtualItems();
   const totalSize = virtualizer.getTotalSize();
+
+  // Viewport-anchor restore. Runs synchronously after every render that changed
+  // measurements (rows/totalSize deps), before paint, so a re-measure or
+  // prepend above the reader never shifts what they see. One scroll write per
+  // render, anchored to a real visible row — the smooth replacement for
+  // TanStack's many small per-item nudges.
+  //
+  // Only fires while the user is reading (scrolled away) AND not mid-gesture:
+  // restoring against an active scroll would yank them (measured: a 27k-px jump
+  // when it fought a live wheel). During an active gesture we let them scroll
+  // freely; the anchor resumes holding position the moment they pause.
+  useLayoutEffect(() => {
+    const el = scrollContainerRef.current;
+    const anchor = viewportAnchorRef.current;
+
+    if (
+      el &&
+      anchor &&
+      userScrolledAwayRef.current &&
+      !bottomLockedRef.current &&
+      !isUserScrollInputRecent() &&
+      performance.now() >= smoothScrollDeadlineRef.current &&
+      !shouldSuppressSizeAdjustment?.()
+    ) {
+      // Prepends shift the anchor row to a higher index; fast-path the common
+      // no-prepend case, else find it by stable semantic key.
+      let index =
+        rows[anchor.index]?.semanticKey === anchor.key ? anchor.index : -1;
+      if (index === -1) {
+        index = rows.findIndex((r) => r.semanticKey === anchor.key);
+      }
+      if (index !== -1) {
+        const start = virtualizer.measurementsCache[index]?.start;
+        if (start !== undefined) {
+          const target = start - anchor.visualTop;
+          if (target >= 0 && Math.abs(target - el.scrollTop) > 0.5) {
+            tagScrollWrite('viewport-anchor');
+            el.scrollTop = target;
+            // If the browser clamped (target beyond the scroll range), the row
+            // could not be held — that surfaces as a visible jump. Diagnostic
+            // only; flags the case for follow-up if it shows in a real session.
+            if (Math.abs(el.scrollTop - target) > 1) {
+              scrollDebug('anchor:clamped', {
+                target: Math.round(target),
+                actual: Math.round(el.scrollTop),
+              });
+            }
+          }
+        }
+      }
+    }
+
+    captureViewportAnchor();
+  }, [
+    rows,
+    totalRowCount,
+    totalSize,
+    virtualizer,
+    scrollContainerRef,
+    shouldSuppressSizeAdjustment,
+    captureViewportAnchor,
+    isUserScrollInputRecent,
+  ]);
 
   useLayoutEffect(() => {
     syncIsAtBottom();
@@ -386,8 +572,35 @@ export function useConversationVirtualizer({
     const el = scrollContainerRef.current;
     if (!el) return;
 
+    // User input wins. While history streams in, this re-pin runs on every
+    // batch; firing it against an actively-scrolling user yanks them back to
+    // the bottom every frame — the load-time "random scroll" fight. A recent
+    // gesture that has left the bottom releases the lock here instead. This is
+    // the backstop for inputs the wheel-direction release can't classify
+    // (touch), and for any path that re-armed the lock mid-gesture.
+    if (
+      isUserScrollInputRecent() &&
+      !isNearBottom(el.scrollTop, el.clientHeight, el.scrollHeight)
+    ) {
+      bottomLockedRef.current = false;
+      scrollDebug('release:repin-gate', { scrollTop: el.scrollTop });
+      syncIsAtBottom();
+      return;
+    }
+
     const maxScroll = el.scrollHeight - el.clientHeight;
     if (maxScroll > 0 && Math.abs(maxScroll - el.scrollTop) > 1) {
+      // `fighting` = re-pinning to bottom while the user is actively scrolling
+      // away from it. With the release paths above this should never be true;
+      // if it shows up in a real session, the lock failed to release.
+      scrollDebug('repin', {
+        from: Math.round(el.scrollTop),
+        to: Math.round(maxScroll),
+        fighting:
+          isUserScrollInputRecent() &&
+          !isNearBottom(el.scrollTop, el.clientHeight, el.scrollHeight),
+      });
+      tagScrollWrite('repin');
       el.scrollTop = maxScroll;
     }
   }, [
@@ -396,6 +609,7 @@ export function useConversationVirtualizer({
     totalSize,
     syncIsAtBottom,
     scrollContainerRef,
+    isUserScrollInputRecent,
   ]);
 
   // -------------------------------------------------------------------------
@@ -407,12 +621,19 @@ export function useConversationVirtualizer({
       const el = scrollContainerRef.current;
       if (!el) return;
 
+      if (!bottomLockedRef.current) {
+        scrollDebug('lock:acquire', { behavior, scrollTop: el.scrollTop });
+      }
       bottomLockedRef.current = true;
+      // An explicit jump to the bottom ends the reading state.
+      userScrolledAwayRef.current = false;
 
       if (behavior === 'smooth') {
         smoothScrollDeadlineRef.current = performance.now() + 500;
+        tagScrollWrite('scroll-to-bottom');
         el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
       } else {
+        tagScrollWrite('scroll-to-bottom');
         el.scrollTop = el.scrollHeight - el.clientHeight;
       }
     },
@@ -505,6 +726,8 @@ export function useConversationVirtualizer({
     isAtBottom: isAtBottomState,
     checkIsAtBottom,
     releaseBottomLock,
+    isUserScrollInputRecent,
+    isUserScrolledAway,
     rowIndexForVirtualItem,
     rowForVirtualItem,
   };

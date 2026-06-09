@@ -284,6 +284,36 @@ export function shouldReleaseBottomLock(
 }
 
 // ---------------------------------------------------------------------------
+// Auto-Bottom Intent Suppression
+// ---------------------------------------------------------------------------
+
+/**
+ * Decide whether an automatic bottom-following intent must be skipped at
+ * execution time because the user is reading history away from the bottom.
+ *
+ * `initial-bottom` / `follow-bottom` are resolved when a data batch is
+ * *emitted* but executed a frame later. While a long history loads, batches
+ * keep arriving for 30–60s. If one executes `scrollToBottom` while the user has
+ * scrolled up to read, it re-pins them to the bottom — the "view keeps jumping"
+ * complaint. The gate is the *sticky* reading state (set on scroll-up, cleared
+ * only when the user returns to the bottom), not a transient input window: the
+ * old 400ms check reopened during every reading pause and let the re-grab
+ * through.
+ */
+export function shouldSuppressAutoBottomIntent(input: {
+  intentType: ScrollIntent['type'];
+  userScrolledAway: boolean;
+}): boolean {
+  if (
+    input.intentType !== 'initial-bottom' &&
+    input.intentType !== 'follow-bottom'
+  ) {
+    return false;
+  }
+  return input.userScrolledAway;
+}
+
+// ---------------------------------------------------------------------------
 // Intent Equality (for deduplication)
 // ---------------------------------------------------------------------------
 
