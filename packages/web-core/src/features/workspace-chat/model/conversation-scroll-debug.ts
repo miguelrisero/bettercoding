@@ -1,106 +1,261 @@
 /**
  * Conversation Scroll Diagnostics
  *
- * Lightweight, opt-out instrumentation for the load-time scroll behaviour.
- * Shipped enabled so a real-world reproduction of the "random scrolls while a
- * chat loads" issue records what actually happened — the synthetic Playwright
- * harness could not trigger it, so we capture it from the real session instead.
+ * Baked-in, opt-out instrumentation for the load-time scroll behaviour. The
+ * synthetic Playwright harness could not reproduce the "random scrolls while a
+ * chat loads" issue, so we capture it from the real session instead.
  *
- * Usage in the browser console:
- *   - `window.__VK_SCROLL_DEBUG = false`  → silence it for this tab.
- *   - `JSON.stringify(window.__vkScrollLog)` → copy the full event ring buffer.
- *   - `window.__vkScrollSummary()` → print a one-line health summary.
+ * It intercepts EVERY programmatic scroll write on the conversation container
+ * (native wheel/touch scrolling doesn't go through these JS setters, so every
+ * captured write is code-initiated — exactly the writes that can fight the
+ * user). Writes are attributed via `tagScrollWrite()` markers our own code
+ * sets; anything untagged is `external` (TanStack's size compensation, the
+ * browser, etc.). When programmatic writes land while the user is actively
+ * scrolling, that's the fight — surfaced as a visible `console.warn`.
  *
- * Console output is deliberately sparse: lock acquire/release and follow-bottom
- * decisions print individually; `repin` events (which can storm) are coalesced,
- * and a repin that fires *while the user is actively scrolling away from the
- * bottom* is flagged as `FIGHTING` — that is the signature of the bug, and with
- * the fix in place it should not appear.
+ * Output is intentionally on visible console levels (`log`/`warn`), because
+ * `console.debug` is hidden behind DevTools' "Verbose" filter by default.
+ *
+ * Browser console helpers:
+ *   - `window.__VK_SCROLL_DEBUG = false`  → silence for this tab.
+ *   - `window.__vkScrollReport()`         → print a grouped summary.
+ *   - `JSON.stringify(window.__vkScrollLog)` → copy the raw ring buffer.
  */
 
-interface ScrollDebugRecord {
+interface ScrollWriteRecord {
   t: number;
-  event: string;
-  [key: string]: unknown;
+  kind: 'set' | 'scrollTo' | 'scrollBy' | 'event';
+  from: number;
+  to: number;
+  delta: number;
+  source: string;
+  msSinceUserInput: number;
 }
 
 interface ScrollDebugWindow {
   __VK_SCROLL_DEBUG?: boolean;
-  __vkScrollLog?: ScrollDebugRecord[];
-  __vkScrollSummary?: () => void;
+  __vkScrollLog?: ScrollWriteRecord[];
+  __vkScrollReport?: () => void;
+  __vkScrollProbeInstalled?: boolean;
 }
 
-const MAX_RECORDS = 4000;
+const MAX_RECORDS = 5000;
+const USER_ACTIVITY_WINDOW_MS = 600;
+const FLUSH_INTERVAL_MS = 1000;
+const SCROLL_KEYS = new Set([
+  'ArrowUp',
+  'ArrowDown',
+  'PageUp',
+  'PageDown',
+  'Home',
+  'End',
+  ' ',
+]);
 
-function debugWindow(): ScrollDebugWindow | null {
+function dbgWindow(): ScrollDebugWindow | null {
   if (typeof window === 'undefined') return null;
   return window as unknown as ScrollDebugWindow;
 }
 
-function debugEnabled(w: ScrollDebugWindow): boolean {
-  // Default ON in this build; set window.__VK_SCROLL_DEBUG = false to disable.
+function enabled(w: ScrollDebugWindow): boolean {
   return w.__VK_SCROLL_DEBUG !== false;
 }
 
-// Coalesce repin bursts so a storm doesn't flood the console.
-let repinRun = 0;
-let fightingRun = 0;
-let repinRunStart = 0;
+// One-shot attribution for the next intercepted write. Our own code sets this
+// immediately before it writes scroll position; the interceptor reads and
+// clears it. Untagged writes are therefore external (TanStack/browser).
+let pendingWriteTag: string | null = null;
 
-function flushRepinRun(now: number): void {
-  if (repinRun === 0) return;
-  const span = now - repinRunStart;
-  if (fightingRun > 0) {
-    // eslint-disable-next-line no-console
-    console.warn(
-      `[vk-scroll] FIGHTING repin x${fightingRun}/${repinRun} over ${span}ms ` +
-        `— bottom-lock re-pinned against active user scroll (this is the bug)`
-    );
-  } else {
-    // eslint-disable-next-line no-console
-    console.debug(
-      `[vk-scroll] repin x${repinRun} over ${span}ms (following bottom, expected)`
-    );
-  }
-  repinRun = 0;
-  fightingRun = 0;
+export function tagScrollWrite(tag: string): void {
+  pendingWriteTag = tag;
 }
 
+let lastUserInputAt = 0;
+let lastUserDir: 'up' | 'down' | 'none' = 'none';
+
+function record(w: ScrollDebugWindow, rec: ScrollWriteRecord): void {
+  const log = (w.__vkScrollLog ??= []);
+  log.push(rec);
+  if (log.length > MAX_RECORDS) log.splice(0, log.length - MAX_RECORDS);
+}
+
+/**
+ * Discrete lifecycle marker (lock acquire/release, follow-bottom suppression).
+ * Printed on a visible level so it shows without the Verbose filter.
+ */
 export function scrollDebug(
   event: string,
   data?: Record<string, unknown>
 ): void {
-  const w = debugWindow();
-  if (!w || !debugEnabled(w)) return;
-
-  const now = Math.round(performance.now());
-  const record: ScrollDebugRecord = { t: now, event, ...data };
-
-  const log = (w.__vkScrollLog ??= []);
-  log.push(record);
-  if (log.length > MAX_RECORDS) log.splice(0, log.length - MAX_RECORDS);
-
-  if (!w.__vkScrollSummary) {
-    w.__vkScrollSummary = () => {
-      const entries = w.__vkScrollLog ?? [];
-      const counts: Record<string, number> = {};
-      for (const e of entries) counts[e.event] = (counts[e.event] ?? 0) + 1;
-      // eslint-disable-next-line no-console
-      console.table(counts);
-    };
-  }
-
-  if (event === 'repin') {
-    if (repinRun === 0) repinRunStart = now;
-    repinRun += 1;
-    if (data?.fighting) fightingRun += 1;
-    // Flush periodically so a long storm still surfaces without spamming.
-    if (repinRun >= 60) flushRepinRun(now);
-    return;
-  }
-
-  // A non-repin event ends any in-progress repin run; surface it first.
-  flushRepinRun(now);
+  const w = dbgWindow();
+  if (!w || !enabled(w)) return;
+  record(w, {
+    t: Math.round(performance.now()),
+    kind: 'event',
+    from: 0,
+    to: 0,
+    delta: 0,
+    source: event,
+    msSinceUserInput: Math.round(performance.now() - lastUserInputAt),
+  });
   // eslint-disable-next-line no-console
-  console.debug('[vk-scroll]', event, data ?? '');
+  console.log('[vk-scroll]', event, data ?? '');
+}
+
+/**
+ * Install the per-element scroll-write interceptor. Idempotent across the app
+ * lifetime (only the first container is probed; that's the conversation list).
+ */
+export function installScrollProbe(el: HTMLElement): () => void {
+  const w = dbgWindow();
+  if (!w || !enabled(w) || w.__vkScrollProbeInstalled) return () => {};
+  w.__vkScrollProbeInstalled = true;
+
+  const now = () => Math.round(performance.now());
+  const proto = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
+  if (!proto || !proto.get || !proto.set) return () => {};
+  const protoGet = proto.get;
+  const protoSet = proto.set;
+
+  let pendingFight: ScrollWriteRecord[] = [];
+  let flushTimer: number | null = null;
+
+  const scheduleFlush = () => {
+    if (flushTimer !== null) return;
+    flushTimer = window.setTimeout(() => {
+      flushTimer = null;
+      if (pendingFight.length === 0) return;
+      const bySource: Record<string, number> = {};
+      let travel = 0;
+      for (const r of pendingFight) {
+        bySource[r.source] = (bySource[r.source] ?? 0) + 1;
+        travel += Math.abs(r.delta);
+      }
+      const sources = Object.entries(bySource)
+        .map(([s, n]) => `${s}:${n}`)
+        .join(' ');
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[vk-scroll] ⚠ FIGHT — ${pendingFight.length} programmatic scrolls ` +
+          `moved the view ${Math.round(travel)}px while you were scrolling ` +
+          `(${sources}). window.__vkScrollReport() for detail.`
+      );
+      pendingFight = [];
+    }, FLUSH_INTERVAL_MS);
+  };
+
+  const capture = (
+    kind: ScrollWriteRecord['kind'],
+    from: number,
+    to: number
+  ) => {
+    const source = pendingWriteTag ?? 'external';
+    pendingWriteTag = null;
+    const sinceInput = now() - lastUserInputAt;
+    const rec: ScrollWriteRecord = {
+      t: now(),
+      kind,
+      from: Math.round(from),
+      to: Math.round(to),
+      delta: Math.round(to - from),
+      source,
+      msSinceUserInput: sinceInput,
+    };
+    record(w, rec);
+    // A programmatic write within the user-activity window is a fight candidate.
+    if (sinceInput < USER_ACTIVITY_WINDOW_MS && Math.abs(rec.delta) > 4) {
+      pendingFight.push(rec);
+      scheduleFlush();
+    }
+  };
+
+  // Per-element scrollTop accessor that delegates to the prototype.
+  Object.defineProperty(el, 'scrollTop', {
+    configurable: true,
+    get() {
+      return protoGet.call(this);
+    },
+    set(v: number) {
+      capture('set', protoGet.call(this), v);
+      protoSet.call(this, v);
+    },
+  });
+
+  const origScrollTo = el.scrollTo.bind(el);
+  const origScrollBy = el.scrollBy.bind(el);
+  el.scrollTo = function (...args: unknown[]) {
+    const from = protoGet.call(el);
+    const opt = args[0];
+    const to =
+      typeof opt === 'object' && opt !== null
+        ? ((opt as ScrollToOptions).top ?? from)
+        : ((args[1] as number) ?? from);
+    capture('scrollTo', from, to);
+    return (origScrollTo as (...a: unknown[]) => void)(...args);
+  } as typeof el.scrollTo;
+  el.scrollBy = function (...args: unknown[]) {
+    const from = protoGet.call(el);
+    capture('scrollBy', from, from);
+    return (origScrollBy as (...a: unknown[]) => void)(...args);
+  } as typeof el.scrollBy;
+
+  const onWheel = (e: WheelEvent) => {
+    lastUserInputAt = now();
+    lastUserDir = e.deltaY < 0 ? 'up' : 'down';
+  };
+  const onTouch = () => {
+    lastUserInputAt = now();
+    lastUserDir = 'none';
+  };
+  const onKey = (e: KeyboardEvent) => {
+    if (SCROLL_KEYS.has(e.key)) {
+      lastUserInputAt = now();
+      lastUserDir =
+        e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === 'Home'
+          ? 'up'
+          : 'down';
+    }
+  };
+  el.addEventListener('wheel', onWheel, { passive: true, capture: true });
+  el.addEventListener('touchmove', onTouch, { passive: true, capture: true });
+  el.addEventListener('keydown', onKey, { capture: true });
+
+  w.__vkScrollReport = () => {
+    const log = w.__vkScrollLog ?? [];
+    const bySource: Record<string, { writes: number; px: number }> = {};
+    for (const r of log) {
+      if (r.kind === 'event') continue;
+      const b = (bySource[r.source] ??= { writes: 0, px: 0 });
+      b.writes += 1;
+      b.px += Math.abs(r.delta);
+    }
+    const duringActivity = log.filter(
+      (r) =>
+        r.kind !== 'event' &&
+        r.msSinceUserInput < USER_ACTIVITY_WINDOW_MS &&
+        Math.abs(r.delta) > 4
+    );
+    // eslint-disable-next-line no-console
+    console.log(
+      `[vk-scroll] report: ${log.length} records, ` +
+        `${duringActivity.length} programmatic writes during user scrolling`
+    );
+    // eslint-disable-next-line no-console
+    console.table(bySource);
+  };
+
+  // Make it obvious the diagnostics are live (visible level).
+  // eslint-disable-next-line no-console
+  console.log(
+    '%c[vk-scroll] diagnostics active — reproduce the jank, then run window.__vkScrollReport()',
+    'color:#a60; font-weight:bold'
+  );
+  void lastUserDir;
+
+  return () => {
+    el.removeEventListener('wheel', onWheel, { capture: true } as never);
+    el.removeEventListener('touchmove', onTouch, { capture: true } as never);
+    el.removeEventListener('keydown', onKey, { capture: true } as never);
+    if (flushTimer !== null) window.clearTimeout(flushTimer);
+  };
 }

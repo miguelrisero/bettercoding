@@ -30,7 +30,11 @@ import {
   isNearBottom,
   shouldReleaseBottomLock,
 } from './conversation-scroll-commands';
-import { scrollDebug } from './conversation-scroll-debug';
+import {
+  scrollDebug,
+  installScrollProbe,
+  tagScrollWrite,
+} from './conversation-scroll-debug';
 
 // TanStack Virtual's ScrollBehavior ('auto' | 'smooth' | 'instant') shadows
 // the DOM ScrollBehavior. Use a narrow type to avoid TS2322 mismatches.
@@ -246,6 +250,10 @@ export function useConversationVirtualizer({
     el.addEventListener('touchmove', onTouchMove, { passive: true });
     el.addEventListener('keydown', onKeyDown);
 
+    // Diagnostics: capture every programmatic scroll write on the container so a
+    // real-world reproduction shows which writer fights the user.
+    const uninstallProbe = installScrollProbe(el);
+
     containerWidthRef.current = el.clientWidth || null;
     const resizeObserver = new ResizeObserver(() => {
       containerWidthRef.current = el.clientWidth || null;
@@ -257,6 +265,7 @@ export function useConversationVirtualizer({
       el.removeEventListener('touchmove', onTouchMove);
       el.removeEventListener('keydown', onKeyDown);
       resizeObserver.disconnect();
+      uninstallProbe();
     };
   }, [scrollContainerRef]);
 
@@ -455,6 +464,7 @@ export function useConversationVirtualizer({
           isUserScrollInputRecent() &&
           !isNearBottom(el.scrollTop, el.clientHeight, el.scrollHeight),
       });
+      tagScrollWrite('repin');
       el.scrollTop = maxScroll;
     }
   }, [
@@ -482,8 +492,10 @@ export function useConversationVirtualizer({
 
       if (behavior === 'smooth') {
         smoothScrollDeadlineRef.current = performance.now() + 500;
+        tagScrollWrite('scroll-to-bottom');
         el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
       } else {
+        tagScrollWrite('scroll-to-bottom');
         el.scrollTop = el.scrollHeight - el.clientHeight;
       }
     },
