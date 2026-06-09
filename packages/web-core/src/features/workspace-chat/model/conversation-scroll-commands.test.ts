@@ -5,42 +5,35 @@ import {
 } from './conversation-scroll-commands';
 
 describe('shouldSuppressAutoBottomIntent', () => {
-  it('suppresses initial-bottom when the user is reading away from bottom', () => {
+  it('suppresses initial-bottom while the user is reading away from bottom', () => {
     expect(
       shouldSuppressAutoBottomIntent({
         intentType: 'initial-bottom',
-        userScrollInputRecent: true,
-        isAtBottom: false,
+        userScrolledAway: true,
       })
     ).toBe(true);
   });
 
-  it('suppresses follow-bottom when the user is reading away from bottom', () => {
+  it('suppresses follow-bottom while the user is reading away from bottom', () => {
     expect(
       shouldSuppressAutoBottomIntent({
         intentType: 'follow-bottom',
-        userScrollInputRecent: true,
-        isAtBottom: false,
+        userScrolledAway: true,
       })
     ).toBe(true);
   });
 
-  it('keeps the pin when the user scrolls but is still at the bottom', () => {
+  it('executes auto-bottom intents once the user is back at the bottom', () => {
     expect(
       shouldSuppressAutoBottomIntent({
         intentType: 'follow-bottom',
-        userScrollInputRecent: true,
-        isAtBottom: true,
+        userScrolledAway: false,
       })
     ).toBe(false);
-  });
-
-  it('executes auto-bottom intents when there is no recent user input', () => {
     expect(
       shouldSuppressAutoBottomIntent({
         intentType: 'initial-bottom',
-        userScrollInputRecent: false,
-        isAtBottom: false,
+        userScrolledAway: false,
       })
     ).toBe(false);
   });
@@ -55,8 +48,7 @@ describe('shouldSuppressAutoBottomIntent', () => {
       expect(
         shouldSuppressAutoBottomIntent({
           intentType,
-          userScrollInputRecent: true,
-          isAtBottom: false,
+          userScrolledAway: true,
         })
       ).toBe(false);
     }

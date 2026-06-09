@@ -161,6 +161,13 @@ export interface ConversationVirtualizerResult {
   isUserScrollInputRecent: () => boolean;
 
   /**
+   * Whether the user has scrolled up off the bottom and is reading history.
+   * Sticky until they return to the bottom themselves — while true, no
+   * auto-bottom intent should execute.
+   */
+  isUserScrolledAway: () => boolean;
+
+  /**
    * Look up the ConversationRow index for a given virtual item.
    * Since our virtualizer uses identity mapping (no lane reordering),
    * this is simply `virtualItem.index`.
@@ -218,6 +225,16 @@ export function useConversationVirtualizer({
     visualTop: number;
   } | null>(null);
 
+  /**
+   * Sticky "the user is reading history, leave their scroll alone" state. Set
+   * the moment they scroll up off the bottom; cleared only when they return to
+   * the bottom themselves (or hit jump-to-bottom). While set, NOTHING
+   * auto-scrolls them — no re-pin, no follow-bottom — so a 30–60s history load
+   * can't yank them around. Unlike the transient 400ms input window, this
+   * survives reading pauses, which is exactly when the old code re-grabbed them.
+   */
+  const userScrolledAwayRef = useRef(false);
+
   const isBottomScrollCorrectionActive = useCallback(
     () => bottomLockedRef.current,
     []
@@ -229,6 +246,8 @@ export function useConversationVirtualizer({
       USER_SCROLL_INPUT_PRIORITY_MS,
     []
   );
+
+  const isUserScrolledAway = useCallback(() => userScrolledAwayRef.current, []);
 
   useEffect(() => {
     const el = scrollContainerRef.current;
@@ -246,9 +265,12 @@ export function useConversationVirtualizer({
     // "at bottom" → no auto-relock).
     const markUserScroll = (movesAwayFromBottom: boolean) => {
       lastUserScrollInputRef.current = performance.now();
-      if (movesAwayFromBottom && bottomLockedRef.current) {
-        bottomLockedRef.current = false;
-        scrollDebug('release:user-up', { scrollTop: el.scrollTop });
+      if (movesAwayFromBottom) {
+        userScrolledAwayRef.current = true;
+        if (bottomLockedRef.current) {
+          bottomLockedRef.current = false;
+          scrollDebug('release:user-up', { scrollTop: el.scrollTop });
+        }
       }
     };
     const onWheel = (event: WheelEvent) => markUserScroll(event.deltaY < 0);
@@ -402,6 +424,9 @@ export function useConversationVirtualizer({
       // content-driven upward moves (shrinking scrollHeight from re-measured
       // rows / browser clamps) — those would otherwise spuriously release the
       // lock while history streams in and cause scroll oscillation.
+      const withinProgrammaticScroll =
+        performance.now() <= smoothScrollDeadlineRef.current;
+
       if (
         shouldReleaseBottomLock({
           bottomLocked: bottomLockedRef.current,
@@ -409,15 +434,31 @@ export function useConversationVirtualizer({
           currentScrollTop,
           prevScrollHeight: prevScrollHeightRef.current,
           currentScrollHeight,
-          withinProgrammaticScroll:
-            performance.now() <= smoothScrollDeadlineRef.current,
+          withinProgrammaticScroll,
           sizeAdjustmentActive: shouldSuppressSizeAdjustment?.() ?? false,
         })
       ) {
         bottomLockedRef.current = false;
+        userScrolledAwayRef.current = true;
         scrollDebug('release:scroll-heuristic', {
           scrollTop: currentScrollTop,
         });
+      }
+
+      // The user returning to the bottom under their own power ends the reading
+      // state and re-arms follow-bottom. Requires recent direct input so a
+      // content-driven clamp (scrollHeight shrinking from a re-measure during a
+      // reading pause) can't masquerade as "user reached bottom" and re-pin
+      // them. Programmatic scrolls in flight are excluded too.
+      if (
+        userScrolledAwayRef.current &&
+        !withinProgrammaticScroll &&
+        isUserScrollInputRecent() &&
+        isNearBottom(currentScrollTop, el.clientHeight, currentScrollHeight)
+      ) {
+        userScrolledAwayRef.current = false;
+        bottomLockedRef.current = true;
+        scrollDebug('reading:end', { scrollTop: currentScrollTop });
       }
 
       prevScrollTopRef.current = currentScrollTop;
@@ -439,6 +480,7 @@ export function useConversationVirtualizer({
     shouldSuppressSizeAdjustment,
     syncIsAtBottom,
     captureViewportAnchor,
+    isUserScrollInputRecent,
   ]);
 
   // -------------------------------------------------------------------------
@@ -452,8 +494,12 @@ export function useConversationVirtualizer({
   // measurements (rows/totalSize deps), before paint, so a re-measure or
   // prepend above the reader never shifts what they see. One scroll write per
   // render, anchored to a real visible row — the smooth replacement for
-  // TanStack's many small per-item nudges. Skipped while bottom-locked (the
-  // re-pin owns position then) and during programmatic/interaction scrolls.
+  // TanStack's many small per-item nudges.
+  //
+  // Only fires while the user is reading (scrolled away) AND not mid-gesture:
+  // restoring against an active scroll would yank them (measured: a 27k-px jump
+  // when it fought a live wheel). During an active gesture we let them scroll
+  // freely; the anchor resumes holding position the moment they pause.
   useLayoutEffect(() => {
     const el = scrollContainerRef.current;
     const anchor = viewportAnchorRef.current;
@@ -461,7 +507,9 @@ export function useConversationVirtualizer({
     if (
       el &&
       anchor &&
+      userScrolledAwayRef.current &&
       !bottomLockedRef.current &&
+      !isUserScrollInputRecent() &&
       performance.now() >= smoothScrollDeadlineRef.current &&
       !shouldSuppressSizeAdjustment?.()
     ) {
@@ -493,6 +541,7 @@ export function useConversationVirtualizer({
     scrollContainerRef,
     shouldSuppressSizeAdjustment,
     captureViewportAnchor,
+    isUserScrollInputRecent,
   ]);
 
   useLayoutEffect(() => {
@@ -557,6 +606,8 @@ export function useConversationVirtualizer({
         scrollDebug('lock:acquire', { behavior, scrollTop: el.scrollTop });
       }
       bottomLockedRef.current = true;
+      // An explicit jump to the bottom ends the reading state.
+      userScrolledAwayRef.current = false;
 
       if (behavior === 'smooth') {
         smoothScrollDeadlineRef.current = performance.now() + 500;
@@ -657,6 +708,7 @@ export function useConversationVirtualizer({
     checkIsAtBottom,
     releaseBottomLock,
     isUserScrollInputRecent,
+    isUserScrolledAway,
     rowIndexForVirtualItem,
     rowForVirtualItem,
   };

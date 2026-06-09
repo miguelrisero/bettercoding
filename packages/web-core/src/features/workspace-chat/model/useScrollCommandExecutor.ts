@@ -56,11 +56,11 @@ export interface ScrollCommandExecutorOptions {
   checkIsAtBottom: () => boolean;
 
   /**
-   * Whether the user issued a direct scroll input within the priority window.
-   * A stale auto-bottom intent must not re-lock an actively-reading user
+   * Whether the user has scrolled up to read history (sticky until they return
+   * to the bottom). A stale auto-bottom intent must not re-pin a reading user
    * (see shouldSuppressAutoBottomIntent).
    */
-  isUserScrollInputRecent?: () => boolean;
+  isUserScrolledAway?: () => boolean;
 
   scrollToBottom: (behavior?: TanStackScrollBehavior) => void;
 
@@ -107,7 +107,7 @@ export function useScrollCommandExecutor({
   itemCount,
   dataVersion,
   checkIsAtBottom,
-  isUserScrollInputRecent,
+  isUserScrolledAway,
   scrollToBottom,
   scrollToAbsoluteIndex,
 }: ScrollCommandExecutorOptions): ScrollCommandExecutorResult {
@@ -197,14 +197,12 @@ export function useScrollCommandExecutor({
     }
 
     // The intent was resolved at emit time but executes a frame later. If the
-    // user has scrolled away from the bottom in between (reading while a long
-    // history loads), executing a follow-bottom would re-lock and hijack their
-    // position — so drop it instead.
+    // user is reading history away from the bottom, executing a follow-bottom
+    // would re-pin and hijack their position — so drop it instead.
     if (
       shouldSuppressAutoBottomIntent({
         intentType: intent.type,
-        userScrollInputRecent: isUserScrollInputRecent?.() ?? false,
-        isAtBottom: checkIsAtBottom(),
+        userScrolledAway: isUserScrolledAway?.() ?? false,
       })
     ) {
       scrollDebug('suppress:auto-bottom', { intent: intent.type });
@@ -226,7 +224,7 @@ export function useScrollCommandExecutor({
     dataVersion,
     itemCount,
     checkIsAtBottom,
-    isUserScrollInputRecent,
+    isUserScrolledAway,
     scrollToAbsoluteIndex,
     scrollToBottom,
     virtualizer,
