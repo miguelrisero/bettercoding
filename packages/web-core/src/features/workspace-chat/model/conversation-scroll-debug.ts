@@ -1,25 +1,23 @@
 /**
  * Conversation Scroll Diagnostics
  *
- * Baked-in, opt-out instrumentation for the load-time scroll behaviour. The
- * synthetic Playwright harness could not reproduce the "random scrolls while a
- * chat loads" issue, so we capture it from the real session instead.
+ * Opt-in instrumentation for the load-time scroll behaviour. Silent by default
+ * (no console output, near-zero overhead — every entry point early-returns).
+ * It earned its keep diagnosing a bug the synthetic Playwright harness could
+ * not reproduce, so it stays in the tree behind a flag for the next time.
  *
- * It intercepts EVERY programmatic scroll write on the conversation container
- * (native wheel/touch scrolling doesn't go through these JS setters, so every
- * captured write is code-initiated — exactly the writes that can fight the
- * user). Writes are attributed via `tagScrollWrite()` markers our own code
+ * Enable from the browser console, then reproduce:
+ *   - `window.__VK_SCROLL_DEBUG = true`   → turn it on for this tab, reload.
+ *   - `window.__vkScrollReport()`         → grouped by-source write summary.
+ *   - `JSON.stringify(window.__vkScrollLog)` → raw ring buffer.
+ *
+ * Once on, it intercepts EVERY programmatic scroll write on the conversation
+ * container (native wheel/touch scrolling doesn't go through these JS setters,
+ * so every captured write is code-initiated — exactly the writes that can fight
+ * the user). Writes are attributed via `tagScrollWrite()` markers our own code
  * sets; anything untagged is `external` (TanStack's size compensation, the
- * browser, etc.). When programmatic writes land while the user is actively
- * scrolling, that's the fight — surfaced as a visible `console.warn`.
- *
- * Output is intentionally on visible console levels (`log`/`warn`), because
+ * browser, etc.). Output is on visible console levels (`log`/`warn`) because
  * `console.debug` is hidden behind DevTools' "Verbose" filter by default.
- *
- * Browser console helpers:
- *   - `window.__VK_SCROLL_DEBUG = false`  → silence for this tab.
- *   - `window.__vkScrollReport()`         → print a grouped summary.
- *   - `JSON.stringify(window.__vkScrollLog)` → copy the raw ring buffer.
  */
 
 interface ScrollWriteRecord {
@@ -58,7 +56,8 @@ function dbgWindow(): ScrollDebugWindow | null {
 }
 
 function enabled(w: ScrollDebugWindow): boolean {
-  return w.__VK_SCROLL_DEBUG !== false;
+  // Opt-in: silent unless explicitly turned on.
+  return w.__VK_SCROLL_DEBUG === true;
 }
 
 // One-shot attribution for the next intercepted write. Our own code sets this
