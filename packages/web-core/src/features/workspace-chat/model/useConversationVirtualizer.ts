@@ -66,6 +66,9 @@ const SCROLL_KEYS = new Set([
   ' ',
 ]);
 
+/** Subset of SCROLL_KEYS that move the viewport up (away from the bottom). */
+const SCROLL_UP_KEYS = new Set(['ArrowUp', 'PageUp', 'Home']);
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -147,6 +150,13 @@ export interface ConversationVirtualizerResult {
   releaseBottomLock: () => void;
 
   /**
+   * Whether the user issued a direct scroll input (wheel/touch/keys) within
+   * the last `USER_SCROLL_INPUT_PRIORITY_MS`. Consumers use this to avoid
+   * hijacking an actively-reading user (e.g. a stale follow-bottom intent).
+   */
+  isUserScrollInputRecent: () => boolean;
+
+  /**
    * Look up the ConversationRow index for a given virtual item.
    * Since our virtualizer uses identity mapping (no lane reordering),
    * this is simply `virtualItem.index`.
@@ -193,19 +203,43 @@ export function useConversationVirtualizer({
     []
   );
 
+  const isUserScrollInputRecent = useCallback(
+    () =>
+      performance.now() - lastUserScrollInputRef.current <
+      USER_SCROLL_INPUT_PRIORITY_MS,
+    []
+  );
+
   useEffect(() => {
     const el = scrollContainerRef.current;
     if (!el) return;
 
-    const markUserScroll = () => {
+    // A direct upward gesture is an unambiguous intent to leave the bottom, so
+    // release the bottom-lock straight from the input event. This is the one
+    // signal the load-time re-pin can't corrupt: wheel/key direction is read
+    // before any scroll write. Inferring the release from scrollTop deltas
+    // (shouldReleaseBottomLock) fails while history streams in, because the
+    // re-pin overwrites the very delta it would read — the user's upward wheel
+    // nets out as a downward move once we slam back to the bottom, so the fight
+    // only ends when loading stops. Releasing here breaks that cycle at its
+    // source and keeps checkIsAtBottom honest afterward (no re-pin → no false
+    // "at bottom" → no auto-relock).
+    const markUserScroll = (movesAwayFromBottom: boolean) => {
       lastUserScrollInputRef.current = performance.now();
+      if (movesAwayFromBottom) bottomLockedRef.current = false;
     };
+    const onWheel = (event: WheelEvent) => markUserScroll(event.deltaY < 0);
+    // Touch direction isn't known cheaply here; the re-pin gate and scroll
+    // handler cover touch via their (now un-corrupted) scrollTop reads.
+    const onTouchMove = () => markUserScroll(false);
     const onKeyDown = (event: KeyboardEvent) => {
-      if (SCROLL_KEYS.has(event.key)) markUserScroll();
+      if (SCROLL_KEYS.has(event.key)) {
+        markUserScroll(SCROLL_UP_KEYS.has(event.key));
+      }
     };
 
-    el.addEventListener('wheel', markUserScroll, { passive: true });
-    el.addEventListener('touchmove', markUserScroll, { passive: true });
+    el.addEventListener('wheel', onWheel, { passive: true });
+    el.addEventListener('touchmove', onTouchMove, { passive: true });
     el.addEventListener('keydown', onKeyDown);
 
     containerWidthRef.current = el.clientWidth || null;
@@ -215,8 +249,8 @@ export function useConversationVirtualizer({
     resizeObserver.observe(el);
 
     return () => {
-      el.removeEventListener('wheel', markUserScroll);
-      el.removeEventListener('touchmove', markUserScroll);
+      el.removeEventListener('wheel', onWheel);
+      el.removeEventListener('touchmove', onTouchMove);
       el.removeEventListener('keydown', onKeyDown);
       resizeObserver.disconnect();
     };
@@ -386,6 +420,21 @@ export function useConversationVirtualizer({
     const el = scrollContainerRef.current;
     if (!el) return;
 
+    // User input wins. While history streams in, this re-pin runs on every
+    // batch; firing it against an actively-scrolling user yanks them back to
+    // the bottom every frame — the load-time "random scroll" fight. A recent
+    // gesture that has left the bottom releases the lock here instead. This is
+    // the backstop for inputs the wheel-direction release can't classify
+    // (touch), and for any path that re-armed the lock mid-gesture.
+    if (
+      isUserScrollInputRecent() &&
+      !isNearBottom(el.scrollTop, el.clientHeight, el.scrollHeight)
+    ) {
+      bottomLockedRef.current = false;
+      syncIsAtBottom();
+      return;
+    }
+
     const maxScroll = el.scrollHeight - el.clientHeight;
     if (maxScroll > 0 && Math.abs(maxScroll - el.scrollTop) > 1) {
       el.scrollTop = maxScroll;
@@ -396,6 +445,7 @@ export function useConversationVirtualizer({
     totalSize,
     syncIsAtBottom,
     scrollContainerRef,
+    isUserScrollInputRecent,
   ]);
 
   // -------------------------------------------------------------------------
@@ -505,6 +555,7 @@ export function useConversationVirtualizer({
     isAtBottom: isAtBottomState,
     checkIsAtBottom,
     releaseBottomLock,
+    isUserScrollInputRecent,
     rowIndexForVirtualItem,
     rowForVirtualItem,
   };

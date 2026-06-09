@@ -544,6 +544,7 @@ export const ConversationList = forwardRef<
     itemCount: conversationRows.length,
     dataVersion,
     checkIsAtBottom: conversationVirtualizer.checkIsAtBottom,
+    isUserScrollInputRecent: conversationVirtualizer.isUserScrollInputRecent,
     scrollToBottom: scrollToBottomAndClearSpacer,
     scrollToAbsoluteIndex,
   });

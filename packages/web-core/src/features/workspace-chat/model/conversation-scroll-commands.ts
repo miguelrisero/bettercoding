@@ -284,6 +284,37 @@ export function shouldReleaseBottomLock(
 }
 
 // ---------------------------------------------------------------------------
+// Auto-Bottom Intent Suppression
+// ---------------------------------------------------------------------------
+
+/**
+ * Decide whether an automatic bottom-following intent must be skipped at
+ * execution time because the user is actively reading away from the bottom.
+ *
+ * `initial-bottom` / `follow-bottom` are resolved when a data batch is
+ * *emitted* but executed a frame later. While a long history loads, batches
+ * keep arriving for 30–60s. If a batch was resolved as follow-bottom because
+ * the viewport was momentarily at the bottom (e.g. a re-pin had just fired),
+ * but the user has since scrolled up, executing it calls `scrollToBottom` and
+ * re-locks — re-arming the very tug-of-war the lock release just broke. A
+ * recent direct gesture that left the bottom means: leave them be.
+ */
+export function shouldSuppressAutoBottomIntent(input: {
+  intentType: ScrollIntent['type'];
+  userScrollInputRecent: boolean;
+  isAtBottom: boolean;
+}): boolean {
+  if (
+    input.intentType !== 'initial-bottom' &&
+    input.intentType !== 'follow-bottom'
+  ) {
+    return false;
+  }
+  if (!input.userScrollInputRecent) return false;
+  return !input.isAtBottom;
+}
+
+// ---------------------------------------------------------------------------
 // Intent Equality (for deduplication)
 // ---------------------------------------------------------------------------
 
