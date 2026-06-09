@@ -13,6 +13,11 @@ interface XTermInstanceProps {
   workspaceId: string;
   isActive: boolean;
   onClose?: () => void;
+  /**
+   * Terminal backend mode. 'shell' (default) is a plain interactive shell;
+   * 'cli' attaches the workspace's persistent tmux-backed `claude` session.
+   */
+  mode?: 'shell' | 'cli';
 }
 
 export function XTermInstance({
@@ -20,6 +25,7 @@ export function XTermInstance({
   workspaceId,
   isActive,
   onClose,
+  mode = 'shell',
 }: XTermInstanceProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const resizeRef = useRef<HTMLDivElement>(null);
@@ -37,8 +43,9 @@ export function XTermInstance({
   const endpoint = useMemo(() => {
     const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
     const host = window.location.host;
-    return `${protocol}//${host}/api/terminal/ws?workspace_id=${workspaceId}&cols=${initialSizeRef.current.cols}&rows=${initialSizeRef.current.rows}`;
-  }, [workspaceId]);
+    const modeParam = mode === 'cli' ? '&mode=cli' : '';
+    return `${protocol}//${host}/api/terminal/ws?workspace_id=${workspaceId}&cols=${initialSizeRef.current.cols}&rows=${initialSizeRef.current.rows}${modeParam}`;
+  }, [workspaceId, mode]);
 
   const fitTerminal = useCallback(() => {
     fitAddonRef.current?.fit();
@@ -90,7 +97,14 @@ export function XTermInstance({
         tabId,
         endpoint,
         (data) => terminal?.write(data),
-        onClose
+        onClose,
+        () => {
+          // Re-fit and report the current grid so the PTY/tmux is sized to the
+          // pane on every (re)connect (see TerminalProvider ws.onopen).
+          fitAddonRef.current?.fit();
+          const t = terminalRef.current;
+          return t ? { cols: t.cols, rows: t.rows } : null;
+        }
       );
     }
 
@@ -120,9 +134,19 @@ export function XTermInstance({
 
   useEffect(() => {
     if (!resizeRef.current) return;
-    const observer = new ResizeObserver(fitTerminal);
+    // Debounce: a pane-divider drag fires dozens of observations per second,
+    // and each un-coalesced fit() becomes a WS resize frame + SIGWINCH +
+    // full TUI redraw. Trailing-edge 75ms keeps the final size exact.
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const observer = new ResizeObserver(() => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(fitTerminal, 75);
+    });
     observer.observe(resizeRef.current);
-    return () => observer.disconnect();
+    return () => {
+      if (timer) clearTimeout(timer);
+      observer.disconnect();
+    };
   }, [fitTerminal]);
 
   useEffect(() => {

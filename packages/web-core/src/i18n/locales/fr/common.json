@@ -1,4 +1,9 @@
 {
+  "cliMode": {
+    "title": "CLI Claude",
+    "persistentHint": "session tmux persistante",
+    "backToChat": "Retour au chat"
+  },
   "editorNames": {
     "custom": "Personnalisé"
   },
@@ -49,7 +54,7 @@
     "subagent": {
       "defaultType": "Sous-agent"
     },
-    "loadingEarlierMessages": "Chargement des messages pr\u00e9c\u00e9dents"
+    "loadingEarlierMessages": "Chargement des messages précédents"
   },
   "folderPicker": {
     "legend": "Cliquez sur les noms de dossiers pour naviguer • Utilisez les boutons d'action pour sélectionner",

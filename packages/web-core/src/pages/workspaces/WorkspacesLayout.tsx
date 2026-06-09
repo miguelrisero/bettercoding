@@ -22,6 +22,7 @@ import {
 import { ReviewProvider } from '@/shared/hooks/ReviewProvider';
 import { ChangesViewProvider } from '@/shared/hooks/ChangesViewProvider';
 import { WorkspacesSidebarContainer } from './WorkspacesSidebarContainer';
+import { CliMainPane } from './CliMainPane';
 import { LogsContentContainer } from './LogsContentContainer';
 import {
   WorkspacesMainContainer,
@@ -131,8 +132,10 @@ export function WorkspacesLayout() {
     isLeftMainPanelVisible,
     isRightSidebarVisible,
     rightMainPanelMode,
+    mainPaneMode,
     setLeftSidebarVisible,
     setLeftMainPanelVisible,
+    setMainPaneMode,
   } = useWorkspacePanelState(isCreateMode ? undefined : workspaceId);
 
   const {
@@ -349,6 +352,11 @@ export function WorkspacesLayout() {
                 {isCreateMode ? (
                   <CreateChatBoxContainer
                     onWorkspaceCreated={handleWorkspaceCreated}
+                  />
+                ) : mainPaneMode === 'cli' && selectedWorkspace?.id ? (
+                  <CliMainPane
+                    workspaceId={selectedWorkspace.id}
+                    onBackToChat={() => setMainPaneMode('chat')}
                   />
                 ) : (
                   <WorkspacesMainContainer

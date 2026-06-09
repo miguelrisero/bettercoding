@@ -8,7 +8,10 @@ import type {
 } from 'shared/types';
 import type { Workspace as RemoteWorkspace } from 'shared/remote-types';
 import type { DiffViewMode } from '@/shared/stores/useDiffViewStore';
-import type { LayoutMode } from '@/shared/stores/useUiPreferencesStore';
+import type {
+  LayoutMode,
+  MainPaneMode,
+} from '@/shared/stores/useUiPreferencesStore';
 import { RIGHT_MAIN_PANEL_MODES } from '@/shared/stores/useUiPreferencesStore';
 import type { AppNavigation } from '@/shared/lib/routes/appNavigation';
 import type { ProjectIssueCreateOptions } from '@/shared/stores/useKanbanIssueComposerStore';
@@ -113,6 +116,7 @@ export interface ActionVisibilityContext {
   isLeftSidebarVisible: boolean;
   isLeftMainPanelVisible: boolean;
   isRightSidebarVisible: boolean;
+  mainPaneMode: MainPaneMode;
   isCreateMode: boolean;
 
   // Workspace state

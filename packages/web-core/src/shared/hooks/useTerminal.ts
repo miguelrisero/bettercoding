@@ -15,6 +15,18 @@ export interface TerminalTab {
   cwd: string;
 }
 
+/**
+ * Stable terminal id for a workspace's CLI-mode pane.
+ *
+ * Unlike side-terminal tabs (`generateTabId()` in TerminalProvider), this id
+ * intentionally lives ONLY in the provider's connection/instance registries —
+ * it is never inserted into `tabsByWorkspace`, so tab-list logic (close-all,
+ * active-tab) does not see it. Reducer actions on it are harmless no-ops.
+ */
+export function cliTabId(workspaceId: string): string {
+  return `cli-${workspaceId}`;
+}
+
 interface TerminalConnection {
   ws: WebSocket;
   send: (data: string) => void;
@@ -40,7 +52,8 @@ export interface TerminalContextType {
     tabId: string,
     endpoint: string,
     onData: (data: string) => void,
-    onExit?: () => void
+    onExit?: () => void,
+    getSize?: () => { cols: number; rows: number } | null
   ) => {
     send: (data: string) => void;
     resize: (cols: number, rows: number) => void;

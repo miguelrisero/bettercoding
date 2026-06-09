@@ -48,6 +48,10 @@ pub struct WorkspaceNotesData {
 pub struct WorkspacePanelStateData {
     pub right_main_panel_mode: Option<String>,
     pub is_left_main_panel_visible: bool,
+    /// What the left-main pane shows: "chat" (default) or "cli"
+    /// (persistent tmux-backed claude terminal).
+    #[serde(default)]
+    pub main_pane_mode: Option<String>,
 }
 
 /// Workspace sidebar PR filter state

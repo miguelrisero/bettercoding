@@ -161,6 +161,13 @@ export const sequentialBindings: SequentialBinding[] = [
     group: 'View',
     actionId: 'toggle-left-main-panel',
   },
+  {
+    id: 'seq-view-cli',
+    keys: ['v', 't'],
+    description: 'Toggle CLI mode (claude in terminal)',
+    group: 'View',
+    actionId: 'toggle-cli-mode',
+  },
 
   // Git (X = eXecute)
   {

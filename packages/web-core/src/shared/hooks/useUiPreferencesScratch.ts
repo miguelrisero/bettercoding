@@ -59,6 +59,7 @@ function storeToScratchData(state: {
     workspacePanelStates[key] = {
       right_main_panel_mode: value.rightMainPanelMode,
       is_left_main_panel_visible: value.isLeftMainPanelVisible,
+      main_pane_mode: value.mainPaneMode ?? 'chat',
     };
   }
 
@@ -126,6 +127,8 @@ function scratchDataToStore(data: UiPreferencesData): {
           rightMainPanelMode:
             (value.right_main_panel_mode as RightMainPanelMode) ?? null,
           isLeftMainPanelVisible: value.is_left_main_panel_visible ?? true,
+          // Older payloads predate mainPaneMode; default to chat.
+          mainPaneMode: value.main_pane_mode === 'cli' ? 'cli' : 'chat',
         };
       }
     }

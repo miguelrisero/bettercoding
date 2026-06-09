@@ -1,4 +1,9 @@
 {
+  "cliMode": {
+    "title": "Claude CLI",
+    "persistentHint": "persistent tmux session",
+    "backToChat": "Back to chat"
+  },
   "editorNames": {
     "custom": "Custom"
   },

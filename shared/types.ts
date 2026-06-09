@@ -58,7 +58,12 @@ export type PreviewSettingsData = { url: string, screen_size: string | null, res
 
 export type WorkspaceNotesData = { content: string, };
 
-export type WorkspacePanelStateData = { right_main_panel_mode: string | null, is_left_main_panel_visible: boolean, };
+export type WorkspacePanelStateData = { right_main_panel_mode: string | null, is_left_main_panel_visible: boolean, 
+/**
+ * What the left-main pane shows: "chat" (default) or "cli"
+ * (persistent tmux-backed claude terminal).
+ */
+main_pane_mode: string | null, };
 
 export type WorkspacePrFilterData = "all" | "has_pr" | "no_pr";
 

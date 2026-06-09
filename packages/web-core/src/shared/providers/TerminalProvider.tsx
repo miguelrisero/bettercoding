@@ -170,7 +170,14 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
 
   // Store callback refs for each connection to prevent stale closures
   const connectionCallbacksRef = useRef<
-    Map<string, { onData: (data: string) => void; onExit?: () => void }>
+    Map<
+      string,
+      {
+        onData: (data: string) => void;
+        onExit?: () => void;
+        getSize?: () => { cols: number; rows: number } | null;
+      }
+    >
   >(new Map());
 
   // Store reconnection state for each connection
@@ -293,7 +300,8 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       tabId: string,
       endpoint: string,
       onData: (data: string) => void,
-      onExit?: () => void
+      onExit?: () => void,
+      getSize?: () => { cols: number; rows: number } | null
     ) => {
       // Close existing connection if any
       const existing = terminalConnectionsRef.current.get(tabId);
@@ -302,7 +310,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       }
 
       // Store callbacks in ref so they can be updated without recreating connection
-      connectionCallbacksRef.current.set(tabId, { onData, onExit });
+      connectionCallbacksRef.current.set(tabId, { onData, onExit, getSize });
 
       // Initialize or reset reconnection state
       const existingReconnectState = reconnectStateRef.current.get(tabId);
@@ -356,6 +364,23 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
               if (latestState) {
                 latestState.retryCount = 0;
               }
+              // Send the current terminal size now that the socket is open. The
+              // initial ResizeObserver fit usually fires before the socket is
+              // ready and is dropped, which would otherwise leave the PTY/tmux
+              // stuck at the 80x24 default; resending on every (re)connect also
+              // restores the right size after a reattach.
+              const size = connectionCallbacksRef.current
+                .get(tabId)
+                ?.getSize?.();
+              if (size && ws.readyState === WebSocket.OPEN) {
+                ws.send(
+                  JSON.stringify({
+                    type: 'resize',
+                    cols: size.cols,
+                    rows: size.rows,
+                  })
+                );
+              }
             };
 
             ws.onmessage = (event) => {
@@ -366,6 +391,15 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
                   callbacks.onData(decodeBase64(msg.data));
                 } else if (msg.type === 'exit' && callbacks) {
                   callbacks.onExit?.();
+                } else if (msg.type === 'error' && callbacks) {
+                  // Hard backend error (e.g. PTY creation failed). Surface it
+                  // in the terminal and stop the reconnect loop — retrying a
+                  // failed create_session forever just blinks silently.
+                  const state = reconnectStateRef.current.get(tabId);
+                  if (state) state.intentionallyClosed = true;
+                  callbacks.onData(
+                    `\r\n\x1b[31m${msg.message ?? 'terminal error'}\x1b[0m\r\n`
+                  );
                 }
               } catch {
                 // Ignore parse errors
