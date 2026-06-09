@@ -37,6 +37,7 @@ import {
   setPendingIntent,
   shouldSuppressAutoBottomIntent,
 } from './conversation-scroll-commands';
+import { scrollDebug } from './conversation-scroll-debug';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -206,6 +207,7 @@ export function useScrollCommandExecutor({
         isAtBottom: checkIsAtBottom(),
       })
     ) {
+      scrollDebug('suppress:auto-bottom', { intent: intent.type });
       stateRef.current = markIntentApplied(stateRef.current);
       prevDataVersionRef.current = dataVersion;
       return;

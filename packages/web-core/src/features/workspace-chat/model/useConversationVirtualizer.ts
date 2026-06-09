@@ -30,6 +30,7 @@ import {
   isNearBottom,
   shouldReleaseBottomLock,
 } from './conversation-scroll-commands';
+import { scrollDebug } from './conversation-scroll-debug';
 
 // TanStack Virtual's ScrollBehavior ('auto' | 'smooth' | 'instant') shadows
 // the DOM ScrollBehavior. Use a narrow type to avoid TS2322 mismatches.
@@ -226,7 +227,10 @@ export function useConversationVirtualizer({
     // "at bottom" → no auto-relock).
     const markUserScroll = (movesAwayFromBottom: boolean) => {
       lastUserScrollInputRef.current = performance.now();
-      if (movesAwayFromBottom) bottomLockedRef.current = false;
+      if (movesAwayFromBottom && bottomLockedRef.current) {
+        bottomLockedRef.current = false;
+        scrollDebug('release:user-up', { scrollTop: el.scrollTop });
+      }
     };
     const onWheel = (event: WheelEvent) => markUserScroll(event.deltaY < 0);
     // Touch direction isn't known cheaply here; the re-pin gate and scroll
@@ -389,6 +393,9 @@ export function useConversationVirtualizer({
         })
       ) {
         bottomLockedRef.current = false;
+        scrollDebug('release:scroll-heuristic', {
+          scrollTop: currentScrollTop,
+        });
       }
 
       prevScrollTopRef.current = currentScrollTop;
@@ -431,12 +438,23 @@ export function useConversationVirtualizer({
       !isNearBottom(el.scrollTop, el.clientHeight, el.scrollHeight)
     ) {
       bottomLockedRef.current = false;
+      scrollDebug('release:repin-gate', { scrollTop: el.scrollTop });
       syncIsAtBottom();
       return;
     }
 
     const maxScroll = el.scrollHeight - el.clientHeight;
     if (maxScroll > 0 && Math.abs(maxScroll - el.scrollTop) > 1) {
+      // `fighting` = re-pinning to bottom while the user is actively scrolling
+      // away from it. With the release paths above this should never be true;
+      // if it shows up in a real session, the lock failed to release.
+      scrollDebug('repin', {
+        from: Math.round(el.scrollTop),
+        to: Math.round(maxScroll),
+        fighting:
+          isUserScrollInputRecent() &&
+          !isNearBottom(el.scrollTop, el.clientHeight, el.scrollHeight),
+      });
       el.scrollTop = maxScroll;
     }
   }, [
@@ -457,6 +475,9 @@ export function useConversationVirtualizer({
       const el = scrollContainerRef.current;
       if (!el) return;
 
+      if (!bottomLockedRef.current) {
+        scrollDebug('lock:acquire', { behavior, scrollTop: el.scrollTop });
+      }
       bottomLockedRef.current = true;
 
       if (behavior === 'smooth') {
