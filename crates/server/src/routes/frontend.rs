@@ -32,6 +32,7 @@ async fn serve_file(path: &str) -> impl IntoResponse + use<> {
                     header::CONTENT_TYPE,
                     HeaderValue::from_str(mime.as_ref()).unwrap(),
                 )
+                .header(header::CACHE_CONTROL, cache_control_for(path))
                 .body(Body::from(content.data.into_owned()))
                 .unwrap()
         }
@@ -41,6 +42,7 @@ async fn serve_file(path: &str) -> impl IntoResponse + use<> {
                 Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, HeaderValue::from_static("text/html"))
+                    .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
                     .body(Body::from(index.data.into_owned()))
                     .unwrap()
             } else {
@@ -50,5 +52,19 @@ async fn serve_file(path: &str) -> impl IntoResponse + use<> {
                     .unwrap()
             }
         }
+    }
+}
+
+/// Cache policy by asset type. The HTML entry point must never be cached, or a
+/// browser keeps loading a stale bundle after a redeploy (it references the old
+/// content-hashed JS). Hashed assets under `/assets/` are immutable and may be
+/// cached aggressively.
+fn cache_control_for(path: &str) -> HeaderValue {
+    if path.is_empty() || path == "index.html" || path.ends_with(".html") {
+        HeaderValue::from_static("no-store")
+    } else if path.starts_with("assets/") {
+        HeaderValue::from_static("public, max-age=31536000, immutable")
+    } else {
+        HeaderValue::from_static("no-cache")
     }
 }

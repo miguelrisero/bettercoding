@@ -35,7 +35,9 @@ import {
   markIntentApplied,
   resolveScrollIntent,
   setPendingIntent,
+  shouldSuppressAutoBottomIntent,
 } from './conversation-scroll-commands';
+import { scrollDebug } from './conversation-scroll-debug';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -52,6 +54,13 @@ export interface ScrollCommandExecutorOptions {
 
   /** Point-in-time DOM check for isAtBottom (avoids stale React state). */
   checkIsAtBottom: () => boolean;
+
+  /**
+   * Whether the user has scrolled up to read history (sticky until they return
+   * to the bottom). A stale auto-bottom intent must not re-pin a reading user
+   * (see shouldSuppressAutoBottomIntent).
+   */
+  isUserScrolledAway?: () => boolean;
 
   scrollToBottom: (behavior?: TanStackScrollBehavior) => void;
 
@@ -98,6 +107,7 @@ export function useScrollCommandExecutor({
   itemCount,
   dataVersion,
   checkIsAtBottom,
+  isUserScrolledAway,
   scrollToBottom,
   scrollToAbsoluteIndex,
 }: ScrollCommandExecutorOptions): ScrollCommandExecutorResult {
@@ -186,6 +196,21 @@ export function useScrollCommandExecutor({
       return;
     }
 
+    // The intent was resolved at emit time but executes a frame later. If the
+    // user is reading history away from the bottom, executing a follow-bottom
+    // would re-pin and hijack their position — so drop it instead.
+    if (
+      shouldSuppressAutoBottomIntent({
+        intentType: intent.type,
+        userScrolledAway: isUserScrolledAway?.() ?? false,
+      })
+    ) {
+      scrollDebug('suppress:auto-bottom', { intent: intent.type });
+      stateRef.current = markIntentApplied(stateRef.current);
+      prevDataVersionRef.current = dataVersion;
+      return;
+    }
+
     executeIntent(
       virtualizer,
       intent,
@@ -198,6 +223,8 @@ export function useScrollCommandExecutor({
   }, [
     dataVersion,
     itemCount,
+    checkIsAtBottom,
+    isUserScrolledAway,
     scrollToAbsoluteIndex,
     scrollToBottom,
     virtualizer,

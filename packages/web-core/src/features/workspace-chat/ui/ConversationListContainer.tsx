@@ -19,6 +19,7 @@ import { deriveConversationEntries } from '../model/deriveConversationEntries';
 import { deriveConversationTimeline } from '../model/deriveConversationTimeline';
 import { useConversationVirtualizer } from '../model/useConversationVirtualizer';
 import { useScrollCommandExecutor } from '../model/useScrollCommandExecutor';
+import { tagScrollWrite } from '../model/conversation-scroll-debug';
 
 import DisplayConversationEntry from './DisplayConversationEntry';
 import { ApprovalFormProvider } from '@/shared/hooks/ApprovalForm';
@@ -291,6 +292,7 @@ export const ConversationList = forwardRef<
     const currentTop = anchor.element.getBoundingClientRect().top;
     const delta = currentTop - anchor.top;
     if (Math.abs(delta) >= 0.5) {
+      tagScrollWrite('interaction-anchor');
       activeScrollContainer.scrollTop += delta;
     }
 
@@ -544,6 +546,7 @@ export const ConversationList = forwardRef<
     itemCount: conversationRows.length,
     dataVersion,
     checkIsAtBottom: conversationVirtualizer.checkIsAtBottom,
+    isUserScrolledAway: conversationVirtualizer.isUserScrolledAway,
     scrollToBottom: scrollToBottomAndClearSpacer,
     scrollToAbsoluteIndex,
   });
