@@ -26,7 +26,6 @@ import {
   findPreviousUserMessageIndex,
 } from './conversation-row-model';
 import {
-  NEAR_BOTTOM_THRESHOLD_PX,
   isNearBottom,
   shouldReleaseBottomLock,
 } from './conversation-scroll-commands';
@@ -203,6 +202,22 @@ export function useConversationVirtualizer({
    */
   const containerWidthRef = useRef<number | null>(null);
 
+  /** Latest rows, readable from callbacks without re-subscribing. */
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+
+  /**
+   * The row pinned to a fixed screen position while the user reads history
+   * during load. `visualTop` is the row's top offset relative to the
+   * container's top (`rowStart - scrollTop`); holding it constant across
+   * re-measures and prepends keeps the content under the reader's eyes still.
+   */
+  const viewportAnchorRef = useRef<{
+    key: string | number;
+    index: number;
+    visualTop: number;
+  } | null>(null);
+
   const isBottomScrollCorrectionActive = useCallback(
     () => bottomLockedRef.current,
     []
@@ -295,51 +310,49 @@ export function useConversationVirtualizer({
   });
 
   // -------------------------------------------------------------------------
-  // shouldAdjustScrollPositionOnItemSizeChange
+  // shouldAdjustScrollPositionOnItemSizeChange — DISABLED
   //
-  // Preserve the reader's position only when a row fully above the viewport
-  // changes size. Mid-list flicker happens when we compensate for rows that
-  // are still visible or below the viewport, because those corrections can
-  // move the render window and trigger another measurement pass.
+  // TanStack's built-in per-item compensation fires once for every row that
+  // re-measures above the viewport. While a long history streams in that is
+  // dozens of separate `scrollTo` nudges (measured live: 46 writes / ~900px of
+  // small, alternating corrections) — the user perceives them as the view
+  // "randomly scrolling up and down" until measurement settles. We replace it
+  // with a single synchronous viewport anchor (below) that holds one visible
+  // row at a fixed screen position across an entire render, so re-measures and
+  // prepends never move what the reader is looking at.
   // -------------------------------------------------------------------------
 
   useEffect(() => {
-    virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (
-      item,
-      _delta,
-      instance
-    ) => {
-      const scrollElement = scrollContainerRef.current;
-      const viewportHeight =
-        scrollElement?.clientHeight ?? instance.scrollRect?.height ?? 0;
-      const scrollOffset =
-        scrollElement?.scrollTop ?? instance.scrollOffset ?? 0;
-      const totalScrollableSize =
-        scrollElement?.scrollHeight ?? instance.getTotalSize();
-      const remainingDistance =
-        totalScrollableSize - (scrollOffset + viewportHeight);
-      const isItemFullyAboveViewport = item.end <= scrollOffset;
-      const isBottomLocked = bottomLockedRef.current;
-      // User input wins: never rewrite scroll position against an active
-      // gesture (see USER_SCROLL_INPUT_PRIORITY_MS).
-      const userScrollingRecently =
-        performance.now() - lastUserScrollInputRef.current <
-        USER_SCROLL_INPUT_PRIORITY_MS;
-
-      const shouldAdjust =
-        !isBottomLocked &&
-        !userScrollingRecently &&
-        !shouldSuppressSizeAdjustment?.() &&
-        isItemFullyAboveViewport &&
-        remainingDistance > NEAR_BOTTOM_THRESHOLD_PX;
-
-      return shouldAdjust;
-    };
-
+    virtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
     return () => {
       virtualizer.shouldAdjustScrollPositionOnItemSizeChange = undefined;
     };
-  }, [shouldSuppressSizeAdjustment, virtualizer]);
+  }, [virtualizer]);
+
+  // -------------------------------------------------------------------------
+  // Viewport anchoring (replaces TanStack's per-item compensation)
+  // -------------------------------------------------------------------------
+
+  /** Record the first visible row and where it sits, to restore after renders. */
+  const captureViewportAnchor = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el || bottomLockedRef.current) {
+      viewportAnchorRef.current = null;
+      return;
+    }
+    const scrollTop = el.scrollTop;
+    const items = virtualizer.getVirtualItems();
+    const first = items.find((item) => item.end > scrollTop) ?? items[0];
+    const row = first ? rowsRef.current[first.index] : undefined;
+    viewportAnchorRef.current =
+      first && row
+        ? {
+            key: row.semanticKey,
+            index: first.index,
+            visualTop: first.start - scrollTop,
+          }
+        : null;
+  }, [scrollContainerRef, virtualizer]);
 
   // -------------------------------------------------------------------------
   // Reactive isAtBottom state
@@ -410,6 +423,9 @@ export function useConversationVirtualizer({
       prevScrollTopRef.current = currentScrollTop;
       prevScrollHeightRef.current = currentScrollHeight;
       syncIsAtBottom();
+      // Re-anchor to whatever the user just scrolled to, so the next render's
+      // restore holds this position.
+      captureViewportAnchor();
     };
 
     el.addEventListener('scroll', handleScroll, { passive: true });
@@ -418,7 +434,12 @@ export function useConversationVirtualizer({
     return () => {
       el.removeEventListener('scroll', handleScroll);
     };
-  }, [scrollContainerRef, shouldSuppressSizeAdjustment, syncIsAtBottom]);
+  }, [
+    scrollContainerRef,
+    shouldSuppressSizeAdjustment,
+    syncIsAtBottom,
+    captureViewportAnchor,
+  ]);
 
   // -------------------------------------------------------------------------
   // Derived state
@@ -426,6 +447,53 @@ export function useConversationVirtualizer({
 
   const virtualItems = virtualizer.getVirtualItems();
   const totalSize = virtualizer.getTotalSize();
+
+  // Viewport-anchor restore. Runs synchronously after every render that changed
+  // measurements (rows/totalSize deps), before paint, so a re-measure or
+  // prepend above the reader never shifts what they see. One scroll write per
+  // render, anchored to a real visible row — the smooth replacement for
+  // TanStack's many small per-item nudges. Skipped while bottom-locked (the
+  // re-pin owns position then) and during programmatic/interaction scrolls.
+  useLayoutEffect(() => {
+    const el = scrollContainerRef.current;
+    const anchor = viewportAnchorRef.current;
+
+    if (
+      el &&
+      anchor &&
+      !bottomLockedRef.current &&
+      performance.now() >= smoothScrollDeadlineRef.current &&
+      !shouldSuppressSizeAdjustment?.()
+    ) {
+      // Prepends shift the anchor row to a higher index; fast-path the common
+      // no-prepend case, else find it by stable semantic key.
+      let index =
+        rows[anchor.index]?.semanticKey === anchor.key ? anchor.index : -1;
+      if (index === -1) {
+        index = rows.findIndex((r) => r.semanticKey === anchor.key);
+      }
+      if (index !== -1) {
+        const start = virtualizer.measurementsCache[index]?.start;
+        if (start !== undefined) {
+          const target = start - anchor.visualTop;
+          if (target >= 0 && Math.abs(target - el.scrollTop) > 0.5) {
+            tagScrollWrite('viewport-anchor');
+            el.scrollTop = target;
+          }
+        }
+      }
+    }
+
+    captureViewportAnchor();
+  }, [
+    rows,
+    totalRowCount,
+    totalSize,
+    virtualizer,
+    scrollContainerRef,
+    shouldSuppressSizeAdjustment,
+    captureViewportAnchor,
+  ]);
 
   useLayoutEffect(() => {
     syncIsAtBottom();
