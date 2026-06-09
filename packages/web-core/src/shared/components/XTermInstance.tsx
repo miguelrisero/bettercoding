@@ -97,7 +97,14 @@ export function XTermInstance({
         tabId,
         endpoint,
         (data) => terminal?.write(data),
-        onClose
+        onClose,
+        () => {
+          // Re-fit and report the current grid so the PTY/tmux is sized to the
+          // pane on every (re)connect (see TerminalProvider ws.onopen).
+          fitAddonRef.current?.fit();
+          const t = terminalRef.current;
+          return t ? { cols: t.cols, rows: t.rows } : null;
+        }
       );
     }
 

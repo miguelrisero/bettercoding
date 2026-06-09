@@ -27,17 +27,26 @@ pub enum PtyCommand {
     TmuxCli { session_name: String },
 }
 
-/// Initial window command for new CLI tmux sessions: run the interactive
-/// `claude` TUI when installed, then drop to a shell instead of ending the
-/// session (so a crashed/exited claude leaves a usable pane where
-/// `claude --continue` resumes the conversation). Ignored by `-A` attaches.
+/// Initial window command for new CLI tmux sessions. Runs the interactive
+/// `claude` TUI when installed, then drops to a shell instead of ending the
+/// session (so a crashed/exited claude leaves a usable pane). Ignored by `-A`
+/// attaches (only runs when the session is first created).
+///
+/// - `--continue` resumes the most recent conversation in the worktree — the
+///   same on-disk transcript the headless executor created, so switching a
+///   workspace to CLI mode picks up where the chat left off, and a session
+///   recreated after a container restart resumes the conversation too. With no
+///   prior session it launches a fresh TUI (verified on claude 2.1.x).
+/// - `--dangerously-skip-permissions` skips per-tool approval prompts for this
+///   trusted worktree. (claude's one-time folder-trust dialog is separate and
+///   self-remembered per worktree; we deliberately don't rewrite the user's
+///   global `~/.claude.json` to suppress it.)
 ///
 /// TODO(profile-integration): this hardcoded invocation must converge on the
 /// executor profile system (`ExecutorProfileId`) before growing any argument
 /// (model, flags, alternate agent CLIs) — do not bolt options onto
 /// `PtyCommand::TmuxCli` piecemeal.
-const CLI_BOOTSTRAP: &str =
-    r#"command -v claude >/dev/null 2>&1 && claude; exec "${SHELL:-/bin/sh}""#;
+const CLI_BOOTSTRAP: &str = r#"command -v claude >/dev/null 2>&1 && claude --dangerously-skip-permissions --continue; exec "${SHELL:-/bin/sh}""#;
 
 /// Bound on queued PTY output (chunks of up to 4KB). Full-screen TUI redraws
 /// are chatty; if the WebSocket consumer stalls (throttled background tab),
@@ -209,11 +218,18 @@ impl PtyService {
                 cmd.arg(CLI_TMUX_SOCKET);
                 cmd.arg("new-session");
                 // -A: attach if the session exists, else create.
-                // -D: detach any other client first, so one workspace pane has
-                //     a single owner — avoids two browser windows fighting the
-                //     same TUI and the "smallest client wins" resize churn.
+                //
+                // We deliberately do NOT pass -D (detach other clients): a new
+                // attach would detach the prior client, whose tmux process then
+                // exits → its PTY hits EOF → the WebSocket closes → the frontend
+                // reconnects → the new attach detaches it again, a self-
+                // sustaining reconnect loop that also resets the session to the
+                // attaching client's 80x24 default on every cycle. Without -D,
+                // reconnects simply attach; the prior client is cleaned up by
+                // close_session killing its PTY child. Two simultaneous browser
+                // windows would mirror (tmux sizes to the smaller) — a rare,
+                // benign trade vs. the loop.
                 cmd.arg("-A");
-                cmd.arg("-D");
                 cmd.arg("-s");
                 cmd.arg(session_name);
                 cmd.arg("-c");

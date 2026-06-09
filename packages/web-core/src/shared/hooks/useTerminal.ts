@@ -52,7 +52,8 @@ export interface TerminalContextType {
     tabId: string,
     endpoint: string,
     onData: (data: string) => void,
-    onExit?: () => void
+    onExit?: () => void,
+    getSize?: () => { cols: number; rows: number } | null
   ) => {
     send: (data: string) => void;
     resize: (cols: number, rows: number) => void;
