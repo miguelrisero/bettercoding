@@ -357,6 +357,7 @@ export function WorkspacesLayout() {
                   <CliMainPane
                     workspaceId={selectedWorkspace.id}
                     onBackToChat={() => setMainPaneMode('chat')}
+                    sessionId={selectedSessionId}
                   />
                 ) : (
                   <WorkspacesMainContainer

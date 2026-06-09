@@ -7,7 +7,9 @@ use axum::{
     routing::get,
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use db::models::{workspace::Workspace, workspace_repo::WorkspaceRepo};
+use db::models::{
+    coding_agent_turn::CodingAgentTurn, workspace::Workspace, workspace_repo::WorkspaceRepo,
+};
 use deployment::Deployment;
 use local_deployment::pty::{PtyCommand, cli_tmux_session_name};
 use serde::{Deserialize, Serialize};
@@ -38,6 +40,10 @@ struct TerminalQuery {
     pub rows: u16,
     #[serde(default)]
     mode: TerminalMode,
+    /// VibeKanban session whose claude conversation CLI mode should resume,
+    /// so the terminal joins the exact chat the UI is showing (handover).
+    #[serde(default)]
+    session_id: Option<Uuid>,
 }
 
 fn default_cols() -> u16 {
@@ -101,9 +107,25 @@ async fn terminal_ws(
     }
 
     let command = match query.mode {
-        TerminalMode::Cli => PtyCommand::TmuxCli {
-            session_name: cli_tmux_session_name(query.workspace_id),
-        },
+        TerminalMode::Cli => {
+            // Resolve claude's session id for the selected uix chat so CLI mode
+            // resumes the exact conversation (handover). Falls back to
+            // --continue in the bootstrap when there's no prior turn.
+            let resume_session_id = match query.session_id {
+                Some(session_id) => {
+                    CodingAgentTurn::find_latest_session_info(&deployment.db().pool, session_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|info| info.session_id)
+                }
+                None => None,
+            };
+            PtyCommand::TmuxCli {
+                session_name: cli_tmux_session_name(query.workspace_id),
+                resume_session_id,
+            }
+        }
         TerminalMode::Shell => PtyCommand::Shell,
     };
 

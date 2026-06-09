@@ -8,6 +8,11 @@ import { cliTabId, useTerminal } from '@/shared/hooks/useTerminal';
 interface CliMainPaneProps {
   workspaceId: string;
   onBackToChat: () => void;
+  /**
+   * The selected uix session — CLI mode resumes its claude conversation so the
+   * terminal joins the exact chat shown in the UI (bidirectional handover).
+   */
+  sessionId?: string | null;
 }
 
 /**
@@ -19,7 +24,11 @@ interface CliMainPaneProps {
  * workspaces don't accumulate live sockets and server-side PTYs. Remounting
  * reattaches the same tmux session with scrollback intact.
  */
-export function CliMainPane({ workspaceId, onBackToChat }: CliMainPaneProps) {
+export function CliMainPane({
+  workspaceId,
+  onBackToChat,
+  sessionId,
+}: CliMainPaneProps) {
   const { t } = useTranslation('common');
   const { closeTab } = useTerminal();
 
@@ -52,6 +61,7 @@ export function CliMainPane({ workspaceId, onBackToChat }: CliMainPaneProps) {
           workspaceId={workspaceId}
           isActive
           mode="cli"
+          sessionId={sessionId ?? undefined}
         />
       </div>
     </div>

@@ -24,19 +24,27 @@ pub enum PtyCommand {
     /// `tmux new-session -A` attaches when the session already exists, so the
     /// session (and whatever runs inside it) survives WebSocket disconnects
     /// and server restarts; reconnects reattach instead of respawning.
-    TmuxCli { session_name: String },
+    TmuxCli {
+        session_name: String,
+        /// claude's own session UUID to resume (the workspace's selected uix
+        /// chat). When set, the bootstrap runs `claude --resume <id>` so CLI
+        /// mode joins the *exact* conversation the chat UI is showing, and
+        /// follow-ups from either side share one transcript. `None` falls back
+        /// to `--continue` (most recent conversation in the worktree).
+        resume_session_id: Option<String>,
+    },
 }
 
-/// Initial window command for new CLI tmux sessions. Runs the interactive
-/// `claude` TUI when installed, then drops to a shell instead of ending the
-/// session (so a crashed/exited claude leaves a usable pane). Ignored by `-A`
-/// attaches (only runs when the session is first created).
+/// Build the initial window command for a new CLI tmux session. Runs the
+/// interactive `claude` TUI when installed, then drops to a shell instead of
+/// ending the session (so a crashed/exited claude leaves a usable pane).
+/// Ignored by `-A` attaches (only runs when the session is first created).
 ///
-/// - `--continue` resumes the most recent conversation in the worktree — the
-///   same on-disk transcript the headless executor created, so switching a
-///   workspace to CLI mode picks up where the chat left off, and a session
-///   recreated after a container restart resumes the conversation too. With no
-///   prior session it launches a fresh TUI (verified on claude 2.1.x).
+/// - `--resume <id>` (when `resume_session_id` is a valid UUID) joins claude's
+///   exact session — the same transcript the headless executor created/uses —
+///   so the chat UI and CLI hand off the conversation in both directions.
+/// - `--continue` (fallback) resumes the most recent conversation in the
+///   worktree; with no prior session claude launches a fresh TUI.
 /// - `--dangerously-skip-permissions` skips per-tool approval prompts for this
 ///   trusted worktree. (claude's one-time folder-trust dialog is separate and
 ///   self-remembered per worktree; we deliberately don't rewrite the user's
@@ -46,7 +54,24 @@ pub enum PtyCommand {
 /// executor profile system (`ExecutorProfileId`) before growing any argument
 /// (model, flags, alternate agent CLIs) — do not bolt options onto
 /// `PtyCommand::TmuxCli` piecemeal.
-const CLI_BOOTSTRAP: &str = r#"command -v claude >/dev/null 2>&1 && claude --dangerously-skip-permissions --continue; exec "${SHELL:-/bin/sh}""#;
+fn cli_bootstrap(resume_session_id: Option<&str>) -> String {
+    // Only interpolate a strict UUID into the shell string; anything else
+    // falls back to --continue. claude session ids are UUIDs, so this both
+    // validates intent and forecloses shell injection via the id.
+    let resume = resume_session_id
+        .filter(|id| is_uuid(id))
+        .map(|id| format!("--resume {id}"))
+        .unwrap_or_else(|| "--continue".to_string());
+    format!(
+        r#"command -v claude >/dev/null 2>&1 && claude --dangerously-skip-permissions {resume}; exec "${{SHELL:-/bin/sh}}""#
+    )
+}
+
+/// Strict UUID check (8-4-4-4-12 hex). Used to vet a session id before it is
+/// interpolated into the bootstrap shell command.
+fn is_uuid(s: &str) -> bool {
+    Uuid::parse_str(s).is_ok()
+}
 
 /// Bound on queued PTY output (chunks of up to 4KB). Full-screen TUI redraws
 /// are chatty; if the WebSocket consumer stalls (throttled background tab),
@@ -190,11 +215,12 @@ impl PtyService {
 
             // CLI mode rides tmux when present; otherwise (and for the
             // default side terminal) spawn the user's shell directly.
-            let tmux_session = match &command {
-                PtyCommand::TmuxCli { session_name } if tmux_available() => {
-                    Some(session_name.clone())
-                }
-                _ => None,
+            let (tmux_session, tmux_resume_id) = match &command {
+                PtyCommand::TmuxCli {
+                    session_name,
+                    resume_session_id,
+                } if tmux_available() => (Some(session_name.clone()), resume_session_id.clone()),
+                _ => (None, None),
             };
 
             // Never silently break the persistence promise: if CLI mode was
@@ -234,7 +260,7 @@ impl PtyService {
                 cmd.arg(session_name);
                 cmd.arg("-c");
                 cmd.arg(&working_dir);
-                cmd.arg(CLI_BOOTSTRAP);
+                cmd.arg(cli_bootstrap(tmux_resume_id.as_deref()));
                 cmd.cwd(&working_dir);
                 // No shell-specific prompt configuration for the tmux client.
                 (cmd, String::new())
@@ -452,10 +478,28 @@ mod tests {
 
     #[test]
     fn cli_bootstrap_runs_claude_then_drops_to_shell() {
-        assert!(CLI_BOOTSTRAP.contains("command -v claude"));
+        let b = cli_bootstrap(None);
+        assert!(b.contains("command -v claude"));
         assert!(
-            CLI_BOOTSTRAP.ends_with(r#"exec "${SHELL:-/bin/sh}""#),
+            b.ends_with(r#"exec "${SHELL:-/bin/sh}""#),
             "bootstrap must keep the pane alive after claude exits"
         );
+    }
+
+    #[test]
+    fn cli_bootstrap_resumes_valid_uuid_else_continues() {
+        // A valid claude session UUID -> --resume <id>.
+        let id = "28b98f08-5f5f-4b1e-8c4e-41ae87c0c706";
+        let b = cli_bootstrap(Some(id));
+        assert!(b.contains(&format!("--resume {id}")));
+        assert!(!b.contains("--continue"));
+        // No id -> --continue.
+        assert!(cli_bootstrap(None).contains("--continue"));
+        // Non-UUID (injection attempt) is rejected -> --continue, never
+        // interpolated into the shell string.
+        let evil = "x; rm -rf ~";
+        let b = cli_bootstrap(Some(evil));
+        assert!(b.contains("--continue"));
+        assert!(!b.contains("rm -rf"));
     }
 }
