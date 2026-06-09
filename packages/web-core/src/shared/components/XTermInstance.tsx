@@ -18,6 +18,11 @@ interface XTermInstanceProps {
    * 'cli' attaches the workspace's persistent tmux-backed `claude` session.
    */
   mode?: 'shell' | 'cli';
+  /**
+   * In 'cli' mode, the VibeKanban session whose claude conversation to resume
+   * (handover from the chat UI). Forwarded to the terminal WS as `session_id`.
+   */
+  sessionId?: string;
 }
 
 export function XTermInstance({
@@ -26,6 +31,7 @@ export function XTermInstance({
   isActive,
   onClose,
   mode = 'shell',
+  sessionId,
 }: XTermInstanceProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const resizeRef = useRef<HTMLDivElement>(null);
@@ -44,8 +50,10 @@ export function XTermInstance({
     const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
     const host = window.location.host;
     const modeParam = mode === 'cli' ? '&mode=cli' : '';
-    return `${protocol}//${host}/api/terminal/ws?workspace_id=${workspaceId}&cols=${initialSizeRef.current.cols}&rows=${initialSizeRef.current.rows}${modeParam}`;
-  }, [workspaceId, mode]);
+    const sessionParam =
+      mode === 'cli' && sessionId ? `&session_id=${sessionId}` : '';
+    return `${protocol}//${host}/api/terminal/ws?workspace_id=${workspaceId}&cols=${initialSizeRef.current.cols}&rows=${initialSizeRef.current.rows}${modeParam}${sessionParam}`;
+  }, [workspaceId, mode, sessionId]);
 
   const fitTerminal = useCallback(() => {
     fitAddonRef.current?.fit();
