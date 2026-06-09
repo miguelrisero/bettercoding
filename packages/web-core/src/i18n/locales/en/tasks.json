@@ -49,8 +49,7 @@
       "title": "No dev server running",
       "setupTitle": "You must set up a dev server script to use the preview feature",
       "setupPrompt": "To use the live preview and click-to-edit, please add a dev server script to this project.",
-      "editDevScript": "Edit Dev Server Script",
-      "learnMore": "Learn more about testing applications"
+      "editDevScript": "Edit Dev Server Script"
     },
     "logs": {
       "label": "Logs",
@@ -256,7 +255,7 @@
       "prMerged": "PR #{{number}} is already merged",
       "loginRequired": {
         "title": "Sign in to manage git actions",
-        "description": "Sign in to Vibe Kanban so you can push branches, merge changes, or open pull requests for this task.",
+        "description": "Sign in to BetterCoding so you can push branches, merge changes, or open pull requests for this task.",
         "action": "Sign in"
       }
     },
@@ -507,31 +506,6 @@
       "failedToLoadPrs": "Failed to load pull requests",
       "prNotFound": "Pull request not found",
       "failedToCreateWorkspace": "Failed to create workspace"
-    }
-  },
-  "linkPrToIssue": {
-    "title": "Link Pull Request",
-    "description": "Link an existing pull request to this issue.",
-    "urlTab": "From URL",
-    "browseTab": "Browse",
-    "urlLabel": "Pull Request URL",
-    "urlPlaceholder": "https://github.com/owner/repo/pull/123",
-    "repositoryLabel": "Repository",
-    "remoteLabel": "Remote",
-    "pullRequestLabel": "Pull Request",
-    "loadingPrInfo": "Loading PR info...",
-    "invalidUrl": "Could not load PR info from this URL",
-    "baseBranch": "Base:",
-    "linkPr": "Link PR",
-    "linking": "Linking...",
-    "status": {
-      "open": "Open",
-      "merged": "Merged",
-      "closed": "Closed",
-      "unknown": "Unknown"
-    },
-    "errors": {
-      "failed": "Failed to link PR. Please try again."
     }
   }
 }

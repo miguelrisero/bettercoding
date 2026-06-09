@@ -9,10 +9,8 @@ import {
   GitFork as GitForkIcon,
   List as ListIcon,
   Gear as GearIcon,
-  Kanban as KanbanIcon,
   CaretLeft as CaretLeftIcon,
   ArrowClockwise as ArrowClockwiseIcon,
-  SidebarSimple as SidebarSimpleIcon,
 } from '@phosphor-icons/react';
 import { cn } from '../lib/cn';
 import { Tooltip } from './Tooltip';
@@ -155,26 +153,28 @@ function NavbarBreadcrumbs({
 export interface NavbarProps {
   workspaceTitle?: string;
   breadcrumbs?: NavbarBreadcrumbItem[];
+  // Brand wordmark rendered as the left-most element (desktop)
+  brand?: ReactNode;
   // Items for left side of navbar
   leftItems?: NavbarSectionItem[];
   // Items for right side of navbar (with dividers inline)
   rightItems?: NavbarSectionItem[];
   // Optional additional content for left side (after leftItems)
   leftSlot?: ReactNode;
+  // Left-most content of the right section (e.g. app version)
+  rightStart?: ReactNode;
+  // Right-most content of the right section (e.g. notifications, user menu)
+  rightEnd?: ReactNode;
   // Sync errors shown in the right section
   syncErrors?: readonly SyncErrorIndicatorError[] | null;
   className?: string;
   // Mobile props
   mobileMode?: boolean;
   mobileUserSlot?: ReactNode;
-  isOnProjectPage?: boolean;
   onOpenCommandBar?: () => void;
   onOpenSettings?: () => void;
-  onNavigateToBoard?: (() => void) | null;
   onNavigateBack?: () => void;
   onReload?: () => void;
-  onOpenDrawer?: () => void;
-  isOnProjectSubRoute?: boolean;
   mobileActiveTab?: MobileTabId;
   onMobileTabChange?: (tab: MobileTabId) => void;
   mobileTabs?: { id: MobileTabId; icon: Icon; label: string }[];
@@ -185,21 +185,20 @@ export interface NavbarProps {
 export function Navbar({
   workspaceTitle,
   breadcrumbs,
+  brand,
   leftItems = [],
   rightItems = [],
   leftSlot,
+  rightStart,
+  rightEnd,
   syncErrors,
   className,
   mobileMode = false,
   mobileUserSlot,
-  isOnProjectPage = false,
   onOpenCommandBar,
   onOpenSettings,
-  onNavigateToBoard,
   onNavigateBack,
   onReload,
-  onOpenDrawer,
-  isOnProjectSubRoute = false,
   mobileActiveTab = 'chat',
   onMobileTabChange,
   mobileTabs,
@@ -238,123 +237,53 @@ export function Navbar({
           className
         )}
       >
-        {/* Row 1: Tab bar (workspace pages) or minimal header (project pages) */}
+        {/* Row 1: Tab bar */}
         <div className="flex items-center justify-between px-base py-half">
-          {isOnProjectPage ? (
-            <div className="flex items-center gap-base">
-              {isOnProjectSubRoute
-                ? onNavigateBack && (
-                    <button
-                      type="button"
-                      className="flex items-center justify-center text-low hover:text-normal"
-                      onClick={onNavigateBack}
-                      aria-label="Back"
-                    >
-                      <CaretLeftIcon className="size-icon-base" />
-                    </button>
-                  )
-                : onOpenDrawer && (
-                    <button
-                      type="button"
-                      className="flex items-center justify-center text-low hover:text-normal"
-                      onClick={onOpenDrawer}
-                      aria-label="Open menu"
-                    >
-                      <SidebarSimpleIcon className="size-icon-base" />
-                    </button>
-                  )}
-              <p className="text-base text-normal font-medium truncate cursor-default select-none">
-                {workspaceTitle}
-              </p>
-            </div>
-          ) : (
-            <div className="flex items-center gap-0.5 overflow-x-auto">
-              {mobileShowBack && onNavigateBack ? (
-                <>
-                  <button
-                    type="button"
-                    className="flex items-center justify-center px-1.5 py-1 text-low hover:text-normal"
-                    onClick={onNavigateBack}
-                    aria-label="Back"
-                  >
-                    <CaretLeftIcon className="size-icon-sm" />
-                  </button>
-                  <div className="h-4 w-px bg-border mx-0.5 shrink-0" />
-                </>
-              ) : (
-                onOpenDrawer && (
-                  <>
-                    <button
-                      type="button"
-                      className="flex items-center justify-center px-1.5 py-1 text-low hover:text-normal"
-                      onClick={onOpenDrawer}
-                      aria-label="Projects"
-                    >
-                      <KanbanIcon className="size-icon-sm" />
-                    </button>
-                    <div className="h-4 w-px bg-border mx-0.5 shrink-0" />
-                  </>
-                )
-              )}
-              {showMobileTabs !== false &&
-                (mobileTabs ?? MOBILE_TABS).map((tab) => {
-                  const TabIcon = tab.icon;
-                  const isActive = mobileActiveTab === tab.id;
-                  return (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      className={cn(
-                        'flex items-center gap-1 px-1.5 py-1 text-xs whitespace-nowrap transition-colors',
-                        isActive
-                          ? 'text-normal border-b-2 border-brand'
-                          : 'text-low hover:text-normal'
-                      )}
-                      onClick={() => onMobileTabChange?.(tab.id)}
-                    >
-                      <TabIcon
-                        className="size-icon-sm"
-                        weight={isActive ? 'fill' : 'regular'}
-                      />
-                      <span className="hidden min-[480px]:inline">
-                        {tab.label}
-                      </span>
-                    </button>
-                  );
-                })}
-              {onNavigateToBoard && (
+          <div className="flex items-center gap-0.5 overflow-x-auto">
+            {mobileShowBack && onNavigateBack && (
+              <>
                 <button
                   type="button"
-                  className="flex items-center gap-1 px-1.5 py-1 text-xs text-low hover:text-normal whitespace-nowrap"
-                  onClick={onNavigateToBoard}
+                  className="flex items-center justify-center px-1.5 py-1 text-low hover:text-normal"
+                  onClick={onNavigateBack}
+                  aria-label="Back"
                 >
-                  <KanbanIcon className="size-icon-sm" />
-                  <span className="hidden min-[480px]:inline">Board</span>
+                  <CaretLeftIcon className="size-icon-sm" />
                 </button>
-              )}
-            </div>
-          )}
+                <div className="h-4 w-px bg-border mx-0.5 shrink-0" />
+              </>
+            )}
+            {showMobileTabs !== false &&
+              (mobileTabs ?? MOBILE_TABS).map((tab) => {
+                const TabIcon = tab.icon;
+                const isActive = mobileActiveTab === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    className={cn(
+                      'flex items-center gap-1 px-1.5 py-1 text-xs whitespace-nowrap transition-colors',
+                      isActive
+                        ? 'text-normal border-b-2 border-brand'
+                        : 'text-low hover:text-normal'
+                    )}
+                    onClick={() => onMobileTabChange?.(tab.id)}
+                  >
+                    <TabIcon
+                      className="size-icon-sm"
+                      weight={isActive ? 'fill' : 'regular'}
+                    />
+                    <span className="hidden min-[480px]:inline">
+                      {tab.label}
+                    </span>
+                  </button>
+                );
+              })}
+          </div>
 
           {/* Right side: sync indicator + action buttons + user slot */}
           <div className="flex items-center gap-1 shrink-0">
             <SyncErrorIndicator errors={syncErrors} />
-            {isOnProjectPage &&
-              rightItems
-                .filter((item): item is NavbarActionItem => !isDivider(item))
-                .map((item) => (
-                  <NavbarIconButton
-                    key={item.id}
-                    icon={item.icon}
-                    isActive={item.isActive}
-                    onClick={item.onClick}
-                    aria-label={item.tooltip}
-                    tooltip={item.tooltip}
-                    disabled={!!item.disabled}
-                    className={
-                      item.disabled ? 'opacity-40 cursor-not-allowed' : ''
-                    }
-                  />
-                ))}
             {onReload && (
               <button
                 type="button"
@@ -365,7 +294,7 @@ export function Navbar({
                 <ArrowClockwiseIcon className="size-icon-sm" />
               </button>
             )}
-            {!isOnProjectPage && onOpenSettings && (
+            {onOpenSettings && (
               <button
                 type="button"
                 className="flex items-center justify-center text-low hover:text-normal"
@@ -375,7 +304,7 @@ export function Navbar({
                 <GearIcon className="size-icon-sm" />
               </button>
             )}
-            {!isOnProjectPage && onOpenCommandBar && (
+            {onOpenCommandBar && (
               <button
                 type="button"
                 className="flex items-center justify-center text-low hover:text-normal"
@@ -392,8 +321,8 @@ export function Navbar({
           </div>
         </div>
 
-        {/* Row 2: Info bar with leftSlot + breadcrumbs/title (workspace pages only) */}
-        {!isOnProjectPage && (workspaceTitle || breadcrumbs) && (
+        {/* Row 2: Info bar with leftSlot + breadcrumbs/title */}
+        {(workspaceTitle || breadcrumbs) && (
           <div className="flex items-center justify-between px-base py-half border-t border-border">
             <div className="flex items-center gap-base flex-1 min-w-0">
               {leftSlot}
@@ -425,8 +354,9 @@ export function Navbar({
         className
       )}
     >
-      {/* Left - Archive & Old UI Link + optional slot */}
+      {/* Left - Brand + actions + optional slot */}
       <div data-tauri-drag-region className="flex-1 flex items-center gap-base">
+        {brand}
         {leftItems.map((item, index) =>
           renderItem(
             item,
@@ -456,11 +386,12 @@ export function Navbar({
         )}
       </div>
 
-      {/* Right - Sync Error Indicator + Diff Controls + Panel Toggles (dividers inline) */}
+      {/* Right - version + sync indicator + panel toggles + user area */}
       <div
         data-tauri-drag-region
         className="flex-1 flex items-center justify-end gap-base"
       >
+        {rightStart}
         <SyncErrorIndicator errors={syncErrors} />
         {rightItems.map((item, index) =>
           renderItem(
@@ -468,6 +399,7 @@ export function Navbar({
             `right-${isDivider(item) ? 'divider' : item.id}-${index}`
           )
         )}
+        {rightEnd}
       </div>
     </nav>
   );

@@ -7,7 +7,6 @@ mod issue_relationships;
 mod issue_tags;
 mod issues;
 mod project_statuses;
-mod projects;
 pub mod pull_requests;
 mod tags;
 mod workspaces;
@@ -18,7 +17,6 @@ pub fn router() -> Router<DeploymentImpl> {
         .merge(issue_relationships::router())
         .merge(issue_tags::router())
         .merge(issues::router())
-        .merge(projects::router())
         .merge(project_statuses::router())
         .merge(pull_requests::router())
         .merge(tags::router())

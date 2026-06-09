@@ -17,7 +17,6 @@ import { TerminalProvider } from "@/shared/providers/TerminalProvider";
 import { LogsPanelProvider } from "@/shared/providers/LogsPanelProvider";
 import { ActionsProvider } from "@/shared/providers/ActionsProvider";
 import { useAuth } from "@/shared/hooks/auth/useAuth";
-import { useKanbanIssueComposerScratch } from "@/shared/hooks/useKanbanIssueComposerScratch";
 import { useUiPreferencesScratch } from "@/shared/hooks/useUiPreferencesScratch";
 import { useWorkspaceContext } from "@/shared/hooks/useWorkspaceContext";
 import { AppNavigationProvider } from "@/shared/hooks/useAppNavigation";
@@ -25,7 +24,6 @@ import {
   SequenceTrackerProvider,
   SequenceIndicator,
   useWorkspaceShortcuts,
-  useIssueShortcuts,
   useKeyShowHelp,
   Scope,
 } from "@/shared/keyboard";
@@ -40,10 +38,7 @@ import {
   useRelayAppBarHosts,
 } from "@remote/shared/hooks/useRelayAppBarHosts";
 import { setActiveRelayHostId } from "@remote/shared/lib/relay/activeHostContext";
-import {
-  isProjectDestination,
-  isWorkspacesDestination,
-} from "@/shared/lib/routes/appNavigation";
+import { isWorkspacesDestination } from "@/shared/lib/routes/appNavigation";
 import NotFoundPage from "../pages/NotFoundPage";
 
 export const Route = createRootRoute({
@@ -80,12 +75,11 @@ function GlobalKeyboardShortcuts() {
 }
 
 /**
- * Workspace & issue keyboard shortcuts that require ActionsProvider + WorkspaceProvider.
+ * Workspace keyboard shortcuts that require ActionsProvider + WorkspaceProvider.
  * Must be rendered inside WorkspaceRouteProviders.
  */
 function WorkspaceKeyboardShortcuts() {
   useWorkspaceShortcuts();
-  useIssueShortcuts();
   return null;
 }
 
@@ -109,7 +103,6 @@ function WorkspaceRouteProviders({ children }: { children: ReactNode }) {
 function RootLayout() {
   useSystemTheme();
   useUiPreferencesScratch();
-  useKanbanIssueComposerScratch();
   const { isSignedIn } = useAuth();
   const location = useLocation();
   const { hostId } = useParams({ strict: false });
@@ -136,8 +129,7 @@ function RootLayout() {
     location.pathname.startsWith("/login") ||
     location.pathname.startsWith("/invitations");
   const destination = resolveRemoteDestinationFromPath(location.pathname);
-  const isWorkspaceProviderRoute =
-    isProjectDestination(destination) || isWorkspacesDestination(destination);
+  const isWorkspaceProviderRoute = isWorkspacesDestination(destination);
 
   const pageContent = isStandaloneRoute ? (
     <Outlet />

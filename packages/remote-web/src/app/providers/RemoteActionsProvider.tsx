@@ -1,10 +1,4 @@
-import {
-  useCallback,
-  useContext,
-  useMemo,
-  useState,
-  type ReactNode,
-} from "react";
+import { useCallback, useContext, useMemo, type ReactNode } from "react";
 import { useParams } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import type { Workspace } from "shared/types";
@@ -19,17 +13,10 @@ import {
   type ActionVisibilityContext,
   getActionLabel,
   resolveLabel,
-  type ProjectMutations,
 } from "@/shared/types/actions";
 import { SettingsDialog } from "@/shared/dialogs/settings/SettingsDialog";
 import { useAppNavigation } from "@/shared/hooks/useAppNavigation";
 import { useAppRuntime } from "@/shared/hooks/useAppRuntime";
-import { useOrganizationStore } from "@/shared/stores/useOrganizationStore";
-import {
-  buildKanbanIssueComposerKey,
-  openKanbanIssueComposer,
-  type ProjectIssueCreateOptions,
-} from "@/shared/stores/useKanbanIssueComposerStore";
 
 interface RemoteActionsProviderProps {
   children: ReactNode;
@@ -45,57 +32,8 @@ export function RemoteActionsProvider({
   const appRuntime = useAppRuntime();
   const appNavigation = useAppNavigation();
   const queryClient = useQueryClient();
-  const { projectId, hostId } = useParams({ strict: false });
+  const { hostId } = useParams({ strict: false });
   const userCtx = useContext(UserContext);
-  const selectedOrgId = useOrganizationStore((s) => s.selectedOrgId);
-  const [defaultCreateStatusId, setDefaultCreateStatusId] = useState<
-    string | undefined
-  >();
-  const [projectMutations, setProjectMutations] =
-    useState<ProjectMutations | null>(null);
-
-  const registerProjectMutations = useCallback(
-    (mutations: ProjectMutations | null) => {
-      setProjectMutations(mutations);
-    },
-    [],
-  );
-
-  const navigateToCreateIssue = useCallback(
-    (options?: ProjectIssueCreateOptions) => {
-      if (!projectId) return;
-      openKanbanIssueComposer(
-        buildKanbanIssueComposerKey(hostId ?? null, projectId),
-        options,
-      );
-    },
-    [hostId, projectId],
-  );
-
-  const openStatusSelection = useCallback(async () => {
-    noOpSelection("Status selection");
-  }, []);
-
-  const openPrioritySelection = useCallback(async () => {
-    noOpSelection("Priority selection");
-  }, []);
-
-  const openAssigneeSelection = useCallback(async () => {
-    noOpSelection("Assignee selection");
-  }, []);
-
-  const openSubIssueSelection = useCallback(async () => {
-    noOpSelection("Sub-issue selection");
-    return undefined;
-  }, []);
-
-  const openWorkspaceSelection = useCallback(async () => {
-    noOpSelection("Workspace selection");
-  }, []);
-
-  const openRelationshipSelection = useCallback(async () => {
-    noOpSelection("Relationship selection");
-  }, []);
 
   const executorContext = useMemo<ActionExecutorContext>(
     () => ({
@@ -118,36 +56,9 @@ export function RemoteActionsProvider({
       },
       currentLogs: null,
       logsPanelContent: null,
-      openStatusSelection,
-      openPrioritySelection,
-      openAssigneeSelection,
-      openSubIssueSelection,
-      openWorkspaceSelection,
-      openRelationshipSelection,
-      navigateToCreateIssue,
-      defaultCreateStatusId,
-      kanbanOrgId: selectedOrgId ?? undefined,
-      kanbanProjectId: projectId,
-      projectMutations: projectMutations ?? undefined,
       remoteWorkspaces: userCtx?.workspaces ?? [],
     }),
-    [
-      appRuntime,
-      hostId,
-      queryClient,
-      openStatusSelection,
-      openPrioritySelection,
-      openAssigneeSelection,
-      openSubIssueSelection,
-      openWorkspaceSelection,
-      openRelationshipSelection,
-      navigateToCreateIssue,
-      defaultCreateStatusId,
-      selectedOrgId,
-      projectId,
-      projectMutations,
-      userCtx?.workspaces,
-    ],
+    [appRuntime, hostId, appNavigation, queryClient, userCtx?.workspaces],
   );
 
   const executeAction = useCallback(
@@ -159,22 +70,11 @@ export function RemoteActionsProvider({
         return;
       }
 
-      if (action.id === "project-settings") {
-        await SettingsDialog.show({
-          initialSection: "remote-projects",
-          initialState: {
-            organizationId: selectedOrgId ?? undefined,
-            projectId: projectId ?? undefined,
-          },
-        });
-        return;
-      }
-
       console.warn(
         `[RemoteActionsProvider] Action "${action.id}" is unavailable in remote web.`,
       );
     },
-    [projectId, selectedOrgId],
+    [],
   );
 
   const getLabel = useCallback(
@@ -195,28 +95,9 @@ export function RemoteActionsProvider({
     () => ({
       executeAction,
       getLabel,
-      openStatusSelection,
-      openPrioritySelection,
-      openAssigneeSelection,
-      openSubIssueSelection,
-      openWorkspaceSelection,
-      openRelationshipSelection,
-      setDefaultCreateStatusId,
-      registerProjectMutations,
       executorContext,
     }),
-    [
-      executeAction,
-      getLabel,
-      openStatusSelection,
-      openPrioritySelection,
-      openAssigneeSelection,
-      openSubIssueSelection,
-      openWorkspaceSelection,
-      openRelationshipSelection,
-      registerProjectMutations,
-      executorContext,
-    ],
+    [executeAction, getLabel, executorContext],
   );
 
   return (

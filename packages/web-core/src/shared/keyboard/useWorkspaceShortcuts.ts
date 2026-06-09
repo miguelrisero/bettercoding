@@ -44,7 +44,6 @@ export function useWorkspaceShortcuts() {
         currentExecuteAction(action, currentWorkspaceId);
         break;
       case ActionTargetType.NONE:
-      case ActionTargetType.ISSUE:
         currentExecuteAction(action);
         break;
     }

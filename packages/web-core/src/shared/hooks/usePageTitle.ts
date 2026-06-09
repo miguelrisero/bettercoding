@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 
-const BASE_TITLE = 'Vibe Kanban';
+const BASE_TITLE = 'BetterCoding';
 
 /**
  * Sets the document title based on the given parts.
@@ -8,8 +8,7 @@ const BASE_TITLE = 'Vibe Kanban';
  * because React runs child effects after parent effects.
  *
  * No cleanup is performed on unmount so that a parent-level caller
- * (e.g. the legacy ProjectProvider) provides a stable fallback without
- * competing with page-level callers.
+ * provides a stable fallback without competing with page-level callers.
  */
 export function usePageTitle(...parts: (string | null | undefined)[]) {
   const filtered = parts.filter(Boolean) as string[];

@@ -1,13 +1,5 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  forwardRef,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react';
-import {
-  BookOpenIcon,
   BirdIcon,
   CheckIcon,
   CowIcon,
@@ -21,18 +13,14 @@ import {
   WaveformIcon,
   type Icon,
 } from '@phosphor-icons/react';
-import type { IconProps } from '@phosphor-icons/react';
 import { usePostHog } from 'posthog-js/react';
-import { siDiscord } from 'simple-icons';
 import {
   BaseCodingAgent,
   EditorType,
   SoundFile,
-  ThemeMode,
   type EditorConfig,
 } from 'shared/types';
 import { useUserSystem } from '@/shared/hooks/useUserSystem';
-import { useTheme } from '@/shared/hooks/useTheme';
 import { AgentIcon, getAgentName } from '@/shared/components/AgentIcon';
 import { IdeIcon } from '@/shared/components/IdeIcon';
 import { getIdeName } from '@/shared/lib/ideName';
@@ -92,36 +80,11 @@ const AGENT_PRIORITY: BaseCodingAgent[] = [
   BaseCodingAgent.GEMINI,
 ];
 
-const DiscordIcon: Icon = forwardRef<SVGSVGElement, IconProps>(
-  ({ className, color = 'currentColor' }, ref) => (
-    <svg
-      ref={ref}
-      className={className}
-      viewBox="0 0 24 24"
-      fill={color}
-      aria-hidden="true"
-    >
-      <path d={siDiscord.path} />
-    </svg>
-  )
-);
-DiscordIcon.displayName = 'DiscordIcon';
-
 const SOCIAL_LINKS = [
   {
-    label: 'Discord',
-    href: 'https://discord.gg/AC4nwVtJM3',
-    icon: DiscordIcon,
-  },
-  {
     label: 'GitHub',
-    href: 'https://github.com/BloopAI/vibe-kanban',
+    href: 'https://github.com/miguelrisero/bettercoding',
     icon: GithubLogoIcon,
-  },
-  {
-    label: 'Docs',
-    href: 'https://www.vibekanban.com/docs',
-    icon: BookOpenIcon,
   },
 ];
 
@@ -137,18 +100,8 @@ function randomDefaultSoundFile(): SoundFile {
   return SOUND_OPTIONS[randomIndex]?.value ?? SoundFile.COW_MOOING;
 }
 
-function resolveTheme(theme: ThemeMode): 'light' | 'dark' {
-  if (theme === ThemeMode.SYSTEM) {
-    return window.matchMedia('(prefers-color-scheme: dark)').matches
-      ? 'dark'
-      : 'light';
-  }
-  return theme === ThemeMode.DARK ? 'dark' : 'light';
-}
-
 export function LandingPage() {
   const appNavigation = useAppNavigation();
-  const { theme } = useTheme();
   const { config, profiles, updateAndSaveConfig, loading } = useUserSystem();
   const posthog = usePostHog();
 
@@ -174,11 +127,6 @@ export function LandingPage() {
     },
     [posthog]
   );
-
-  const logoSrc =
-    resolveTheme(theme) === 'dark'
-      ? '/vibe-kanban-logo-dark.svg'
-      : '/vibe-kanban-logo.svg';
 
   useEffect(() => {
     if (!config || initialized) return;
@@ -337,7 +285,9 @@ export function LandingPage() {
         {/* Header */}
         <header className="shrink-0 space-y-base p-double pb-base">
           <div className="flex items-center justify-between">
-            <img src={logoSrc} alt="Vibe Kanban" className="h-8 w-auto logo" />
+            <span className="font-ibm-plex-mono text-xl font-semibold tracking-tight text-high select-none">
+              Better<span className="text-brand">Coding</span>
+            </span>
             <div className="flex flex-wrap items-center gap-2">
               {SOCIAL_LINKS.map((link) => (
                 <PrimaryButton
@@ -357,19 +307,10 @@ export function LandingPage() {
                 weight="fill"
               />
               <p className="text-sm text-normal">
-                Vibe Kanban runs AI coding agents with{' '}
+                BetterCoding runs AI coding agents with{' '}
                 <code>--dangerously-skip-permissions</code> /{' '}
                 <code>--yolo</code> by default. Always review what agents are
-                doing.{' '}
-                <a
-                  href="https://www.vibekanban.com/docs/getting-started#safety-notice"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-brand hover:underline"
-                >
-                  Learn more
-                </a>
-                .
+                doing.
               </p>
             </div>
           </div>
@@ -548,28 +489,7 @@ export function LandingPage() {
         </div>
 
         {/* Footer */}
-        <div className="shrink-0 border-t border-border p-double pt-base flex items-center justify-between gap-base">
-          <p className="text-xs text-low">
-            By continuing you agree to the{' '}
-            <a
-              href="https://www.vibekanban.com/terms"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-brand hover:underline"
-            >
-              terms and conditions
-            </a>{' '}
-            and{' '}
-            <a
-              href="https://www.vibekanban.com/privacy"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-brand hover:underline"
-            >
-              privacy policy
-            </a>
-            .
-          </p>
+        <div className="shrink-0 border-t border-border p-double pt-base flex items-center justify-end gap-base">
           <PrimaryButton
             value={saving ? 'Saving...' : 'Continue'}
             onClick={handleContinue}

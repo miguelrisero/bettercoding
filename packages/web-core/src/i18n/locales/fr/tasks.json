@@ -49,8 +49,7 @@
       "title": "Aucun serveur de développement en cours d'exécution",
       "setupTitle": "Vous devez configurer un script de serveur de développement pour utiliser la fonction d'aperçu",
       "setupPrompt": "Pour utiliser l'aperçu en direct et le clic-pour-éditer, veuillez ajouter un script de serveur de développement à ce projet.",
-      "editDevScript": "Modifier le script du serveur de développement",
-      "learnMore": "En savoir plus sur le test des applications"
+      "editDevScript": "Modifier le script du serveur de développement"
     },
     "logs": {
       "label": "Logs",
@@ -256,7 +255,7 @@
       "prMerged": "La PR #{{number}} est déjà fusionnée",
       "loginRequired": {
         "title": "Connectez-vous pour gérer les actions git",
-        "description": "Connectez-vous à Vibe Kanban pour pouvoir pousser des branches, fusionner des modifications ou ouvrir des pull requests pour cette tâche.",
+        "description": "Connectez-vous à BetterCoding pour pouvoir pousser des branches, fusionner des modifications ou ouvrir des pull requests pour cette tâche.",
         "action": "Se connecter"
       }
     },
@@ -507,31 +506,6 @@
       "title": "Sign in required",
       "description": "Sign in to access this feature.",
       "action": "Sign in"
-    }
-  },
-  "linkPrToIssue": {
-    "title": "Lier une pull request",
-    "description": "Lier une pull request existante à ce ticket.",
-    "urlTab": "Depuis une URL",
-    "browseTab": "Parcourir",
-    "urlLabel": "URL de la pull request",
-    "urlPlaceholder": "https://github.com/owner/repo/pull/123",
-    "repositoryLabel": "Dépôt",
-    "remoteLabel": "Remote",
-    "pullRequestLabel": "Pull request",
-    "loadingPrInfo": "Chargement des informations du PR...",
-    "invalidUrl": "Impossible de charger les informations du PR depuis cette URL",
-    "baseBranch": "Base :",
-    "linkPr": "Lier le PR",
-    "linking": "Liaison en cours...",
-    "status": {
-      "open": "Ouvert",
-      "merged": "Fusionné",
-      "closed": "Fermé",
-      "unknown": "Inconnu"
-    },
-    "errors": {
-      "failed": "Échec de la liaison du PR. Veuillez réessayer."
     }
   }
 }

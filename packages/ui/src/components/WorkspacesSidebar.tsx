@@ -11,7 +11,7 @@ import { useTranslation } from 'react-i18next';
 import { cn } from '../lib/cn';
 import { InputField } from './InputField';
 import { WorkspaceSummary } from './WorkspaceSummary';
-import type { AppBarHostStatus } from './AppBar';
+export type WorkspacesSidebarHostStatus = 'online' | 'offline' | 'unpaired';
 import {
   CollapsibleSectionHeader,
   type SectionAction,
@@ -83,7 +83,7 @@ export interface WorkspacesSidebarProps {
   persistKeys?: WorkspacesSidebarPersistKeys;
   activeRemoteHost?: {
     name: string;
-    status: AppBarHostStatus;
+    status: WorkspacesSidebarHostStatus;
   } | null;
   onOpenRemoteHostSettings?: () => void;
 }

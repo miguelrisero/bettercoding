@@ -1,5 +1,4 @@
-import { useRef, useEffect, useCallback, useMemo } from 'react';
-import { useParams } from '@tanstack/react-router';
+import { useRef, useEffect, useCallback } from 'react';
 import { create, useModal } from '@ebay/nice-modal-react';
 import { useQueryClient } from '@tanstack/react-query';
 import type { Workspace } from 'shared/types';
@@ -23,30 +22,21 @@ import type { SelectionPage } from './SelectionDialog';
 import type { RepoSelectionResult } from './selections/repoSelection';
 import { useCommandBarState } from './commandBar/useCommandBarState';
 import { useResolvedPage } from './commandBar/useResolvedPage';
-import { useIssueSelectionStore } from '@/shared/stores/useIssueSelectionStore';
 
 export interface CommandBarDialogProps {
   page?: PageId;
   workspaceId?: string;
   repoId?: string;
-  /** Issue context for kanban mode - projectId */
-  projectId?: string;
-  /** Issue context for kanban mode - selected issue IDs */
-  issueIds?: string[];
 }
 
 function CommandBarContent({
   page,
   workspaceId,
   initialRepoId,
-  propProjectId,
-  propIssueIds,
 }: {
   page: PageId;
   workspaceId?: string;
   initialRepoId?: string;
-  propProjectId?: string;
-  propIssueIds?: string[];
 }) {
   const modal = useModal();
   const previousFocusRef = useRef<HTMLElement | null>(null);
@@ -54,25 +44,7 @@ function CommandBarContent({
   const { executeAction, getLabel } = useActions();
   const { workspaceId: contextWorkspaceId, repos } = useWorkspaceContext();
 
-  // Get issue context from props, multi-selection store, or route params
-  const { projectId: routeProjectId, issueId: routeIssueId } = useParams({
-    strict: false,
-  });
-  const multiSelectedIssueIds = useIssueSelectionStore(
-    (s) => s.selectedIssueIds
-  );
-
-  // Effective issue context: props > multi-selection > route param
-  const effectiveProjectId = propProjectId ?? routeProjectId;
-  const effectiveIssueIds = useMemo(() => {
-    if (propIssueIds) return propIssueIds;
-    if (multiSelectedIssueIds.size > 0) return [...multiSelectedIssueIds];
-    return routeIssueId ? [routeIssueId] : [];
-  }, [propIssueIds, multiSelectedIssueIds, routeIssueId]);
-  const visibilityContext = useActionVisibilityContext({
-    projectId: effectiveProjectId,
-    issueIds: effectiveIssueIds,
-  });
+  const visibilityContext = useActionVisibilityContext();
 
   const effectiveWorkspaceId = workspaceId ?? contextWorkspaceId;
   const workspace = effectiveWorkspaceId
@@ -111,14 +83,7 @@ function CommandBarContent({
 
       modal.hide();
 
-      if (effect.action.requiresTarget === ActionTargetType.ISSUE) {
-        executeAction(
-          effect.action,
-          undefined,
-          effectiveProjectId,
-          effectiveIssueIds
-        );
-      } else if (effect.action.requiresTarget === ActionTargetType.GIT) {
+      if (effect.action.requiresTarget === ActionTargetType.GIT) {
         // Resolve repoId: use initialRepoId, single repo, or show selection dialog
         let repoId: string | undefined = initialRepoId;
         if (!repoId && repos.length === 1) {
@@ -146,16 +111,7 @@ function CommandBarContent({
         executeAction(effect.action, effectiveWorkspaceId);
       }
     },
-    [
-      dispatch,
-      modal,
-      executeAction,
-      effectiveWorkspaceId,
-      effectiveProjectId,
-      effectiveIssueIds,
-      repos,
-      initialRepoId,
-    ]
+    [dispatch, modal, executeAction, effectiveWorkspaceId, repos, initialRepoId]
   );
 
   // Restore focus when dialog closes (unless another dialog has taken focus)
@@ -197,19 +153,11 @@ function CommandBarContent({
 }
 
 const CommandBarDialogImpl = create<CommandBarDialogProps>(
-  ({
-    page = 'root',
-    workspaceId,
-    repoId: initialRepoId,
-    projectId: propProjectId,
-    issueIds: propIssueIds,
-  }) => (
+  ({ page = 'root', workspaceId, repoId: initialRepoId }) => (
     <CommandBarContent
       page={page}
       workspaceId={workspaceId}
       initialRepoId={initialRepoId}
-      propProjectId={propProjectId}
-      propIssueIds={propIssueIds}
     />
   )
 );
