@@ -4,8 +4,10 @@ import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import '@xterm/xterm/css/xterm.css';
 
-import { useTheme } from '@/shared/hooks/useTheme';
-import { getTerminalTheme } from '@/shared/lib/terminalTheme';
+import {
+  TERMINAL_BACKGROUND,
+  getTerminalTheme,
+} from '@/shared/lib/terminalTheme';
 import { useTerminal } from '@/shared/hooks/useTerminal';
 
 interface XTermInstanceProps {
@@ -38,7 +40,6 @@ export function XTermInstance({
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const initialSizeRef = useRef({ cols: 80, rows: 24 });
-  const { theme } = useTheme();
   const {
     registerTerminalInstance,
     getTerminalInstance,
@@ -241,14 +242,15 @@ export function XTermInstance({
     if (isActive) terminalRef.current?.focus();
   }, [isActive]);
 
-  useEffect(() => {
-    if (terminalRef.current) {
-      terminalRef.current.options.theme = getTerminalTheme();
-    }
-  }, [theme]);
-
   return (
-    <div ref={resizeRef} className="w-full h-full px-2 py-1">
+    // The padding ring is painted terminal-black (not the app surface color)
+    // so the always-dark terminal doesn't sit in a light frame on the light
+    // theme.
+    <div
+      ref={resizeRef}
+      className="w-full h-full px-2 py-1"
+      style={{ background: TERMINAL_BACKGROUND }}
+    >
       <div ref={containerRef} className="w-full h-full" />
     </div>
   );
