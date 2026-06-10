@@ -84,7 +84,7 @@
   "signIn": "登入",
   "signOut": "登出",
   "oauth": {
-    "title": "登入 Vibe Kanban",
+    "title": "登入 BetterCoding",
     "description": "登入以加入組織並與團隊共享任務",
     "continueWithGitHub": "使用 GitHub 繼續",
     "continueWithGoogle": "使用 Google 繼續",
@@ -221,7 +221,7 @@
   "workspacesGuide": {
     "welcome": {
       "title": "歡迎",
-      "content": "歡迎使用 Workspaces，這是 Vibe Kanban 的全新設計介面。我們正在向部分使用者推出以獲取早期回饋。您可以隨時透過導覽列中的回饋圖示分享您的想法。"
+      "content": "歡迎使用 Workspaces，這是 BetterCoding 的全新設計介面。我們正在向部分使用者推出以獲取早期回饋。您可以隨時透過導覽列中的回饋圖示分享您的想法。"
     },
     "commandBar": {
       "title": "命令列",
@@ -352,9 +352,6 @@
     "noCommands": "此代理沒有可用的指令。"
   },
   "kanban": {
-    "noVisibleStatuses": "所有狀態已隱藏。請使用顯示設定或切換到其他標籤頁查看問題。",
-    "noProjectFound": "找不到專案",
-    "unassigned": "未指派",
     "noTagsAvailable": "無可用標籤",
     "createNewIssue": "建立新問題",
     "searchTags": "搜尋標籤...",
@@ -369,9 +366,6 @@
     "attachFileHint": "附加檔案（每個檔案最大 20MB）",
     "dropFilesHere": "將檔案拖放到這裡",
     "fileDropHint": "任意檔案類型，最大 20MB",
-    "unknownUser": "未知使用者",
-    "deletedUser": "已刪除使用者",
-    "replyQuotePrefix": "寫道：",
     "moreActions": "更多操作",
     "closePanel": "關閉面板",
     "copyLink": "複製連結",
@@ -402,21 +396,12 @@
       "active": "活動",
       "all": "全部"
     },
-    "loginRequired": {
-      "title": "需要登入",
-      "description": "請登入以查看此專案。",
-      "action": "登入"
-    },
     "team": "Team",
     "personal": "Personal",
     "searchPlaceholder": "Search issues...",
     "filters": "Filters",
     "clearFilters": "Clear filters",
-    "filtersDescription": "Adjust filters and sorting for this board view.",
-    "filterByTag": "Filter by tag",
     "filterByPriority": "Filter by priority",
-    "tags": "Tags",
-    "sortBy": "Sort",
     "workspaceSidebar": {
       "sortDialogTitle": "Sort workspaces",
       "sortDialogDescription": "Choose how workspaces are ordered in the sidebar.",
@@ -426,64 +411,19 @@
       "sortCreatedAt": "Created at",
       "filterDialogTitle": "Filter workspaces",
       "filterDialogDescription": "Narrow down workspaces by project and PR state.",
-      "projectFilterLabel": "Project",
       "prFilterLabel": "PR",
       "prFilterAll": "All",
       "prFilterHasPr": "Has PR",
       "prFilterNoPr": "No PR",
-      "noProject": "No project",
       "sortButtonTitle": "Sort workspaces",
       "filterButtonTitle": "Filter workspaces"
     },
     "sortAscending": "Ascending",
     "sortDescending": "Descending",
     "assignee": "Assignee",
-    "self": "Me",
     "priority": "Priority",
-    "subIssuesFilterLabel": "Sub-issues",
-    "workspacesFilterLabel": "Workspaces",
-    "selectAssignees": "Select assignees...",
     "relationships": "Relationships",
-    "noRelationships": "No relationships",
-    "openProjectsGuide": "Projects guide",
-    "editProjectSettings": "Edit project settings",
-    "linkWorkspace": "Link workspace...",
-    "createNewWorkspace": "Create new workspace",
-    "workspaces": "Workspaces",
-    "showingWorkspaces": "Showing {{count}} of {{total}}",
-    "changeColor": "Change color",
-    "editName": "Edit name",
-    "deleteStatus": "Delete status",
-    "cannotDeleteWithIssues": "Move issues first",
-    "lastVisibleStatus": "At least one status must be visible",
-    "showStatus": "Show status",
-    "hideStatus": "Hide status",
-    "newStatus": "New Status",
-    "visibleColumns": "Visible Columns",
-    "dragToRearrange": "Drag to re-arrange",
-    "addColumn": "Add column",
-    "projectsGuide": {
-      "intro": {
-        "title": "Welcome",
-        "content": "Welcome to Vibe Kanban. Use the help sections in this panel to learn how things work, then create your first issue. You can re-open this help dialog or give feedback anytime from the navbar."
-      },
-      "welcome": {
-        "title": "Projects",
-        "content": "The project page is where you manage issues. You can view your issues as a kanban board, or as a list, and filter by status, tag, assignee and more."
-      },
-      "issues": {
-        "title": "Issues",
-        "content": "Each issue represents a feature or problem to solve. Issues have statuses, priorities, assignees, tags, relationships, comments, sub-issues and more."
-      },
-      "workspaces": {
-        "title": "Workspaces",
-        "content": "To start working on an issue, create a workspace. A single issue can have multiple workspaces. Issues describe the work to be done, workspaces are where the work happens."
-      },
-      "organizations": {
-        "title": "Invite your team",
-        "content": "We've automatically created a personal organization and initial project so you can get started with Vibe Kanban. Export your cloud data before shutdown."
-      }
-    }
+    "noRelationships": "No relationships"
   },
   "createMode": {
     "headings": {
@@ -537,13 +477,6 @@
     "skipSignInHeader": "Don't sign in",
     "yes": "Yes",
     "no": "No"
-  },
-  "appBar": {
-    "kanban": {
-      "tooltip": "登入以查看專案",
-      "title": "看板",
-      "description": "登入以使用看板管理您的編碼代理。"
-    }
   },
   "errors": {
     "generic": "An unexpected error occurred"

@@ -1,19 +1,13 @@
 interface BrandLogoProps {
   className?: string;
-  alt?: string;
 }
 
-export function BrandLogo({
-  className = "h-8 w-auto",
-  alt = "Vibe Kanban",
-}: BrandLogoProps) {
+export function BrandLogo({ className }: BrandLogoProps) {
   return (
-    <picture>
-      <source
-        srcSet="/vibe-kanban-logo-dark.svg"
-        media="(prefers-color-scheme: dark)"
-      />
-      <img src="/vibe-kanban-logo.svg" alt={alt} className={className} />
-    </picture>
+    <span
+      className={`font-ibm-plex-mono text-xl font-semibold tracking-tight text-high select-none ${className ?? ""}`}
+    >
+      Better<span className="text-brand">Coding</span>
+    </span>
   );
 }

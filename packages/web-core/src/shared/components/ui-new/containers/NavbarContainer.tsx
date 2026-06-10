@@ -1,7 +1,6 @@
-import { useMemo, useCallback } from 'react';
+import { useEffect, useMemo, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useWorkspaceContext } from '@/shared/hooks/useWorkspaceContext';
-import { useUserContext } from '@/shared/hooks/useUserContext';
 import { useActions } from '@/shared/hooks/useActions';
 import { useSyncErrorContext } from '@/shared/hooks/useSyncErrorContext';
 import { useUserOrganizations } from '@/shared/hooks/useUserOrganizations';
@@ -9,15 +8,15 @@ import { useOrganizationStore } from '@/shared/stores/useOrganizationStore';
 import {
   Navbar,
   type NavbarSectionItem,
-  type NavbarBreadcrumbItem,
   type MobileTabId,
 } from '@vibe/ui/components/Navbar';
-import { useAllOrganizationProjects } from '@/shared/hooks/useAllOrganizationProjects';
-import { useShape } from '@/shared/integrations/electric/hooks';
-import { PROJECT_ISSUES_SHAPE } from 'shared/remote-types';
-import { RemoteIssueLink } from './RemoteIssueLink';
+import { Tooltip } from '@vibe/ui/components/Tooltip';
 import { AppBarUserPopoverContainer } from './AppBarUserPopoverContainer';
+import { AppBarNotificationBellContainer } from '@/pages/workspaces/AppBarNotificationBellContainer';
 import { useUserSystem } from '@/shared/hooks/useUserSystem';
+import { useAppUpdateStore } from '@/shared/stores/useAppUpdateStore';
+import { useAuth } from '@/shared/hooks/auth/useAuth';
+import { isTauriMac } from '@/shared/lib/platform';
 import { NavbarActionGroups } from '@/shared/actions';
 import {
   NavbarDivider,
@@ -35,9 +34,7 @@ import { useActionVisibilityContext } from '@/shared/hooks/useActionVisibilityCo
 import { useMobileActiveTab } from '@/shared/stores/useUiPreferencesStore';
 import { CommandBarDialog } from '@/shared/dialogs/command-bar/CommandBarDialog';
 import { SettingsDialog } from '@/shared/dialogs/settings/SettingsDialog';
-import { getProjectDestination } from '@/shared/lib/routes/appNavigation';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
-import { useCurrentAppDestination } from '@/shared/hooks/useCurrentAppDestination';
 import { getRemoteAuthDegradedMessage } from '@/shared/lib/auth/remoteAuthDegraded';
 
 /**
@@ -115,44 +112,41 @@ function toNavbarSectionItems(
 
 export function NavbarContainer({
   mobileMode = false,
-  onOrgSelect,
-  onOpenDrawer,
 }: {
   mobileMode?: boolean;
-  onOrgSelect?: (orgId: string) => void;
-  onOpenDrawer?: () => void;
 }) {
   const { t } = useTranslation('common');
   const { executeAction } = useActions();
   const { workspace: selectedWorkspace, isCreateMode } = useWorkspaceContext();
-  const { workspaces } = useUserContext();
   const syncErrorContext = useSyncErrorContext();
-  const { remoteAuthDegraded } = useUserSystem();
+  const { remoteAuthDegraded, appVersion } = useUserSystem();
+  const updateVersion = useAppUpdateStore((s) => s.updateVersion);
+  const restartForUpdate = useAppUpdateStore((s) => s.restart);
+  const { isSignedIn } = useAuth();
   const appNavigation = useAppNavigation();
-  const destination = useCurrentAppDestination();
-  const projectDestination = useMemo(
-    () => getProjectDestination(destination),
-    [destination]
-  );
-  const isOnProjectPage = projectDestination !== null;
-  const projectId = projectDestination?.projectId ?? null;
-  const isOnProjectSubRoute =
-    projectDestination !== null && projectDestination.kind !== 'project';
   const [mobileActiveTab, setMobileActiveTab] = useMobileActiveTab();
 
-  // Find remote workspace linked to current local workspace
-  const linkedRemoteWorkspace = useMemo(() => {
-    if (!selectedWorkspace?.id) return null;
-    return (
-      workspaces.find((w) => w.local_workspace_id === selectedWorkspace.id) ??
-      null
-    );
-  }, [workspaces, selectedWorkspace?.id]);
-
   const { data: orgsData } = useUserOrganizations();
+  const organizations = useMemo(
+    () => orgsData?.organizations ?? [],
+    [orgsData?.organizations]
+  );
   const selectedOrgId = useOrganizationStore((s) => s.selectedOrgId);
-  const orgName =
-    orgsData?.organizations.find((o) => o.id === selectedOrgId)?.name ?? '';
+  const setSelectedOrgId = useOrganizationStore((s) => s.setSelectedOrgId);
+
+  // Auto-select first org if none selected or selection is invalid
+  useEffect(() => {
+    if (organizations.length === 0) return;
+
+    const hasValidSelection = selectedOrgId
+      ? organizations.some((org) => org.id === selectedOrgId)
+      : false;
+
+    if (!selectedOrgId || !hasValidSelection) {
+      const firstNonPersonal = organizations.find((org) => !org.is_personal);
+      setSelectedOrgId((firstNonPersonal ?? organizations[0]).id);
+    }
+  }, [organizations, selectedOrgId, setSelectedOrgId]);
 
   // Get action visibility context (includes all state for visibility/active/enabled)
   const actionCtx = useActionVisibilityContext();
@@ -191,83 +185,7 @@ export function NavbarContainer({
 
   const navbarTitle = isCreateMode
     ? 'Create Workspace'
-    : isOnProjectPage
-      ? orgName
-      : selectedWorkspace?.branch;
-
-  // Breadcrumbs: Project / Issue / Workspace (only on workspace pages with linked project)
-  const linkedProjectId = linkedRemoteWorkspace?.project_id ?? null;
-  const linkedIssueId = linkedRemoteWorkspace?.issue_id ?? null;
-  const shouldResolveBreadcrumbData =
-    !isOnProjectPage && !isCreateMode && !!linkedProjectId;
-  const shouldResolveIssueBreadcrumb =
-    shouldResolveBreadcrumbData && !!linkedIssueId;
-
-  const { data: allProjects, isLoading: isProjectsLoading } =
-    useAllOrganizationProjects({
-      enabled: shouldResolveBreadcrumbData,
-    });
-  const { data: projectIssues, isLoading: isProjectIssuesLoading } = useShape(
-    PROJECT_ISSUES_SHAPE,
-    { project_id: linkedProjectId || '' },
-    { enabled: shouldResolveIssueBreadcrumb }
-  );
-  const linkedProject = allProjects.find((p) => p.id === linkedProjectId);
-  const isWaitingForProjectBreadcrumb =
-    shouldResolveBreadcrumbData && !linkedProject && isProjectsLoading;
-  const isWaitingForIssueBreadcrumb =
-    shouldResolveIssueBreadcrumb && isProjectIssuesLoading;
-  const isWaitingForBreadcrumbData =
-    isWaitingForProjectBreadcrumb || isWaitingForIssueBreadcrumb;
-
-  const breadcrumbs = useMemo((): NavbarBreadcrumbItem[] | undefined => {
-    if (
-      !shouldResolveBreadcrumbData ||
-      !linkedProjectId ||
-      isWaitingForBreadcrumbData
-    ) {
-      return undefined;
-    }
-
-    const project = linkedProject;
-    if (!project) return undefined;
-
-    const items: NavbarBreadcrumbItem[] = [
-      {
-        label: project.name,
-        onClick: () => appNavigation.goToProject(linkedProjectId),
-      },
-    ];
-
-    if (linkedIssueId) {
-      const issue = projectIssues.find((i) => i.id === linkedIssueId);
-      if (issue) {
-        items.push({
-          label: issue.simple_id,
-          onClick: () =>
-            appNavigation.goToProjectIssue(linkedProjectId, linkedIssueId),
-        });
-      }
-    }
-
-    const workspaceLabel =
-      selectedWorkspace?.name || selectedWorkspace?.branch || '';
-    if (workspaceLabel) {
-      items.push({ label: workspaceLabel });
-    }
-
-    return items.length > 1 ? items : undefined;
-  }, [
-    shouldResolveBreadcrumbData,
-    linkedProjectId,
-    linkedIssueId,
-    linkedProject,
-    isWaitingForBreadcrumbData,
-    projectIssues,
-    selectedWorkspace?.name,
-    selectedWorkspace?.branch,
-    appNavigation,
-  ]);
+    : selectedWorkspace?.branch;
 
   // Mobile-specific callbacks
   const handleOpenCommandBar = useCallback(() => {
@@ -279,33 +197,74 @@ export function NavbarContainer({
   }, []);
 
   const handleNavigateBack = useCallback(() => {
-    if (isOnProjectPage && projectId) {
-      // On project sub-route: go back to project root (kanban board)
-      appNavigation.goToProject(projectId);
-    } else {
-      // Non-project page: go to workspaces
-      appNavigation.goToWorkspaces();
-    }
-  }, [isOnProjectPage, projectId, appNavigation]);
+    appNavigation.goToWorkspaces();
+  }, [appNavigation]);
 
-  const handleNavigateToBoard = useMemo(() => {
-    if (!isOnProjectPage || !projectId) return null;
-    return () => {
-      appNavigation.goToProject(projectId);
-    };
-  }, [isOnProjectPage, projectId, appNavigation]);
-
-  // Build user popover slot for mobile mode
-  const userPopoverSlot = useMemo(() => {
-    if (!mobileMode) return undefined;
-    return (
+  const userPopover = useMemo(
+    () => (
       <AppBarUserPopoverContainer
-        organizations={orgsData?.organizations ?? []}
+        organizations={organizations}
         selectedOrgId={selectedOrgId ?? ''}
-        onOrgSelect={onOrgSelect ?? (() => {})}
+        onOrgSelect={setSelectedOrgId}
       />
+    ),
+    [organizations, selectedOrgId, setSelectedOrgId]
+  );
+
+  const brand = useMemo(
+    () => (
+      <button
+        type="button"
+        onClick={() => appNavigation.goToWorkspaces()}
+        className="font-ibm-plex-mono text-sm font-semibold tracking-tight text-high hover:opacity-80 transition-opacity cursor-pointer select-none whitespace-nowrap"
+        aria-label="BetterCoding — home"
+      >
+        Better<span className="text-brand">Coding</span>
+      </button>
+    ),
+    [appNavigation]
+  );
+
+  // App version (or pending update) — left-most element of the right section.
+  const versionSlot = useMemo(() => {
+    if (updateVersion) {
+      return (
+        <Tooltip content={`Update to v${updateVersion}`}>
+          <button
+            type="button"
+            onClick={restartForUpdate ?? undefined}
+            className="px-1.5 py-0.5 rounded-sm text-[10px] font-ibm-plex-mono font-medium leading-none bg-brand text-on-brand hover:bg-brand-hover transition-colors cursor-pointer"
+          >
+            Update
+          </button>
+        </Tooltip>
+      );
+    }
+    if (!appVersion) {
+      return undefined;
+    }
+    return (
+      <span
+        className="text-[10px] font-ibm-plex-mono text-low leading-none select-none"
+        title={`v${appVersion}`}
+      >
+        v{appVersion}
+      </span>
     );
-  }, [mobileMode, orgsData?.organizations, selectedOrgId, onOrgSelect]);
+  }, [appVersion, updateVersion, restartForUpdate]);
+
+  const rightEnd = useMemo(() => {
+    if (mobileMode) {
+      return undefined;
+    }
+    return (
+      <div className="flex items-center gap-base">
+        <div className="h-4 w-px bg-border" />
+        {isSignedIn && <AppBarNotificationBellContainer />}
+        {userPopover}
+      </div>
+    );
+  }, [mobileMode, isSignedIn, userPopover]);
 
   const syncErrors = useMemo(() => {
     const errors = syncErrorContext?.errors ? [...syncErrorContext.errors] : [];
@@ -327,31 +286,20 @@ export function NavbarContainer({
   return (
     <Navbar
       workspaceTitle={navbarTitle}
-      breadcrumbs={breadcrumbs}
+      brand={mobileMode ? undefined : brand}
       leftItems={leftItems}
       rightItems={rightItems}
+      rightStart={versionSlot}
+      rightEnd={rightEnd}
       syncErrors={syncErrors}
+      className={!mobileMode && isTauriMac() ? 'pl-16' : undefined}
       mobileMode={mobileMode}
-      mobileUserSlot={userPopoverSlot}
-      isOnProjectPage={isOnProjectPage}
-      isOnProjectSubRoute={isOnProjectSubRoute}
+      mobileUserSlot={mobileMode ? userPopover : undefined}
       onOpenCommandBar={handleOpenCommandBar}
       onOpenSettings={handleOpenSettings}
       onNavigateBack={handleNavigateBack}
-      onNavigateToBoard={handleNavigateToBoard}
-      onOpenDrawer={onOpenDrawer}
       mobileActiveTab={mobileActiveTab as MobileTabId}
       onMobileTabChange={(tab) => setMobileActiveTab(tab)}
-      leftSlot={
-        !breadcrumbs &&
-        !isWaitingForBreadcrumbData &&
-        linkedRemoteWorkspace?.issue_id ? (
-          <RemoteIssueLink
-            projectId={linkedRemoteWorkspace.project_id}
-            issueId={linkedRemoteWorkspace.issue_id}
-          />
-        ) : null
-      }
     />
   );
 }

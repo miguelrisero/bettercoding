@@ -5,37 +5,26 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useQuery } from "@tanstack/react-query";
 import { useLocation, useNavigate, useParams } from "@tanstack/react-router";
-import { siDiscord, siGithub } from "simple-icons";
-import { AppBar, type AppBarHostStatus } from "@vibe/ui/components/AppBar";
-import { XIcon, PlusIcon, HouseIcon, KanbanIcon } from "@phosphor-icons/react";
+import { XIcon, PlusIcon, HouseIcon, LinkIcon } from "@phosphor-icons/react";
 import { MobileDrawer } from "@vibe/ui/components/MobileDrawer";
-import type { Project } from "shared/remote-types";
+import { Tooltip } from "@vibe/ui/components/Tooltip";
 import { useIsMobile } from "@/shared/hooks/useIsMobile";
 import { cn } from "@/shared/lib/utils";
 import { useUserOrganizations } from "@/shared/hooks/useUserOrganizations";
 import { useAuth } from "@/shared/hooks/auth/useAuth";
 import { useOrganizationStore } from "@/shared/stores/useOrganizationStore";
-import { useDiscordOnlineCount } from "@/shared/hooks/useDiscordOnlineCount";
-import { useGitHubStars } from "@/shared/hooks/useGitHubStars";
 import { AppBarNotificationBellContainer } from "@/pages/workspaces/AppBarNotificationBellContainer";
 import { SettingsDialog } from "@/shared/dialogs/settings/SettingsDialog";
 import { CommandBarDialog } from "@/shared/dialogs/command-bar/CommandBarDialog";
 import { useCommandBarShortcut } from "@/shared/hooks/useCommandBarShortcut";
-import { listOrganizationProjects } from "@remote/shared/lib/api";
 import { RemoteAppBarUserPopoverContainer } from "@remote/app/layout/RemoteAppBarUserPopoverContainer";
 import { RemoteNavbarContainer } from "@remote/app/layout/RemoteNavbarContainer";
 import { RemoteDesktopNavbar } from "@remote/app/layout/RemoteDesktopNavbar";
 import {
-  resolveRelayNavigationHostId,
   useRelayAppBarHosts,
+  type RelayAppBarHostStatus,
 } from "@remote/shared/hooks/useRelayAppBarHosts";
-import {
-  CreateRemoteProjectDialog,
-  type CreateRemoteProjectResult,
-} from "@/shared/dialogs/org/CreateRemoteProjectDialog";
-import { CloudShutdownExportBanner } from "@/shared/components/CloudShutdownExportBanner";
 
 interface RemoteAppShellProps {
   children: ReactNode;
@@ -51,21 +40,20 @@ function getHostInitials(name: string): string {
   return trimmed.slice(0, 2).toUpperCase();
 }
 
+function getHostStatusLabel(status: RelayAppBarHostStatus): string {
+  if (status === "online") return "Online";
+  if (status === "offline") return "Offline";
+  return "Unpaired";
+}
+
 export function RemoteAppShell({ children }: RemoteAppShellProps) {
   const navigate = useNavigate();
   const location = useLocation();
   const { hostId: routeHostId } = useParams({ strict: false });
   const { isSignedIn } = useAuth();
   const isWorkspaceContextRoute = location.pathname.includes("/workspaces");
-  const isProjectRoute = /^\/projects\/[^/]+/.test(location.pathname);
-  const isExportRoute = location.pathname === "/export";
-  const showCloudShutdownBanner =
-    isExportRoute || (isSignedIn && isProjectRoute);
 
-  useCommandBarShortcut(
-    () => CommandBarDialog.show(),
-    isWorkspaceContextRoute || isProjectRoute,
-  );
+  useCommandBarShortcut(() => CommandBarDialog.show(), isWorkspaceContextRoute);
   const isMobile = useIsMobile();
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
 
@@ -91,64 +79,13 @@ export function RemoteAppShell({ children }: RemoteAppShellProps) {
     }
   }, [organizations, selectedOrgId, setSelectedOrgId]);
 
-  const activeOrganizationId = useMemo(() => {
-    if (!selectedOrgId) {
-      return organizations[0]?.id ?? null;
-    }
-
-    const isSelectedOrgAvailable = organizations.some(
-      (organization) => organization.id === selectedOrgId,
-    );
-
-    if (!isSelectedOrgAvailable) {
-      return organizations[0]?.id ?? null;
-    }
-
-    return selectedOrgId;
-  }, [organizations, selectedOrgId]);
-
-  const projectsQuery = useQuery({
-    queryKey: ["remote-app-shell", "projects", activeOrganizationId],
-    queryFn: async (): Promise<Project[]> => {
-      if (!activeOrganizationId) {
-        return [];
-      }
-
-      const projects = await listOrganizationProjects(activeOrganizationId);
-      return [...projects].sort((a, b) => a.sort_order - b.sort_order);
-    },
-    enabled: isSignedIn && !!activeOrganizationId,
-    staleTime: 30_000,
-  });
-
-  const projects = projectsQuery.data ?? [];
-  const isLoadingProjects =
-    isSignedIn && !!activeOrganizationId && projectsQuery.isLoading;
-
-  const { data: onlineCount } = useDiscordOnlineCount();
-  const { data: starCount } = useGitHubStars();
   const { hosts: relayHosts } = useRelayAppBarHosts(isSignedIn);
 
   const selectedOrgName =
     organizations.find((organization) => organization.id === selectedOrgId)
       ?.name ?? null;
 
-  const isWorkspacesActive = location.pathname.includes("/workspaces");
   const activeHostId = routeHostId ?? null;
-  const preferredHostId = useMemo(
-    () => resolveRelayNavigationHostId(relayHosts, { routeHostId }),
-    [relayHosts, routeHostId],
-  );
-
-  const activeProjectId = useMemo(() => {
-    const segments = location.pathname.split("/").filter(Boolean);
-    const projectSegmentIndex = segments.indexOf("projects");
-    if (projectSegmentIndex === -1) {
-      return null;
-    }
-
-    return segments[projectSegmentIndex + 1] ?? null;
-  }, [location.pathname]);
 
   const openRelaySettings = useCallback((hostId?: string) => {
     void SettingsDialog.show({
@@ -157,59 +94,8 @@ export function RemoteAppShell({ children }: RemoteAppShellProps) {
     });
   }, []);
 
-  const handleWorkspacesClick = useCallback(() => {
-    if (preferredHostId) {
-      navigate({
-        to: "/hosts/$hostId/workspaces",
-        params: { hostId: preferredHostId },
-      });
-      return;
-    }
-
-    openRelaySettings();
-  }, [navigate, openRelaySettings, preferredHostId]);
-
-  const handleProjectClick = useCallback(
-    (projectId: string) => {
-      navigate({
-        to: "/projects/$projectId",
-        params: { projectId },
-      });
-    },
-    [navigate],
-  );
-
-  const handleExportClick = useCallback(() => {
-    navigate({ to: "/export" });
-  }, [navigate]);
-
-  const handleCreateProject = useCallback(async () => {
-    if (!activeOrganizationId) {
-      return;
-    }
-
-    try {
-      const result: CreateRemoteProjectResult =
-        await CreateRemoteProjectDialog.show({
-          organizationId: activeOrganizationId,
-        });
-
-      if (result.action === "created" && result.project) {
-        void projectsQuery.refetch();
-        navigate({
-          to: "/projects/$projectId",
-          params: {
-            projectId: result.project.id,
-          },
-        });
-      }
-    } catch {
-      // Dialog cancelled
-    }
-  }, [activeOrganizationId, navigate, projectsQuery]);
-
   const handleHostClick = useCallback(
-    (hostId: string, status: AppBarHostStatus) => {
+    (hostId: string, status: RelayAppBarHostStatus) => {
       if (status === "online") {
         navigate({
           to: "/hosts/$hostId/workspaces",
@@ -231,6 +117,14 @@ export function RemoteAppShell({ children }: RemoteAppShellProps) {
     openRelaySettings();
   }, [openRelaySettings]);
 
+  const userPopover = (
+    <RemoteAppBarUserPopoverContainer
+      organizations={organizations}
+      selectedOrgId={selectedOrgId ?? ""}
+      onOrgSelect={setSelectedOrgId}
+    />
+  );
+
   const mobileUserSlot = useMemo(() => {
     if (!isMobile) return undefined;
     return (
@@ -241,6 +135,7 @@ export function RemoteAppShell({ children }: RemoteAppShellProps) {
       />
     );
   }, [isMobile, organizations, selectedOrgId, setSelectedOrgId]);
+
   return (
     <div
       className={cn(
@@ -250,46 +145,90 @@ export function RemoteAppShell({ children }: RemoteAppShellProps) {
           : "h-screen",
       )}
     >
-      {showCloudShutdownBanner && (
-        <CloudShutdownExportBanner onClick={handleExportClick} />
-      )}
-
       <div className="flex min-h-0 flex-1">
         {!isMobile && (
-          <AppBar
-            projects={projects}
-            hosts={relayHosts}
-            onPairHostClick={isSignedIn ? handlePairHostClick : undefined}
-            activeHostId={activeHostId}
-            onCreateProject={handleCreateProject}
-            onWorkspacesClick={handleWorkspacesClick}
-            onHostClick={handleHostClick}
-            showWorkspacesButton={false}
-            onProjectClick={handleProjectClick}
-            onProjectsDragEnd={() => {}}
-            isSavingProjectOrder={true}
-            isWorkspacesActive={isWorkspacesActive}
-            activeProjectId={activeProjectId}
-            isSignedIn={isSignedIn}
-            isLoadingProjects={isLoadingProjects}
-            onSignIn={() => {
-              navigate({ to: "/account" });
-            }}
-            notificationBell={
-              isSignedIn ? <AppBarNotificationBellContainer /> : undefined
-            }
-            userPopover={
-              <RemoteAppBarUserPopoverContainer
-                organizations={organizations}
-                selectedOrgId={selectedOrgId ?? ""}
-                onOrgSelect={setSelectedOrgId}
-              />
-            }
-            starCount={starCount}
-            onlineCount={onlineCount}
-            githubIconPath={siGithub.path}
-            discordIconPath={siDiscord.path}
-          />
+          <div
+            className={cn(
+              "flex flex-col items-center h-full min-h-0 overflow-y-auto p-base gap-base",
+              "bg-secondary border-r border-border",
+            )}
+          >
+            {/* Home */}
+            <Tooltip content="Home" side="right">
+              <button
+                type="button"
+                onClick={() => navigate({ to: "/" })}
+                className="flex items-center justify-center w-10 h-10 rounded-lg bg-primary text-normal hover:bg-brand/10 cursor-pointer"
+                aria-label="Home"
+              >
+                <HouseIcon className="size-icon-base" weight="bold" />
+              </button>
+            </Tooltip>
+
+            {/* Hosts */}
+            {isSignedIn &&
+              relayHosts.map((host) => {
+                const isOffline = host.status === "offline";
+                return (
+                  <Tooltip
+                    key={host.id}
+                    content={`${host.name} · ${getHostStatusLabel(host.status)}`}
+                    side="right"
+                  >
+                    <div className="relative">
+                      <span
+                        className={cn(
+                          "absolute -top-1 -right-1 z-10",
+                          "w-3.5 h-3.5 rounded-full border border-secondary",
+                          host.status === "online"
+                            ? "bg-success"
+                            : host.status === "offline"
+                              ? "bg-low"
+                              : "bg-white border-warning",
+                        )}
+                        aria-hidden="true"
+                      />
+                      <button
+                        type="button"
+                        disabled={isOffline}
+                        onClick={() => handleHostClick(host.id, host.status)}
+                        className={cn(
+                          "flex items-center justify-center w-10 h-10 rounded-lg text-sm font-medium",
+                          isOffline
+                            ? "bg-primary text-low opacity-50 cursor-not-allowed"
+                            : host.id === activeHostId
+                              ? "bg-brand/20 text-brand cursor-pointer"
+                              : "bg-primary text-normal cursor-pointer hover:bg-brand/10",
+                        )}
+                        aria-label={`${host.name} (${getHostStatusLabel(host.status)})`}
+                      >
+                        {getHostInitials(host.name)}
+                      </button>
+                    </div>
+                  </Tooltip>
+                );
+              })}
+
+            {/* Pair a host */}
+            {isSignedIn && (
+              <Tooltip content="Pair a remote device" side="right">
+                <button
+                  type="button"
+                  onClick={handlePairHostClick}
+                  className="flex items-center justify-center w-10 h-10 rounded-lg bg-primary text-muted hover:text-normal hover:bg-tertiary cursor-pointer"
+                  aria-label="Pair a remote device"
+                >
+                  <LinkIcon className="size-icon-base" weight="bold" />
+                </button>
+              </Tooltip>
+            )}
+
+            {/* Bottom: notifications + user */}
+            <div className="mt-auto pt-base flex flex-col items-center gap-4">
+              {isSignedIn && <AppBarNotificationBellContainer />}
+              {userPopover}
+            </div>
+          </div>
         )}
 
         <MobileDrawer
@@ -395,101 +334,17 @@ export function RemoteAppShell({ children }: RemoteAppShellProps) {
                 </button>
               </div>
             )}
-
-            {/* Divider */}
-            <div className="mx-3 border-t border-border" />
-
-            {/* Project list */}
-            <div className="flex-1 overflow-y-auto p-2">
-              {isSignedIn ? (
-                isLoadingProjects ? (
-                  <p className="px-3 py-4 text-sm text-low">
-                    Loading projects…
-                  </p>
-                ) : (
-                  projects.map((project) => (
-                    <button
-                      type="button"
-                      key={project.id}
-                      onClick={() => {
-                        handleProjectClick(project.id);
-                        setIsDrawerOpen(false);
-                      }}
-                      className={cn(
-                        "flex items-center gap-3 w-full px-3 py-2.5 rounded-md text-sm text-left cursor-pointer",
-                        "transition-colors",
-                        project.id === activeProjectId
-                          ? "bg-brand/10 text-high"
-                          : "text-normal hover:bg-secondary",
-                      )}
-                    >
-                      <span
-                        className="h-2.5 w-2.5 rounded-full shrink-0"
-                        style={{ backgroundColor: `hsl(${project.color})` }}
-                      />
-                      <span className="truncate">{project.name}</span>
-                    </button>
-                  ))
-                )
-              ) : (
-                <div className="px-4 py-6 text-center">
-                  <KanbanIcon
-                    className="h-8 w-8 mx-auto text-low"
-                    weight="bold"
-                  />
-                  <p className="mt-3 text-sm font-medium text-high">
-                    Kanban Boards
-                  </p>
-                  <p className="mt-1 text-xs text-low">
-                    Sign in to organise your coding agents with kanban boards.
-                  </p>
-                  <div className="mt-4">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        navigate({ to: "/account" });
-                        setIsDrawerOpen(false);
-                      }}
-                      className="w-full px-3 py-2 rounded-md text-sm font-medium bg-brand text-on-brand hover:bg-brand-hover cursor-pointer"
-                    >
-                      Sign in
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* Create Project button */}
-            {isSignedIn && (
-              <div className="p-3 border-t border-border">
-                <button
-                  type="button"
-                  onClick={() => {
-                    handleCreateProject();
-                    setIsDrawerOpen(false);
-                  }}
-                  className="flex items-center gap-2 w-full px-3 py-2.5 rounded-md text-sm text-low hover:text-normal hover:bg-secondary cursor-pointer"
-                >
-                  <PlusIcon className="h-4 w-4" />
-                  Create Project
-                </button>
-              </div>
-            )}
           </div>
         </MobileDrawer>
 
         <div className="flex min-w-0 flex-1 flex-col">
-          {isMobile && (isWorkspaceContextRoute || isProjectRoute) && (
+          {isMobile && isWorkspaceContextRoute && (
             <RemoteNavbarContainer
-              organizationName={selectedOrgName}
               mobileMode={isMobile}
-              onOpenDrawer={() => setIsDrawerOpen(true)}
               mobileUserSlot={mobileUserSlot}
             />
           )}
-          {!isMobile && (isWorkspaceContextRoute || isProjectRoute) && (
-            <RemoteDesktopNavbar />
-          )}
+          {!isMobile && isWorkspaceContextRoute && <RemoteDesktopNavbar />}
           <div className="min-h-0 flex-1">{children}</div>
         </div>
       </div>

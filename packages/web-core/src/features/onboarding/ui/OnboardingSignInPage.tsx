@@ -2,25 +2,19 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { CheckIcon, XIcon } from '@phosphor-icons/react';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { ThemeMode } from 'shared/types';
 import {
   OAuthDialog,
   type OAuthProvider,
 } from '@/shared/dialogs/global/OAuthDialog';
 import { usePostHog } from 'posthog-js/react';
 import { useUserSystem } from '@/shared/hooks/useUserSystem';
-import { useTheme } from '@/shared/hooks/useTheme';
 import { OAuthSignInButton } from '@vibe/ui/components/OAuthButtons';
 import { PrimaryButton } from '@vibe/ui/components/PrimaryButton';
 import { oauthApi, type AuthMethodsResponse } from '@/shared/lib/api';
-import { getFirstProjectDestination } from '@/shared/lib/firstProjectDestination';
-import { useOrganizationStore } from '@/shared/stores/useOrganizationStore';
 import { isTauriApp } from '@/shared/lib/platform';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
 
-type OnboardingDestination =
-  | { kind: 'workspaces-create' }
-  | { kind: 'project'; projectId: string };
+type OnboardingDestination = { kind: 'workspaces-create' };
 
 const COMPARISON_ROWS = [
   {
@@ -62,22 +56,11 @@ type SignInCompletionMethod =
   | 'local_auth'
   | 'oauth_github'
   | 'oauth_google';
-function resolveTheme(theme: ThemeMode): 'light' | 'dark' {
-  if (theme === ThemeMode.SYSTEM) {
-    return window.matchMedia('(prefers-color-scheme: dark)').matches
-      ? 'dark'
-      : 'light';
-  }
-  return theme === ThemeMode.DARK ? 'dark' : 'light';
-}
-
 export function OnboardingSignInPage() {
   const appNavigation = useAppNavigation();
   const { t } = useTranslation('common');
-  const { theme } = useTheme();
   const posthog = usePostHog();
   const { config, loginStatus, loading, updateAndSaveConfig } = useUserSystem();
-  const setSelectedOrgId = useOrganizationStore((s) => s.setSelectedOrgId);
 
   const [showComparison, setShowComparison] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -112,11 +95,6 @@ export function OnboardingSignInPage() {
     [posthog]
   );
 
-  const logoSrc =
-    resolveTheme(theme) === 'dark'
-      ? '/vibe-kanban-logo-dark.svg'
-      : '/vibe-kanban-logo.svg';
-
   const isLoggedIn = loginStatus?.status === 'loggedin';
 
   useEffect(() => {
@@ -142,20 +120,7 @@ export function OnboardingSignInPage() {
   }, [appNavigation, config?.remote_onboarding_acknowledged]);
 
   const getOnboardingDestination = async (): Promise<OnboardingDestination> => {
-    const firstProjectDestination =
-      await getFirstProjectDestination(setSelectedOrgId);
-    if (
-      !firstProjectDestination ||
-      firstProjectDestination.kind !== 'project'
-    ) {
-      trackRemoteOnboardingEvent(REMOTE_ONBOARDING_EVENTS.STAGE_FAILED, {
-        stage: 'sign_in',
-        reason: 'destination_lookup_failed',
-      });
-      return { kind: 'workspaces-create' };
-    }
-
-    return firstProjectDestination;
+    return { kind: 'workspaces-create' };
   };
 
   const finishOnboarding = async (options: {
@@ -193,17 +158,8 @@ export function OnboardingSignInPage() {
       stage: 'sign_in',
       method: options.method,
       destination_kind: destination.kind,
-      destination_project_id:
-        destination.kind === 'project' ? destination.projectId : null,
     });
-    switch (destination.kind) {
-      case 'workspaces-create':
-        appNavigation.goToWorkspacesCreate({ replace: true });
-        return;
-      case 'project':
-        appNavigation.goToProject(destination.projectId, { replace: true });
-        return;
-    }
+    appNavigation.goToWorkspacesCreate({ replace: true });
   };
 
   const handleProviderSignIn = async (provider: OAuthProvider) => {
@@ -276,11 +232,9 @@ export function OnboardingSignInPage() {
         <div className="rounded-sm border border-border bg-secondary p-double space-y-double">
           <header className="space-y-double text-center">
             <div className="flex justify-center">
-              <img
-                src={logoSrc}
-                alt="Vibe Kanban"
-                className="h-8 w-auto logo"
-              />
+              <span className="font-ibm-plex-mono text-xl font-semibold tracking-tight text-high select-none">
+                Better<span className="text-brand">Coding</span>
+              </span>
             </div>
             {!isLoggedIn && (
               <p className="text-sm text-low">

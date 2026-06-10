@@ -1,10 +1,7 @@
 import { useMemo, useCallback } from "react";
-import { useLocation } from "@tanstack/react-router";
 import { useWorkspaceContext } from "@/shared/hooks/useWorkspaceContext";
 import { useActions } from "@/shared/hooks/useActions";
 import { useSyncErrorContext } from "@/shared/hooks/useSyncErrorContext";
-import { useUserOrganizations } from "@/shared/hooks/useUserOrganizations";
-import { useOrganizationStore } from "@/shared/stores/useOrganizationStore";
 import { Navbar, type NavbarSectionItem } from "@vibe/ui/components/Navbar";
 import { NavbarActionGroups } from "@/shared/actions";
 import {
@@ -93,10 +90,10 @@ function toNavbarSectionItems(
 }
 
 /**
- * Desktop navbar for remote workspace and project pages.
+ * Desktop navbar for remote workspace pages.
  *
- * Mounted on workspace detail routes (/workspaces/:id) and project routes (/projects/:id)
- * where all required providers (ActionsProvider, WorkspaceProvider, etc.) are available.
+ * Mounted on workspace detail routes (/workspaces/:id) where all required
+ * providers (ActionsProvider, WorkspaceProvider, etc.) are available.
  *
  * Mobile navbar is handled separately by RemoteNavbarContainer.
  */
@@ -104,16 +101,6 @@ export function RemoteDesktopNavbar() {
   const { executeAction } = useActions();
   const { workspace: selectedWorkspace } = useWorkspaceContext();
   const syncErrorContext = useSyncErrorContext();
-  const location = useLocation();
-
-  const isOnProjectPage =
-    /^\/projects\/[^/]+/.test(location.pathname) ||
-    /^\/hosts\/[^/]+\/projects\/[^/]+/.test(location.pathname);
-
-  const { data: orgsData } = useUserOrganizations();
-  const selectedOrgId = useOrganizationStore((s) => s.selectedOrgId);
-  const orgName =
-    orgsData?.organizations.find((o) => o.id === selectedOrgId)?.name ?? "";
 
   const actionCtx = useActionVisibilityContext();
 
@@ -156,7 +143,7 @@ export function RemoteDesktopNavbar() {
     CommandBarDialog.show();
   }, []);
 
-  const navbarTitle = isOnProjectPage ? orgName : selectedWorkspace?.branch;
+  const navbarTitle = selectedWorkspace?.branch;
 
   return (
     <Navbar
@@ -164,7 +151,6 @@ export function RemoteDesktopNavbar() {
       leftItems={leftItems}
       rightItems={rightItems}
       syncErrors={syncErrorContext?.errors}
-      isOnProjectPage={isOnProjectPage}
       onOpenSettings={handleOpenSettings}
       onOpenCommandBar={handleOpenCommandBar}
     />

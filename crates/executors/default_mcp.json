@@ -46,10 +46,10 @@
   },
   "meta": {
     "vibe_kanban": {
-      "name": "Vibe Kanban",
-      "description": "Create, update and delete Vibe Kanban tasks",
-      "url": "https://www.vibekanban.com/docs/integrations/vibe-kanban-mcp-server",
-      "icon": "favicon-vk-light.svg"
+      "name": "BetterCoding",
+      "description": "Create, update and delete BetterCoding tasks",
+      "url": "https://github.com/miguelrisero/bettercoding",
+      "icon": "favicon-light.svg"
     },
     "context7": {
       "name": "Context7",
@@ -83,4 +83,3 @@
     }
   }
 }
-

@@ -172,7 +172,7 @@
       "changeTarget": "Cambiar destino",
       "loginRequired": {
         "title": "Inicia sesión para gestionar acciones de Git",
-        "description": "Inicia sesión en Vibe Kanban para enviar ramas, fusionar cambios o abrir pull requests para esta tarea.",
+        "description": "Inicia sesión en BetterCoding para enviar ramas, fusionar cambios o abrir pull requests para esta tarea.",
         "action": "Iniciar sesión"
       }
     },
@@ -218,8 +218,7 @@
       "setupTitle": "Debes configurar un script de servidor de desarrollo para usar la función de vista previa",
       "setupPrompt": "Para usar la vista previa en vivo y la función de hacer clic y editar, por favor agrega un script de servidor de desarrollo a este proyecto.",
       "title": "No hay servidor de desarrollo en ejecución",
-      "editDevScript": "Editar Script de Servidor de Desarrollo",
-      "learnMore": "Más información sobre cómo probar aplicaciones"
+      "editDevScript": "Editar Script de Servidor de Desarrollo"
     },
     "toolbar": {
       "copyUrl": "Copiar URL",
@@ -507,31 +506,6 @@
       "title": "Sign in required",
       "description": "Sign in to access this feature.",
       "action": "Sign in"
-    }
-  },
-  "linkPrToIssue": {
-    "title": "Vincular solicitud de extracción",
-    "description": "Vincular una solicitud de extracción existente a este issue.",
-    "urlTab": "Desde URL",
-    "browseTab": "Explorar",
-    "urlLabel": "URL de la solicitud de extracción",
-    "urlPlaceholder": "https://github.com/owner/repo/pull/123",
-    "repositoryLabel": "Repositorio",
-    "remoteLabel": "Remoto",
-    "pullRequestLabel": "Solicitud de extracción",
-    "loadingPrInfo": "Cargando información del PR...",
-    "invalidUrl": "No se pudo cargar la información del PR desde esta URL",
-    "baseBranch": "Base:",
-    "linkPr": "Vincular PR",
-    "linking": "Vinculando...",
-    "status": {
-      "open": "Abierto",
-      "merged": "Fusionado",
-      "closed": "Cerrado",
-      "unknown": "Desconocido"
-    },
-    "errors": {
-      "failed": "Error al vincular el PR. Inténtelo de nuevo."
     }
   }
 }

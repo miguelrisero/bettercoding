@@ -21,7 +21,6 @@ export const Pages: Record<StaticPageId, CommandBarPage> = {
 
           { type: 'childPages', id: 'workspaceActions' },
           { type: 'childPages', id: 'repoActions' },
-          { type: 'childPages', id: 'issueActions' },
         ],
       },
       {
@@ -40,8 +39,6 @@ export const Pages: Record<StaticPageId, CommandBarPage> = {
           { type: 'action', action: Actions.SignOut },
           { type: 'action', action: Actions.Feedback },
           { type: 'action', action: Actions.WorkspacesGuide },
-          { type: 'action', action: Actions.ProjectsGuide },
-          { type: 'action', action: Actions.ProjectSettings },
           { type: 'action', action: Actions.Settings },
         ],
       },
@@ -144,39 +141,6 @@ export const Pages: Record<StaticPageId, CommandBarPage> = {
           { type: 'action', action: Actions.GitPush },
           { type: 'action', action: Actions.GitRebase },
           { type: 'action', action: Actions.GitChangeTarget },
-        ],
-      },
-    ],
-  },
-
-  // Issue actions page - shown in kanban mode
-  issueActions: {
-    id: 'issue-actions',
-    title: 'Issue Actions',
-    parent: 'root',
-    isVisible: (ctx) => ctx.layoutMode === 'kanban',
-    items: [
-      {
-        type: 'group',
-        label: 'Actions',
-        items: [
-          { type: 'action', action: Actions.CreateIssue },
-          { type: 'action', action: Actions.ChangeIssueStatus },
-          { type: 'action', action: Actions.ChangeNewIssueStatus },
-          { type: 'action', action: Actions.ChangePriority },
-          { type: 'action', action: Actions.ChangeNewIssuePriority },
-          { type: 'action', action: Actions.ChangeAssignees },
-          { type: 'action', action: Actions.ChangeNewIssueAssignees },
-          { type: 'action', action: Actions.MakeSubIssueOf },
-          { type: 'action', action: Actions.AddSubIssue },
-          { type: 'action', action: Actions.RemoveParentIssue },
-          { type: 'action', action: Actions.LinkWorkspace },
-          { type: 'action', action: Actions.MarkBlocking },
-          { type: 'action', action: Actions.MarkBlockedBy },
-          { type: 'action', action: Actions.MarkRelated },
-          { type: 'action', action: Actions.MarkDuplicateOf },
-          { type: 'action', action: Actions.DuplicateIssue },
-          { type: 'action', action: Actions.DeleteIssue },
         ],
       },
     ],

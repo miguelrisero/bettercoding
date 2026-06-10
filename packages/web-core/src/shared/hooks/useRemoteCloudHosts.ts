@@ -1,12 +1,18 @@
 import { useMemo } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { AppBarHost, AppBarHostStatus } from '@vibe/ui/components/AppBar';
 import type { PairRelayHostRequest, RelayPairedHost } from 'shared/types';
 import type { RelayHost } from 'shared/remote-types';
 import { relayApi } from '@/shared/lib/api';
 import { listRelayHosts } from '@/shared/lib/remoteApi';
 
-export type RemoteCloudHostStatus = AppBarHostStatus;
+export type RemoteCloudHostStatus = 'online' | 'offline' | 'unpaired';
+
+/** Compact host summary consumed by navigation surfaces (sidebar, pickers). */
+export interface RemoteCloudHostSummary {
+  id: string;
+  name: string;
+  status: RemoteCloudHostStatus;
+}
 
 export interface RemoteCloudHost {
   id: string;
@@ -107,14 +113,14 @@ export function useRemoveRemoteCloudHostMutation() {
 }
 
 export function useRemoteCloudHostsAppBarModel(): {
-  hosts: AppBarHost[];
+  hosts: RemoteCloudHostSummary[];
   remoteHosts: RemoteCloudHost[];
 } {
   const { data } = useRemoteCloudHostsState();
 
   const remoteHosts = data?.hosts ?? [];
 
-  const hosts = useMemo<AppBarHost[]>(
+  const hosts = useMemo<RemoteCloudHostSummary[]>(
     () =>
       remoteHosts.map((host) => ({
         id: host.id,

@@ -1,9 +1,16 @@
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
-import type { AppBarHost } from "@vibe/ui/components/AppBar";
 import type { RelayHost } from "shared/remote-types";
 import { listPairedRelayHosts } from "@/shared/lib/relayPairingStorage";
 import { listRelayHosts } from "@/shared/lib/remoteApi";
+
+export type RelayAppBarHostStatus = "online" | "offline" | "unpaired";
+
+export interface RelayAppBarHost {
+  id: string;
+  name: string;
+  status: RelayAppBarHostStatus;
+}
 
 const RELAY_APP_BAR_HOSTS_QUERY_KEY = ["relay-app-bar-hosts", "hosts"] as const;
 const RELAY_APP_BAR_PAIRED_HOSTS_QUERY_KEY = [
@@ -12,7 +19,7 @@ const RELAY_APP_BAR_PAIRED_HOSTS_QUERY_KEY = [
 ] as const;
 
 interface UseRelayAppBarHostsResult {
-  hosts: AppBarHost[];
+  hosts: RelayAppBarHost[];
   isLoading: boolean;
 }
 
@@ -21,7 +28,7 @@ export interface ResolveRelayNavigationHostOptions {
 }
 
 export function resolveRelayNavigationHostId(
-  hosts: AppBarHost[],
+  hosts: RelayAppBarHost[],
   options?: ResolveRelayNavigationHostOptions,
 ): string | null {
   const routeHostId = options?.routeHostId ?? null;
@@ -40,7 +47,7 @@ export function resolveRelayNavigationHostId(
 function mapRelayHostStatus(
   host: RelayHost,
   pairedHostIds: Set<string>,
-): AppBarHost["status"] {
+): RelayAppBarHost["status"] {
   if (!pairedHostIds.has(host.id)) {
     return "unpaired";
   }
@@ -74,7 +81,7 @@ export function useRelayAppBarHosts(
     refetchInterval: 5_000,
   });
 
-  const hosts = useMemo<AppBarHost[]>(() => {
+  const hosts = useMemo<RelayAppBarHost[]>(() => {
     if (!enabled) {
       return [];
     }

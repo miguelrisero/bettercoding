@@ -84,7 +84,7 @@
   "signIn": "Iniciar sesión",
   "signOut": "Cerrar sesión",
   "oauth": {
-    "title": "Iniciar sesión en Vibe Kanban",
+    "title": "Iniciar sesión en BetterCoding",
     "description": "Inicia sesión para unirte a organizaciones y compartir tareas con tu equipo",
     "continueWithGitHub": "Continuar con GitHub",
     "continueWithGoogle": "Continuar con Google",
@@ -221,7 +221,7 @@
   "workspacesGuide": {
     "welcome": {
       "title": "Bienvenido",
-      "content": "Bienvenido a Workspaces, una interfaz rediseñada para Vibe Kanban. Estamos lanzando esto a usuarios seleccionados para recibir comentarios tempranos. Comparte tus opiniones en cualquier momento usando el ícono de comentarios en la barra de navegación."
+      "content": "Bienvenido a Workspaces, una interfaz rediseñada para BetterCoding. Estamos lanzando esto a usuarios seleccionados para recibir comentarios tempranos. Comparte tus opiniones en cualquier momento usando el ícono de comentarios en la barra de navegación."
     },
     "commandBar": {
       "title": "Barra de comandos",
@@ -352,9 +352,6 @@
     "noCommands": "No hay comandos disponibles para este agente."
   },
   "kanban": {
-    "noVisibleStatuses": "Todos los estados están ocultos. Usa la configuración de visualización o cambia a otra pestaña para ver los problemas.",
-    "noProjectFound": "No se encontró el proyecto",
-    "unassigned": "Sin asignar",
     "noTagsAvailable": "No hay etiquetas disponibles",
     "createNewIssue": "Crear nuevo issue",
     "searchTags": "Buscar etiquetas...",
@@ -369,9 +366,6 @@
     "attachFileHint": "Adjuntar archivos (máx. 20MB por archivo)",
     "dropFilesHere": "Suelta archivos aquí",
     "fileDropHint": "Cualquier tipo de archivo hasta 20MB",
-    "unknownUser": "Usuario desconocido",
-    "deletedUser": "Usuario eliminado",
-    "replyQuotePrefix": "escribió:",
     "moreActions": "Más acciones",
     "closePanel": "Cerrar panel",
     "copyLink": "Copiar enlace",
@@ -402,21 +396,12 @@
       "active": "Activo",
       "all": "Todo"
     },
-    "loginRequired": {
-      "title": "Se requiere iniciar sesión",
-      "description": "Por favor inicia sesión para ver este proyecto.",
-      "action": "Iniciar sesión"
-    },
     "team": "Team",
     "personal": "Personal",
     "searchPlaceholder": "Search issues...",
     "filters": "Filters",
     "clearFilters": "Clear filters",
-    "filtersDescription": "Adjust filters and sorting for this board view.",
-    "filterByTag": "Filter by tag",
     "filterByPriority": "Filter by priority",
-    "tags": "Tags",
-    "sortBy": "Sort",
     "workspaceSidebar": {
       "sortDialogTitle": "Sort workspaces",
       "sortDialogDescription": "Choose how workspaces are ordered in the sidebar.",
@@ -426,64 +411,19 @@
       "sortCreatedAt": "Created at",
       "filterDialogTitle": "Filter workspaces",
       "filterDialogDescription": "Narrow down workspaces by project and PR state.",
-      "projectFilterLabel": "Project",
       "prFilterLabel": "PR",
       "prFilterAll": "All",
       "prFilterHasPr": "Has PR",
       "prFilterNoPr": "No PR",
-      "noProject": "No project",
       "sortButtonTitle": "Sort workspaces",
       "filterButtonTitle": "Filter workspaces"
     },
     "sortAscending": "Ascending",
     "sortDescending": "Descending",
     "assignee": "Assignee",
-    "self": "Me",
     "priority": "Priority",
-    "subIssuesFilterLabel": "Sub-issues",
-    "workspacesFilterLabel": "Workspaces",
-    "selectAssignees": "Select assignees...",
     "relationships": "Relationships",
-    "noRelationships": "No relationships",
-    "openProjectsGuide": "Projects guide",
-    "editProjectSettings": "Edit project settings",
-    "linkWorkspace": "Link workspace...",
-    "createNewWorkspace": "Create new workspace",
-    "workspaces": "Workspaces",
-    "showingWorkspaces": "Showing {{count}} of {{total}}",
-    "changeColor": "Change color",
-    "editName": "Edit name",
-    "deleteStatus": "Delete status",
-    "cannotDeleteWithIssues": "Move issues first",
-    "lastVisibleStatus": "At least one status must be visible",
-    "showStatus": "Show status",
-    "hideStatus": "Hide status",
-    "newStatus": "New Status",
-    "visibleColumns": "Visible Columns",
-    "dragToRearrange": "Drag to re-arrange",
-    "addColumn": "Add column",
-    "projectsGuide": {
-      "intro": {
-        "title": "Welcome",
-        "content": "Welcome to Vibe Kanban. Use the help sections in this panel to learn how things work, then create your first issue. You can re-open this help dialog or give feedback anytime from the navbar."
-      },
-      "welcome": {
-        "title": "Projects",
-        "content": "The project page is where you manage issues. You can view your issues as a kanban board, or as a list, and filter by status, tag, assignee and more."
-      },
-      "issues": {
-        "title": "Issues",
-        "content": "Each issue represents a feature or problem to solve. Issues have statuses, priorities, assignees, tags, relationships, comments, sub-issues and more."
-      },
-      "workspaces": {
-        "title": "Workspaces",
-        "content": "To start working on an issue, create a workspace. A single issue can have multiple workspaces. Issues describe the work to be done, workspaces are where the work happens."
-      },
-      "organizations": {
-        "title": "Invite your team",
-        "content": "We've automatically created a personal organization and initial project so you can get started with Vibe Kanban. Export your cloud data before shutdown."
-      }
-    }
+    "noRelationships": "No relationships"
   },
   "createMode": {
     "headings": {
@@ -537,13 +477,6 @@
     "skipSignInHeader": "Don't sign in",
     "yes": "Yes",
     "no": "No"
-  },
-  "appBar": {
-    "kanban": {
-      "tooltip": "Inicia sesión para ver proyectos",
-      "title": "Tableros Kanban",
-      "description": "Inicia sesión para organizar tus agentes de codificación con tableros kanban."
-    }
   },
   "errors": {
     "generic": "An unexpected error occurred"
