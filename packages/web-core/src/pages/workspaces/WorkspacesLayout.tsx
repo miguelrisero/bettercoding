@@ -357,7 +357,15 @@ export function WorkspacesLayout() {
                   <CliMainPane
                     workspaceId={selectedWorkspace.id}
                     onBackToChat={() => setMainPaneMode('chat')}
-                    sessionId={selectedSessionId}
+                    // Mid-switch, selectedSession can briefly still be the
+                    // previous workspace's; never hand a foreign session to
+                    // the terminal resume.
+                    sessionId={
+                      selectedSession?.workspace_id === selectedWorkspace.id
+                        ? selectedSessionId
+                        : undefined
+                    }
+                    sessionsReady={!isSessionsLoading}
                   />
                 ) : (
                   <WorkspacesMainContainer

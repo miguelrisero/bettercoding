@@ -63,48 +63,67 @@ export function XTermInstance({
     }
   }, [tabId, getTerminalConnection]);
 
+  // Terminal + connection lifecycle. Every run of this effect MUST register
+  // the same cleanup: an early return without one leaves `terminalRef`
+  // pointing at the previous tab's (possibly disposed) terminal across a
+  // `tabId` change, which used to permanently disarm terminal creation for
+  // every workspace visited afterwards (the "CLI panes all blank after
+  // switching" bug — the old code had `if (terminalRef.current) return;`
+  // after a cleanup-less reattach run).
   useEffect(() => {
-    if (!containerRef.current) return;
+    const container = containerRef.current;
+    if (!container) return;
+
+    let terminal: Terminal;
+    let fitAddon: FitAddon;
 
     const existing = getTerminalInstance(tabId);
     if (existing) {
-      const { terminal, fitAddon } = existing;
+      // Reattach a live terminal preserved across remounts (side terminals
+      // keep their instance registered while hidden).
+      terminal = existing.terminal;
+      fitAddon = existing.fitAddon;
       if (terminal.element) {
-        containerRef.current.appendChild(terminal.element);
+        container.appendChild(terminal.element);
         fitAddon.fit();
       }
-      terminalRef.current = terminal;
-      fitAddonRef.current = fitAddon;
-      return;
+    } else {
+      terminal = new Terminal({
+        cursorBlink: true,
+        fontSize: 12,
+        fontFamily: '"IBM Plex Mono", monospace',
+        theme: getTerminalTheme(),
+      });
+
+      fitAddon = new FitAddon();
+      const webLinksAddon = new WebLinksAddon();
+
+      terminal.loadAddon(fitAddon);
+      terminal.loadAddon(webLinksAddon);
+      terminal.open(container);
+
+      fitAddon.fit();
+      initialSizeRef.current = { cols: terminal.cols, rows: terminal.rows };
+
+      registerTerminalInstance(tabId, terminal, fitAddon);
+
+      terminal.onData((data) => {
+        const conn = getTerminalConnection(tabId);
+        conn?.send(data);
+      });
     }
-
-    if (terminalRef.current) return;
-
-    const terminal = new Terminal({
-      cursorBlink: true,
-      fontSize: 12,
-      fontFamily: '"IBM Plex Mono", monospace',
-      theme: getTerminalTheme(),
-    });
-
-    const fitAddon = new FitAddon();
-    const webLinksAddon = new WebLinksAddon();
-
-    terminal.loadAddon(fitAddon);
-    terminal.loadAddon(webLinksAddon);
-    terminal.open(containerRef.current);
-
-    fitAddon.fit();
-    initialSizeRef.current = { cols: terminal.cols, rows: terminal.rows };
 
     terminalRef.current = terminal;
     fitAddonRef.current = fitAddon;
 
+    // Ensure a backend connection exists for this tab — also on the reattach
+    // path, so a tab whose connection died (e.g. reconnect gave up, server
+    // restarted) heals on the next mount instead of staying dead.
     if (!getTerminalConnection(tabId)) {
       createTerminalConnection(
         tabId,
         endpoint,
-        (data) => terminal?.write(data),
+        (data) => terminal.write(data),
         onClose,
         () => {
           // Re-fit and report the current grid so the PTY/tmux is sized to the
@@ -115,13 +134,6 @@ export function XTermInstance({
         }
       );
     }
-
-    registerTerminalInstance(tabId, terminal, fitAddon);
-
-    terminal.onData((data) => {
-      const conn = getTerminalConnection(tabId);
-      conn?.send(data);
-    });
 
     return () => {
       if (terminal.element && terminal.element.parentNode) {

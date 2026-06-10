@@ -30,6 +30,24 @@ import type { RepoAction } from '@vibe/ui/components/RepoCard';
 const UI_PREFERENCES_ID = '00000000-0000-0000-0000-000000000001';
 
 /**
+ * Resolve a persisted `main_pane_mode` value to the effective mode.
+ *
+ * Payloads saved before the CLI-by-default rollout lack the
+ * `cli_default_applied` marker; their persisted "chat" values are just the
+ * old default (never a user choice), so the one-time migration flips
+ * everything to "cli". Once the marker is present, an explicit "chat" is a
+ * real per-workspace preference and is honored; anything else defaults to
+ * "cli".
+ */
+export function resolvePersistedMainPaneMode(
+  persisted: string | null | undefined,
+  cliDefaultApplied: boolean
+): 'chat' | 'cli' {
+  if (!cliDefaultApplied) return 'cli';
+  return persisted === 'chat' ? 'chat' : 'cli';
+}
+
+/**
  * Converts store state to scratch data format (camelCase to snake_case)
  */
 function storeToScratchData(state: {
@@ -59,7 +77,7 @@ function storeToScratchData(state: {
     workspacePanelStates[key] = {
       right_main_panel_mode: value.rightMainPanelMode,
       is_left_main_panel_visible: value.isLeftMainPanelVisible,
-      main_pane_mode: value.mainPaneMode ?? 'chat',
+      main_pane_mode: value.mainPaneMode ?? 'cli',
     };
   }
 
@@ -91,6 +109,8 @@ function storeToScratchData(state: {
     >,
     kanban_project_view_preferences:
       state.kanbanProjectViewPreferences as Record<string, JsonValue>,
+    // Every save from a CLI-by-default build is post-migration.
+    cli_default_applied: true,
   };
 }
 
@@ -120,6 +140,7 @@ function scratchDataToStore(data: UiPreferencesData): {
   >;
 } {
   const workspacePanelStates: Record<string, WorkspacePanelState> = {};
+  const cliDefaultApplied = data.cli_default_applied === true;
   if (data.workspace_panel_states) {
     for (const [key, value] of Object.entries(data.workspace_panel_states)) {
       if (value) {
@@ -127,8 +148,10 @@ function scratchDataToStore(data: UiPreferencesData): {
           rightMainPanelMode:
             (value.right_main_panel_mode as RightMainPanelMode) ?? null,
           isLeftMainPanelVisible: value.is_left_main_panel_visible ?? true,
-          // Older payloads predate mainPaneMode; default to chat.
-          mainPaneMode: value.main_pane_mode === 'cli' ? 'cli' : 'chat',
+          mainPaneMode: resolvePersistedMainPaneMode(
+            value.main_pane_mode,
+            cliDefaultApplied
+          ),
         };
       }
     }
@@ -302,8 +325,15 @@ export function useUiPreferencesScratch() {
       setTimeout(() => {
         isApplyingServerDataRef.current = false;
       }, 100);
+
+      // Persist the one-time CLI-default migration immediately (after the
+      // applying flag clears) so the flip happens exactly once in storage and
+      // explicit "chat" choices made afterwards stick across reloads.
+      if (scratchData.cli_default_applied !== true) {
+        setTimeout(() => debouncedSave(), 150);
+      }
     }
-  }, [isLoading, isConnected, scratchData]);
+  }, [isLoading, isConnected, scratchData, debouncedSave]);
 
   // Subscribe to store changes and save to server
   useEffect(() => {

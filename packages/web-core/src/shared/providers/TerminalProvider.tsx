@@ -14,6 +14,14 @@ interface TerminalConnection {
   resize: (cols: number, rows: number) => void;
 }
 
+interface ConnectionGeneration {
+  endpoint: string;
+  retryCount: number;
+  retryTimer: ReturnType<typeof setTimeout> | null;
+  /** Cancelled (tab closed / superseded by a newer generation). */
+  closed: boolean;
+}
+
 interface TerminalState {
   tabsByWorkspace: Record<string, TerminalTab[]>;
   activeTabByWorkspace: Record<string, string | null>;
@@ -180,18 +188,17 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
     >
   >(new Map());
 
-  // Store reconnection state for each connection
-  const reconnectStateRef = useRef<
-    Map<
-      string,
-      {
-        endpoint: string;
-        retryCount: number;
-        retryTimer: ReturnType<typeof setTimeout> | null;
-        intentionallyClosed: boolean;
-      }
-    >
-  >(new Map());
+  // Per-tab connection "generation". Each createTerminalConnection call makes
+  // a fresh generation object; async opens, retry timers, and socket handlers
+  // capture THEIR generation and check `closed` on it (object identity, not a
+  // map lookup). This is load-bearing: a close followed by a quick re-create
+  // re-seeds the map slot, so an in-flight open from the cancelled generation
+  // that re-read the slot would see the new, un-closed state and resurrect
+  // itself as an orphan socket (observed live: leaked tmux clients mirroring
+  // every pane redraw into a void).
+  const reconnectStateRef = useRef<Map<string, ConnectionGeneration>>(
+    new Map()
+  );
 
   const getTabsForWorkspace = useCallback(
     (workspaceId: string): TerminalTab[] => {
@@ -215,12 +222,13 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
   }, []);
 
   const closeTerminalConnection = useCallback((tabId: string) => {
-    // Mark as intentionally closed to prevent reconnection
-    const reconnectState = reconnectStateRef.current.get(tabId);
-    if (reconnectState) {
-      reconnectState.intentionallyClosed = true;
-      if (reconnectState.retryTimer) {
-        clearTimeout(reconnectState.retryTimer);
+    // Cancel the live generation: in-flight opens and pending retries hold
+    // this object and observe `closed` even after the map entry is gone.
+    const generation = reconnectStateRef.current.get(tabId);
+    if (generation) {
+      generation.closed = true;
+      if (generation.retryTimer) {
+        clearTimeout(generation.retryTimer);
       }
       reconnectStateRef.current.delete(tabId);
     }
@@ -303,67 +311,89 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       onExit?: () => void,
       getSize?: () => { cols: number; rows: number } | null
     ) => {
-      // Close existing connection if any
+      // Close any previous connection and cancel its generation. Marking the
+      // old generation closed (on the object) is what actually cancels its
+      // in-flight opens/retries; replacing the map slot alone would not.
+      const previousGeneration = reconnectStateRef.current.get(tabId);
+      if (previousGeneration) {
+        previousGeneration.closed = true;
+        if (previousGeneration.retryTimer) {
+          clearTimeout(previousGeneration.retryTimer);
+        }
+      }
       const existing = terminalConnectionsRef.current.get(tabId);
       if (existing) {
         existing.ws.close();
+        terminalConnectionsRef.current.delete(tabId);
       }
 
       // Store callbacks in ref so they can be updated without recreating connection
       connectionCallbacksRef.current.set(tabId, { onData, onExit, getSize });
 
-      // Initialize or reset reconnection state
-      const existingReconnectState = reconnectStateRef.current.get(tabId);
-      if (existingReconnectState?.retryTimer) {
-        clearTimeout(existingReconnectState.retryTimer);
-      }
-      reconnectStateRef.current.set(tabId, {
+      const generation: ConnectionGeneration = {
         endpoint,
         retryCount: 0,
         retryTimer: null,
-        intentionallyClosed: false,
-      });
+        closed: false,
+      };
+      reconnectStateRef.current.set(tabId, generation);
+
+      const giveUp = () => {
+        // Out of retries: never leave the pane silently dead. Surface the
+        // failure in the terminal and clear this tab's entries so the next
+        // mount (e.g. switching away and back) starts a fresh connection.
+        connectionCallbacksRef.current
+          .get(tabId)
+          ?.onData(
+            '\r\n\x1b[31mterminal connection lost — switch away and back to retry\x1b[0m\r\n'
+          );
+        generation.closed = true;
+        if (reconnectStateRef.current.get(tabId) === generation) {
+          reconnectStateRef.current.delete(tabId);
+        }
+        terminalConnectionsRef.current.delete(tabId);
+      };
 
       const scheduleReconnect = () => {
-        const state = reconnectStateRef.current.get(tabId);
-        if (!state || state.intentionallyClosed) {
+        if (generation.closed) {
           return;
         }
 
         const maxRetries = 6;
-        if (state.retryCount >= maxRetries) {
+        if (generation.retryCount >= maxRetries) {
+          giveUp();
           return;
         }
 
-        const delay = Math.min(8000, 500 * Math.pow(2, state.retryCount));
-        state.retryCount += 1;
-        state.retryTimer = setTimeout(() => {
-          state.retryTimer = null;
+        const delay = Math.min(8000, 500 * Math.pow(2, generation.retryCount));
+        generation.retryCount += 1;
+        generation.retryTimer = setTimeout(() => {
+          generation.retryTimer = null;
           connectWebSocket();
         }, delay);
       };
 
       const connectWebSocket = () => {
-        const reconnectState = reconnectStateRef.current.get(tabId);
-        if (!reconnectState || reconnectState.intentionallyClosed) {
+        if (generation.closed) {
           return;
         }
 
         void (async () => {
           try {
             const ws = await openLocalApiWebSocket(endpoint);
-            const state = reconnectStateRef.current.get(tabId);
-            if (!state || state.intentionallyClosed) {
+            // The tab may have closed, or a newer generation may have taken
+            // over, while the socket was opening.
+            if (
+              generation.closed ||
+              reconnectStateRef.current.get(tabId) !== generation
+            ) {
               ws.close();
               return;
             }
 
             ws.onopen = () => {
               // Reset retry count on successful connection
-              const latestState = reconnectStateRef.current.get(tabId);
-              if (latestState) {
-                latestState.retryCount = 0;
-              }
+              generation.retryCount = 0;
               // Send the current terminal size now that the socket is open. The
               // initial ResizeObserver fit usually fires before the socket is
               // ready and is dropped, which would otherwise leave the PTY/tmux
@@ -395,8 +425,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
                   // Hard backend error (e.g. PTY creation failed). Surface it
                   // in the terminal and stop the reconnect loop — retrying a
                   // failed create_session forever just blinks silently.
-                  const state = reconnectStateRef.current.get(tabId);
-                  if (state) state.intentionallyClosed = true;
+                  generation.closed = true;
                   callbacks.onData(
                     `\r\n\x1b[31m${msg.message ?? 'terminal error'}\x1b[0m\r\n`
                   );
@@ -411,8 +440,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
             };
 
             ws.onclose = (event) => {
-              const latestState = reconnectStateRef.current.get(tabId);
-              if (!latestState || latestState.intentionallyClosed) {
+              if (generation.closed) {
                 return;
               }
 
