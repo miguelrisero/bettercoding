@@ -171,6 +171,8 @@ export interface NavbarProps {
   // Mobile props
   mobileMode?: boolean;
   mobileUserSlot?: ReactNode;
+  /** Extra buttons for the mobile top-right cluster (e.g. CLI mode toggle). */
+  mobileActionsSlot?: ReactNode;
   onOpenCommandBar?: () => void;
   onOpenSettings?: () => void;
   onNavigateBack?: () => void;
@@ -195,6 +197,7 @@ export function Navbar({
   className,
   mobileMode = false,
   mobileUserSlot,
+  mobileActionsSlot,
   onOpenCommandBar,
   onOpenSettings,
   onNavigateBack,
@@ -284,6 +287,7 @@ export function Navbar({
           {/* Right side: sync indicator + action buttons + user slot */}
           <div className="flex items-center gap-1 shrink-0">
             <SyncErrorIndicator errors={syncErrors} />
+            {mobileActionsSlot}
             {onReload && (
               <button
                 type="button"
