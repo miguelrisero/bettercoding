@@ -2,7 +2,10 @@
   "cliMode": {
     "title": "Claude CLI",
     "persistentHint": "persistent tmux session",
-    "backToChat": "Back to chat"
+    "backToChat": "Back to chat",
+    "agentRunningTitle": "Claude is working on your prompt",
+    "agentRunningBody": "The coding agent is running this task in chat. The terminal will take over with the same conversation as soon as it finishes — no need to repeat the prompt here.",
+    "agentRunningViewChat": "Watch progress in chat"
   },
   "editorNames": {
     "custom": "Custom"

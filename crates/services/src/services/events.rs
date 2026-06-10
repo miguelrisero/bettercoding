@@ -4,7 +4,7 @@ use db::{
     DBService,
     models::{
         execution_process::ExecutionProcess, scratch::Scratch, session::Session,
-        workspace::Workspace,
+        workspace::Workspace, workspace_cli_activity::WorkspaceCliActivity,
     },
 };
 use serde_json::json;
@@ -125,10 +125,36 @@ impl EventService {
                     if let Ok(table) = HookTables::from_str(hook.table) {
                         let rowid = hook.rowid;
                         runtime_handle.spawn(async move {
+                            // CLI tmux activity has no record type of its own:
+                            // a change just re-broadcasts the owning
+                            // workspace's status (is_running folds it in), so
+                            // the sidebar bucket moves the moment the monitor
+                            // records a transition.
+                            if matches!(table, HookTables::WorkspaceCliActivity) {
+                                if !matches!(hook.operation, SqliteOperation::Delete)
+                                    && let Ok(Some(activity)) =
+                                        WorkspaceCliActivity::find_by_rowid(&db.pool, rowid).await
+                                    && let Ok(Some(workspace_with_status)) =
+                                        Workspace::find_by_id_with_status(
+                                            &db.pool,
+                                            activity.workspace_id,
+                                        )
+                                        .await
+                                {
+                                    msg_store_for_hook
+                                        .push_patch(workspace_patch::replace(&workspace_with_status));
+                                }
+                                return;
+                            }
+
                             let record_type: RecordTypes = match (table, hook.operation.clone()) {
                                 (HookTables::Workspaces, SqliteOperation::Delete)
                                 | (HookTables::ExecutionProcesses, SqliteOperation::Delete)
                                 | (HookTables::Scratch, SqliteOperation::Delete) => {
+                                    return;
+                                }
+                                // Fully handled by the early return above.
+                                (HookTables::WorkspaceCliActivity, _) => {
                                     return;
                                 }
                                 (HookTables::Workspaces, _) => {

@@ -50,6 +50,7 @@ export function WorkspacesLayout() {
   const {
     workspaceId,
     workspace: selectedWorkspace,
+    activeWorkspaces,
     isLoading,
     isCreateMode,
     selectedSession,
@@ -366,6 +367,16 @@ export function WorkspacesLayout() {
                         : undefined
                     }
                     sessionsReady={!isSessionsLoading}
+                    // Hold the terminal back while the chat executor runs
+                    // (e.g. a just-created workspace's initial prompt) — it
+                    // would otherwise bake a conversation-less tmux session
+                    // and split work between chat and CLI. Streams live via
+                    // the workspaces WebSocket.
+                    executorRunning={
+                      activeWorkspaces.find(
+                        (w) => w.id === selectedWorkspace.id
+                      )?.isExecutorRunning ?? false
+                    }
                   />
                 ) : (
                   <WorkspacesMainContainer

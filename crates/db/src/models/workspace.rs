@@ -58,7 +58,14 @@ pub struct WorkspaceWithStatus {
     #[serde(flatten)]
     #[ts(flatten)]
     pub workspace: Workspace,
+    /// Anything is actively running here: an executor process OR the
+    /// CLI-mode tmux claude. Drives the sidebar "Running" bucket.
     pub is_running: bool,
+    /// An executor process (setup/cleanup/coding agent) is running. The CLI
+    /// pane uses this to hold off attaching while the chat agent owns the
+    /// conversation (resuming a session mid-write would fork it).
+    #[serde(default)]
+    pub is_executor_running: bool,
     pub is_errored: bool,
 }
 
@@ -523,7 +530,23 @@ impl Workspace {
                       AND ep.status = 'running'
                       AND ep.run_reason IN ('setupscript','cleanupscript','codingagent')
                     LIMIT 1
+                ) OR EXISTS (
+                    -- CLI-mode tmux claude actively producing output
+                    SELECT 1
+                    FROM workspace_cli_activity ca
+                    WHERE ca.workspace_id = w.id
+                      AND ca.state = 'running'
                 ) THEN 1 ELSE 0 END AS "is_running!: i64",
+
+                CASE WHEN EXISTS (
+                    SELECT 1
+                    FROM sessions s
+                    JOIN execution_processes ep ON ep.session_id = s.id
+                    WHERE s.workspace_id = w.id
+                      AND ep.status = 'running'
+                      AND ep.run_reason IN ('setupscript','cleanupscript','codingagent')
+                    LIMIT 1
+                ) THEN 1 ELSE 0 END AS "is_executor_running!: i64",
 
                 CASE WHEN (
                     SELECT ep.status
@@ -558,6 +581,7 @@ impl Workspace {
                     worktree_deleted: rec.worktree_deleted,
                 },
                 is_running: rec.is_running != 0,
+                is_executor_running: rec.is_executor_running != 0,
                 is_errored: rec.is_errored != 0,
             })
             // Apply archived filter if provided
@@ -617,7 +641,23 @@ impl Workspace {
                       AND ep.status = 'running'
                       AND ep.run_reason IN ('setupscript','cleanupscript','codingagent')
                     LIMIT 1
+                ) OR EXISTS (
+                    -- CLI-mode tmux claude actively producing output
+                    SELECT 1
+                    FROM workspace_cli_activity ca
+                    WHERE ca.workspace_id = w.id
+                      AND ca.state = 'running'
                 ) THEN 1 ELSE 0 END AS "is_running!: i64",
+
+                CASE WHEN EXISTS (
+                    SELECT 1
+                    FROM sessions s
+                    JOIN execution_processes ep ON ep.session_id = s.id
+                    WHERE s.workspace_id = w.id
+                      AND ep.status = 'running'
+                      AND ep.run_reason IN ('setupscript','cleanupscript','codingagent')
+                    LIMIT 1
+                ) THEN 1 ELSE 0 END AS "is_executor_running!: i64",
 
                 CASE WHEN (
                     SELECT ep.status
@@ -655,6 +695,7 @@ impl Workspace {
                 worktree_deleted: rec.worktree_deleted,
             },
             is_running: rec.is_running != 0,
+            is_executor_running: rec.is_executor_running != 0,
             is_errored: rec.is_errored != 0,
         };
 

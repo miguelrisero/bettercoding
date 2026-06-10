@@ -43,8 +43,11 @@ pub enum PtyCommand {
 /// - `--resume <id>` (when `resume_session_id` is a valid UUID) joins claude's
 ///   exact session — the same transcript the headless executor created/uses —
 ///   so the chat UI and CLI hand off the conversation in both directions.
-/// - `--continue` (fallback) resumes the most recent conversation in the
-///   worktree; with no prior session claude launches a fresh TUI.
+/// - With nothing to resume, claude starts a FRESH TUI. Never `--continue`:
+///   on a brand-new workspace it printed "No conversation found to continue"
+///   and dumped the pane into a bare shell (the resume target is resolved
+///   workspace-wide server-side, so a missing id really means there is no
+///   conversation yet).
 /// - `--dangerously-skip-permissions` skips per-tool approval prompts for this
 ///   trusted worktree. (claude's one-time folder-trust dialog is separate and
 ///   self-remembered per worktree; we deliberately don't rewrite the user's
@@ -55,16 +58,85 @@ pub enum PtyCommand {
 /// (model, flags, alternate agent CLIs) — do not bolt options onto
 /// `PtyCommand::TmuxCli` piecemeal.
 fn cli_bootstrap(resume_session_id: Option<&str>) -> String {
-    // Only interpolate a strict UUID into the shell string; anything else
-    // falls back to --continue. claude session ids are UUIDs, so this both
-    // validates intent and forecloses shell injection via the id.
+    // Only interpolate a strict UUID into the shell string. claude session
+    // ids are UUIDs, so this both validates intent and forecloses shell
+    // injection via the id.
     let resume = resume_session_id
         .filter(|id| is_uuid(id))
-        .map(|id| format!("--resume {id}"))
-        .unwrap_or_else(|| "--continue".to_string());
+        .map(|id| format!(" --resume {id}"))
+        .unwrap_or_default();
     format!(
-        r#"command -v claude >/dev/null 2>&1 && claude --dangerously-skip-permissions {resume}; exec "${{SHELL:-/bin/sh}}""#
+        r#"command -v claude >/dev/null 2>&1 && claude --dangerously-skip-permissions{resume}; exec "${{SHELL:-/bin/sh}}""#
     )
+}
+
+/// Configuration for the embedded tmux server, written next to the app's
+/// other runtime assets and passed via `-f` so a fresh server never loads the
+/// user's personal `~/.tmux.conf` (prefix remaps, status styling — and most
+/// importantly `mouse` surprises) into the web terminal.
+///
+/// The choices reconcile "Windows-style" copying with wheel scrolling:
+/// - `mouse on`: the wheel scrolls pane history via tmux copy-mode, and a
+///   plain drag selects text tmux-side.
+/// - `set-clipboard on` + the `clipboard` terminal feature: releasing a drag
+///   copies the selection and emits OSC 52, which the web terminal's
+///   clipboard addon forwards to the system clipboard — select-to-copy with
+///   no keystroke.
+/// - right-click is unbound from tmux's context menu so the web terminal can
+///   use it for paste.
+const CLI_TMUX_CONF: &str = "\
+# BetterCoding embedded terminal tmux server (socket: vibe-kanban).
+# Written by the backend before each CLI terminal attach - edits are overwritten.
+set -g mouse on
+set -s set-clipboard on
+set -as terminal-features ',xterm*:clipboard'
+unbind-key -n MouseDown3Pane
+";
+
+/// Write the embedded server config (idempotent) and return its path.
+fn cli_tmux_conf_path() -> Option<PathBuf> {
+    let dir = utils::assets::asset_dir();
+    let path = dir.join("cli-tmux.conf");
+    let current = std::fs::read_to_string(&path).ok();
+    if current.as_deref() != Some(CLI_TMUX_CONF) {
+        std::fs::create_dir_all(&dir).ok()?;
+        std::fs::write(&path, CLI_TMUX_CONF).ok()?;
+    }
+    Some(path)
+}
+
+/// Apply the embedded-server options to an ALREADY-RUNNING tmux server (the
+/// `-f` config only applies to fresh server starts). Probes `set-clipboard`
+/// first so the append-style options aren't re-applied on every attach.
+/// Best-effort: no server running is the common case and simply a no-op.
+fn ensure_cli_tmux_server_options() {
+    let tmux = |args: &[&str]| {
+        std::process::Command::new("tmux")
+            .args(["-L", CLI_TMUX_SOCKET])
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+    };
+
+    let Ok(probe) = tmux(&["show-options", "-s", "set-clipboard"]) else {
+        return;
+    };
+    if !probe.status.success()
+        || String::from_utf8_lossy(&probe.stdout).contains("set-clipboard on")
+    {
+        return;
+    }
+
+    let _ = tmux(&["set-option", "-g", "mouse", "on"]);
+    let _ = tmux(&["set-option", "-s", "set-clipboard", "on"]);
+    let _ = tmux(&[
+        "set-option",
+        "-as",
+        "terminal-features",
+        ",xterm*:clipboard",
+    ]);
+    let _ = tmux(&["unbind-key", "-n", "MouseDown3Pane"]);
 }
 
 /// Strict UUID check (8-4-4-4-12 hex). Used to vet a session id before it is
@@ -84,13 +156,24 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 256;
 /// collide with or appear in the user's personal tmux; a single
 /// `tmux -L <socket> kill-server` can reclaim everything; and the long-lived
 /// server that inherits the backend environment is clearly ours, not shared.
-const CLI_TMUX_SOCKET: &str = "vibe-kanban";
+pub(crate) const CLI_TMUX_SOCKET: &str = "vibe-kanban";
 
 /// tmux session name for a workspace's CLI-mode terminal. The `vk_` namespace
 /// is ours: creation, attach, and cleanup only ever target these names.
 /// `simple()` (32 hex chars, no hyphens) avoids tmux-special characters.
 pub fn cli_tmux_session_name(workspace_id: Uuid) -> String {
     format!("vk_{}", workspace_id.simple())
+}
+
+/// Inverse of [`cli_tmux_session_name`]: recover the workspace id from one of
+/// our tmux session names. Returns `None` for anything outside the `vk_`
+/// namespace (e.g. a user-created session on the same socket).
+pub(crate) fn workspace_id_from_cli_session_name(name: &str) -> Option<Uuid> {
+    let hex = name.strip_prefix("vk_")?;
+    if hex.len() != 32 {
+        return None;
+    }
+    Uuid::parse_str(hex).ok()
 }
 
 /// Best-effort kill of a workspace's CLI tmux session (used on workspace
@@ -122,7 +205,7 @@ pub async fn kill_cli_tmux_session(workspace_id: Uuid) {
 
 /// Whether tmux is on PATH. Checked once per process; when unavailable
 /// (e.g. Windows, minimal containers) CLI mode degrades to a bare shell.
-fn tmux_available() -> bool {
+pub(crate) fn tmux_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
         let available = std::process::Command::new("tmux")
@@ -240,7 +323,20 @@ impl PtyService {
             }
 
             let (mut cmd, shell_name) = if let Some(session_name) = &tmux_session {
+                // Bring an already-running server in line with our config
+                // (options are server-wide; `-f` below only affects a fresh
+                // server start).
+                ensure_cli_tmux_server_options();
+
                 let mut cmd = CommandBuilder::new("tmux");
+                // Our own config instead of the user's ~/.tmux.conf — the
+                // embedded terminal needs deterministic mouse/clipboard
+                // behavior (see CLI_TMUX_CONF); the user's personal tmux on
+                // the default socket is unaffected.
+                if let Some(conf) = cli_tmux_conf_path() {
+                    cmd.arg("-f");
+                    cmd.arg(conf);
+                }
                 // Dedicated socket isolates our sessions from the user's tmux.
                 cmd.arg("-L");
                 cmd.arg(CLI_TMUX_SOCKET);
@@ -501,19 +597,31 @@ mod tests {
     }
 
     #[test]
-    fn cli_bootstrap_resumes_valid_uuid_else_continues() {
+    fn cli_bootstrap_resumes_valid_uuid_else_fresh() {
         // A valid claude session UUID -> --resume <id>.
         let id = "28b98f08-5f5f-4b1e-8c4e-41ae87c0c706";
         let b = cli_bootstrap(Some(id));
         assert!(b.contains(&format!("--resume {id}")));
-        assert!(!b.contains("--continue"));
-        // No id -> --continue.
-        assert!(cli_bootstrap(None).contains("--continue"));
-        // Non-UUID (injection attempt) is rejected -> --continue, never
-        // interpolated into the shell string.
+        // No id -> a fresh TUI: no --resume, and never --continue (which
+        // exits with "No conversation found to continue" on new worktrees).
+        let fresh = cli_bootstrap(None);
+        assert!(!fresh.contains("--resume"));
+        assert!(!fresh.contains("--continue"));
+        // Non-UUID (injection attempt) is rejected and never interpolated
+        // into the shell string.
         let evil = "x; rm -rf ~";
         let b = cli_bootstrap(Some(evil));
-        assert!(b.contains("--continue"));
         assert!(!b.contains("rm -rf"));
+        assert!(!b.contains("--resume"));
+    }
+
+    #[test]
+    fn cli_tmux_conf_keeps_mouse_scroll_and_osc52_copy() {
+        // The reconciliation contract: wheel scrolling stays (mouse on) AND
+        // selections land in the system clipboard via OSC 52.
+        assert!(CLI_TMUX_CONF.contains("set -g mouse on"));
+        assert!(CLI_TMUX_CONF.contains("set -s set-clipboard on"));
+        assert!(CLI_TMUX_CONF.contains("clipboard"));
+        assert!(CLI_TMUX_CONF.contains("unbind-key -n MouseDown3Pane"));
     }
 }

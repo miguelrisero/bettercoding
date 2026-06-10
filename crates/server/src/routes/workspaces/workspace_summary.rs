@@ -7,6 +7,7 @@ use db::models::{
     merge::MergeStatus,
     pull_request::PullRequest,
     workspace::Workspace,
+    workspace_cli_activity::WorkspaceCliActivity,
 };
 use deployment::Deployment;
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,9 @@ pub struct WorkspaceSummary {
     pub has_running_dev_server: bool,
     /// Does this workspace have unseen coding agent turns?
     pub has_unseen_turns: bool,
+    /// Did this workspace's CLI-mode claude session finish while no terminal
+    /// was attached? (Cleared when the user opens the pane again.)
+    pub cli_attention: bool,
     /// PR status for this workspace (if any PR exists)
     pub pr_status: Option<MergeStatus>,
     /// PR number for this workspace (if any PR exists)
@@ -109,6 +113,10 @@ pub async fn get_workspace_summaries(
     // 5. Check which workspaces have unseen coding agent turns
     let unseen_workspaces = CodingAgentTurn::find_workspaces_with_unseen(pool, archived).await?;
 
+    // 5b. Check which workspaces' CLI tmux sessions finished unattended
+    let cli_attention_workspaces =
+        WorkspaceCliActivity::find_workspaces_needing_attention(pool, archived).await?;
+
     // 6. Get PR status for each workspace
     let pr_statuses = PullRequest::get_latest_for_workspaces(pool, archived).await?;
 
@@ -156,6 +164,7 @@ pub async fn get_workspace_summaries(
                 latest_process_status: latest.map(|p| p.status.clone()),
                 has_running_dev_server: dev_server_workspaces.contains(&id),
                 has_unseen_turns: unseen_workspaces.contains(&id),
+                cli_attention: cli_attention_workspaces.contains(&id),
                 pr_status: pr_statuses.get(&id).map(|pr| pr.pr_status.clone()),
                 pr_number: pr_statuses.get(&id).map(|pr| pr.pr_number),
                 pr_url: pr_statuses.get(&id).map(|pr| pr.pr_url.clone()),

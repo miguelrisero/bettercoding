@@ -2,7 +2,10 @@
   "cliMode": {
     "title": "Claude CLI",
     "persistentHint": "持久 tmux 工作階段",
-    "backToChat": "返回聊天"
+    "backToChat": "返回聊天",
+    "agentRunningTitle": "Claude 正在處理你的提示",
+    "agentRunningBody": "編碼代理正在聊天中執行此任務。完成後終端將接管同一會話 — 無需在此重複提示。",
+    "agentRunningViewChat": "在聊天中查看進度"
   },
   "editorNames": {
     "custom": "自訂"

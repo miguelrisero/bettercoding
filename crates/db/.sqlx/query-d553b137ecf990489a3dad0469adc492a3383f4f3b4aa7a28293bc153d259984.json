@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT ca.workspace_id as \"workspace_id!: Uuid\"\n               FROM workspace_cli_activity ca\n               JOIN workspaces w ON ca.workspace_id = w.id\n               WHERE ca.state = 'attention' AND w.archived = $1",
+  "describe": {
+    "columns": [
+      {
+        "name": "workspace_id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "d553b137ecf990489a3dad0469adc492a3383f4f3b4aa7a28293bc153d259984"
+}
