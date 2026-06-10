@@ -25,6 +25,10 @@ pub enum HookTables {
     ExecutionProcesses,
     #[strum(to_string = "scratch")]
     Scratch,
+    /// CLI-mode tmux activity; changes re-emit the owning workspace's status
+    /// patch (no record type of its own).
+    #[strum(to_string = "workspace_cli_activity")]
+    WorkspaceCliActivity,
 }
 
 #[derive(Serialize, Deserialize, TS)]

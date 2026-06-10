@@ -43,6 +43,7 @@ use workspace_manager::WorkspaceManager;
 use worktree_manager::WorktreeManager;
 
 use crate::{container::LocalContainerService, pty::PtyService};
+pub mod cli_activity;
 mod command;
 pub mod container;
 mod copy;
@@ -262,6 +263,10 @@ impl Deployment for LocalDeployment {
             let rc = remote_client.clone().ok();
             PrMonitorService::spawn(db, analytics, container, rc, pr_sync_notify.clone()).await;
         }
+
+        // Surface CLI-mode tmux claude activity as workspace stage state
+        // (Running / Needs Attention buckets in the sidebar).
+        cli_activity::CliActivityMonitor::spawn(db.clone());
 
         let deployment = Self {
             config,

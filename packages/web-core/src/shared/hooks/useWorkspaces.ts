@@ -23,6 +23,8 @@ export interface SidebarWorkspace {
   linesAdded?: number;
   linesRemoved?: number;
   isRunning?: boolean;
+  /** An executor process (setup/cleanup/coding agent) is running right now. */
+  isExecutorRunning?: boolean;
   isPinned?: boolean;
   isArchived?: boolean;
   hasPendingApproval?: boolean;
@@ -69,12 +71,15 @@ function toSidebarWorkspace(
     linesRemoved: summary?.lines_removed ?? undefined,
     // Real data from stream
     isRunning: ws.is_running,
+    isExecutorRunning: ws.is_executor_running,
     isPinned: ws.pinned,
     isArchived: ws.archived,
     // Additional data from summary
     hasPendingApproval: summary?.has_pending_approval,
     hasRunningDevServer: summary?.has_running_dev_server,
-    hasUnseenActivity: summary?.has_unseen_turns,
+    // CLI-mode claude finishing unattended raises a hand exactly like unseen
+    // chat turns do.
+    hasUnseenActivity: summary?.has_unseen_turns || summary?.cli_attention,
     latestProcessCompletedAt: summary?.latest_process_completed_at ?? undefined,
     latestProcessStatus: summary?.latest_process_status ?? undefined,
     prStatus: summary?.pr_status ?? undefined,

@@ -102,6 +102,38 @@ export function XTermInstance({
       terminal.loadAddon(webLinksAddon);
       terminal.open(container);
 
+      // OSC 52 → system clipboard. This is how tmux-side selections (CLI
+      // mode: drag in the pane, tmux copies on release with
+      // `set-clipboard on`) land in the browser clipboard — select-to-copy
+      // without xterm.js ever owning the selection. Hand-rolled instead of
+      // @xterm/addon-clipboard because tmux emits an EMPTY selection field
+      // (`ESC]52;;<base64>`), which the addon silently ignores (it only
+      // matches an explicit 'c').
+      terminal.parser.registerOscHandler(52, (data) => {
+        const sep = data.indexOf(';');
+        if (sep === -1) return true;
+        const selection = data.slice(0, sep);
+        const payload = data.slice(sep + 1);
+        if (selection !== '' && selection !== 'c' && selection !== 's') {
+          return true;
+        }
+        // '?' is a clipboard READ request — never answer those (a malicious
+        // pane process could exfiltrate the clipboard).
+        if (payload === '?') return true;
+        try {
+          const bytes = Uint8Array.from(atob(payload), (ch) =>
+            ch.charCodeAt(0)
+          );
+          const text = new TextDecoder().decode(bytes);
+          if (text) {
+            void navigator.clipboard?.writeText(text).catch(() => {});
+          }
+        } catch {
+          // Malformed base64 — ignore.
+        }
+        return true;
+      });
+
       fitAddon.fit();
       initialSizeRef.current = { cols: terminal.cols, rows: terminal.rows };
 
@@ -110,6 +142,42 @@ export function XTermInstance({
       terminal.onData((data) => {
         const conn = getTerminalConnection(tabId);
         conn?.send(data);
+      });
+
+      // Windows-console clipboard ergonomics. Selecting text copies it
+      // immediately (no keystroke needed); right-click copies the selection
+      // when one exists, otherwise pastes. Both attach once per created
+      // terminal and live exactly as long as it does (the listener dies with
+      // the element on dispose, the selection hook with the terminal).
+      terminal.onSelectionChange(() => {
+        const text = terminal.getSelection();
+        if (text) {
+          void navigator.clipboard?.writeText(text).catch(() => {
+            // Clipboard access can be denied (permissions/insecure context);
+            // selection itself still works, so fail silently.
+          });
+        }
+      });
+
+      terminal.element?.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        if (terminal.hasSelection()) {
+          const text = terminal.getSelection();
+          if (text) {
+            void navigator.clipboard?.writeText(text).catch(() => {});
+          }
+          terminal.clearSelection();
+        } else {
+          void navigator.clipboard
+            ?.readText()
+            .then((text) => {
+              if (text) terminal.paste(text);
+            })
+            .catch(() => {
+              // Paste permission denied — Ctrl+V still works via the
+              // terminal's own textarea.
+            });
+        }
       });
     }
 

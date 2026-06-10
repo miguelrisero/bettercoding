@@ -2,7 +2,10 @@
   "cliMode": {
     "title": "Claude CLI",
     "persistentHint": "지속되는 tmux 세션",
-    "backToChat": "채팅으로 돌아가기"
+    "backToChat": "채팅으로 돌아가기",
+    "agentRunningTitle": "Claude가 프롬프트를 처리하고 있습니다",
+    "agentRunningBody": "코딩 에이전트가 채팅에서 이 작업을 실행 중입니다. 완료되면 터미널이 같은 대화를 이어받습니다 — 여기서 프롬프트를 반복할 필요가 없습니다.",
+    "agentRunningViewChat": "채팅에서 진행 상황 보기"
   },
   "editorNames": {
     "custom": "사용자 지정"

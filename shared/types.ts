@@ -166,7 +166,18 @@ export type UpdateScratch = { payload: ScratchPayload, };
 
 export type Workspace = { id: string, task_id: string | null, container_ref: string | null, branch: string, setup_completed_at: string | null, created_at: string, updated_at: string, archived: boolean, pinned: boolean, name: string | null, worktree_deleted: boolean, };
 
-export type WorkspaceWithStatus = { is_running: boolean, is_errored: boolean, id: string, task_id: string | null, container_ref: string | null, branch: string, setup_completed_at: string | null, created_at: string, updated_at: string, archived: boolean, pinned: boolean, name: string | null, worktree_deleted: boolean, };
+export type WorkspaceWithStatus = { 
+/**
+ * Anything is actively running here: an executor process OR the
+ * CLI-mode tmux claude. Drives the sidebar "Running" bucket.
+ */
+is_running: boolean, 
+/**
+ * An executor process (setup/cleanup/coding agent) is running. The CLI
+ * pane uses this to hold off attaching while the chat agent owns the
+ * conversation (resuming a session mid-write would fork it).
+ */
+is_executor_running: boolean, is_errored: boolean, id: string, task_id: string | null, container_ref: string | null, branch: string, setup_completed_at: string | null, created_at: string, updated_at: string, archived: boolean, pinned: boolean, name: string | null, worktree_deleted: boolean, };
 
 export type Session = { id: string, workspace_id: string, name: string | null, executor: string | null, agent_working_dir: string | null, created_at: string, updated_at: string, };
 
@@ -477,6 +488,11 @@ has_running_dev_server: boolean,
  * Does this workspace have unseen coding agent turns?
  */
 has_unseen_turns: boolean, 
+/**
+ * Did this workspace's CLI-mode claude session finish while no terminal
+ * was attached? (Cleared when the user opens the pane again.)
+ */
+cli_attention: boolean, 
 /**
  * PR status for this workspace (if any PR exists)
  */

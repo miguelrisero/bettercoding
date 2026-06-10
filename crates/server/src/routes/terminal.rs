@@ -8,8 +8,8 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use db::models::{
-    coding_agent_turn::CodingAgentTurn, session::Session, workspace::Workspace,
-    workspace_repo::WorkspaceRepo,
+    coding_agent_turn::CodingAgentTurn, execution_process::ExecutionProcess, session::Session,
+    workspace::Workspace, workspace_repo::WorkspaceRepo,
 };
 use deployment::Deployment;
 use local_deployment::pty::{PtyCommand, cli_tmux_session_name};
@@ -133,14 +133,27 @@ async fn terminal_ws(
             }
 
             // Resolve claude's session id for the selected uix chat so CLI
-            // mode resumes the exact conversation (handover). Falls back to
-            // --continue in the bootstrap when there's no prior turn.
+            // mode resumes the exact conversation (handover). With no prior
+            // turn the bootstrap starts a fresh TUI. While the headless
+            // executor is actively RUNNING this session, never hand its id to
+            // a second claude — resuming a session mid-write forks it and the
+            // user ends up with chat and CLI doing the same work twice.
             let resume_session_id = match &session {
-                Some(s) => CodingAgentTurn::find_latest_session_info(pool, s.id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|info| info.session_id),
+                Some(s) => {
+                    let executor_active =
+                        ExecutionProcess::has_running_coding_agent_for_session(pool, s.id)
+                            .await
+                            .unwrap_or(false);
+                    if executor_active {
+                        None
+                    } else {
+                        CodingAgentTurn::find_latest_session_info(pool, s.id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|info| info.session_id)
+                    }
+                }
                 None => None,
             };
 

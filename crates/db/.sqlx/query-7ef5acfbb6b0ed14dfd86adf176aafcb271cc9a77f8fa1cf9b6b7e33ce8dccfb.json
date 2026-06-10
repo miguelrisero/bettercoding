@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                 workspace_id as \"workspace_id!: Uuid\",\n                 state,\n                 updated_at as \"updated_at!: DateTime<Utc>\"\n               FROM workspace_cli_activity\n               WHERE rowid = $1",
+  "describe": {
+    "columns": [
+      {
+        "name": "workspace_id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "state",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "updated_at!: DateTime<Utc>",
+        "ordinal": 2,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "7ef5acfbb6b0ed14dfd86adf176aafcb271cc9a77f8fa1cf9b6b7e33ce8dccfb"
+}
