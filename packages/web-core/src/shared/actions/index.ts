@@ -1184,6 +1184,7 @@ export const NavbarActionGroups = {
     NavbarDivider,
     Actions.ToggleLeftSidebar,
     Actions.ToggleLeftMainPanel,
+    Actions.ToggleCliMode,
     Actions.ToggleChangesMode,
     Actions.ToggleLogsMode,
     Actions.TogglePreviewMode,

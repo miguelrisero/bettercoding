@@ -239,6 +239,25 @@ export function WorkspacesLayout() {
                 <CreateChatBoxContainer
                   onWorkspaceCreated={handleWorkspaceCreated}
                 />
+              ) : mainPaneMode === 'cli' && selectedWorkspace?.id ? (
+                // Same CLI pane as desktop — phones get the terminal too,
+                // with the navbar's terminal button (and the pane's "Back to
+                // chat") to switch. All handover gates mirror the desktop
+                // call site.
+                <CliMainPane
+                  workspaceId={selectedWorkspace.id}
+                  onBackToChat={() => setMainPaneMode('chat')}
+                  sessionId={
+                    selectedSession?.workspace_id === selectedWorkspace.id
+                      ? selectedSessionId
+                      : undefined
+                  }
+                  sessionsReady={!isSessionsLoading}
+                  executorRunning={
+                    activeWorkspaces.find((w) => w.id === selectedWorkspace.id)
+                      ?.isExecutorRunning ?? false
+                  }
+                />
               ) : (
                 <WorkspacesMainContainer
                   ref={mainContainerRef}

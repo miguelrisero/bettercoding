@@ -17,7 +17,8 @@ import { useUserSystem } from '@/shared/hooks/useUserSystem';
 import { useAppUpdateStore } from '@/shared/stores/useAppUpdateStore';
 import { useAuth } from '@/shared/hooks/auth/useAuth';
 import { isTauriMac } from '@/shared/lib/platform';
-import { NavbarActionGroups } from '@/shared/actions';
+import { Actions, NavbarActionGroups } from '@/shared/actions';
+import { TerminalWindowIcon } from '@phosphor-icons/react';
 import {
   NavbarDivider,
   type ActionDefinition,
@@ -253,6 +254,33 @@ export function NavbarContainer({
     );
   }, [appVersion, updateVersion, restartForUpdate]);
 
+  // Mobile keeps the action rail hidden, so CLI mode gets a dedicated
+  // always-visible toggle in the top-right cluster — without it phones have
+  // no way to switch between chat and the terminal.
+  const mobileActionsSlot = useMemo(() => {
+    if (!mobileMode || !isActionVisible(Actions.ToggleCliMode, actionCtx)) {
+      return undefined;
+    }
+    const cliActive = isActionActive(Actions.ToggleCliMode, actionCtx);
+    return (
+      <button
+        type="button"
+        className={
+          cliActive
+            ? 'flex items-center justify-center text-brand'
+            : 'flex items-center justify-center text-low hover:text-normal'
+        }
+        onClick={() => handleExecuteAction(Actions.ToggleCliMode)}
+        aria-label={getActionTooltip(Actions.ToggleCliMode, actionCtx)}
+      >
+        <TerminalWindowIcon
+          className="size-icon-sm"
+          weight={cliActive ? 'fill' : 'regular'}
+        />
+      </button>
+    );
+  }, [mobileMode, actionCtx, handleExecuteAction]);
+
   const rightEnd = useMemo(() => {
     if (mobileMode) {
       return undefined;
@@ -295,6 +323,7 @@ export function NavbarContainer({
       className={!mobileMode && isTauriMac() ? 'pl-16' : undefined}
       mobileMode={mobileMode}
       mobileUserSlot={mobileMode ? userPopover : undefined}
+      mobileActionsSlot={mobileActionsSlot}
       onOpenCommandBar={handleOpenCommandBar}
       onOpenSettings={handleOpenSettings}
       onNavigateBack={handleNavigateBack}
