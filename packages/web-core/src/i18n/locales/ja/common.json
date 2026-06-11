@@ -5,7 +5,9 @@
     "backToChat": "チャットに戻る",
     "agentRunningTitle": "Claude がプロンプトを処理しています",
     "agentRunningBody": "コーディングエージェントがチャットでこのタスクを実行中です。完了するとターミナルが同じ会話を引き継ぎます — ここでプロンプトを繰り返す必要はありません。",
-    "agentRunningViewChat": "チャットで進捗を見る"
+    "agentRunningViewChat": "チャットで進捗を見る",
+    "setupRunningTitle": "ワークスペースを準備しています",
+    "setupRunningBody": "セットアップスクリプトを実行中です。完了するとターミナルがプロンプトとともに開きます。"
   },
   "editorNames": {
     "custom": "カスタム"

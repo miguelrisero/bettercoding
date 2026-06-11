@@ -29,9 +29,13 @@ pub enum PtyCommand {
         /// claude's own session UUID to resume (the workspace's selected uix
         /// chat). When set, the bootstrap runs `claude --resume <id>` so CLI
         /// mode joins the *exact* conversation the chat UI is showing, and
-        /// follow-ups from either side share one transcript. `None` falls back
-        /// to `--continue` (most recent conversation in the worktree).
+        /// follow-ups from either side share one transcript.
         resume_session_id: Option<String>,
+        /// The workspace's initial prompt (CLI-first creation): handed to
+        /// interactive claude as its argument so the run happens visibly in
+        /// the terminal instead of a headless executor. Ignored when
+        /// `resume_session_id` is set.
+        initial_prompt: Option<String>,
     },
 }
 
@@ -57,17 +61,40 @@ pub enum PtyCommand {
 /// executor profile system (`ExecutorProfileId`) before growing any argument
 /// (model, flags, alternate agent CLIs) — do not bolt options onto
 /// `PtyCommand::TmuxCli` piecemeal.
-fn cli_bootstrap(resume_session_id: Option<&str>) -> String {
-    // Only interpolate a strict UUID into the shell string. claude session
-    // ids are UUIDs, so this both validates intent and forecloses shell
-    // injection via the id.
-    let resume = resume_session_id
-        .filter(|id| is_uuid(id))
-        .map(|id| format!(" --resume {id}"))
-        .unwrap_or_default();
-    format!(
-        r#"command -v claude >/dev/null 2>&1 && claude --dangerously-skip-permissions{resume}; exec "${{SHELL:-/bin/sh}}""#
-    )
+fn cli_bootstrap(resume_session_id: Option<&str>, initial_prompt: Option<&str>) -> String {
+    const BASE: &str = "claude --dangerously-skip-permissions";
+
+    // Only a strict UUID may be interpolated into the shell string. claude
+    // session ids are UUIDs, so this both validates intent and forecloses
+    // shell injection via the id.
+    let launch = if let Some(id) = resume_session_id.filter(|id| is_uuid(id)) {
+        format!("{BASE} --resume {id}")
+    } else if let Some(prompt) = initial_prompt.map(str::trim).filter(|p| !p.is_empty()) {
+        // CLI-first creation: the workspace prompt becomes claude's argument
+        // (single-quote escaped — the prompt is arbitrary user text). A
+        // leading space neutralizes prompts that start with '-' so they can
+        // never parse as flags.
+        let guarded = if prompt.starts_with('-') {
+            format!(" {prompt}")
+        } else {
+            prompt.to_string()
+        };
+        format!("{BASE} {}", shell_single_quote(&guarded))
+    } else {
+        // Nothing explicit to run: resume the most recent conversation in
+        // this cwd if one exists (a CLI-first workspace whose tmux session
+        // died), otherwise fall through to a fresh TUI — `--continue` exits
+        // non-zero when there is no conversation to continue.
+        format!("{BASE} --continue || {BASE}")
+    };
+
+    format!(r#"command -v claude >/dev/null 2>&1 && {launch}; exec "${{SHELL:-/bin/sh}}""#)
+}
+
+/// POSIX single-quote escaping: the only character that needs handling
+/// inside single quotes is the single quote itself.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Configuration for the embedded tmux server, written next to the app's
@@ -163,6 +190,32 @@ pub(crate) const CLI_TMUX_SOCKET: &str = "vibe-kanban";
 /// `simple()` (32 hex chars, no hyphens) avoids tmux-special characters.
 pub fn cli_tmux_session_name(workspace_id: Uuid) -> String {
     format!("vk_{}", workspace_id.simple())
+}
+
+/// Whether a workspace's CLI tmux session already exists. Lets the terminal
+/// route consume the parked initial prompt ONLY on the genuine first attach:
+/// reattaches (switch away/back) and post-tmux-death reconnects see no parked
+/// prompt and the bootstrap's `--continue` fallback takes over instead of
+/// replaying the prompt. `=` forces exact-name matching.
+pub async fn cli_tmux_session_exists(workspace_id: Uuid) -> bool {
+    if !tmux_available() {
+        return false;
+    }
+    let session_name = cli_tmux_session_name(workspace_id);
+    tokio::process::Command::new("tmux")
+        .args([
+            "-L",
+            CLI_TMUX_SOCKET,
+            "has-session",
+            "-t",
+            &format!("={session_name}"),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Inverse of [`cli_tmux_session_name`]: recover the workspace id from one of
@@ -300,12 +353,17 @@ impl PtyService {
 
             // CLI mode rides tmux when present; otherwise (and for the
             // default side terminal) spawn the user's shell directly.
-            let (tmux_session, tmux_resume_id) = match &command {
+            let (tmux_session, tmux_resume_id, tmux_initial_prompt) = match &command {
                 PtyCommand::TmuxCli {
                     session_name,
                     resume_session_id,
-                } if tmux_available() => (Some(session_name.clone()), resume_session_id.clone()),
-                _ => (None, None),
+                    initial_prompt,
+                } if tmux_available() => (
+                    Some(session_name.clone()),
+                    resume_session_id.clone(),
+                    initial_prompt.clone(),
+                ),
+                _ => (None, None, None),
             };
 
             // Never silently break the persistence promise: if CLI mode was
@@ -358,7 +416,10 @@ impl PtyService {
                 cmd.arg(session_name);
                 cmd.arg("-c");
                 cmd.arg(&working_dir);
-                cmd.arg(cli_bootstrap(tmux_resume_id.as_deref()));
+                cmd.arg(cli_bootstrap(
+                    tmux_resume_id.as_deref(),
+                    tmux_initial_prompt.as_deref(),
+                ));
                 cmd.cwd(&working_dir);
                 // No shell-specific prompt configuration for the tmux client.
                 (cmd, String::new())
@@ -588,7 +649,7 @@ mod tests {
 
     #[test]
     fn cli_bootstrap_runs_claude_then_drops_to_shell() {
-        let b = cli_bootstrap(None);
+        let b = cli_bootstrap(None, None);
         assert!(b.contains("command -v claude"));
         assert!(
             b.ends_with(r#"exec "${SHELL:-/bin/sh}""#),
@@ -597,22 +658,60 @@ mod tests {
     }
 
     #[test]
-    fn cli_bootstrap_resumes_valid_uuid_else_fresh() {
-        // A valid claude session UUID -> --resume <id>.
+    fn cli_bootstrap_resume_takes_precedence_and_rejects_non_uuids() {
+        // A valid claude session UUID -> --resume <id>, even if a prompt is
+        // also present (an existing conversation always wins).
         let id = "28b98f08-5f5f-4b1e-8c4e-41ae87c0c706";
-        let b = cli_bootstrap(Some(id));
+        let b = cli_bootstrap(Some(id), Some("do things"));
         assert!(b.contains(&format!("--resume {id}")));
-        // No id -> a fresh TUI: no --resume, and never --continue (which
-        // exits with "No conversation found to continue" on new worktrees).
-        let fresh = cli_bootstrap(None);
-        assert!(!fresh.contains("--resume"));
-        assert!(!fresh.contains("--continue"));
-        // Non-UUID (injection attempt) is rejected and never interpolated
-        // into the shell string.
+        assert!(!b.contains("do things"));
+        // Non-UUID (injection attempt) is rejected and never interpolated.
         let evil = "x; rm -rf ~";
-        let b = cli_bootstrap(Some(evil));
+        let b = cli_bootstrap(Some(evil), None);
         assert!(!b.contains("rm -rf"));
         assert!(!b.contains("--resume"));
+    }
+
+    #[test]
+    fn cli_bootstrap_passes_initial_prompt_injection_safe() {
+        let b = cli_bootstrap(None, Some("Fix the login bug"));
+        assert!(b.contains("claude --dangerously-skip-permissions 'Fix the login bug'"));
+
+        // Quotes and shell metacharacters stay inert inside the quoting.
+        let evil = "'; rm -rf ~; echo '";
+        let b = cli_bootstrap(None, Some(evil));
+        // The single quotes in the prompt are escaped as '\'' — the raw
+        // sequence `'; rm` can therefore never terminate the quoting.
+        assert!(b.contains(r"'"), "quotes must be escaped: {b}");
+        assert!(!b.contains("&& rm"), "injection must not escape: {b}");
+
+        // A prompt starting with '-' is space-guarded so claude can't parse
+        // it as a flag.
+        let dashy = cli_bootstrap(None, Some("-rf is a flag-looking prompt"));
+        assert!(dashy.contains("' -rf is a flag-looking prompt'"));
+
+        // Blank prompts fall through to the no-prompt path.
+        let blank = cli_bootstrap(None, Some("   "));
+        assert!(blank.contains("--continue || claude"));
+    }
+
+    #[test]
+    fn cli_bootstrap_falls_back_to_continue_then_fresh() {
+        // With nothing explicit to run: resume the cwd's latest conversation
+        // when one exists (CLI-first workspace after tmux death), else a
+        // fresh TUI — never a stranded "No conversation found" pane.
+        let b = cli_bootstrap(None, None);
+        assert!(b.contains(
+            "claude --dangerously-skip-permissions --continue || claude --dangerously-skip-permissions"
+        ));
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_quotes() {
+        assert_eq!(shell_single_quote("plain"), "'plain'");
+        // POSIX rule: close the quote, emit an escaped quote, reopen.
+        assert_eq!(shell_single_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_single_quote("''"), r"''\'''\'''");
     }
 
     #[test]

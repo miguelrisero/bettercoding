@@ -5,7 +5,9 @@
     "backToChat": "返回聊天",
     "agentRunningTitle": "Claude 正在处理你的提示",
     "agentRunningBody": "编码代理正在聊天中执行此任务。完成后终端将接管同一会话 — 无需在此重复提示。",
-    "agentRunningViewChat": "在聊天中查看进度"
+    "agentRunningViewChat": "在聊天中查看进度",
+    "setupRunningTitle": "正在准备工作区",
+    "setupRunningBody": "安装脚本正在运行。完成后终端将带着你的提示打开。"
   },
   "editorNames": {
     "custom": "自定义"

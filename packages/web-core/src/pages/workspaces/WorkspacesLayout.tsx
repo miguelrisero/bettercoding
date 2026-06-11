@@ -257,6 +257,10 @@ export function WorkspacesLayout() {
                     activeWorkspaces.find((w) => w.id === selectedWorkspace.id)
                       ?.isExecutorRunning ?? false
                   }
+                  codingAgentRunning={
+                    activeWorkspaces.find((w) => w.id === selectedWorkspace.id)
+                      ?.isCodingAgentRunning ?? false
+                  }
                 />
               ) : (
                 <WorkspacesMainContainer
@@ -395,6 +399,11 @@ export function WorkspacesLayout() {
                       activeWorkspaces.find(
                         (w) => w.id === selectedWorkspace.id
                       )?.isExecutorRunning ?? false
+                    }
+                    codingAgentRunning={
+                      activeWorkspaces.find(
+                        (w) => w.id === selectedWorkspace.id
+                      )?.isCodingAgentRunning ?? false
                     }
                   />
                 ) : (

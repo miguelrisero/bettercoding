@@ -12,7 +12,7 @@ use db::models::{
     workspace::Workspace, workspace_repo::WorkspaceRepo,
 };
 use deployment::Deployment;
-use local_deployment::pty::{PtyCommand, cli_tmux_session_name};
+use local_deployment::pty::{PtyCommand, cli_tmux_session_exists, cli_tmux_session_name};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -157,11 +157,33 @@ async fn terminal_ws(
                 None => None,
             };
 
+            // CLI-first creation parks the workspace's initial prompt on the
+            // session; consume it here so the tmux bootstrap runs claude with
+            // it directly. Only on the genuine FIRST attach (no tmux session
+            // yet) — reattaches and post-death reconnects must not replay it,
+            // and consuming only when we are the ones about to create the
+            // session keeps consume and create on the same connection (the
+            // bootstrap that runs is the one that carries the prompt). An
+            // existing resumable conversation always wins over a parked
+            // prompt.
+            let initial_prompt = match &session {
+                Some(s)
+                    if resume_session_id.is_none()
+                        && !cli_tmux_session_exists(query.workspace_id).await =>
+                {
+                    Session::take_pending_cli_prompt(pool, s.id)
+                        .await
+                        .unwrap_or_default()
+                }
+                _ => None,
+            };
+
             (
                 dir,
                 PtyCommand::TmuxCli {
                     session_name: cli_tmux_session_name(query.workspace_id),
                     resume_session_id,
+                    initial_prompt,
                 },
             )
         }

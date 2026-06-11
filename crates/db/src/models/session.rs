@@ -190,6 +190,53 @@ impl Session {
         Ok(Some(path.to_string_lossy().to_string()))
     }
 
+    /// Park the workspace's initial prompt for the CLI terminal (CLI-first
+    /// creation: the headless executor never runs it; the tmux bootstrap
+    /// hands it to interactive claude instead). Deliberately NOT part of the
+    /// `Session` struct — it's transport between creation and first terminal
+    /// attach, not session state worth serializing to clients.
+    pub async fn set_pending_cli_prompt(
+        pool: &SqlitePool,
+        id: Uuid,
+        prompt: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            r#"UPDATE sessions SET pending_cli_prompt = $1 WHERE id = $2"#,
+            prompt,
+            id
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Consume the parked CLI prompt: read it, then clear it. A concurrent
+    /// double-read is harmless — only the FIRST terminal attach creates the
+    /// tmux session, and `-A` reattaches ignore the bootstrap entirely.
+    pub async fn take_pending_cli_prompt(
+        pool: &SqlitePool,
+        id: Uuid,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let prompt: Option<String> = sqlx::query_scalar!(
+            r#"SELECT pending_cli_prompt FROM sessions WHERE id = $1"#,
+            id
+        )
+        .fetch_optional(pool)
+        .await?
+        .flatten();
+
+        if prompt.is_some() {
+            sqlx::query!(
+                r#"UPDATE sessions SET pending_cli_prompt = NULL WHERE id = $1"#,
+                id
+            )
+            .execute(pool)
+            .await?;
+        }
+
+        Ok(prompt)
+    }
+
     pub async fn update(
         pool: &SqlitePool,
         id: Uuid,
