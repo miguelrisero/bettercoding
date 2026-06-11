@@ -60,7 +60,7 @@
       "defaultType": "Sous-agent"
     },
     "loadingEarlierMessages": "Chargement des messages précédents",
-    "cliEmptyTitle": "Cet espace de travail s'exécute dans le terminal",
+    "cliEmptyTitle": "Cet espace de travail s'exécute généralement dans le terminal",
     "cliEmptyDescription": "Les nouveaux espaces de travail démarrent dans la CLI. Ouvrez le terminal pour voir et poursuivre la conversation, ou envoyez un message ici pour utiliser le chat.",
     "cliEmptyAction": "Ouvrir le terminal"
   },

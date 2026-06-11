@@ -73,7 +73,7 @@
       "defaultType": "서브에이전트"
     },
     "loadingEarlierMessages": "이전 메시지 불러오는 중",
-    "cliEmptyTitle": "이 워크스페이스는 터미널에서 실행됩니다",
+    "cliEmptyTitle": "이 워크스페이스는 보통 터미널에서 실행됩니다",
     "cliEmptyDescription": "새 워크스페이스는 CLI에서 시작됩니다. 터미널을 열어 대화를 확인하고 이어가거나, 여기에 메시지를 보내 채팅을 사용하세요.",
     "cliEmptyAction": "터미널 열기"
   },

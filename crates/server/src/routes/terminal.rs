@@ -12,7 +12,9 @@ use db::models::{
     workspace::Workspace, workspace_repo::WorkspaceRepo,
 };
 use deployment::Deployment;
-use local_deployment::pty::{PtyCommand, cli_tmux_session_exists, cli_tmux_session_name};
+use local_deployment::pty::{
+    PtyCommand, cli_tmux_available, cli_tmux_session_exists, cli_tmux_session_name,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -173,14 +175,33 @@ async fn terminal_ws(
             // the same prompt are safe (whichever wins `new-session` carries
             // it; the loser's `-A` reattach ignores its bootstrap). An
             // existing resumable conversation always wins over a parked prompt.
+            //
+            // Gate on tmux availability: with tmux down, CLI mode degrades to
+            // an ephemeral shell that can't run claude, so the bootstrap would
+            // never deliver the prompt — peeking+clearing it would lose it.
+            // Since availability is process-cached, `true` here means
+            // `create_session` also takes the tmux branch, so a successful
+            // spawn really did carry the prompt into a tmux session.
             let initial_prompt = match &session {
                 Some(s)
                     if resume_session_id.is_none()
+                        && cli_tmux_available()
                         && !cli_tmux_session_exists(query.workspace_id).await =>
                 {
-                    Session::peek_pending_cli_prompt(pool, s.id)
-                        .await
-                        .unwrap_or_default()
+                    match Session::peek_pending_cli_prompt(pool, s.id).await {
+                        Ok(prompt) => prompt,
+                        Err(e) => {
+                            // The prompt is not lost — it stays parked and the
+                            // next attach re-peeks — but a transient DB error
+                            // here delays delivery, so make it observable.
+                            tracing::warn!(
+                                "Failed to read pending CLI prompt for session {}: {}",
+                                s.id,
+                                e
+                            );
+                            None
+                        }
+                    }
                 }
                 _ => None,
             };
@@ -262,9 +283,17 @@ async fn handle_terminal_ws(
 
     // The tmux session is now created and its bootstrap (carrying the parked
     // CLI prompt) is running; only now is it safe to clear the prompt, so a
-    // failure before this point leaves it parked for the next attach.
-    if let Some(session_id) = prompt_session_to_clear {
-        let _ = Session::clear_pending_cli_prompt(&deployment.db().pool, session_id).await;
+    // failure before this point leaves it parked for the next attach. If the
+    // clear itself fails the prompt stays parked and a later attach (after a
+    // tmux death) could replay it — narrow, but log so it's observable.
+    if let Some(session_id) = prompt_session_to_clear
+        && let Err(e) = Session::clear_pending_cli_prompt(&deployment.db().pool, session_id).await
+    {
+        tracing::warn!(
+            "Failed to clear delivered CLI prompt for session {}: {}",
+            session_id,
+            e
+        );
     }
 
     let pty_service = deployment.pty().clone();

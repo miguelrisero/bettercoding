@@ -60,7 +60,7 @@
       "defaultType": "子代理"
     },
     "loadingEarlierMessages": "正在加载早期消息",
-    "cliEmptyTitle": "此工作区在终端中运行",
+    "cliEmptyTitle": "此工作区通常在终端中运行",
     "cliEmptyDescription": "新工作区从 CLI 开始。打开终端查看并继续对话，或在此发送消息以使用聊天。",
     "cliEmptyAction": "打开终端"
   },

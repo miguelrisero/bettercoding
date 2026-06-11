@@ -65,7 +65,7 @@
       "defaultType": "Subagent"
     },
     "loadingEarlierMessages": "Loading earlier messages",
-    "cliEmptyTitle": "This workspace runs in the terminal",
+    "cliEmptyTitle": "This workspace usually runs in the terminal",
     "cliEmptyDescription": "New workspaces start in the CLI. Open the terminal to see and continue the conversation — or send a message here to use chat instead.",
     "cliEmptyAction": "Open terminal"
   },

@@ -73,7 +73,7 @@
       "defaultType": "Subagente"
     },
     "loadingEarlierMessages": "Cargando mensajes anteriores",
-    "cliEmptyTitle": "Este workspace se ejecuta en la terminal",
+    "cliEmptyTitle": "Este workspace normalmente se ejecuta en la terminal",
     "cliEmptyDescription": "Los nuevos workspaces empiezan en la CLI. Abre la terminal para ver y continuar la conversación, o envía un mensaje aquí para usar el chat.",
     "cliEmptyAction": "Abrir terminal"
   },

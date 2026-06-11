@@ -52,6 +52,15 @@ interface ConversationListProps {
   repos?: RepoWithTargetBranch[];
   onAtBottomChange?: (atBottom: boolean) => void;
   sessionScopeId?: string;
+  /**
+   * Whether this surface can switch to the CLI pane. Only the workspaces
+   * shell (desktop + mobile) renders CliMainPane, so only it gets the
+   * CLI-aware empty state with an "Open terminal" button. Surfaces without a
+   * terminal (e.g. the VS Code webview page) leave this false and fall back
+   * to the generic empty state — otherwise "Open terminal" would be a dead
+   * no-op there.
+   */
+  cliAvailable?: boolean;
 }
 
 export interface ConversationListHandle {
@@ -150,7 +159,13 @@ export const ConversationList = forwardRef<
   ConversationListHandle,
   ConversationListProps
 >(function ConversationList(
-  { attempt, repos: reposProp = [], onAtBottomChange, sessionScopeId },
+  {
+    attempt,
+    repos: reposProp = [],
+    onAtBottomChange,
+    sessionScopeId,
+    cliAvailable = false,
+  },
   ref
 ) {
   const { t } = useTranslation('common');
@@ -816,25 +831,39 @@ export const ConversationList = forwardRef<
 
           {showEmptyState && (
             <div className="flex min-h-full items-center justify-center px-double py-12">
-              {/* CLI is the default main pane and new workspaces run their
-                  prompt in the terminal, so an empty chat usually means the
-                  conversation lives in the CLI — not that nothing happened.
-                  Point the user there instead of the old "send a message"
-                  dead-end, while still allowing chat. */}
-              <ChatEmptyState
-                icon={<TerminalWindowIcon className="size-6" />}
-                title={t('conversation.cliEmptyTitle', {
-                  defaultValue: 'This workspace runs in the terminal',
-                })}
-                description={t('conversation.cliEmptyDescription', {
-                  defaultValue:
-                    'New workspaces start in the CLI. Open the terminal to see and continue the conversation — or send a message here to use chat instead.',
-                })}
-                actionLabel={t('conversation.cliEmptyAction', {
-                  defaultValue: 'Open terminal',
-                })}
-                onAction={openCliPane}
-              />
+              {cliAvailable ? (
+                // CLI is the default main pane and new workspaces run their
+                // prompt in the terminal, so an empty chat here usually means
+                // the conversation lives in the CLI — not that nothing
+                // happened. Point the user there instead of the old "send a
+                // message" dead-end, while still allowing chat. Only on
+                // surfaces that can actually open the terminal (see
+                // cliAvailable).
+                <ChatEmptyState
+                  icon={<TerminalWindowIcon className="size-6" />}
+                  title={t('conversation.cliEmptyTitle', {
+                    defaultValue: 'This workspace usually runs in the terminal',
+                  })}
+                  description={t('conversation.cliEmptyDescription', {
+                    defaultValue:
+                      'New workspaces start in the CLI. Open the terminal to see and continue the conversation — or send a message here to use chat instead.',
+                  })}
+                  actionLabel={t('conversation.cliEmptyAction', {
+                    defaultValue: 'Open terminal',
+                  })}
+                  onAction={openCliPane}
+                />
+              ) : (
+                <ChatEmptyState
+                  title={t('conversation.emptyTitle', {
+                    defaultValue: 'Send a message to start the conversation.',
+                  })}
+                  description={t('conversation.emptyDescription', {
+                    defaultValue:
+                      'Your workspace conversation will appear here once a new turn starts.',
+                  })}
+                />
+              )}
             </div>
           )}
 

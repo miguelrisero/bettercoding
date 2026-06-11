@@ -218,6 +218,16 @@ pub async fn cli_tmux_session_exists(workspace_id: Uuid) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether CLI mode can actually run claude in a tmux session (vs. degrading
+/// to an ephemeral shell). The terminal route uses this to decide whether to
+/// deliver+clear a parked CLI-first prompt: with tmux down the bootstrap
+/// can't hand the prompt to claude, so the prompt must stay parked rather
+/// than be cleared into the void. Because the result is process-cached, a
+/// `true` here guarantees `create_session` also takes the tmux branch.
+pub fn cli_tmux_available() -> bool {
+    tmux_available()
+}
+
 /// Inverse of [`cli_tmux_session_name`]: recover the workspace id from one of
 /// our tmux session names. Returns `None` for anything outside the `vk_`
 /// namespace (e.g. a user-created session on the same socket).
