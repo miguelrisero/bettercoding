@@ -59,7 +59,10 @@
     "subagent": {
       "defaultType": "Sous-agent"
     },
-    "loadingEarlierMessages": "Chargement des messages précédents"
+    "loadingEarlierMessages": "Chargement des messages précédents",
+    "cliEmptyTitle": "Cet espace de travail s'exécute dans le terminal",
+    "cliEmptyDescription": "Les nouveaux espaces de travail démarrent dans la CLI. Ouvrez le terminal pour voir et poursuivre la conversation, ou envoyez un message ici pour utiliser le chat.",
+    "cliEmptyAction": "Ouvrir le terminal"
   },
   "folderPicker": {
     "legend": "Cliquez sur les noms de dossiers pour naviguer • Utilisez les boutons d'action pour sélectionner",

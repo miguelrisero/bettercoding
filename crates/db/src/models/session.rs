@@ -210,31 +210,38 @@ impl Session {
         Ok(())
     }
 
-    /// Consume the parked CLI prompt: read it, then clear it. A concurrent
-    /// double-read is harmless — only the FIRST terminal attach creates the
-    /// tmux session, and `-A` reattaches ignore the bootstrap entirely.
-    pub async fn take_pending_cli_prompt(
+    /// Read the parked CLI prompt WITHOUT clearing it. The clear is deferred
+    /// to [`clear_pending_cli_prompt`] after the tmux session is confirmed
+    /// created, so a failure between attach and spawn can't destroy the
+    /// user's only copy of their prompt, and two racing first-attaches that
+    /// both peek the same prompt are harmless — whichever wins `new-session`
+    /// carries it (the loser's `-A` reattach ignores its bootstrap).
+    pub async fn peek_pending_cli_prompt(
         pool: &SqlitePool,
         id: Uuid,
     ) -> Result<Option<String>, sqlx::Error> {
-        let prompt: Option<String> = sqlx::query_scalar!(
+        Ok(sqlx::query_scalar!(
             r#"SELECT pending_cli_prompt FROM sessions WHERE id = $1"#,
             id
         )
         .fetch_optional(pool)
         .await?
-        .flatten();
+        .flatten())
+    }
 
-        if prompt.is_some() {
-            sqlx::query!(
-                r#"UPDATE sessions SET pending_cli_prompt = NULL WHERE id = $1"#,
-                id
-            )
-            .execute(pool)
-            .await?;
-        }
-
-        Ok(prompt)
+    /// Clear the parked CLI prompt once it has been delivered to a freshly
+    /// created tmux session. Idempotent and atomic (a single guarded UPDATE),
+    /// so a double-call from racing attaches is a no-op.
+    pub async fn clear_pending_cli_prompt(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            r#"UPDATE sessions
+               SET pending_cli_prompt = NULL
+               WHERE id = $1 AND pending_cli_prompt IS NOT NULL"#,
+            id
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn update(

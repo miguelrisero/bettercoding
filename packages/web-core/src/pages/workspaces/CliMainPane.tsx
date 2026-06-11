@@ -83,10 +83,15 @@ export function CliMainPane({
       </div>
       <div className="flex-1 min-h-0 border-t border-border">
         {executorRunning ? (
-          <div className="h-full flex flex-col items-center justify-center gap-3 px-8 text-center">
+          <div
+            role="status"
+            aria-live="polite"
+            className="h-full flex flex-col items-center justify-center gap-3 px-8 text-center"
+          >
             <CircleNotchIcon
-              className="size-6 animate-spin text-low"
+              className="size-6 animate-spin motion-reduce:animate-none text-low"
               weight="bold"
+              aria-hidden="true"
             />
             <p className="text-sm font-medium text-normal">
               {codingAgentRunning

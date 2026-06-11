@@ -59,7 +59,10 @@
     "subagent": {
       "defaultType": "子代理"
     },
-    "loadingEarlierMessages": "正在載入先前的訊息"
+    "loadingEarlierMessages": "正在載入先前的訊息",
+    "cliEmptyTitle": "此工作區在終端機中執行",
+    "cliEmptyDescription": "新工作區從 CLI 開始。開啟終端機查看並繼續對話，或在此傳送訊息以使用聊天。",
+    "cliEmptyAction": "開啟終端機"
   },
   "folderPicker": {
     "legend": "點擊資料夾名稱進行導覽 • 使用操作按鈕進行選擇",
