@@ -1044,6 +1044,103 @@ pub trait ContainerService {
         }
     }
 
+    /// CLI-first start: create the worktree and session, run setup scripts,
+    /// and PARK the prompt for the workspace's CLI terminal instead of
+    /// spawning a headless coding agent. The tmux bootstrap hands the prompt
+    /// to interactive claude on first attach, so the whole run happens
+    /// visibly in the terminal. (`start_workspace` below remains the
+    /// headless path, used by MCP/automation.)
+    async fn start_workspace_cli(
+        &self,
+        workspace: &Workspace,
+        prompt: String,
+    ) -> Result<Option<ExecutionProcess>, ContainerError> {
+        self.create(workspace).await?;
+
+        let repos = WorkspaceRepo::find_repos_for_workspace(&self.db().pool, workspace.id).await?;
+
+        let workspace = Workspace::find_by_id(&self.db().pool, workspace.id)
+            .await?
+            .ok_or(SqlxError::RowNotFound)?;
+
+        let session = Session::create(
+            &self.db().pool,
+            &CreateSession {
+                executor: Some(executors::executors::BaseCodingAgent::ClaudeCode.to_string()),
+                name: None,
+            },
+            Uuid::new_v4(),
+            workspace.id,
+        )
+        .await?;
+
+        Session::set_pending_cli_prompt(&self.db().pool, session.id, &prompt).await?;
+
+        // Setup scripts still run exactly as before — the CLI pane holds the
+        // terminal back (is_executor_running gate) until they finish, then
+        // claude starts in a fully prepared worktree.
+        let repos_with_setup: Vec<_> = repos.iter().filter(|r| r.setup_script.is_some()).collect();
+        if repos_with_setup.is_empty() {
+            return Ok(None);
+        }
+
+        let all_parallel = repos_with_setup.iter().all(|r| r.parallel_setup_script);
+        let mut first_process = None;
+
+        if all_parallel {
+            for repo in &repos_with_setup {
+                if let Some(action) = Self::setup_action_for_repo(repo) {
+                    match self
+                        .start_execution(
+                            &workspace,
+                            &session,
+                            &action,
+                            &ExecutionProcessRunReason::SetupScript,
+                        )
+                        .await
+                    {
+                        Ok(process) => {
+                            first_process.get_or_insert(process);
+                        }
+                        Err(e) => {
+                            tracing::warn!(?e, "Failed to start setup script in parallel mode");
+                        }
+                    }
+                }
+            }
+        } else {
+            // Chain all setups sequentially; unlike the headless path there
+            // is no coding-agent tail, so the last setup ends the chain.
+            let mut chained: Option<ExecutorAction> = None;
+            for repo in repos_with_setup.iter().rev() {
+                if let Some(script) = &repo.setup_script {
+                    chained = Some(ExecutorAction::new(
+                        ExecutorActionType::ScriptRequest(ScriptRequest {
+                            script: script.clone(),
+                            language: ScriptRequestLanguage::Bash,
+                            context: ScriptContext::SetupScript,
+                            working_dir: Some(repo.name.clone()),
+                        }),
+                        chained.take().map(Box::new),
+                    ));
+                }
+            }
+            if let Some(main_action) = chained {
+                first_process = Some(
+                    self.start_execution(
+                        &workspace,
+                        &session,
+                        &main_action,
+                        &ExecutionProcessRunReason::SetupScript,
+                    )
+                    .await?,
+                );
+            }
+        }
+
+        Ok(first_process)
+    }
+
     async fn start_workspace(
         &self,
         workspace: &Workspace,

@@ -214,6 +214,10 @@ export const WorkspacesMainContainer = forwardRef<
             repos={repos}
             onAtBottomChange={handleAtBottomChange}
             sessionScopeId={selectedSessionId}
+            // The workspaces shell can switch to the CLI pane, so its empty
+            // chat offers "Open terminal" (the VS Code page, which renders
+            // ConversationList without a terminal, omits this).
+            cliAvailable
           />
         </RetryUiProvider>
       </div>

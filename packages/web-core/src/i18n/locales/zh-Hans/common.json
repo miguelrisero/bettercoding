@@ -5,7 +5,9 @@
     "backToChat": "返回聊天",
     "agentRunningTitle": "Claude 正在处理你的提示",
     "agentRunningBody": "编码代理正在聊天中执行此任务。完成后终端将接管同一会话 — 无需在此重复提示。",
-    "agentRunningViewChat": "在聊天中查看进度"
+    "agentRunningViewChat": "在聊天中查看进度",
+    "setupRunningTitle": "正在准备工作区",
+    "setupRunningBody": "安装脚本正在运行。完成后终端将带着你的提示打开。"
   },
   "editorNames": {
     "custom": "自定义"
@@ -57,7 +59,10 @@
     "subagent": {
       "defaultType": "子代理"
     },
-    "loadingEarlierMessages": "正在加载早期消息"
+    "loadingEarlierMessages": "正在加载早期消息",
+    "cliEmptyTitle": "此工作区通常在终端中运行",
+    "cliEmptyDescription": "新工作区从 CLI 开始。打开终端查看并继续对话，或在此发送消息以使用聊天。",
+    "cliEmptyAction": "打开终端"
   },
   "folderPicker": {
     "legend": "点击文件夹名称进行导航 • 使用操作按钮进行选择",

@@ -41,7 +41,9 @@ pub struct CreateAndStartWorkspaceRequest {
 #[derive(Debug, Serialize, Deserialize, TS)]
 pub struct CreateAndStartWorkspaceResponse {
     pub workspace: Workspace,
-    pub execution_process: ExecutionProcess,
+    /// CLI-first creation only spawns a process when a setup script runs;
+    /// the initial prompt itself executes in the workspace's CLI terminal.
+    pub execution_process: Option<ExecutionProcess>,
 }
 
 #[derive(Debug, Serialize, Deserialize, TS)]

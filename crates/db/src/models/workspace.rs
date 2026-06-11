@@ -66,6 +66,11 @@ pub struct WorkspaceWithStatus {
     /// conversation (resuming a session mid-write would fork it).
     #[serde(default)]
     pub is_executor_running: bool,
+    /// Specifically a CODING AGENT process is running (vs. setup/cleanup
+    /// scripts). Lets the CLI gate phrase itself correctly: "claude is
+    /// working in chat" vs "preparing the workspace".
+    #[serde(default)]
+    pub is_coding_agent_running: bool,
     pub is_errored: bool,
 }
 
@@ -548,6 +553,16 @@ impl Workspace {
                     LIMIT 1
                 ) THEN 1 ELSE 0 END AS "is_executor_running!: i64",
 
+                CASE WHEN EXISTS (
+                    SELECT 1
+                    FROM sessions s
+                    JOIN execution_processes ep ON ep.session_id = s.id
+                    WHERE s.workspace_id = w.id
+                      AND ep.status = 'running'
+                      AND ep.run_reason = 'codingagent'
+                    LIMIT 1
+                ) THEN 1 ELSE 0 END AS "is_coding_agent_running!: i64",
+
                 CASE WHEN (
                     SELECT ep.status
                     FROM sessions s
@@ -582,6 +597,7 @@ impl Workspace {
                 },
                 is_running: rec.is_running != 0,
                 is_executor_running: rec.is_executor_running != 0,
+                is_coding_agent_running: rec.is_coding_agent_running != 0,
                 is_errored: rec.is_errored != 0,
             })
             // Apply archived filter if provided
@@ -659,6 +675,16 @@ impl Workspace {
                     LIMIT 1
                 ) THEN 1 ELSE 0 END AS "is_executor_running!: i64",
 
+                CASE WHEN EXISTS (
+                    SELECT 1
+                    FROM sessions s
+                    JOIN execution_processes ep ON ep.session_id = s.id
+                    WHERE s.workspace_id = w.id
+                      AND ep.status = 'running'
+                      AND ep.run_reason = 'codingagent'
+                    LIMIT 1
+                ) THEN 1 ELSE 0 END AS "is_coding_agent_running!: i64",
+
                 CASE WHEN (
                     SELECT ep.status
                     FROM sessions s
@@ -696,6 +722,7 @@ impl Workspace {
             },
             is_running: rec.is_running != 0,
             is_executor_running: rec.is_executor_running != 0,
+            is_coding_agent_running: rec.is_coding_agent_running != 0,
             is_errored: rec.is_errored != 0,
         };
 

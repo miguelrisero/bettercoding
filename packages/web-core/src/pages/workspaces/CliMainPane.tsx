@@ -22,14 +22,20 @@ interface CliMainPaneProps {
    */
   sessionsReady?: boolean;
   /**
-   * An executor process (setup script / coding agent) is running right now —
-   * typically the just-created workspace's initial prompt. The terminal is
-   * held back behind a notice: attaching would bake a session-less bootstrap
-   * into tmux (fresh TUI instead of the conversation) and invite working the
-   * same prompt twice in chat and CLI. When the run finishes this flips via
-   * the workspace stream and the terminal mounts with the proper resume.
+   * An executor process (setup script / coding agent) is running right now.
+   * The terminal is held back behind a notice: attaching would bake a
+   * premature bootstrap into tmux and (for agent runs) invite working the
+   * same conversation twice in chat and CLI. When the run finishes this
+   * flips via the workspace stream and the terminal mounts with the proper
+   * resume or the parked CLI-first prompt.
    */
   executorRunning?: boolean;
+  /**
+   * The running process is specifically a coding agent (chat follow-up) as
+   * opposed to a setup/cleanup script — switches the gate copy between
+   * "claude is working in chat" and "preparing the workspace".
+   */
+  codingAgentRunning?: boolean;
 }
 
 /**
@@ -47,6 +53,7 @@ export function CliMainPane({
   sessionId,
   sessionsReady = true,
   executorRunning = false,
+  codingAgentRunning = false,
 }: CliMainPaneProps) {
   const { t } = useTranslation('common');
   const { closeTab } = useTerminal();
@@ -76,25 +83,36 @@ export function CliMainPane({
       </div>
       <div className="flex-1 min-h-0 border-t border-border">
         {executorRunning ? (
-          <div className="h-full flex flex-col items-center justify-center gap-3 px-8 text-center">
+          <div
+            role="status"
+            aria-live="polite"
+            className="h-full flex flex-col items-center justify-center gap-3 px-8 text-center"
+          >
             <CircleNotchIcon
-              className="size-6 animate-spin text-low"
+              className="size-6 animate-spin motion-reduce:animate-none text-low"
               weight="bold"
+              aria-hidden="true"
             />
             <p className="text-sm font-medium text-normal">
-              {t('cliMode.agentRunningTitle')}
+              {codingAgentRunning
+                ? t('cliMode.agentRunningTitle')
+                : t('cliMode.setupRunningTitle')}
             </p>
             <p className="text-xs text-low max-w-md">
-              {t('cliMode.agentRunningBody')}
+              {codingAgentRunning
+                ? t('cliMode.agentRunningBody')
+                : t('cliMode.setupRunningBody')}
             </p>
-            <button
-              type="button"
-              onClick={onBackToChat}
-              className="mt-1 flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs text-normal hover:bg-primary transition-colors"
-            >
-              <ChatsTeardropIcon className="size-icon-sm" weight="bold" />
-              {t('cliMode.agentRunningViewChat')}
-            </button>
+            {codingAgentRunning && (
+              <button
+                type="button"
+                onClick={onBackToChat}
+                className="mt-1 flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs text-normal hover:bg-primary transition-colors"
+              >
+                <ChatsTeardropIcon className="size-icon-sm" weight="bold" />
+                {t('cliMode.agentRunningViewChat')}
+              </button>
+            )}
           </div>
         ) : (
           sessionsReady && (

@@ -295,9 +295,13 @@ pub async fn create_and_start_workspace(
     let workspace = managed_workspace.workspace.clone();
     tracing::info!("Created workspace {}", workspace.id);
 
+    // CLI-first: the prompt is parked for the workspace's CLI terminal and
+    // runs in interactive claude there; only setup scripts (if any) spawn a
+    // headless process. The chat-driven path (`start_workspace`) remains for
+    // MCP/automation callers.
     let execution_process = deployment
         .container()
-        .start_workspace(&workspace, executor_config.clone(), workspace_prompt)
+        .start_workspace_cli(&workspace, workspace_prompt)
         .await?;
 
     deployment

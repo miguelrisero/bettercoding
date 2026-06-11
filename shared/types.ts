@@ -177,7 +177,13 @@ is_running: boolean,
  * pane uses this to hold off attaching while the chat agent owns the
  * conversation (resuming a session mid-write would fork it).
  */
-is_executor_running: boolean, is_errored: boolean, id: string, task_id: string | null, container_ref: string | null, branch: string, setup_completed_at: string | null, created_at: string, updated_at: string, archived: boolean, pinned: boolean, name: string | null, worktree_deleted: boolean, };
+is_executor_running: boolean, 
+/**
+ * Specifically a CODING AGENT process is running (vs. setup/cleanup
+ * scripts). Lets the CLI gate phrase itself correctly: "claude is
+ * working in chat" vs "preparing the workspace".
+ */
+is_coding_agent_running: boolean, is_errored: boolean, id: string, task_id: string | null, container_ref: string | null, branch: string, setup_completed_at: string | null, created_at: string, updated_at: string, archived: boolean, pinned: boolean, name: string | null, worktree_deleted: boolean, };
 
 export type Session = { id: string, workspace_id: string, name: string | null, executor: string | null, agent_working_dir: string | null, created_at: string, updated_at: string, };
 
@@ -423,7 +429,12 @@ export type GetPrCommentsQuery = { repo_id: string, };
 
 export type CreateAndStartWorkspaceRequest = { name: string | null, repos: Array<WorkspaceRepoInput>, linked_issue: LinkedIssueInfo | null, executor_config: ExecutorConfig, prompt: string, attachment_ids: Array<string> | null, };
 
-export type CreateAndStartWorkspaceResponse = { workspace: Workspace, execution_process: ExecutionProcess, };
+export type CreateAndStartWorkspaceResponse = { workspace: Workspace, 
+/**
+ * CLI-first creation only spawns a process when a setup script runs;
+ * the initial prompt itself executes in the workspace's CLI terminal.
+ */
+execution_process: ExecutionProcess | null, };
 
 export type UnifiedPrComment = { "comment_type": "general", id: string, author: string, author_association: string | null, body: string, created_at: string, url: string | null, } | { "comment_type": "review", id: bigint, author: string, author_association: string | null, body: string, created_at: string, url: string | null, path: string, line: bigint | null, side: string | null, diff_hunk: string | null, };
 

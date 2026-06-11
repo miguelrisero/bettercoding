@@ -5,7 +5,9 @@
     "backToChat": "チャットに戻る",
     "agentRunningTitle": "Claude がプロンプトを処理しています",
     "agentRunningBody": "コーディングエージェントがチャットでこのタスクを実行中です。完了するとターミナルが同じ会話を引き継ぎます — ここでプロンプトを繰り返す必要はありません。",
-    "agentRunningViewChat": "チャットで進捗を見る"
+    "agentRunningViewChat": "チャットで進捗を見る",
+    "setupRunningTitle": "ワークスペースを準備しています",
+    "setupRunningBody": "セットアップスクリプトを実行中です。完了するとターミナルがプロンプトとともに開きます。"
   },
   "editorNames": {
     "custom": "カスタム"
@@ -70,7 +72,10 @@
     "subagent": {
       "defaultType": "サブエージェント"
     },
-    "loadingEarlierMessages": "以前のメッセージを読み込み中"
+    "loadingEarlierMessages": "以前のメッセージを読み込み中",
+    "cliEmptyTitle": "このワークスペースは通常ターミナルで実行されます",
+    "cliEmptyDescription": "新しいワークスペースは CLI で開始します。ターミナルを開いて会話を確認・継続するか、ここにメッセージを送信してチャットを使用してください。",
+    "cliEmptyAction": "ターミナルを開く"
   },
   "language": {
     "browserDefault": "ブラウザ設定"

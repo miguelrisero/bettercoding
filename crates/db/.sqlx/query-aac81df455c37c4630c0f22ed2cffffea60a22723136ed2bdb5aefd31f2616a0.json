@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT pending_cli_prompt FROM sessions WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "name": "pending_cli_prompt",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "aac81df455c37c4630c0f22ed2cffffea60a22723136ed2bdb5aefd31f2616a0"
+}

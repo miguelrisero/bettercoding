@@ -25,6 +25,8 @@ export interface SidebarWorkspace {
   isRunning?: boolean;
   /** An executor process (setup/cleanup/coding agent) is running right now. */
   isExecutorRunning?: boolean;
+  /** Specifically a coding-agent process (not just setup/cleanup scripts). */
+  isCodingAgentRunning?: boolean;
   isPinned?: boolean;
   isArchived?: boolean;
   hasPendingApproval?: boolean;
@@ -72,6 +74,7 @@ function toSidebarWorkspace(
     // Real data from stream
     isRunning: ws.is_running,
     isExecutorRunning: ws.is_executor_running,
+    isCodingAgentRunning: ws.is_coding_agent_running,
     isPinned: ws.pinned,
     isArchived: ws.archived,
     // Additional data from summary

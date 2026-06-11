@@ -5,7 +5,9 @@
     "backToChat": "채팅으로 돌아가기",
     "agentRunningTitle": "Claude가 프롬프트를 처리하고 있습니다",
     "agentRunningBody": "코딩 에이전트가 채팅에서 이 작업을 실행 중입니다. 완료되면 터미널이 같은 대화를 이어받습니다 — 여기서 프롬프트를 반복할 필요가 없습니다.",
-    "agentRunningViewChat": "채팅에서 진행 상황 보기"
+    "agentRunningViewChat": "채팅에서 진행 상황 보기",
+    "setupRunningTitle": "워크스페이스를 준비하는 중",
+    "setupRunningBody": "설정 스크립트가 실행 중입니다. 완료되면 터미널이 프롬프트와 함께 열립니다."
   },
   "editorNames": {
     "custom": "사용자 지정"
@@ -70,7 +72,10 @@
     "subagent": {
       "defaultType": "서브에이전트"
     },
-    "loadingEarlierMessages": "이전 메시지 불러오는 중"
+    "loadingEarlierMessages": "이전 메시지 불러오는 중",
+    "cliEmptyTitle": "이 워크스페이스는 보통 터미널에서 실행됩니다",
+    "cliEmptyDescription": "새 워크스페이스는 CLI에서 시작됩니다. 터미널을 열어 대화를 확인하고 이어가거나, 여기에 메시지를 보내 채팅을 사용하세요.",
+    "cliEmptyAction": "터미널 열기"
   },
   "language": {
     "browserDefault": "브라우저 기본값"
