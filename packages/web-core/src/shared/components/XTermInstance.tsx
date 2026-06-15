@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
@@ -8,6 +8,7 @@ import {
   TERMINAL_BACKGROUND,
   getTerminalTheme,
 } from '@/shared/lib/terminalTheme';
+import { buildTerminalWsUrl } from '@/shared/lib/terminalWsUrl';
 import { useTerminal } from '@/shared/hooks/useTerminal';
 
 interface XTermInstanceProps {
@@ -39,7 +40,6 @@ export function XTermInstance({
   const resizeRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
-  const initialSizeRef = useRef({ cols: 80, rows: 24 });
   const {
     registerTerminalInstance,
     getTerminalInstance,
@@ -47,14 +47,23 @@ export function XTermInstance({
     getTerminalConnection,
   } = useTerminal();
 
-  const endpoint = useMemo(() => {
-    const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
-    const host = window.location.host;
-    const modeParam = mode === 'cli' ? '&mode=cli' : '';
-    const sessionParam =
-      mode === 'cli' && sessionId ? `&session_id=${sessionId}` : '';
-    return `${protocol}//${host}/api/terminal/ws?workspace_id=${workspaceId}&cols=${initialSizeRef.current.cols}&rows=${initialSizeRef.current.rows}${modeParam}${sessionParam}`;
-  }, [workspaceId, mode, sessionId]);
+  // Built with the terminal's CURRENT grid size (see buildTerminalWsUrl): a
+  // fresh attach must open the PTY at the real size, not the 80x24 default, or
+  // claude reflows on the follow-up onopen resize and stacks blank lines every
+  // time the CLI pane is reopened.
+  const buildEndpoint = useCallback(
+    (cols: number, rows: number) =>
+      buildTerminalWsUrl({
+        workspaceId,
+        cols,
+        rows,
+        protocol: window.location.protocol,
+        host: window.location.host,
+        mode,
+        sessionId,
+      }),
+    [workspaceId, mode, sessionId]
+  );
 
   const fitTerminal = useCallback(() => {
     fitAddonRef.current?.fit();
@@ -136,7 +145,6 @@ export function XTermInstance({
       });
 
       fitAddon.fit();
-      initialSizeRef.current = { cols: terminal.cols, rows: terminal.rows };
 
       registerTerminalInstance(tabId, terminal, fitAddon);
 
@@ -189,9 +197,11 @@ export function XTermInstance({
     // path, so a tab whose connection died (e.g. reconnect gave up, server
     // restarted) heals on the next mount instead of staying dead.
     if (!getTerminalConnection(tabId)) {
+      // Connect at the fitted size (set by fit() above) so the backend opens
+      // the PTY at the real dimensions — no 80x24-then-resize reflow.
       createTerminalConnection(
         tabId,
-        endpoint,
+        buildEndpoint(terminal.cols, terminal.rows),
         (data) => terminal.write(data),
         onClose,
         () => {
@@ -213,7 +223,7 @@ export function XTermInstance({
     };
   }, [
     tabId,
-    endpoint,
+    buildEndpoint,
     onClose,
     getTerminalInstance,
     registerTerminalInstance,
