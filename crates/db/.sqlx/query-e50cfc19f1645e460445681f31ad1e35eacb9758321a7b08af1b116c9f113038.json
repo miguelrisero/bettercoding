@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE sessions SET cli_model_id = $1, cli_reasoning_id = $2 WHERE id = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "e50cfc19f1645e460445681f31ad1e35eacb9758321a7b08af1b116c9f113038"
+}

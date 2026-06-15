@@ -244,6 +244,46 @@ impl Session {
         Ok(())
     }
 
+    /// Persist the model + reasoning effort chosen at CLI-first creation so the
+    /// workspace's CLI terminal launches interactive claude with the same
+    /// selection. Like [`set_pending_cli_prompt`], this is launch transport
+    /// rather than session state worth serializing to clients, so it stays off
+    /// the `Session` struct. Either value may be `None` (then the launch falls
+    /// back to its defaults).
+    pub async fn set_cli_model_effort(
+        pool: &SqlitePool,
+        id: Uuid,
+        model_id: Option<&str>,
+        reasoning_id: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            r#"UPDATE sessions SET cli_model_id = $1, cli_reasoning_id = $2 WHERE id = $3"#,
+            model_id,
+            reasoning_id,
+            id
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Read the CLI launch model + reasoning effort persisted at creation.
+    /// Returns `(model_id, reasoning_id)`; either may be `None`.
+    pub async fn get_cli_model_effort(
+        pool: &SqlitePool,
+        id: Uuid,
+    ) -> Result<(Option<String>, Option<String>), sqlx::Error> {
+        let row = sqlx::query!(
+            r#"SELECT cli_model_id, cli_reasoning_id FROM sessions WHERE id = $1"#,
+            id
+        )
+        .fetch_optional(pool)
+        .await?;
+        Ok(row
+            .map(|r| (r.cli_model_id, r.cli_reasoning_id))
+            .unwrap_or((None, None)))
+    }
+
     pub async fn update(
         pool: &SqlitePool,
         id: Uuid,

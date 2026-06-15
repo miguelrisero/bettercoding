@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT cli_model_id, cli_reasoning_id FROM sessions WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "name": "cli_model_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "cli_reasoning_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "fcddd0871d89afe3563d432053f13ae4382c8b1b59585071abf211e55d0b70ed"
+}

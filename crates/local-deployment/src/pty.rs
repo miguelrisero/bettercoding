@@ -1,7 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -36,6 +36,11 @@ pub enum PtyCommand {
         /// the terminal instead of a headless executor. Ignored when
         /// `resume_session_id` is set.
         initial_prompt: Option<String>,
+        /// Profile-derived flags for the interactive `claude` launch
+        /// (currently `--model`/`--effort`), pre-resolved from the session's
+        /// selected ExecutorConfig. Empty falls back to claude's own defaults;
+        /// the resolver defaults a fresh CLI start to Opus at max effort.
+        agent_args: Vec<String>,
     },
 }
 
@@ -53,22 +58,36 @@ pub enum PtyCommand {
 ///   workspace-wide server-side, so a missing id really means there is no
 ///   conversation yet).
 /// - `--dangerously-skip-permissions` skips per-tool approval prompts for this
-///   trusted worktree. (claude's one-time folder-trust dialog is separate and
-///   self-remembered per worktree; we deliberately don't rewrite the user's
-///   global `~/.claude.json` to suppress it.)
+///   trusted worktree. claude's one-time folder-trust dialog is separate and
+///   has no flag/setting to suppress; we pre-accept it for the worktree in
+///   `ensure_claude_folder_trusted` (the workspace is app-created, so trusted)
+///   before this bootstrap runs.
+/// - `agent_args` carries profile-derived flags (`--model`/`--effort`) resolved
+///   from the session's selected ExecutorConfig, so CLI mode honors the same
+///   model + reasoning effort as the headless executor.
 ///
-/// TODO(profile-integration): this hardcoded invocation must converge on the
-/// executor profile system (`ExecutorProfileId`) before growing any argument
-/// (model, flags, alternate agent CLIs) — do not bolt options onto
-/// `PtyCommand::TmuxCli` piecemeal.
-fn cli_bootstrap(resume_session_id: Option<&str>, initial_prompt: Option<&str>) -> String {
-    const BASE: &str = "claude --dangerously-skip-permissions";
+/// TODO(profile-integration): model/effort now flow through `agent_args`, but a
+/// full convergence on the executor profile system (`ExecutorProfileId`,
+/// alternate agent CLIs) is still future work — keep new options flowing as
+/// pre-resolved `agent_args` rather than bolting fields onto `PtyCommand`.
+fn cli_bootstrap(
+    resume_session_id: Option<&str>,
+    initial_prompt: Option<&str>,
+    agent_args: &[String],
+) -> String {
+    // Profile-derived flags (model/effort) applied to EVERY launch form below,
+    // shell-quoted so a model id can never break out of the command.
+    let flags: String = agent_args
+        .iter()
+        .map(|arg| format!(" {}", shell_single_quote(arg)))
+        .collect();
+    let base = format!("claude{flags} --dangerously-skip-permissions");
 
     // Only a strict UUID may be interpolated into the shell string. claude
     // session ids are UUIDs, so this both validates intent and forecloses
     // shell injection via the id.
     let launch = if let Some(id) = resume_session_id.filter(|id| is_uuid(id)) {
-        format!("{BASE} --resume {id}")
+        format!("{base} --resume {id}")
     } else if let Some(prompt) = initial_prompt.map(str::trim).filter(|p| !p.is_empty()) {
         // CLI-first creation: the workspace prompt becomes claude's argument
         // (single-quote escaped — the prompt is arbitrary user text). A
@@ -79,13 +98,13 @@ fn cli_bootstrap(resume_session_id: Option<&str>, initial_prompt: Option<&str>) 
         } else {
             prompt.to_string()
         };
-        format!("{BASE} {}", shell_single_quote(&guarded))
+        format!("{base} {}", shell_single_quote(&guarded))
     } else {
         // Nothing explicit to run: resume the most recent conversation in
         // this cwd if one exists (a CLI-first workspace whose tmux session
         // died), otherwise fall through to a fresh TUI — `--continue` exits
         // non-zero when there is no conversation to continue.
-        format!("{BASE} --continue || {BASE}")
+        format!("{base} --continue || {base}")
     };
 
     format!(r#"command -v claude >/dev/null 2>&1 && {launch}; exec "${{SHELL:-/bin/sh}}""#)
@@ -95,6 +114,138 @@ fn cli_bootstrap(resume_session_id: Option<&str>, initial_prompt: Option<&str>) 
 /// inside single quotes is the single quote itself.
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Pre-accept claude's per-directory "Do you trust the files in this folder?"
+/// dialog for an app-created workspace, so CLI mode never blocks the user on it.
+///
+/// claude exposes no flag/setting/env to suppress this — `--dangerously-skip-permissions`
+/// only covers per-tool approval — and records trust per directory in the global
+/// `~/.claude.json`. BetterCoding created this worktree, so the user implicitly
+/// trusts it; we pre-seed the very key claude writes on "Yes". Best-effort and
+/// per-process memoized: any failure just means the dialog shows as before.
+fn ensure_claude_folder_trusted(dir: &Path) {
+    static SEEDED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let seeded = SEEDED.get_or_init(|| Mutex::new(HashSet::new()));
+
+    if seeded
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(dir)
+    {
+        return;
+    }
+
+    match seed_claude_trust(dir) {
+        Ok(()) => {
+            seeded
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(dir.to_path_buf());
+        }
+        Err(e) => {
+            tracing::debug!(
+                "Could not pre-trust {} in ~/.claude.json (folder-trust dialog may show): {e}",
+                dir.display()
+            );
+        }
+    }
+}
+
+/// Read `~/.claude.json`, mark `dir` trusted, and write it back atomically.
+/// Serialized against itself so concurrent CLI attaches don't clobber each
+/// other's additions. Bails (never clobbers) if the file exists but isn't valid
+/// JSON. NOTE: this rewrites the whole file, so a claude instance writing it in
+/// the same instant could lose that write — a narrow, single-user-tool trade we
+/// accept; writes only happen once per worktree per process.
+fn seed_claude_trust(dir: &Path) -> std::io::Result<()> {
+    static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
+    let Some(config_path) = dirs::home_dir().map(|home| home.join(".claude.json")) else {
+        return Ok(());
+    };
+
+    let mut root: serde_json::Value = match std::fs::read_to_string(&config_path) {
+        Ok(contents) => serde_json::from_str(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e),
+    };
+
+    // claude keys trust by the cwd it resolves (getcwd resolves symlinks), so
+    // seed both the given path and its canonical form to be safe.
+    let mut keys = vec![dir.to_string_lossy().into_owned()];
+    if let Ok(canonical) = dir.canonicalize() {
+        let canonical = canonical.to_string_lossy().into_owned();
+        if !keys.contains(&canonical) {
+            keys.push(canonical);
+        }
+    }
+
+    if !apply_trust_to_config(&mut root, &keys) {
+        return Ok(());
+    }
+
+    // Atomic replace: write a sibling temp file then rename over the original.
+    let serialized = serde_json::to_vec_pretty(&root)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp_path = config_path.with_extension("json.vk-trust-tmp");
+    std::fs::write(&tmp_path, &serialized)?;
+    std::fs::rename(&tmp_path, &config_path)?;
+    Ok(())
+}
+
+/// Pure merge: set the trust + onboarding keys for each project path, preserving
+/// everything else. Returns whether anything changed. Split out so the merge is
+/// unit-testable without touching the real `~/.claude.json`.
+fn apply_trust_to_config(root: &mut serde_json::Value, project_keys: &[String]) -> bool {
+    let Some(obj) = root.as_object_mut() else {
+        return false;
+    };
+    let projects = obj
+        .entry("projects")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(projects) = projects.as_object_mut() else {
+        return false;
+    };
+
+    let mut changed = false;
+    for key in project_keys {
+        let entry = projects
+            .entry(key.clone())
+            .or_insert_with(|| serde_json::json!({}));
+        let Some(entry) = entry.as_object_mut() else {
+            continue;
+        };
+        for (field, value) in [
+            ("hasTrustDialogAccepted", serde_json::Value::Bool(true)),
+            (
+                "hasCompletedProjectOnboarding",
+                serde_json::Value::Bool(true),
+            ),
+        ] {
+            if entry.get(field) != Some(&value) {
+                entry.insert(field.to_string(), value);
+                changed = true;
+            }
+        }
+        let seen = entry
+            .get("projectOnboardingSeenCount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if seen < 1 {
+            entry.insert(
+                "projectOnboardingSeenCount".to_string(),
+                serde_json::json!(1),
+            );
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Configuration for the embedded tmux server, written next to the app's
@@ -363,18 +514,21 @@ impl PtyService {
 
             // CLI mode rides tmux when present; otherwise (and for the
             // default side terminal) spawn the user's shell directly.
-            let (tmux_session, tmux_resume_id, tmux_initial_prompt) = match &command {
-                PtyCommand::TmuxCli {
-                    session_name,
-                    resume_session_id,
-                    initial_prompt,
-                } if tmux_available() => (
-                    Some(session_name.clone()),
-                    resume_session_id.clone(),
-                    initial_prompt.clone(),
-                ),
-                _ => (None, None, None),
-            };
+            let (tmux_session, tmux_resume_id, tmux_initial_prompt, tmux_agent_args) =
+                match &command {
+                    PtyCommand::TmuxCli {
+                        session_name,
+                        resume_session_id,
+                        initial_prompt,
+                        agent_args,
+                    } if tmux_available() => (
+                        Some(session_name.clone()),
+                        resume_session_id.clone(),
+                        initial_prompt.clone(),
+                        agent_args.clone(),
+                    ),
+                    _ => (None, None, None, Vec::new()),
+                };
 
             // Never silently break the persistence promise: if CLI mode was
             // requested but tmux is absent, say so in the pane itself.
@@ -395,6 +549,10 @@ impl PtyService {
                 // (options are server-wide; `-f` below only affects a fresh
                 // server start).
                 ensure_cli_tmux_server_options();
+
+                // Pre-accept claude's per-directory folder-trust dialog for
+                // this app-created worktree so the launch never blocks on it.
+                ensure_claude_folder_trusted(&working_dir);
 
                 let mut cmd = CommandBuilder::new("tmux");
                 // Our own config instead of the user's ~/.tmux.conf — the
@@ -429,6 +587,7 @@ impl PtyService {
                 cmd.arg(cli_bootstrap(
                     tmux_resume_id.as_deref(),
                     tmux_initial_prompt.as_deref(),
+                    &tmux_agent_args,
                 ));
                 cmd.cwd(&working_dir);
                 // No shell-specific prompt configuration for the tmux client.
@@ -659,7 +818,7 @@ mod tests {
 
     #[test]
     fn cli_bootstrap_runs_claude_then_drops_to_shell() {
-        let b = cli_bootstrap(None, None);
+        let b = cli_bootstrap(None, None, &[]);
         assert!(b.contains("command -v claude"));
         assert!(
             b.ends_with(r#"exec "${SHELL:-/bin/sh}""#),
@@ -672,24 +831,24 @@ mod tests {
         // A valid claude session UUID -> --resume <id>, even if a prompt is
         // also present (an existing conversation always wins).
         let id = "28b98f08-5f5f-4b1e-8c4e-41ae87c0c706";
-        let b = cli_bootstrap(Some(id), Some("do things"));
+        let b = cli_bootstrap(Some(id), Some("do things"), &[]);
         assert!(b.contains(&format!("--resume {id}")));
         assert!(!b.contains("do things"));
         // Non-UUID (injection attempt) is rejected and never interpolated.
         let evil = "x; rm -rf ~";
-        let b = cli_bootstrap(Some(evil), None);
+        let b = cli_bootstrap(Some(evil), None, &[]);
         assert!(!b.contains("rm -rf"));
         assert!(!b.contains("--resume"));
     }
 
     #[test]
     fn cli_bootstrap_passes_initial_prompt_injection_safe() {
-        let b = cli_bootstrap(None, Some("Fix the login bug"));
+        let b = cli_bootstrap(None, Some("Fix the login bug"), &[]);
         assert!(b.contains("claude --dangerously-skip-permissions 'Fix the login bug'"));
 
         // Quotes and shell metacharacters stay inert inside the quoting.
         let evil = "'; rm -rf ~; echo '";
-        let b = cli_bootstrap(None, Some(evil));
+        let b = cli_bootstrap(None, Some(evil), &[]);
         // The single quotes in the prompt are escaped as '\'' — the raw
         // sequence `'; rm` can therefore never terminate the quoting.
         assert!(b.contains(r"'"), "quotes must be escaped: {b}");
@@ -697,11 +856,11 @@ mod tests {
 
         // A prompt starting with '-' is space-guarded so claude can't parse
         // it as a flag.
-        let dashy = cli_bootstrap(None, Some("-rf is a flag-looking prompt"));
+        let dashy = cli_bootstrap(None, Some("-rf is a flag-looking prompt"), &[]);
         assert!(dashy.contains("' -rf is a flag-looking prompt'"));
 
         // Blank prompts fall through to the no-prompt path.
-        let blank = cli_bootstrap(None, Some("   "));
+        let blank = cli_bootstrap(None, Some("   "), &[]);
         assert!(blank.contains("--continue || claude"));
     }
 
@@ -710,10 +869,51 @@ mod tests {
         // With nothing explicit to run: resume the cwd's latest conversation
         // when one exists (CLI-first workspace after tmux death), else a
         // fresh TUI — never a stranded "No conversation found" pane.
-        let b = cli_bootstrap(None, None);
+        let b = cli_bootstrap(None, None, &[]);
         assert!(b.contains(
             "claude --dangerously-skip-permissions --continue || claude --dangerously-skip-permissions"
         ));
+    }
+
+    #[test]
+    fn cli_bootstrap_applies_model_and_effort_flags() {
+        let args = ["--model", "opus", "--effort", "max"].map(String::from);
+        let b = cli_bootstrap(None, None, &args);
+        assert!(
+            b.contains("claude '--model' 'opus' '--effort' 'max' --dangerously-skip-permissions")
+        );
+    }
+
+    #[test]
+    fn cli_bootstrap_shell_quotes_agent_args_on_every_form() {
+        // Glob/metacharacters in a model id stay inert (single-quoted)...
+        let args = ["--model".to_string(), "opus[1m]".to_string()];
+        let b = cli_bootstrap(None, None, &args);
+        assert!(b.contains("'--model' 'opus[1m]'"));
+        // ...and the flags ride the continue/fresh fallback too.
+        assert!(b.contains("--dangerously-skip-permissions --continue"));
+    }
+
+    #[test]
+    fn apply_trust_seeds_keys_and_preserves_other_data() {
+        let mut root = serde_json::json!({
+            "projects": { "/existing": { "hasTrustDialogAccepted": true, "foo": 1 } },
+            "other": "keep me"
+        });
+        assert!(apply_trust_to_config(&mut root, &["/new/dir".to_string()]));
+        assert_eq!(
+            root["projects"]["/new/dir"]["hasTrustDialogAccepted"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            root["projects"]["/new/dir"]["hasCompletedProjectOnboarding"],
+            serde_json::json!(true)
+        );
+        // Unrelated data is preserved.
+        assert_eq!(root["other"], serde_json::json!("keep me"));
+        assert_eq!(root["projects"]["/existing"]["foo"], serde_json::json!(1));
+        // Idempotent: re-applying to an already-trusted key changes nothing.
+        assert!(!apply_trust_to_config(&mut root, &["/new/dir".to_string()]));
     }
 
     #[test]

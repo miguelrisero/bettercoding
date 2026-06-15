@@ -85,6 +85,29 @@ impl ReasoningOption {
         Self::from_names_with_labels(names.into_iter().map(|n| (n.into(), None)))
     }
 
+    /// Like [`from_names`] but marks `default_id` as the default option instead
+    /// of the built-in "high". Lets an executor (e.g. Claude in BetterCoding)
+    /// pick a different out-of-the-box reasoning effort. If `default_id` matches
+    /// no option, none is marked default — logged, since that's a caller bug.
+    pub fn from_names_with_default(
+        names: impl IntoIterator<Item = impl Into<String>>,
+        default_id: &str,
+    ) -> Vec<ReasoningOption> {
+        let mut options = Self::from_names(names);
+        let mut matched = false;
+        for option in &mut options {
+            option.is_default = option.id.eq_ignore_ascii_case(default_id);
+            matched |= option.is_default;
+        }
+        if !matched && !options.is_empty() {
+            tracing::warn!(
+                "from_names_with_default: default reasoning '{default_id}' matched no option; \
+                 leaving no default"
+            );
+        }
+        options
+    }
+
     pub fn from_names_with_labels(
         pairs: impl IntoIterator<Item = (String, Option<String>)>,
     ) -> Vec<ReasoningOption> {
