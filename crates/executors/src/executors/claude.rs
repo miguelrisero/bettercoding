@@ -339,16 +339,95 @@ impl ClaudeCode {
     }
 }
 
+/// Models whose CLI accepts a reasoning `--effort` flag (Opus / Sonnet
+/// families). Haiku has no effort control.
+pub(crate) fn model_supports_effort(id: &str) -> bool {
+    id.contains("opus") || id.contains("sonnet")
+}
+
+/// BetterCoding's default model for an interactive CLI start with no explicit
+/// selection. `opus` is an alias the claude CLI resolves to the latest Opus
+/// (currently Opus 4.8).
+pub const CLI_DEFAULT_MODEL: &str = "opus";
+
+/// Default reasoning effort for an interactive CLI start. Max by design — the
+/// initial start should run Opus at full strength.
+pub const CLI_DEFAULT_EFFORT: &str = "max";
+
+/// Extra flags for launching the INTERACTIVE `claude` TUI (CLI mode) for the
+/// selected model/effort, mirroring the `--model`/`--effort` that
+/// [`ClaudeCode::build_command_builder`] passes in headless mode so CLI mode
+/// honors the same profile selection. An unset model falls back to Opus and an
+/// unset effort to max; effort is emitted only for models that support it.
+/// Values are returned as discrete argv entries — the caller shell-quotes them.
+pub fn interactive_cli_args(model_id: Option<&str>, reasoning_id: Option<&str>) -> Vec<String> {
+    let model = model_id
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or(CLI_DEFAULT_MODEL);
+    let mut args = vec!["--model".to_string(), model.to_string()];
+    if model_supports_effort(model) {
+        let effort = reasoning_id
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .unwrap_or(CLI_DEFAULT_EFFORT);
+        args.push("--effort".to_string());
+        args.push(effort.to_string());
+    }
+    args
+}
+
+#[cfg(test)]
+mod cli_launch_tests {
+    use super::interactive_cli_args;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn defaults_to_opus_at_max() {
+        assert_eq!(
+            interactive_cli_args(None, None),
+            v(&["--model", "opus", "--effort", "max"])
+        );
+    }
+
+    #[test]
+    fn respects_explicit_selection() {
+        assert_eq!(
+            interactive_cli_args(Some("sonnet"), Some("high")),
+            v(&["--model", "sonnet", "--effort", "high"])
+        );
+    }
+
+    #[test]
+    fn omits_effort_for_models_without_support() {
+        assert_eq!(
+            interactive_cli_args(Some("haiku"), Some("max")),
+            v(&["--model", "haiku"])
+        );
+    }
+
+    #[test]
+    fn blank_values_fall_back_to_defaults() {
+        assert_eq!(
+            interactive_cli_args(Some(" "), Some("")),
+            v(&["--model", "opus", "--effort", "max"])
+        );
+    }
+}
+
 fn default_discovered_options() -> crate::executor_discovery::ExecutorDiscoveredOptions {
     use crate::{
         executor_discovery::ExecutorDiscoveredOptions,
         model_selector::{ModelInfo, ModelSelectorConfig, ReasoningOption},
     };
 
-    let effort_options =
-        ReasoningOption::from_names(["low", "medium", "high", "xhigh", "max"].map(String::from));
-
-    let supports_effort = |id: &str| -> bool { id.contains("opus") || id.contains("sonnet") };
+    let effort_options = ReasoningOption::from_names_with_default(
+        ["low", "medium", "high", "xhigh", "max"].map(String::from),
+        CLI_DEFAULT_EFFORT,
+    );
 
     ExecutorDiscoveredOptions {
         model_selector: ModelSelectorConfig {
@@ -364,7 +443,7 @@ fn default_discovered_options() -> crate::executor_discovery::ExecutorDiscovered
                 id: id.to_string(),
                 name: name.to_string(),
                 provider_id: None,
-                reasoning_options: if supports_effort(id) {
+                reasoning_options: if model_supports_effort(id) {
                     effort_options.clone()
                 } else {
                     vec![]

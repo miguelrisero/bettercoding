@@ -12,10 +12,12 @@ use db::models::{
     workspace::Workspace, workspace_repo::WorkspaceRepo,
 };
 use deployment::Deployment;
+use executors::{actions::ExecutorActionType, executors::claude};
 use local_deployment::pty::{
     PtyCommand, cli_tmux_available, cli_tmux_session_exists, cli_tmux_session_name,
 };
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::{
@@ -69,6 +71,52 @@ enum TerminalCommand {
 enum TerminalMessage {
     Output { data: String },
     Error { message: String },
+}
+
+/// Recover the model + reasoning effort the workspace's CLI session should
+/// launch claude with. CLI-first creation persists the picked selection on the
+/// session; chat/automation sessions fall back to the most recent coding-agent
+/// run's `executor_config`. `(None, None)` means none was found and the launch
+/// uses its own defaults (Opus at max effort).
+async fn resolve_cli_model_effort(
+    pool: &SqlitePool,
+    session: Option<&Session>,
+) -> (Option<String>, Option<String>) {
+    let Some(session) = session else {
+        return (None, None);
+    };
+
+    // CLI-first: the selection persisted at creation wins.
+    if let Ok((model, reasoning)) = Session::get_cli_model_effort(pool, session.id).await
+        && (model.is_some() || reasoning.is_some())
+    {
+        return (model, reasoning);
+    }
+
+    // Chat/automation sessions carry the selection in the execution process's
+    // action instead (find_by_session_id is ordered created_at ASC, so the most
+    // recent coding-agent run is the last match).
+    if let Ok(processes) = ExecutionProcess::find_by_session_id(pool, session.id, false).await {
+        for process in processes.iter().rev() {
+            let Ok(action) = process.executor_action() else {
+                continue;
+            };
+            let config = match action.typ() {
+                ExecutorActionType::CodingAgentInitialRequest(request) => {
+                    Some(&request.executor_config)
+                }
+                ExecutorActionType::CodingAgentFollowUpRequest(request) => {
+                    Some(&request.executor_config)
+                }
+                _ => None,
+            };
+            if let Some(config) = config {
+                return (config.model_id.clone(), config.reasoning_id.clone());
+            }
+        }
+    }
+
+    (None, None)
 }
 
 async fn terminal_ws(
@@ -211,12 +259,19 @@ async fn terminal_ws(
                 prompt_session_to_clear = session.as_ref().map(|s| s.id);
             }
 
+            // Honor the workspace's selected model/effort at launch (defaults
+            // to Opus at max effort when nothing was selected).
+            let (model_id, reasoning_id) = resolve_cli_model_effort(pool, session.as_ref()).await;
+            let agent_args =
+                claude::interactive_cli_args(model_id.as_deref(), reasoning_id.as_deref());
+
             (
                 dir,
                 PtyCommand::TmuxCli {
                     session_name: cli_tmux_session_name(query.workspace_id),
                     resume_session_id,
                     initial_prompt,
+                    agent_args,
                 },
             )
         }

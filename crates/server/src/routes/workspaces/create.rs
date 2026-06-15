@@ -301,7 +301,7 @@ pub async fn create_and_start_workspace(
     // MCP/automation callers.
     let execution_process = deployment
         .container()
-        .start_workspace_cli(&workspace, workspace_prompt)
+        .start_workspace_cli(&workspace, executor_config.clone(), workspace_prompt)
         .await?;
 
     deployment

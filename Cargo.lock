@@ -4967,6 +4967,7 @@ dependencies = [
  "command-group",
  "db",
  "deployment",
+ "dirs 5.0.1",
  "dotenv",
  "ed25519-dalek",
  "embedded-ssh",

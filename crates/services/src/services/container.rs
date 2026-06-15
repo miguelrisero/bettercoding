@@ -1053,6 +1053,7 @@ pub trait ContainerService {
     async fn start_workspace_cli(
         &self,
         workspace: &Workspace,
+        executor_config: ExecutorConfig,
         prompt: String,
     ) -> Result<Option<ExecutionProcess>, ContainerError> {
         self.create(workspace).await?;
@@ -1075,6 +1076,18 @@ pub trait ContainerService {
         .await?;
 
         Session::set_pending_cli_prompt(&self.db().pool, session.id, &prompt).await?;
+
+        // Persist the picked model/effort so the workspace's CLI terminal
+        // launches claude with the same selection — this path runs no headless
+        // executor to carry `executor_config`, so otherwise the choice is lost.
+        // Unset values default to Opus at max effort when the terminal launches.
+        Session::set_cli_model_effort(
+            &self.db().pool,
+            session.id,
+            executor_config.model_id.as_deref(),
+            executor_config.reasoning_id.as_deref(),
+        )
+        .await?;
 
         // Setup scripts still run exactly as before — the CLI pane holds the
         // terminal back (is_executor_running gate) until they finish, then
