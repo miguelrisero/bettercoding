@@ -253,7 +253,8 @@ impl ClaudeCode {
             builder = builder.extend_params(["--dangerously-skip-permissions"]);
         }
         if let Some(model) = &self.model {
-            builder = builder.extend_params(["--model", model]);
+            let model = normalize_claude_model_id(model);
+            builder = builder.extend_params(["--model", model.as_str()]);
         }
         if let Some(effort) = &self.effort {
             builder = builder.extend_params(["--effort", effort.as_ref()]);
@@ -345,6 +346,19 @@ pub(crate) fn model_supports_effort(id: &str) -> bool {
     id.contains("opus") || id.contains("sonnet")
 }
 
+/// Claude model ids use hyphens in the version (e.g. `claude-opus-4-8`), but a
+/// user typing a dot (`claude-opus-4.8`) yields a model the CLI rejects as
+/// "model may not exist". Normalize dots to hyphens for `claude-*` ids so a
+/// near-miss still launches; aliases (`opus`, `sonnet`, `haiku`) and ids without
+/// a dot are returned unchanged.
+pub(crate) fn normalize_claude_model_id(id: &str) -> String {
+    if id.starts_with("claude-") && id.contains('.') {
+        id.replace('.', "-")
+    } else {
+        id.to_string()
+    }
+}
+
 /// BetterCoding's default model for an interactive CLI start with no explicit
 /// selection. `opus` is an alias the claude CLI resolves to the latest Opus
 /// (currently Opus 4.8).
@@ -365,7 +379,7 @@ pub fn interactive_cli_args(model_id: Option<&str>, reasoning_id: Option<&str>) 
         .map(str::trim)
         .filter(|m| !m.is_empty())
         .unwrap_or(CLI_DEFAULT_MODEL);
-    let mut args = vec!["--model".to_string(), model.to_string()];
+    let mut args = vec!["--model".to_string(), normalize_claude_model_id(model)];
     if model_supports_effort(model) {
         let effort = reasoning_id
             .map(str::trim)
@@ -379,7 +393,7 @@ pub fn interactive_cli_args(model_id: Option<&str>, reasoning_id: Option<&str>) 
 
 #[cfg(test)]
 mod cli_launch_tests {
-    use super::interactive_cli_args;
+    use super::{interactive_cli_args, normalize_claude_model_id};
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -414,6 +428,33 @@ mod cli_launch_tests {
         assert_eq!(
             interactive_cli_args(Some(" "), Some("")),
             v(&["--model", "opus", "--effort", "max"])
+        );
+    }
+
+    #[test]
+    fn normalizes_dotted_claude_model_ids() {
+        assert_eq!(
+            normalize_claude_model_id("claude-opus-4.8"),
+            "claude-opus-4-8"
+        );
+        assert_eq!(
+            normalize_claude_model_id("claude-haiku-4.5"),
+            "claude-haiku-4-5"
+        );
+        // aliases, already-hyphenated, [1m] variants, and non-claude ids unchanged
+        assert_eq!(normalize_claude_model_id("opus"), "opus");
+        assert_eq!(
+            normalize_claude_model_id("claude-opus-4-8"),
+            "claude-opus-4-8"
+        );
+        assert_eq!(normalize_claude_model_id("opus[1m]"), "opus[1m]");
+    }
+
+    #[test]
+    fn interactive_cli_args_normalizes_a_dotted_model() {
+        assert_eq!(
+            interactive_cli_args(Some("claude-opus-4.8"), Some("max")),
+            v(&["--model", "claude-opus-4-8", "--effort", "max"])
         );
     }
 }

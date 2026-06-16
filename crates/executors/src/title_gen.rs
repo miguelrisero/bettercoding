@@ -32,7 +32,10 @@ struct RawNames {
 const TITLE_MAX_CHARS: usize = 72;
 const BRANCH_MAX_CHARS: usize = 40;
 const PROMPT_MAX_CHARS: usize = 2000;
-const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+// claude's startup (loading the user's possibly-large ~/.claude.json) can take
+// 10-15s+, so allow generous headroom — measured calls were 5-14s. A genuinely
+// stuck call still falls back to heuristic naming.
+const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Ask Claude Haiku for a concise title + branch slug describing `first_message`.
 /// Returns `None` on any failure (spawn error, non-zero exit, timeout, or
@@ -69,17 +72,41 @@ pub async fn generate_workspace_names(first_message: &str) -> Option<WorkspaceNa
         .current_dir(std::env::temp_dir())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let output = tokio::time::timeout(CALL_TIMEOUT, cmd.output())
-        .await
-        .ok()? // timed out
-        .ok()?; // spawn / IO error
+    // Each branch logs WHY it fell back — the original silent `?` chain made a
+    // timed-out/erroring call indistinguishable from "model produced no title".
+    let output = match tokio::time::timeout(CALL_TIMEOUT, cmd.output()).await {
+        Err(_) => {
+            tracing::warn!(
+                "workspace title generation timed out after {}s; using heuristic naming",
+                CALL_TIMEOUT.as_secs()
+            );
+            return None;
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("workspace title generation could not spawn claude: {e}");
+            return None;
+        }
+        Ok(Ok(output)) => output,
+    };
     if !output.status.success() {
+        tracing::warn!(
+            "workspace title generation exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
         return None;
     }
-    parse_workspace_names(&String::from_utf8_lossy(&output.stdout))
+    let names = parse_workspace_names(&String::from_utf8_lossy(&output.stdout));
+    if names.is_none() {
+        tracing::warn!(
+            "workspace title generation returned unparseable output: {}",
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+    }
+    names
 }
 
 /// Extract `{title, branch}` from claude's stdout (which may wrap the JSON in a
