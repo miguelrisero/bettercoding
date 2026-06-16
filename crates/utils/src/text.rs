@@ -2,6 +2,14 @@ use regex::Regex;
 use uuid::Uuid;
 
 pub fn git_branch_id(input: &str) -> String {
+    git_branch_id_with_len(input, 16)
+}
+
+/// Slugify `input` for a git branch / worktree dir name: lowercase, runs of
+/// non-alphanumerics collapsed to a single hyphen, trimmed, then capped at
+/// `max_len` chars (trailing hyphens trimmed again so a mid-word cut never
+/// leaves a dangling `-`).
+pub fn git_branch_id_with_len(input: &str, max_len: usize) -> String {
     // 1. lowercase
     let lower = input.to_lowercase();
 
@@ -12,8 +20,8 @@ pub fn git_branch_id(input: &str) -> String {
     // 3. trim extra hyphens
     let trimmed = slug.trim_matches('-');
 
-    // 4. take up to 16 chars, then trim trailing hyphens again
-    let cut: String = trimmed.chars().take(16).collect();
+    // 4. take up to max_len chars, then trim trailing hyphens again
+    let cut: String = trimmed.chars().take(max_len).collect();
     cut.trim_end_matches('-').to_string()
 }
 
