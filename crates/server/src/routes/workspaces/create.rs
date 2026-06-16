@@ -23,28 +23,16 @@ use crate::{
 pub(crate) async fn create_workspace_record(
     deployment: &DeploymentImpl,
     name: Option<String>,
-    branch_slug: Option<&str>,
 ) -> Result<Workspace, ApiError> {
     let workspace_id = Uuid::new_v4();
     let branch_label = name
         .as_deref()
         .filter(|branch_label| !branch_label.is_empty())
         .unwrap_or("workspace");
-    let git_branch_name = match branch_slug.filter(|slug| !slug.trim().is_empty()) {
-        // A descriptive (e.g. LLM-generated) slug — keep it longer + readable.
-        Some(slug) => {
-            deployment
-                .container()
-                .git_branch_from_workspace_with_slug(&workspace_id, slug)
-                .await
-        }
-        None => {
-            deployment
-                .container()
-                .git_branch_from_workspace(&workspace_id, branch_label)
-                .await
-        }
-    };
+    let git_branch_name = deployment
+        .container()
+        .git_branch_from_workspace(&workspace_id, branch_label)
+        .await;
 
     let workspace = Workspace::create(
         &deployment.db().pool,
@@ -63,7 +51,7 @@ pub async fn create_workspace(
     State(deployment): State<DeploymentImpl>,
     Json(payload): Json<CreateWorkspaceApiRequest>,
 ) -> Result<ResponseJson<ApiResponse<Workspace>>, ApiError> {
-    let workspace = create_workspace_record(&deployment, payload.name, None).await?;
+    let workspace = create_workspace_record(&deployment, payload.name).await?;
 
     deployment
         .track_if_analytics_allowed(
@@ -246,20 +234,9 @@ pub async fn create_and_start_workspace(
         ));
     }
 
-    // Derive a concise title + branch slug from the first message via a fast
-    // Haiku call, replacing the heuristic first-words name. Best-effort: on any
-    // failure/timeout it falls back to the caller-provided name and the
-    // heuristic branch, so creation is never blocked for long or broken.
-    let (name, branch_slug) = match executors::title_gen::generate_workspace_names(&prompt).await {
-        Some(names) => (Some(names.title), Some(names.branch_slug)),
-        None => (name, None),
-    };
-
     let mut managed_workspace = deployment
         .workspace_manager()
-        .load_managed_workspace(
-            create_workspace_record(&deployment, name, branch_slug.as_deref()).await?,
-        )
+        .load_managed_workspace(create_workspace_record(&deployment, name).await?)
         .await?;
 
     for repo in &repos {
@@ -317,6 +294,28 @@ pub async fn create_and_start_workspace(
 
     let workspace = managed_workspace.workspace.clone();
     tracing::info!("Created workspace {}", workspace.id);
+
+    // Generate a concise title from the first message in the BACKGROUND and
+    // apply it once Haiku responds — workspace creation is never blocked. The
+    // branch keeps its heuristic slug (a live worktree branch can't be safely
+    // renamed). Best-effort: a failed/timed-out call leaves the heuristic name
+    // (the call logs why); the `workspaces` UPDATE auto-pushes the new name to
+    // the UI via the DB change-hook.
+    {
+        let pool = deployment.db().pool.clone();
+        let first_message = prompt.clone();
+        let workspace_id = workspace.id;
+        tokio::spawn(async move {
+            if let Some(names) =
+                executors::title_gen::generate_workspace_names(&first_message).await
+                && let Err(e) =
+                    Workspace::update(&pool, workspace_id, None, None, Some(names.title.as_str()))
+                        .await
+            {
+                tracing::warn!("Failed to apply generated title to workspace {workspace_id}: {e}");
+            }
+        });
+    }
 
     // CLI-first: the prompt is parked for the workspace's CLI terminal and
     // runs in interactive claude there; only setup scripts (if any) spawn a
