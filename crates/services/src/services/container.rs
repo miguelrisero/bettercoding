@@ -52,7 +52,7 @@ use tokio::{sync::RwLock, task::JoinHandle};
 use utils::{
     log_msg::LogMsg,
     msg_store::MsgStore,
-    text::{git_branch_id, git_branch_id_with_len, short_uuid},
+    text::{git_branch_id, short_uuid},
 };
 use uuid::Uuid;
 use worktree_manager::WorktreeError;
@@ -791,21 +791,6 @@ pub trait ContainerService {
             format!("{}-{}", short_uuid(workspace_id), task_title_id)
         } else {
             format!("{}/{}-{}", prefix, short_uuid(workspace_id), task_title_id)
-        }
-    }
-
-    /// Like [`git_branch_from_workspace`] but takes a pre-built descriptive slug
-    /// (e.g. an LLM-generated branch name) instead of slugifying a short title,
-    /// with a longer cap so the branch stays readable. Re-slugified here so the
-    /// result is always git-safe regardless of the caller's input.
-    async fn git_branch_from_workspace_with_slug(&self, workspace_id: &Uuid, slug: &str) -> String {
-        let slug_id = git_branch_id_with_len(slug, 40);
-        let prefix = self.git_branch_prefix().await;
-        match (prefix.is_empty(), slug_id.is_empty()) {
-            (true, true) => short_uuid(workspace_id),
-            (true, false) => format!("{}-{}", short_uuid(workspace_id), slug_id),
-            (false, true) => format!("{}/{}", prefix, short_uuid(workspace_id)),
-            (false, false) => format!("{}/{}-{}", prefix, short_uuid(workspace_id), slug_id),
         }
     }
 
