@@ -417,6 +417,96 @@ pub async fn kill_cli_tmux_session(workspace_id: Uuid) {
     }
 }
 
+/// Seconds since the Unix epoch (best-effort; 0 if the system clock is before
+/// the epoch). Used to turn tmux's `session_activity` epoch into an idle age.
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// List our CLI tmux sessions for the reaper: `(workspace_id, attached,
+/// idle_secs)` for every `vk_*` session on our socket. Returns empty when tmux
+/// is unavailable or no server is running (both mean "nothing to reap"). Idle is
+/// derived from tmux `session_activity`; non-`vk_` sessions are ignored so we
+/// never touch a user's own session on the same socket.
+pub async fn list_cli_tmux_sessions() -> Vec<(Uuid, bool, i64)> {
+    if !tmux_available() {
+        return Vec::new();
+    }
+    let output = tokio::process::Command::new("tmux")
+        .args([
+            "-L",
+            CLI_TMUX_SOCKET,
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{session_attached}\t#{session_activity}",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await;
+    let stdout = match output {
+        Ok(o) if o.status.success() => o.stdout,
+        // Non-zero exit (no server / no sessions) or spawn error => nothing to reap.
+        _ => return Vec::new(),
+    };
+    let now = now_unix_secs();
+    String::from_utf8_lossy(&stdout)
+        .lines()
+        .filter_map(|line| parse_cli_session_line(line, now))
+        .collect()
+}
+
+/// Parse one `name\tattached\tactivity` tmux row into `(workspace_id, attached,
+/// idle_secs)`, skipping anything outside the `vk_` namespace or malformed.
+fn parse_cli_session_line(line: &str, now: i64) -> Option<(Uuid, bool, i64)> {
+    let mut parts = line.split('\t');
+    let workspace_id = workspace_id_from_cli_session_name(parts.next()?)?;
+    let attached = parts.next()?.trim() != "0";
+    let activity: i64 = parts.next()?.trim().parse().ok()?;
+    Some((workspace_id, attached, (now - activity).max(0)))
+}
+
+/// Fresh `(attached, idle_secs)` for one CLI session, or `None` if it no longer
+/// exists. The reaper calls this immediately before killing as a TOCTOU
+/// recheck, so a session that was attached or became active between the list
+/// snapshot and the kill is spared. `=` forces exact-name matching.
+pub async fn cli_tmux_session_liveness(workspace_id: Uuid) -> Option<(bool, i64)> {
+    if !tmux_available() {
+        return None;
+    }
+    let session_name = cli_tmux_session_name(workspace_id);
+    let output = tokio::process::Command::new("tmux")
+        .args([
+            "-L",
+            CLI_TMUX_SOCKET,
+            "display-message",
+            "-p",
+            "-t",
+            &format!("={session_name}"),
+            "-F",
+            "#{session_attached}\t#{session_activity}",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None; // session gone
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_cli_session_line(
+        // display-message has no name field; prefix a dummy so the shared parser
+        // can reuse its attached/activity columns.
+        &format!("vk_{}\t{}", workspace_id.simple(), stdout.lines().next()?),
+        now_unix_secs(),
+    )
+    .map(|(_, attached, idle)| (attached, idle))
+}
+
 /// Whether tmux is on PATH. Checked once per process; when unavailable
 /// (e.g. Windows, minimal containers) CLI mode degrades to a bare shell.
 pub(crate) fn tmux_available() -> bool {

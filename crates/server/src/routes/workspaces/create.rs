@@ -295,28 +295,6 @@ pub async fn create_and_start_workspace(
     let workspace = managed_workspace.workspace.clone();
     tracing::info!("Created workspace {}", workspace.id);
 
-    // Generate a concise title from the first message in the BACKGROUND and
-    // apply it once Haiku responds — workspace creation is never blocked. The
-    // branch keeps its heuristic slug (a live worktree branch can't be safely
-    // renamed). Best-effort: a failed/timed-out call leaves the heuristic name
-    // (the call logs why); the `workspaces` UPDATE auto-pushes the new name to
-    // the UI via the DB change-hook.
-    {
-        let pool = deployment.db().pool.clone();
-        let first_message = prompt.clone();
-        let workspace_id = workspace.id;
-        tokio::spawn(async move {
-            if let Some(names) =
-                executors::title_gen::generate_workspace_names(&first_message).await
-                && let Err(e) =
-                    Workspace::update(&pool, workspace_id, None, None, Some(names.title.as_str()))
-                        .await
-            {
-                tracing::warn!("Failed to apply generated title to workspace {workspace_id}: {e}");
-            }
-        });
-    }
-
     // CLI-first: the prompt is parked for the workspace's CLI terminal and
     // runs in interactive claude there; only setup scripts (if any) spawn a
     // headless process. The chat-driven path (`start_workspace`) remains for
@@ -325,6 +303,21 @@ pub async fn create_and_start_workspace(
         .container()
         .start_workspace_cli(&workspace, executor_config.clone(), workspace_prompt)
         .await?;
+
+    // Generate a concise title AND a descriptive branch from the first message
+    // in the BACKGROUND — creation is never blocked. Spawned AFTER
+    // start_workspace_cli so the worktree exists before we rename its branch
+    // (the rename can't then race worktree creation). The rename is
+    // compare-and-set on the original heuristic branch, so a manual rename in
+    // the window wins. Both updates reach the UI via the workspaces change-hook.
+    {
+        let deployment = deployment.clone();
+        let first_message = prompt.clone();
+        let workspace = workspace.clone();
+        tokio::spawn(async move {
+            apply_generated_workspace_names(&deployment, &workspace, &first_message).await;
+        });
+    }
 
     deployment
         .track_if_analytics_allowed(
@@ -343,6 +336,71 @@ pub async fn create_and_start_workspace(
             execution_process,
         },
     )))
+}
+
+/// Background best-effort: ask Haiku for a concise title + branch slug from the
+/// first message, apply the title, and rename the branch IF it is still the
+/// original heuristic one (compare-and-set, so a manual rename always wins).
+/// Any failure leaves the heuristic name/branch and is logged. Spawned only
+/// after the worktree exists, so the git rename can't race worktree creation.
+async fn apply_generated_workspace_names(
+    deployment: &DeploymentImpl,
+    workspace: &Workspace,
+    first_message: &str,
+) {
+    let Some(names) = executors::title_gen::generate_workspace_names(first_message).await else {
+        return;
+    };
+    let pool = &deployment.db().pool;
+
+    if let Err(e) =
+        Workspace::update(pool, workspace.id, None, None, Some(names.title.as_str())).await
+    {
+        tracing::warn!(
+            "Failed to apply generated title to workspace {}: {e}",
+            workspace.id
+        );
+    }
+
+    // Compare-and-set: only rename if the branch is still the heuristic one the
+    // workspace was created with. The user may have manually renamed it in the
+    // 5-14s Haiku window, and we must not clobber that.
+    let current = match Workspace::find_by_id(pool, workspace.id).await {
+        Ok(Some(ws)) => ws,
+        Ok(None) => return, // workspace deleted meanwhile
+        Err(e) => {
+            tracing::warn!(
+                "Failed to reload workspace {} before branch rename: {e}",
+                workspace.id
+            );
+            return;
+        }
+    };
+    if current.branch != workspace.branch {
+        tracing::debug!(
+            "Skipping generated branch rename for {}: branch already changed",
+            workspace.id
+        );
+        return;
+    }
+
+    let new_branch = deployment
+        .container()
+        .git_branch_from_workspace_with_len(&workspace.id, &names.branch_slug, 40)
+        .await;
+    if new_branch == current.branch {
+        return;
+    }
+
+    if let Err(e) =
+        super::git::rename_workspace_branch(deployment, &current, &new_branch, true).await
+    {
+        tracing::info!(
+            "Kept heuristic branch for workspace {} (generated rename to '{}' failed: {e:?})",
+            workspace.id,
+            new_branch
+        );
+    }
 }
 
 #[cfg(test)]

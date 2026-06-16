@@ -52,7 +52,7 @@ use tokio::{sync::RwLock, task::JoinHandle};
 use utils::{
     log_msg::LogMsg,
     msg_store::MsgStore,
-    text::{git_branch_id, short_uuid},
+    text::{git_branch_id_with_len, short_uuid},
 };
 use uuid::Uuid;
 use worktree_manager::WorktreeError;
@@ -523,6 +523,14 @@ pub trait ContainerService {
         Ok(())
     }
 
+    /// Kill a workspace's CLI tmux session, if any.
+    ///
+    /// Default is a no-op. Deployments that run CLI tmux sessions (the local
+    /// deployment) MUST override this so delete/archive don't leak a detached
+    /// `claude` session that outlives its workspace — the interactive session
+    /// is not an `execution_process`, so the running-process guards miss it.
+    async fn kill_cli_session(&self, _workspace_id: Uuid) {}
+
     /// Archive a workspace: set archived flag, stop running dev servers, and run archive script.
     async fn archive_workspace(&self, workspace_id: Uuid) -> Result<(), ContainerError> {
         let pool = &self.db().pool;
@@ -547,6 +555,11 @@ pub trait ContainerService {
                 }
             }
         }
+
+        // Reap the CLI tmux session BEFORE the archive script runs, so a live
+        // `claude` turn can't keep mutating files while the script snapshots or
+        // moves workspace state. Best-effort + idempotent.
+        self.kill_cli_session(workspace_id).await;
 
         // Run archive script (silently skips if not configured)
         if let Err(e) = self.try_run_archive_script(workspace_id).await {
@@ -784,7 +797,21 @@ pub trait ContainerService {
     async fn git_branch_prefix(&self) -> String;
 
     async fn git_branch_from_workspace(&self, workspace_id: &Uuid, task_title: &str) -> String {
-        let task_title_id = git_branch_id(task_title);
+        self.git_branch_from_workspace_with_len(workspace_id, task_title, 16)
+            .await
+    }
+
+    /// Like [`git_branch_from_workspace`] but with a custom slug length cap, so a
+    /// descriptive LLM-generated slug can keep a longer, readable tail (e.g. 40)
+    /// instead of the 16-char title cut. The `<prefix>/<short_uuid>-` shape — and
+    /// thus per-workspace uniqueness — is preserved either way.
+    async fn git_branch_from_workspace_with_len(
+        &self,
+        workspace_id: &Uuid,
+        task_title: &str,
+        max_len: usize,
+    ) -> String {
+        let task_title_id = git_branch_id_with_len(task_title, max_len);
         let prefix = self.git_branch_prefix().await;
 
         if prefix.is_empty() {
