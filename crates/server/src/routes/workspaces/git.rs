@@ -560,41 +560,83 @@ pub async fn rename_branch(
     State(deployment): State<DeploymentImpl>,
     Json(payload): Json<RenameBranchRequest>,
 ) -> Result<ResponseJson<ApiResponse<RenameBranchResponse, RenameBranchError>>, ApiError> {
-    let new_branch_name = payload.new_branch_name.trim();
+    let new_branch_name = payload.new_branch_name.trim().to_string();
+
+    match rename_workspace_branch(&deployment, &workspace, &new_branch_name, false).await {
+        Ok(updated_children_count) => {
+            deployment
+                .track_if_analytics_allowed(
+                    "task_attempt_branch_renamed",
+                    serde_json::json!({
+                        "updated_children": updated_children_count,
+                    }),
+                )
+                .await;
+            Ok(ResponseJson(ApiResponse::success(RenameBranchResponse {
+                branch: new_branch_name,
+            })))
+        }
+        Err(e) => Ok(ResponseJson(ApiResponse::error_with_data(e))),
+    }
+}
+
+/// Rename a workspace's git branch across all of its repos and persist it.
+/// Shared by the manual `PUT /branch` endpoint and the async Haiku title/branch
+/// task — the manual path proves this is safe while an agent is running, since
+/// it only moves refs + HEAD and never touches the working tree.
+///
+/// All-or-nothing across the per-repo git renames + the parent branch row: it
+/// rolls the git renames back if a repo rename or the DB write fails, so git and
+/// the DB never diverge. Re-pointing child workspaces is best-effort (logged, not
+/// rolled back) since the rename has already committed by then.
+///
+/// With `cas` set (the async generated rename), the DB write is a compare-and-set
+/// against the original branch, so a manual rename that landed in the meantime is
+/// never clobbered. Returns the number of child workspaces re-pointed.
+pub(crate) async fn rename_workspace_branch(
+    deployment: &DeploymentImpl,
+    workspace: &Workspace,
+    new_branch_name: &str,
+    cas: bool,
+) -> Result<u64, RenameBranchError> {
+    let new_branch_name = new_branch_name.trim();
 
     if new_branch_name.is_empty() {
-        return Ok(ResponseJson(ApiResponse::error_with_data(
-            RenameBranchError::EmptyBranchName,
-        )));
+        return Err(RenameBranchError::EmptyBranchName);
     }
     if !deployment.git().is_branch_name_valid(new_branch_name) {
-        return Ok(ResponseJson(ApiResponse::error_with_data(
-            RenameBranchError::InvalidBranchNameFormat,
-        )));
+        return Err(RenameBranchError::InvalidBranchNameFormat);
     }
     if new_branch_name == workspace.branch {
-        return Ok(ResponseJson(ApiResponse::success(RenameBranchResponse {
-            branch: workspace.branch.clone(),
-        })));
+        return Ok(0);
     }
 
     let pool = &deployment.db().pool;
+    // Infra/DB failures surface as RenameFailed (the FE renders the message);
+    // there's no separate transport for them, and they are rare.
+    let infra = |e: String| RenameBranchError::RenameFailed {
+        repo_name: "workspace".to_string(),
+        message: e,
+    };
 
-    let merges = Merge::find_by_workspace_id(pool, workspace.id).await?;
+    let merges = Merge::find_by_workspace_id(pool, workspace.id)
+        .await
+        .map_err(|e| infra(e.to_string()))?;
     let has_open_pr = merges.into_iter().any(|merge| {
         matches!(merge, Merge::Pr(pr_merge) if matches!(pr_merge.pr_info.status, MergeStatus::Open))
     });
     if has_open_pr {
-        return Ok(ResponseJson(ApiResponse::error_with_data(
-            RenameBranchError::OpenPullRequest,
-        )));
+        return Err(RenameBranchError::OpenPullRequest);
     }
 
-    let repos = WorkspaceRepo::find_repos_for_workspace(pool, workspace.id).await?;
+    let repos = WorkspaceRepo::find_repos_for_workspace(pool, workspace.id)
+        .await
+        .map_err(|e| infra(e.to_string()))?;
     let container_ref = deployment
         .container()
-        .ensure_container_exists(&workspace)
-        .await?;
+        .ensure_container_exists(workspace)
+        .await
+        .map_err(|e| infra(e.to_string()))?;
     let workspace_dir = PathBuf::from(&container_ref);
 
     for repo in &repos {
@@ -602,21 +644,21 @@ pub async fn rename_branch(
 
         if deployment
             .git()
-            .check_branch_exists(&repo.path, new_branch_name)?
+            .check_branch_exists(&repo.path, new_branch_name)
+            .map_err(|e| infra(e.to_string()))?
         {
-            return Ok(ResponseJson(ApiResponse::error_with_data(
-                RenameBranchError::BranchAlreadyExists {
-                    repo_name: repo.name.clone(),
-                },
-            )));
+            return Err(RenameBranchError::BranchAlreadyExists {
+                repo_name: repo.name.clone(),
+            });
         }
-
-        if deployment.git().is_rebase_in_progress(&worktree_path)? {
-            return Ok(ResponseJson(ApiResponse::error_with_data(
-                RenameBranchError::RebaseInProgress {
-                    repo_name: repo.name.clone(),
-                },
-            )));
+        if deployment
+            .git()
+            .is_rebase_in_progress(&worktree_path)
+            .map_err(|e| infra(e.to_string()))?
+        {
+            return Err(RenameBranchError::RebaseInProgress {
+                repo_name: repo.name.clone(),
+            });
         }
     }
 
@@ -626,48 +668,100 @@ pub async fn rename_branch(
     for repo in &repos {
         let worktree_path = workspace_dir.join(&repo.name);
 
-        match deployment.git().rename_local_branch(
-            &worktree_path,
-            &workspace.branch,
-            new_branch_name,
-        ) {
-            Ok(()) => {
-                renamed_repos.push(repo);
-            }
+        match deployment
+            .git()
+            .rename_local_branch(&worktree_path, &workspace.branch, new_branch_name)
+        {
+            Ok(()) => renamed_repos.push(repo),
             Err(e) => {
-                for renamed_repo in &renamed_repos {
-                    let rollback_path = workspace_dir.join(&renamed_repo.name);
-                    if let Err(rollback_err) = deployment.git().rename_local_branch(
-                        &rollback_path,
-                        new_branch_name,
-                        &old_branch,
-                    ) {
-                        tracing::error!(
-                            "Failed to rollback branch rename in '{}': {}",
-                            renamed_repo.name,
-                            rollback_err
-                        );
-                    }
-                }
-                return Ok(ResponseJson(ApiResponse::error_with_data(
-                    RenameBranchError::RenameFailed {
-                        repo_name: repo.name.clone(),
-                        message: e.to_string(),
-                    },
-                )));
+                rollback_branch_renames(
+                    deployment,
+                    &workspace_dir,
+                    &renamed_repos,
+                    new_branch_name,
+                    &old_branch,
+                )
+                .await;
+                return Err(RenameBranchError::RenameFailed {
+                    repo_name: repo.name.clone(),
+                    message: e.to_string(),
+                });
             }
         }
     }
 
-    db::models::workspace::Workspace::update_branch_name(pool, workspace.id, new_branch_name)
-        .await?;
-    let updated_children_count = WorkspaceRepo::update_target_branch_for_children_of_workspace(
-        pool,
-        workspace.id,
-        &old_branch,
-        new_branch_name,
-    )
-    .await?;
+    // Persist the new branch. For the async generated rename (`cas`), this is a
+    // compare-and-set against the original branch so a manual rename that landed
+    // in the window isn't clobbered. Undo the git renames if the write fails or
+    // the CAS misses, so git and the DB never diverge.
+    let persisted = if cas {
+        db::models::workspace::Workspace::update_branch_name_if_unchanged(
+            pool,
+            workspace.id,
+            new_branch_name,
+            &old_branch,
+        )
+        .await
+        .map_err(|e| infra(e.to_string()))
+    } else {
+        db::models::workspace::Workspace::update_branch_name(pool, workspace.id, new_branch_name)
+            .await
+            .map(|()| true)
+            .map_err(|e| infra(e.to_string()))
+    };
+    match persisted {
+        Ok(true) => {}
+        Ok(false) => {
+            // Branch changed concurrently (e.g. a manual rename won) — undo ours.
+            rollback_branch_renames(
+                deployment,
+                &workspace_dir,
+                &renamed_repos,
+                new_branch_name,
+                &old_branch,
+            )
+            .await;
+            return Err(RenameBranchError::RenameFailed {
+                repo_name: "workspace".to_string(),
+                message: "branch changed concurrently".to_string(),
+            });
+        }
+        Err(e) => {
+            rollback_branch_renames(
+                deployment,
+                &workspace_dir,
+                &renamed_repos,
+                new_branch_name,
+                &old_branch,
+            )
+            .await;
+            return Err(e);
+        }
+    }
+
+    // Best-effort: the parent rename (git + DB) has already committed, so failing
+    // to re-point child workspaces must NOT fail the rename or roll it back —
+    // just log it. (The all-or-nothing guarantee covers the git renames + parent
+    // branch row, not this downstream child update.)
+    let updated_children_count =
+        match WorkspaceRepo::update_target_branch_for_children_of_workspace(
+            pool,
+            workspace.id,
+            &old_branch,
+            new_branch_name,
+        )
+        .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    "Renamed branch to '{}' but failed to re-point child workspaces: {}",
+                    new_branch_name,
+                    e
+                );
+                0
+            }
+        };
 
     if updated_children_count > 0 {
         tracing::info!(
@@ -677,18 +771,24 @@ pub async fn rename_branch(
         );
     }
 
-    deployment
-        .track_if_analytics_allowed(
-            "task_attempt_branch_renamed",
-            serde_json::json!({
-                "updated_children": updated_children_count,
-            }),
-        )
-        .await;
+    Ok(updated_children_count)
+}
 
-    Ok(ResponseJson(ApiResponse::success(RenameBranchResponse {
-        branch: new_branch_name.to_string(),
-    })))
+/// Best-effort rollback of already-renamed repos (`from` -> `to`) after a
+/// partial failure, so a failed rename never leaves git half-renamed.
+async fn rollback_branch_renames(
+    deployment: &DeploymentImpl,
+    workspace_dir: &Path,
+    renamed_repos: &[&Repo],
+    from: &str,
+    to: &str,
+) {
+    for repo in renamed_repos {
+        let path = workspace_dir.join(&repo.name);
+        if let Err(e) = deployment.git().rename_local_branch(&path, from, to) {
+            tracing::error!("Failed to rollback branch rename in '{}': {}", repo.name, e);
+        }
+    }
 }
 
 #[axum::debug_handler]

@@ -357,6 +357,29 @@ impl Workspace {
         Ok(())
     }
 
+    /// Compare-and-set rename: only updates `branch` if it still equals
+    /// `expected_old`. Returns `true` if a row was updated (the branch was
+    /// unchanged since the caller read it), `false` if it changed concurrently.
+    /// Lets the async generated-branch rename avoid clobbering a manual rename
+    /// that landed in the meantime.
+    pub async fn update_branch_name_if_unchanged(
+        pool: &SqlitePool,
+        workspace_id: Uuid,
+        new_branch_name: &str,
+        expected_old: &str,
+    ) -> Result<bool, WorkspaceError> {
+        let result = sqlx::query!(
+            "UPDATE workspaces SET branch = $1, updated_at = datetime('now') WHERE id = $2 AND branch = $3",
+            new_branch_name,
+            workspace_id,
+            expected_old,
+        )
+        .execute(pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Find workspace by path using container-ref path containment.
     /// Used by clients that may open a repo subfolder rather than the workspace root.
     pub async fn resolve_container_ref_by_prefix(

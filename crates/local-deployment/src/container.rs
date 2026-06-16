@@ -300,6 +300,112 @@ impl LocalContainerService {
         Ok(())
     }
 
+    /// Reap CLI tmux sessions that have outlived their usefulness. This is the
+    /// SAFETY NET complementing the immediate kills on delete/archive: it
+    /// catches sessions whose workspace was hard-deleted (orphans), whose
+    /// worktree was already cleaned, that were archived, or that have been idle
+    /// past the TTL. Reopening any live workspace recreates its session and
+    /// resumes the conversation from disk, so reaping is non-destructive.
+    ///
+    /// Kill authority is FRESH tmux state, not the `WorkspaceCliActivity` UI
+    /// projection (a lossy 2s `/proc` poll): never reap an attached session; for
+    /// non-terminal (archived / idle-TTL) sessions also require a settle grace
+    /// since last activity and no running coding agent, so a freshly-resumed
+    /// detached turn is spared. A per-session recheck closes the list→kill race.
+    async fn reap_idle_cli_sessions(&self) {
+        const IDLE_REAP_HOURS: i64 = 48;
+        const ACTIVITY_GRACE_SECS: i64 = 60;
+
+        if std::env::var("DISABLE_CLI_SESSION_REAP").is_ok() {
+            return;
+        }
+        let sessions = crate::pty::list_cli_tmux_sessions().await;
+        if sessions.is_empty() {
+            return;
+        }
+        let idle_ttl = IDLE_REAP_HOURS * 3600;
+        let mut reaped = 0usize;
+
+        for (workspace_id, attached, idle_secs) in sessions {
+            // Never reap a session a user is currently attached to.
+            if attached {
+                continue;
+            }
+            // Fail CLOSED: a transient DB error must never read as "workspace
+            // missing", which would classify a live session as an orphan and
+            // kill it. Skip this session for the round on any error.
+            let workspace = match Workspace::find_by_id(&self.db.pool, workspace_id).await {
+                Ok(ws) => ws,
+                Err(e) => {
+                    tracing::warn!("Reaper: skipping workspace {workspace_id}; load failed: {e}");
+                    continue;
+                }
+            };
+            // Terminal: workspace hard-deleted (no row) or worktree already
+            // removed — the session is pure garbage, reaped once detached.
+            let terminal = workspace
+                .as_ref()
+                .map(|w| w.worktree_deleted)
+                .unwrap_or(true);
+            let reason = if terminal {
+                "orphan"
+            } else if workspace.as_ref().is_some_and(|w| w.archived) {
+                "archived"
+            } else if idle_secs > idle_ttl {
+                "idle"
+            } else {
+                continue; // live, recent workspace — leave it alone
+            };
+
+            // Non-terminal sessions get extra protection: a settle grace since
+            // last activity, and no running coding agent (the interactive
+            // session isn't an execution_process, so this guards the rarer case
+            // of a tracked agent process tied to the same workspace).
+            if !terminal {
+                if idle_secs < ACTIVITY_GRACE_SECS {
+                    continue;
+                }
+                match ExecutionProcess::has_running_non_dev_server_processes_for_workspace(
+                    &self.db.pool,
+                    workspace_id,
+                )
+                .await
+                {
+                    Ok(true) => continue, // a coding agent is running — leave it
+                    Ok(false) => {}
+                    Err(e) => {
+                        // Fail closed: don't kill if we can't confirm it's idle.
+                        tracing::warn!(
+                            "Reaper: skipping workspace {workspace_id}; running-process check failed: {e}"
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // Pre-kill recheck against fresh tmux state (TOCTOU): a user may
+            // have attached or the pane may have become active since listing.
+            match crate::pty::cli_tmux_session_liveness(workspace_id).await {
+                Some((now_attached, now_idle)) => {
+                    if now_attached || (!terminal && now_idle < ACTIVITY_GRACE_SECS) {
+                        continue;
+                    }
+                }
+                None => continue, // already gone
+            }
+
+            crate::pty::kill_cli_tmux_session(workspace_id).await;
+            reaped += 1;
+            tracing::info!(
+                "Reaped CLI tmux session for workspace {workspace_id} (reason={reason}, idle_secs={idle_secs})"
+            );
+        }
+
+        if reaped > 0 {
+            tracing::info!("CLI session reaper killed {reaped} session(s)");
+        }
+    }
+
     fn spawn_workspace_cleanup(&self) {
         let container = self.clone();
         tokio::spawn(async move {
@@ -319,6 +425,9 @@ impl LocalContainerService {
                     .unwrap_or_else(|e| {
                         tracing::error!("Failed to clean up expired workspaces: {}", e)
                     });
+                // Backstop for CLI tmux sessions the explicit delete/archive
+                // kills missed (hard-deleted orphans, archived, idle > TTL).
+                container.reap_idle_cli_sessions().await;
             }
         });
     }
@@ -1139,6 +1248,10 @@ fn failure_exit_status() -> std::process::ExitStatus {
 impl ContainerService for LocalContainerService {
     fn msg_stores(&self) -> &Arc<RwLock<HashMap<Uuid, Arc<MsgStore>>>> {
         &self.msg_stores
+    }
+
+    async fn kill_cli_session(&self, workspace_id: Uuid) {
+        crate::pty::kill_cli_tmux_session(workspace_id).await;
     }
 
     fn db(&self) -> &DBService {
