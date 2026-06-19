@@ -170,6 +170,10 @@
       "pullRequests": {
         "title": "拉取请求",
         "description": "配置PR创建行为",
+        "autoArchive": {
+          "label": "合并后自动归档工作区",
+          "helper": "当工作通过拉取请求或直接合并完成合并后，自动归档工作区。关闭时，已合并的工作区会保留在活动列表中。"
+        },
         "autoDescription": {
           "label": "默认自动生成PR描述",
           "helper": "启用后，AI代理将在创建PR后自动更新标题和描述。"

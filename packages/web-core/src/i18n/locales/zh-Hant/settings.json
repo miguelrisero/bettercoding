@@ -170,6 +170,10 @@
       "pullRequests": {
         "title": "PR",
         "description": "設定 PR 建立行為",
+        "autoArchive": {
+          "label": "合併後自動封存工作區",
+          "helper": "當工作透過拉取請求或直接合併完成合併後，自動封存工作區。關閉時，已合併的工作區會保留在使用中的清單中。"
+        },
         "autoDescription": {
           "label": "預設自動產生 PR 描述",
           "helper": "啟用後，AI 代理會在建立 PR 後自動更新標題與描述。"

@@ -599,6 +599,16 @@ export function GeneralSettingsSection() {
         description={t('settings.general.pullRequests.description')}
       >
         <SettingsCheckbox
+          id="auto-archive-on-merge"
+          label={t('settings.general.pullRequests.autoArchive.label')}
+          description={t('settings.general.pullRequests.autoArchive.helper')}
+          checked={draft?.auto_archive_on_merge ?? false}
+          onChange={(checked) =>
+            updateDraft({ auto_archive_on_merge: checked })
+          }
+        />
+
+        <SettingsCheckbox
           id="pr-auto-description"
           label={t('settings.general.pullRequests.autoDescription.label')}
           description={t(
