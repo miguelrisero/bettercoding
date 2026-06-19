@@ -14,11 +14,15 @@ use git_host::{GitHostError, GitHostProvider, GitHostService};
 use serde_json::json;
 use sqlx::error::Error as SqlxError;
 use thiserror::Error;
-use tokio::{sync::Notify, time::interval};
+use tokio::{
+    sync::{Notify, RwLock},
+    time::interval,
+};
 use tracing::{debug, error, info, warn};
 
 use crate::services::{
     analytics::AnalyticsContext,
+    config::Config,
     container::ContainerService,
     remote_client::{RemoteClient, RemoteClientError},
     remote_sync,
@@ -53,6 +57,7 @@ pub struct PrMonitorService<C: ContainerService> {
     container: C,
     remote_client: Option<RemoteClient>,
     sync_notify: Arc<Notify>,
+    config: Arc<RwLock<Config>>,
 }
 
 impl<C: ContainerService + Send + Sync + 'static> PrMonitorService<C> {
@@ -62,6 +67,7 @@ impl<C: ContainerService + Send + Sync + 'static> PrMonitorService<C> {
         container: C,
         remote_client: Option<RemoteClient>,
         sync_notify: Arc<Notify>,
+        config: Arc<RwLock<Config>>,
     ) -> tokio::task::JoinHandle<()> {
         let service = Self {
             db,
@@ -70,6 +76,7 @@ impl<C: ContainerService + Send + Sync + 'static> PrMonitorService<C> {
             container,
             remote_client,
             sync_notify,
+            config,
         };
         tokio::spawn(async move {
             service.start().await;
@@ -181,14 +188,20 @@ impl<C: ContainerService + Send + Sync + 'static> PrMonitorService<C> {
             PullRequest::count_open_for_workspace(&self.db.pool, workspace_id).await?;
 
         if open_pr_count == 0 {
-            info!(
-                "PR #{} was merged, archiving workspace {}",
-                pr_number, workspace.id
-            );
-            if !workspace.pinned
-                && let Err(e) = self.container.archive_workspace(workspace.id).await
-            {
-                error!("Failed to archive workspace {}: {}", workspace.id, e);
+            let auto_archive = self.config.read().await.auto_archive_on_merge;
+            if auto_archive && !workspace.pinned {
+                info!(
+                    "PR #{} was merged, archiving workspace {}",
+                    pr_number, workspace.id
+                );
+                if let Err(e) = self.container.archive_workspace(workspace.id).await {
+                    error!("Failed to archive workspace {}: {}", workspace.id, e);
+                }
+            } else {
+                info!(
+                    "PR #{} was merged; auto-archive disabled, leaving workspace {} active",
+                    pr_number, workspace.id
+                );
             }
 
             if let Some(analytics) = &self.analytics {

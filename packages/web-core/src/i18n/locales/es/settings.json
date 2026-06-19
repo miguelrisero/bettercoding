@@ -170,6 +170,10 @@
       "pullRequests": {
         "title": "Pull Requests",
         "description": "Configura el comportamiento de creación de PR",
+        "autoArchive": {
+          "label": "Archivar automáticamente el espacio de trabajo al fusionar",
+          "helper": "Archiva automáticamente un espacio de trabajo cuando su trabajo se fusiona mediante una pull request o una fusión directa. Cuando está desactivado, los espacios de trabajo fusionados permanecen en tu lista activa."
+        },
         "autoDescription": {
           "label": "Auto-generar descripción de PR por defecto",
           "helper": "Cuando está habilitado, el agente de IA actualizará automáticamente el título y la descripción del PR después de la creación."

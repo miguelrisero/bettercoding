@@ -68,6 +68,11 @@ pub struct Config {
     pub relay_enabled: bool,
     #[serde(default)]
     pub host_nickname: Option<String>,
+    /// Whether a workspace is automatically archived once its work is merged
+    /// (PR merged or a direct local merge). Defaults to false so merged
+    /// workspaces stay in the active list unless the user opts in.
+    #[serde(default)]
+    pub auto_archive_on_merge: bool,
 }
 
 impl Config {
@@ -99,6 +104,7 @@ impl Config {
             send_message_shortcut: SendMessageShortcut::default(),
             relay_enabled: true,
             host_nickname: None,
+            auto_archive_on_merge: false,
         }
     }
 
@@ -155,6 +161,35 @@ impl Default for Config {
             send_message_shortcut: SendMessageShortcut::default(),
             relay_enabled: true,
             host_nickname: None,
+            auto_archive_on_merge: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_disables_auto_archive_on_merge() {
+        assert!(!Config::default().auto_archive_on_merge);
+    }
+
+    #[test]
+    fn existing_v8_config_without_field_defaults_to_false() {
+        // Simulate a config.json written before the field existed: serialize a
+        // default config, strip the key, and ensure it still loads as v8 with
+        // the field defaulting to false (no migration reset).
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("auto_archive_on_merge");
+        let raw = serde_json::to_string(&value).unwrap();
+
+        let config = Config::from(raw);
+
+        assert_eq!(config.config_version, "v8");
+        assert!(!config.auto_archive_on_merge);
     }
 }

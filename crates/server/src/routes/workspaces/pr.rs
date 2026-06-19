@@ -504,12 +504,14 @@ pub async fn attach_existing_pr(
             });
         }
 
-        // If PR is merged, archive workspace
+        // If PR is merged, archive workspace (when auto-archive-on-merge is enabled)
         if matches!(pr_info.status, MergeStatus::Merged) {
             let open_pr_count = PullRequest::count_open_for_workspace(pool, workspace.id).await?;
 
             if open_pr_count == 0 {
-                if !workspace.pinned
+                let auto_archive = deployment.config().read().await.auto_archive_on_merge;
+                if auto_archive
+                    && !workspace.pinned
                     && let Err(e) = deployment.container().archive_workspace(workspace.id).await
                 {
                     tracing::error!("Failed to archive workspace {}: {}", workspace.id, e);

@@ -247,7 +247,9 @@ pub async fn merge_workspace(
         });
     }
 
-    if !workspace.pinned
+    let auto_archive = deployment.config().read().await.auto_archive_on_merge;
+    if auto_archive
+        && !workspace.pinned
         && let Err(e) = deployment.container().archive_workspace(workspace.id).await
     {
         tracing::error!("Failed to archive workspace {}: {}", workspace.id, e);

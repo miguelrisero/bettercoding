@@ -178,6 +178,10 @@
       "pullRequests": {
         "title": "Pull Requests",
         "description": "Configure PR creation behavior",
+        "autoArchive": {
+          "label": "Auto-archive workspace when merged",
+          "helper": "Automatically archive a workspace once its work is merged via pull request or direct merge. When off, merged workspaces stay in your active list."
+        },
         "autoDescription": {
           "label": "Auto-generate PR description by default",
           "helper": "When enabled, the AI agent will automatically update the PR title and description after creation."
