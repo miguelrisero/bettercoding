@@ -1,204 +1,140 @@
-# Workspace File Upload / Download — Design
+# Workspace File Upload / Download — Design (v2, council-hardened)
 
 - **Date:** 2026-06-24
 - **Branch:** `mr/c515-research-file-upload-download`
-- **Status:** Proposed (awaiting spec review)
+- **Status:** Approved for implementation (council round applied)
 
 ## 1. Goal
 
-Let a user **upload files into** and **download files from** any workspace's
-worktree directory directly from the web UI, on **local** deployments. The
-feature is surfaced as a collapsible **"Files"** section in the workspace right
-sidebar.
+Let a user **browse + download** files from any workspace's worktree, and
+**upload** files into it, from the web UI on **local** deployments. Surfaced as a
+collapsible "Files" section in the workspace right sidebar.
 
-## 2. Background — what already exists
+## 2. Background — what exists
 
-The codebase already provides ~80% of the primitives:
+- `Workspace.container_ref` = absolute worktree root; `ensure_container_exists(ws)` returns it.
+- Streaming download + traversal guard pattern: `crates/server/src/routes/workspaces/attachments.rs::serve_file` (canonicalize + `starts_with`), and the hardened header helper `content_type_and_disposition_for_attachment` in `crates/server/src/routes/attachments.rs` (static `attachment`, octet-stream + `nosniff`).
+- `utils::path::ALWAYS_SKIP_DIRS` already denylists `.git`, `node_modules`, etc.
+- Relay signing middleware buffers bodies to 50 MB **only for relay requests** (`is_relay_request` short-circuit); the **host-relay proxy** (`routes/host_relay/proxy.rs`) buffers at `usize::MAX`. Local *direct* requests bypass both.
+- Frontend: central `api.ts` (`makeLocalApiRequest`), `react-dropzone`, sidebar sections in `RightSidebar.tsx`. `localApiTransport.ts` rewrites `/api/...` → `/api/host/{host_id}/...` when a remote host is selected.
 
-- **Worktree on disk:** each workspace's directory is stored as
-  `Workspace.container_ref` (absolute path, e.g.
-  `/var/tmp/vibe-kanban/worktrees/vk-<uuid>/`), containing one subdir per repo.
-  `ContainerService::ensure_container_exists(workspace)` returns it.
-- **Streaming file download** is an established pattern:
-  `crates/server/src/routes/workspaces/attachments.rs::serve_file` streams via
-  `Body::from_stream(ReaderStream::new(file))` and guards traversal (reject
-  `..`, `canonicalize` + `starts_with(base)`).
-- **Upload-into-worktree** exists for attachments (multipart → copied into the
-  worktree's `.vibe-attachments/`), with a per-route `DefaultBodyLimit`.
-- **Directory listing** exists: `GET /api/filesystem/directory?path=`.
-- **Relay signing middleware** (`require_relay_request_signature`) buffers
-  request bodies to 50 MB **only for relay requests** — it short-circuits
-  (`if !is_relay_request(&request) { return next.run(...) }`) for local,
-  non-relay requests. Local in-browser uploads use `makeLocalApiRequest`, so
-  they never hit the buffer.
-- **Frontend:** central API client `packages/web-core/src/shared/lib/api.ts`;
-  `react-dropzone` already wired for image drops; right sidebar sections defined
-  in `packages/web-core/src/pages/workspaces/RightSidebar.tsx`.
+## 3. Resolved decisions (incl. council round)
 
-**Gap:** there is no general endpoint to browse the worktree's working tree or
-to read/write arbitrary files in it. The attachment flow is special-cased to
-`.vibe-attachments/`; the directory lister cannot read or write file contents.
+| Decision | Choice |
+| --- | --- |
+| Interface | In-browser UI only. |
+| Deployment | **Local only, ENFORCED** — backend rejects relay/host-proxied requests on these routes; frontend hides the panel when a remote host is selected. |
+| Browse / download scope | Full worktree root (read-only), hiding hidden + `ALWAYS_SKIP_DIRS` by default; `.git` always denied. |
+| **Upload destination** | **Drop folder + opt-in path.** Default target = git-ignored `.vibe-uploads/` (auto-created). User may opt to upload into the directory they're browsing. Both paths: deny `.git`/`ALWAYS_SKIP_DIRS`, no-overwrite (409) unless `overwrite=true`, hard caps. |
+| Upload size | Concrete caps (NOT `disable()`): per-file + per-request byte caps, file-count cap, filename-length cap, streaming byte-count abort, temp cleanup. |
+| Zip download | Kept, but **bounded**: `follow_links(false)`, skip `.git`/`ALWAYS_SKIP_DIRS`/hidden, max entries + max uncompressed bytes + wall-time, sanitized relative names, **fail-loud** (no silent partial archive). |
+| Policy | One `WorkspaceFilePolicy` helper centralizes path-safety + denylist + caps; unit-tested. |
 
-## 3. Resolved decisions
+## 4. Non-goals (v1)
 
-| Decision | Choice | Rationale |
-| --- | --- | --- |
-| Interface | In-browser UI only | Lowest friction; lands where the workspace UI already is. |
-| Deployment | Local only (for now) | Endpoints route through the `Deployment` abstraction so remote can be added later, but remote is **not** implemented or tested in v1. |
-| File size | Stream both directions; raise/disable upload body limit | Confirmed cheap: local requests bypass the 50 MB relay buffer, and streaming download is already the codebase pattern. |
-| Browse scope | Workspace root (`container_ref`) | Reach **any repo** in the workspace from one tree. |
-| Zip download | Included in v1 | "Grab the results" in one click. |
-| UI placement | New collapsible "Files" section in `RightSidebar`, **collapsed by default** | Consistent with Git / Notes / Terminal sections. |
-| Sidebar order | **Git → Notes → Terminal → Files** | Per request: move Terminal below Notes, append Files. |
-
-## 4. Non-goals (v1, YAGNI)
-
-Delete / rename / mkdir / move; inline file editing; multi-select bulk
-operations; resumable / chunked (tus-style) uploads; **remote/cloud** worktree
-file access; a dedicated mobile tab (sidebar section only); any new auth/RBAC
-beyond the existing workspace-scoped routes.
+Delete/rename/mkdir/move; inline editing; resumable/chunked uploads; **remote/cloud** worktree access; a new app-wide CSRF-token/secret scheme (these routes match the **existing** local origin posture of comparable mutating endpoints — attachment upload, git ops — plus relay rejection; an app-wide auth upgrade is out of scope); mobile tab.
 
 ## 5. Backend
 
 ### 5.1 Module & mounting
 
 New module `crates/server/src/routes/workspaces/files.rs`, nested at
-`/api/workspaces/{id}/files`, behind the existing `load_workspace_middleware`
-(so `Workspace` is in request extensions and `{id}` is validated). Paths are
-passed as a **`?path=` query param** (not a wildcard segment) to keep middleware
-simple and mirror `filesystem.rs`.
+`/api/workspaces/{id}/files`, behind `load_workspace_middleware` **and** a
+`reject_relay_requests` guard (403 if the `x-vibe-relay` header is present) so the
+surface is local-direct only. Paths passed as `?path=` query params.
 
-### 5.2 Base directory
+### 5.2 Policy helper (`crates/utils/src/path.rs` or `crates/utils/src/file_policy.rs`)
 
-`base = ensure_container_exists(workspace)` → the workspace root
-(`container_ref`). All `?path=` values are interpreted relative to this root.
-Empty/absent `path` = the root itself.
+- `resolve_safe_path(base, rel) -> Result<PathBuf, FilePolicyError>` — reject `..`/absolute components; reject any component in `ALWAYS_SKIP_DIRS` or equal to `.git`; join; `canonicalize`; assert `starts_with(canonicalize(base))`. **Any `canonicalize` error = hard reject** (never fall back to the raw join — guards against the existing `path.rs` raw-fallback antipattern).
+- `safe_basename(name) -> Result<String, _>` — strip directory components, reject empty / `..` / path separators / over-long (>255).
+- Listing uses `symlink_metadata` (no-follow). Upload-target resolution validates the parent dir exists, is a real directory (not a symlink), and passes `resolve_safe_path`.
 
-### 5.3 Path-safety helper
-
-Add `resolve_safe_path(base: &Path, rel: &str, require: PathExistence)` to
-`crates/utils/src/path.rs` (shared + unit-testable):
-
-1. Reject if any component of `rel` is `..` (or `rel` is absolute).
-2. Join `base.join(rel)`.
-3. `canonicalize` the target (for read) or its **parent** (for upload, since the
-   file doesn't exist yet) and assert it `starts_with(canonicalize(base))`.
-
-`canonicalize` resolves symlinks, so a symlink inside the worktree pointing
-outside the base is rejected by the `starts_with` check. Optionally refactor the
-inline guard in `attachments.rs::serve_file` to call this helper (low priority).
-
-### 5.4 Endpoints
+### 5.3 Endpoints
 
 | Method & path | Behavior |
 | --- | --- |
-| `GET /list?path=<rel>` | `read_dir` the directory; return `WorkspaceDirListing`. Dirs and files with name, relative path, `is_dir`, size, modified time. |
-| `GET /download?path=<rel>` | Stream the file (`Body::from_stream(ReaderStream::new(..))`), `Content-Type` via `MimeGuess` (octet-stream fallback), `Content-Disposition: attachment; filename=...`, `Content-Length`. |
-| `GET /download-zip?path=<rel>` | Stream a zip of the subtree at `path` (default = root). Prefer a streaming zip writer (`async_zip`); a build-to-tempfile-then-stream fallback is acceptable for v1. Skip symlinks that escape base. |
-| `POST /upload?path=<rel>` (multipart) | For each multipart field: take the original filename, reduce to **basename** (strip dir components, reject `..`), stream the field body to a temp file in the target dir, then atomically rename into place. Target dir must already exist and pass `resolve_safe_path`. Layer `DefaultBodyLimit::disable()` (or a high cap, e.g. 2 GiB) on this route only. |
+| `GET /list?path=<rel>` | `read_dir`; `symlink_metadata` per entry; skip hidden + `ALWAYS_SKIP_DIRS`; entries `{name, path, is_dir, is_symlink, size_bytes, modified}`; cap at `MAX_LIST_ENTRIES` with a `truncated` flag. |
+| `GET /download?path=<rel>` | `resolve_safe_path` (must be a file); stream `Body::from_stream(ReaderStream::new(..))`; headers via the existing `content_type_and_disposition_for_attachment` (static `attachment`, octet-stream + `nosniff`) — **no attacker-controlled `filename`**. |
+| `GET /download-zip?path=<rel>` | `walkdir(follow_links=false)` under the resolved subtree; skip `.git`/`ALWAYS_SKIP_DIRS`/hidden/symlinks; enforce `MAX_ZIP_ENTRIES`, `MAX_ZIP_UNCOMPRESSED_BYTES`, `ZIP_WALL_TIME`; sanitized relative entry names; **exceeding a cap → 4xx/5xx error, not a partial zip.** Build via sync `zip` crate in `spawn_blocking` → `NamedTempFile` → stream → drop. |
+| `POST /upload?path=<rel>&overwrite=<bool>` (multipart) | Target dir = `.vibe-uploads/` when `path` absent/empty (auto-created + gitignored), else the validated browsed dir. Per file: `safe_basename`; stream to a temp file (`create_new`) in the **canonical target dir** with a byte counter (abort at `MAX_UPLOAD_FILE_BYTES` → 413 + cleanup); if final exists and not `overwrite` → 409 + cleanup; revalidate target under base; atomic rename. Enforce `MAX_UPLOAD_FILES` + filename length. Route layers `DefaultBodyLimit::max(MAX_UPLOAD_REQUEST_BYTES)`. |
+
+### 5.4 Constants (tunable)
+
+`MAX_LIST_ENTRIES = 2000`; `MAX_UPLOAD_FILE_BYTES = 2 GiB`;
+`MAX_UPLOAD_REQUEST_BYTES = 5 GiB`; `MAX_UPLOAD_FILES = 50`; filename ≤ 255;
+`MAX_ZIP_ENTRIES = 10_000`; `MAX_ZIP_UNCOMPRESSED_BYTES = 2 GiB`; `ZIP_WALL_TIME = 120s`.
 
 ### 5.5 Errors
 
-Reuse `ApiError` / `FileError`: `404` for not-found / outside-base, `400` for
-malformed path, `413` only reachable on the relay path (out of scope). Log and
-skip individual unreadable entries during zip streaming rather than failing the
-whole archive.
+Reuse `ApiError`/`FileError`: `404` not-found/outside-base, `400` malformed path,
+`409` overwrite conflict, `413` too large, `403` relay-rejected. No silent partials.
 
 ## 6. Shared types
 
-Add to `crates/api-types` (with `#[derive(..., TS)]`) and register in
-`crates/server/src/bin/generate_types.rs`, then `pnpm run generate-types`:
+`crates/api-types/src/workspace_files.rs` (`#[derive(Debug, Clone, Serialize, Deserialize, TS)]`),
+re-export in `lib.rs`, register both in `crates/server/src/bin/generate_types.rs`:
 
 ```rust
-pub struct WorkspaceFileEntry {
-    pub name: String,
-    pub path: String,          // relative to workspace root
-    pub is_dir: bool,
-    pub size_bytes: i64,
-    pub modified: Option<DateTime<Utc>>,
-}
-pub struct WorkspaceDirListing {
-    pub path: String,          // the listed dir, relative to root
-    pub entries: Vec<WorkspaceFileEntry>,
-}
+pub struct WorkspaceFileEntry { name: String, path: String, is_dir: bool, is_symlink: bool, size_bytes: i64, modified: Option<DateTime<Utc>> }
+pub struct WorkspaceDirListing { path: String, entries: Vec<WorkspaceFileEntry>, truncated: bool }
 ```
 
 ## 7. Frontend
 
 ### 7.1 API client (`packages/web-core/src/shared/lib/api.ts`)
 
-New `filesApi` using `makeLocalApiRequest`:
-
-- `list(workspaceId, path)` → `GET …/files/list?path=` → `WorkspaceDirListing`.
-- `downloadUrl(workspaceId, path)` / `downloadZipUrl(workspaceId, path)` →
-  return the URL string; downloads are plain `GET`s triggered by an `<a download>`
-  / `window.open` (no signing needed locally).
-- `uploadFiles(workspaceId, path, files)` → `FormData` `POST …/files/upload?path=`.
+`workspaceFilesApi` via `makeLocalApiRequest`: `list(workspaceId, path)`;
+`downloadUrl/downloadZipUrl(workspaceId, path)` (plain GET, `<a download>`);
+`upload(workspaceId, files, { path?, overwrite? })` (FormData).
 
 ### 7.2 Component
 
-`WorkspaceFilesPanel.tsx` (+ a thin container following the existing
-`*Container` pattern, fetching via React Query):
+`WorkspaceFilesPanel.tsx` (+ container): breadcrumb + listing (dirs first, sizes,
+modified, symlink/`truncated` indicators), per-file download, **drag-drop upload
+with a target toggle** ("Drop folder `.vibe-uploads/`" default vs "This folder"),
+overwrite confirmation on 409, progress, and "Download folder as zip".
 
-- Breadcrumb path navigation (click a crumb to go up; click a dir row to descend).
-- Directory listing: dirs first, then files, showing size + modified.
-- Per-file **download** link/button.
-- **Drag-drop upload zone** (`react-dropzone`) targeting the current dir, with a
-  progress indicator; refresh the listing on success.
-- **"Download folder as zip"** button for the current dir.
+### 7.3 Visibility & sidebar
 
-### 7.3 Sidebar integration (`RightSidebar.tsx`)
+- Gate: render only when `selectedWorkspace` is set **and** no remote host is
+  selected (`useHostId()` null) — the panel is local-only.
+- `RightSidebar.tsx`: reorder base sections to **Git → Notes → Terminal → Files**;
+  Files **collapsed by default** via `usePersistedExpanded(PERSIST_KEYS.filesSection, false)`.
+- Add `filesSection` to `PERSIST_KEYS` + `PersistKey` in `useUiPreferencesStore`.
 
-- Reorder the base `sections` array to **`[Git, Notes, Terminal]`** (move the
-  Terminal object below Notes; its `visible`/action logic is unchanged).
-- Append a **Files** section: `visible: true`, `content: <WorkspaceFilesPanel
-  workspaceId={selectedWorkspace.id} />`.
-- Add `const [filesExpanded] = usePersistedExpanded(PERSIST_KEYS.filesSection,
-  false)` → **collapsed by default**; thread it into the section + `useMemo` deps.
-- Add `filesSection` to `PERSIST_KEYS` in
-  `@/shared/stores/useUiPreferencesStore`.
+## 8. Security (council-driven)
 
-(Active Changes/Logs/Preview tabs continue to `unshift` on top — unaffected.)
+Local-only enforced (relay reject + host-gated UI); `WorkspaceFilePolicy` on every
+endpoint (canonicalize + `starts_with`, `.git`/`ALWAYS_SKIP_DIRS` denied, canonicalize-error
+= hard reject); symlink-safe (`symlink_metadata`/no-follow, `create_new` temp in canonical
+parent, revalidate before rename — TOCTOU mitigation); no-overwrite-by-default; hardened
+download headers (no attacker filename); bounded uploads + zip (DoS); no silent partial archives.
 
-## 8. Data flow
+## 9. Testing (test it hard)
 
-1. Section expands → `filesApi.list(id, "")` → render root entries.
-2. Click dir → `list(id, dirPath)` → re-render breadcrumb + entries.
-3. Click file → browser navigates to `downloadUrl` → server streams it.
-4. Drop files → `uploadFiles(id, currentPath, files)` → server streams to disk →
-   client refreshes the listing.
-5. "Download as zip" → browser navigates to `downloadZipUrl(id, currentPath)`.
+- **Rust unit** (`WorkspaceFilePolicy`): rejects `..`/absolute/`.git`/`node_modules`/symlink-escape/canonicalize-error; accepts valid nested; `safe_basename` strips dirs + rejects `..`/separators/over-long.
+- **Rust handler**: upload→list→download round-trip (default drop folder + opt-in path); upload to `.git/hooks/post-checkout` → 4xx; overwrite without flag → 409; over-cap upload → 413; relay header → 403; zip excludes `.git`/`node_modules` and over-cap → error.
+- **Backend**: `cargo test` touched crates; `pnpm run backend:check`; `pnpm run generate-types:check`.
+- **Frontend**: `pnpm run check` + `pnpm run lint`; Vitest for any pure helper.
+- **Manual/browser**: expand Files, upload (small + large) to drop folder + opt-in dir, download back byte-identical, zip a subtree + verify no `.git`, attempt `../` + `.git` writes → rejected, confirm panel hidden when a remote host is selected.
 
-## 9. Security
+## 10. Sequencing
 
-- **Path traversal:** every endpoint runs `resolve_safe_path` against the
-  canonicalized workspace root.
-- **Symlink escape:** caught by `canonicalize` + `starts_with`.
-- **Upload names:** reduced to basename; no caller-controlled directories.
-- **Body limit:** raised only on the local upload route; the relay path keeps
-  its 50 MB cap (remote is out of scope).
-- **No new auth surface:** same workspace-scoped path + middleware as existing
-  endpoints.
+1. `WorkspaceFilePolicy` + unit tests. 2. `api-types` + generate-types. 3. `files.rs` endpoints + relay guard + nest. 4. backend handler tests. 5. fmt/check/test. 6. frontend api + panel + sidebar + gating + store. 7. frontend check/lint. 8. draft PR + review rounds + babysit.
 
-## 10. Testing
+---
 
-- **Rust unit tests** for `resolve_safe_path`: rejects `..` and absolute paths,
-  rejects symlink-escape, accepts valid nested paths, handles the upload
-  "parent must exist" case.
-- **Handler round-trip** tests (upload → list → download) if the server test
-  harness supports it.
-- **Frontend:** Vitest for any pure breadcrumb/path helper; manual QA for
-  drag-drop upload, single-file download, and zip download.
+## Council review — applied (2026-06-24)
 
-## 11. Sequencing
+`/council:council` (mixed: 4 Codex personas + 1 Claude penetration-tester seat) reviewed v1 → **BLOCK 5/5** ("directionally fine, too broad as written"). Applied P0/P1:
 
-1. `api-types` structs + `generate_types` registration + `pnpm run generate-types`.
-2. `utils::path::resolve_safe_path` + unit tests.
-3. `files.rs` endpoints + nest under `workspaces/mod.rs`.
-4. `filesApi` in `api.ts`.
-5. `WorkspaceFilesPanel` + container.
-6. `RightSidebar` reorder + Files section + `PERSIST_KEYS.filesSection`.
-7. `pnpm run format` / `pnpm run check` / `pnpm run lint`; manual QA.
-
-**Effort:** Medium — one backend module and one frontend panel, both reusing
-established patterns.
+- **P0 local-only not enforced** → backend `reject_relay_requests` guard + frontend host-gating.
+- **P0 unbounded upload (`disable()`)** → concrete per-file/per-request/file-count/filename caps + streaming abort + temp cleanup.
+- **P0/P1 arbitrary worktree write** → default to git-ignored `.vibe-uploads/` drop folder (user opt-in for browsed dir); `.git`/`ALWAYS_SKIP_DIRS` denied; no-overwrite → 409.
+- **P1 canonicalize+starts_with TOCTOU/symlink** → `symlink_metadata`/no-follow, `create_new` temp in canonical parent + revalidate before rename, canonicalize-error = hard reject.
+- **P1 zip-slip/zip-bomb/partial** → `follow_links(false)`, skip denylist, caps, sanitized names, fail-loud.
+- **P1 Content-Disposition injection/XSS** → reuse existing hardened `content_type_and_disposition_for_attachment`.
+- **P1 listing cost/exposure** → skip hidden + `ALWAYS_SKIP_DIRS`, entry cap + `truncated`.
+- **P1 frontend visibility** → gate on `selectedWorkspace` + local capability.
+- **Maintainability** → single `WorkspaceFilePolicy` helper + tests.
+- **Deferred (noted non-goals):** app-wide CSRF-token/secret scheme (match existing local posture instead), resumable uploads, remote support.
