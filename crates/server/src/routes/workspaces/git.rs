@@ -670,10 +670,11 @@ pub(crate) async fn rename_workspace_branch(
     for repo in &repos {
         let worktree_path = workspace_dir.join(&repo.name);
 
-        match deployment
-            .git()
-            .rename_local_branch(&worktree_path, &workspace.branch, new_branch_name)
-        {
+        match deployment.git().rename_local_branch(
+            &worktree_path,
+            &workspace.branch,
+            new_branch_name,
+        ) {
             Ok(()) => renamed_repos.push(repo),
             Err(e) => {
                 rollback_branch_renames(
