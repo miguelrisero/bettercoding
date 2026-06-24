@@ -220,10 +220,14 @@ jobs:
 
   backend-remote-checks:
     needs: changes
+    # Skipped on forks: this job builds crates/remote, which depends on the
+    # private BloopAI/vibe-kanban-private `billing` crate via VK_PRIVATE_DEPLOY_KEY.
+    # Forks can't access that, so the job can never pass there.
     if: >-
       always()
       && (needs.changes.outputs['backend-remote'] == 'true' || needs.changes.result == 'skipped')
       && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      && github.event.repository.fork == false
     runs-on: *runner_label
     env:
       SCCACHE_GHA_ENABLED: "true"
