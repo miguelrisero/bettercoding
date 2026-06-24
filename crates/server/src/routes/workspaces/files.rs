@@ -5,8 +5,8 @@
 //! `.git`/`node_modules` denylist, and size caps live in one place.
 
 use std::{
-    io::{Seek, SeekFrom},
-    path::{Path, PathBuf},
+    io::{Read, Seek, SeekFrom},
+    path::{Component, Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -219,6 +219,26 @@ fn zip_io_error(msg: impl std::fmt::Display) -> ApiError {
     ApiError::Io(std::io::Error::other(msg.to_string()))
 }
 
+/// Build a safe, forward-slash zip entry name for `path` relative to `root`.
+/// Only `Normal` components are accepted, and none may contain a path separator,
+/// so a Unix filename containing `\` can't become a `../` zip-slip entry.
+#[allow(clippy::result_large_err)]
+fn zip_entry_name(root: &Path, path: &Path) -> Result<String, ApiError> {
+    let rel = path.strip_prefix(root).map_err(zip_io_error)?;
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        let Component::Normal(part) = component else {
+            return Err(ApiError::BadRequest("Unsafe archive path".to_string()));
+        };
+        let part = part.to_string_lossy();
+        if part == "." || part == ".." || part.contains('/') || part.contains('\\') {
+            return Err(ApiError::BadRequest("Unsafe archive path".to_string()));
+        }
+        parts.push(part.into_owned());
+    }
+    Ok(parts.join("/"))
+}
+
 /// Build a bounded zip of `root` into an anonymous temp file (auto-deleted when the
 /// returned handle drops). Skips `.git`/`node_modules`/hidden/symlinks. Fails loud
 /// when any cap is exceeded rather than emitting a silent partial archive.
@@ -255,8 +275,7 @@ fn build_zip(root: &Path) -> Result<std::fs::File, ApiError> {
         if file_type.is_symlink() || !file_type.is_file() {
             continue;
         }
-        let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
-        let name = rel.to_string_lossy().replace('\\', "/");
+        let name = zip_entry_name(root, entry.path())?;
         if name.is_empty() {
             continue;
         }
@@ -268,13 +287,19 @@ fn build_zip(root: &Path) -> Result<std::fs::File, ApiError> {
             ));
         }
 
-        zip.start_file(name, options).map_err(zip_io_error)?;
-        let mut src = std::fs::File::open(entry.path())?;
-        let written = std::io::copy(&mut src, &mut zip)?;
-        total_bytes += written;
-        if total_bytes > MAX_ZIP_UNCOMPRESSED_BYTES {
+        // Bound the copy so a single oversized file can't blow the uncompressed
+        // cap (or the temp disk) before a post-copy check would fire.
+        let remaining = MAX_ZIP_UNCOMPRESSED_BYTES.saturating_sub(total_bytes);
+        if remaining == 0 {
             return Err(ApiError::PayloadTooLarge);
         }
+        zip.start_file(name, options).map_err(zip_io_error)?;
+        let mut src = std::fs::File::open(entry.path())?;
+        let written = std::io::copy(&mut src.by_ref().take(remaining + 1), &mut zip)?;
+        if written > remaining {
+            return Err(ApiError::PayloadTooLarge);
+        }
+        total_bytes += written;
     }
 
     let mut file = zip.finish().map_err(zip_io_error)?;
@@ -327,7 +352,8 @@ async fn ensure_uploads_dir(canonical_base: &Path) -> Result<PathBuf, ApiError> 
     tokio::fs::create_dir_all(&dir).await?;
     let gitignore = dir.join(".gitignore");
     if !tokio::fs::try_exists(&gitignore).await.unwrap_or(false) {
-        let _ = tokio::fs::write(&gitignore, "*\n").await;
+        // Fail loudly: a missing .gitignore would let uploads leak into git.
+        tokio::fs::write(&gitignore, "*\n").await?;
     }
     Ok(dir)
 }
@@ -403,16 +429,28 @@ pub async fn upload_files(
         out.flush().await?;
         drop(out);
 
-        tokio::fs::rename(&tmp_path, &final_path)
-            .await
-            .map_err(|e| {
-                // best-effort cleanup of the temp file on failure
-                let tmp = tmp_path.clone();
-                tokio::spawn(async move {
-                    let _ = tokio::fs::remove_file(tmp).await;
-                });
-                ApiError::from(e)
-            })?;
+        // Publish atomically. For no-overwrite, hard_link fails if the target
+        // already exists, closing the try_exists -> rename race (TOCTOU).
+        if query.overwrite {
+            if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(e.into());
+            }
+        } else {
+            match tokio::fs::hard_link(&tmp_path, &final_path).await {
+                Ok(()) => {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Err(ApiError::Conflict(format!("File '{name}' already exists")));
+                }
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Err(e.into());
+                }
+            }
+        }
 
         let meta = tokio::fs::symlink_metadata(&final_path).await.ok();
         uploaded.push(WorkspaceFileEntry {
@@ -522,5 +560,17 @@ mod tests {
         assert!(!names.contains(&".secret".to_string()));
         #[cfg(unix)]
         assert!(!names.contains(&"link.txt".to_string()));
+    }
+
+    #[test]
+    fn zip_entry_name_rejects_backslash_and_traversal() {
+        let root = Path::new("/base");
+        assert_eq!(
+            zip_entry_name(root, Path::new("/base/a/b.txt")).unwrap(),
+            "a/b.txt"
+        );
+        // A Unix filename containing a backslash must be rejected, never
+        // rewritten into a "/" separator (zip-slip on extraction).
+        assert!(zip_entry_name(root, Path::new("/base/..\\evil.txt")).is_err());
     }
 }
