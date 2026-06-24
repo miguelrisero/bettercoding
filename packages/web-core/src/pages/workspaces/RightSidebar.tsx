@@ -6,6 +6,8 @@ import { PreviewControlsContainer } from './PreviewControlsContainer';
 import { GitPanelContainer } from './GitPanelContainer';
 import { TerminalPanelContainer } from '@/shared/components/TerminalPanelContainer';
 import { WorkspaceNotesContainer } from './WorkspaceNotesContainer';
+import { WorkspaceFilesContainer } from './WorkspaceFilesContainer';
+import { useHostId } from '@/shared/providers/HostIdProvider';
 import { useDiffs } from '@/shared/stores/useWorkspaceDiffStore';
 import { ArrowsOutSimpleIcon } from '@phosphor-icons/react';
 import { useLogsPanel } from '@/shared/hooks/useLogsPanel';
@@ -45,6 +47,8 @@ export const RightSidebar = memo(function RightSidebar({
 }: RightSidebarProps) {
   const { t } = useTranslation(['tasks', 'common']);
   const diffs = useDiffs();
+  // The Files panel is local-only: hide it whenever a remote host is selected.
+  const hostId = useHostId();
   const isTerminalVisible = useUiPreferencesStore((s) => s.isTerminalVisible);
   const { expandTerminal, isTerminalExpanded } = useLogsPanel();
 
@@ -70,6 +74,10 @@ export const RightSidebar = memo(function RightSidebar({
   );
   const [notesExpanded] = usePersistedExpanded(
     PERSIST_KEYS.notesSection,
+    false
+  );
+  const [filesExpanded] = usePersistedExpanded(
+    PERSIST_KEYS.filesSection,
     false
   );
 
@@ -104,6 +112,14 @@ export const RightSidebar = memo(function RightSidebar({
         actions: [],
       },
       {
+        title: t('common:sections.notes'),
+        persistKey: PERSIST_KEYS.notesSection,
+        visible: true,
+        expanded: notesExpanded,
+        content: <WorkspaceNotesContainer />,
+        actions: [],
+      },
+      {
         title: 'Terminal',
         persistKey: PERSIST_KEYS.terminalSection,
         visible: isTerminalVisible && !isTerminalExpanded,
@@ -112,11 +128,15 @@ export const RightSidebar = memo(function RightSidebar({
         actions: [{ icon: ArrowsOutSimpleIcon, onClick: expandTerminal }],
       },
       {
-        title: t('common:sections.notes'),
-        persistKey: PERSIST_KEYS.notesSection,
-        visible: true,
-        expanded: notesExpanded,
-        content: <WorkspaceNotesContainer />,
+        title: 'Files',
+        persistKey: PERSIST_KEYS.filesSection,
+        // Local-only feature: only show for a selected workspace when no
+        // remote host is selected (host-scoped browsing is not supported).
+        visible: !!selectedWorkspace && !hostId,
+        expanded: filesExpanded,
+        content: selectedWorkspace ? (
+          <WorkspaceFilesContainer workspaceId={selectedWorkspace.id} />
+        ) : null,
         actions: [],
       },
     ];
@@ -181,6 +201,8 @@ export const RightSidebar = memo(function RightSidebar({
     gitExpanded,
     terminalExpanded,
     notesExpanded,
+    filesExpanded,
+    hostId,
     changesExpanded,
     processesExpanded,
     devServerExpanded,
