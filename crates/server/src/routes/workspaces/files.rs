@@ -89,11 +89,15 @@ async fn workspace_root(
     Ok(PathBuf::from(container_ref))
 }
 
-fn relative_to(base: &Path, full: &Path) -> String {
-    full.strip_prefix(base)
-        .unwrap_or(full)
+/// Render `full` as a worktree-relative, forward-slash path. Fails closed if
+/// `full` is not under `base` rather than leaking an absolute server path.
+#[allow(clippy::result_large_err)]
+fn relative_to(base: &Path, full: &Path) -> Result<String, ApiError> {
+    Ok(full
+        .strip_prefix(base)
+        .map_err(|_| ApiError::File(FileError::NotFound))?
         .to_string_lossy()
-        .replace('\\', "/")
+        .replace('\\', "/"))
 }
 
 // --- GET /list ---
@@ -134,7 +138,7 @@ pub async fn list_files(
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false);
         entries.push(WorkspaceFileEntry {
-            path: relative_to(&canonical_base, &entry.path()),
+            path: relative_to(&canonical_base, &entry.path())?,
             name,
             is_dir: meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
             is_symlink,
@@ -153,7 +157,7 @@ pub async fn list_files(
     });
 
     Ok(ResponseJson(ApiResponse::success(WorkspaceDirListing {
-        path: relative_to(&canonical_base, &dir),
+        path: relative_to(&canonical_base, &dir)?,
         entries,
         truncated,
     })))
@@ -182,16 +186,18 @@ pub async fn download_file(
 ) -> Result<Response, ApiError> {
     let base = workspace_root(&deployment, &workspace).await?;
     let path = file_policy::resolve_existing_path(&base, &query.path)?;
-    let meta = tokio::fs::metadata(&path)
+    // Open once, then read metadata from the handle so the streamed bytes and
+    // the Content-Length come from the same inode (no reopen/swap race).
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|_| ApiError::File(FileError::NotFound))?;
+    let meta = file
+        .metadata()
         .await
         .map_err(|_| ApiError::File(FileError::NotFound))?;
     if !meta.is_file() {
         return Err(ApiError::File(FileError::NotFound));
     }
-
-    let file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|_| ApiError::File(FileError::NotFound))?;
     let body = Body::from_stream(ReaderStream::new(file));
 
     let filename = path
@@ -454,7 +460,7 @@ pub async fn upload_files(
 
         let meta = tokio::fs::symlink_metadata(&final_path).await.ok();
         uploaded.push(WorkspaceFileEntry {
-            path: relative_to(&canonical_base, &final_path),
+            path: relative_to(&canonical_base, &final_path)?,
             name,
             is_dir: false,
             is_symlink: false,

@@ -39,8 +39,12 @@ export function WorkspaceFilesPanel({ workspaceId }: WorkspaceFilesPanelProps) {
   const [uploadTarget, setUploadTarget] = useState<UploadTarget>('drop');
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
-  // Files held back after a 409 so the user can confirm an overwrite.
-  const [conflictFiles, setConflictFiles] = useState<File[] | null>(null);
+  // Upload held back after a 409 so the user can confirm an overwrite. The
+  // resolved target path is captured so a later target toggle can't redirect it.
+  const [conflict, setConflict] = useState<{
+    files: File[];
+    targetPath: string | undefined;
+  } | null>(null);
 
   const {
     data: listing,
@@ -66,22 +70,26 @@ export function WorkspaceFilesPanel({ workspaceId }: WorkspaceFilesPanelProps) {
   }, [queryClient, workspaceId]);
 
   const runUpload = useCallback(
-    async (files: File[], overwrite: boolean) => {
+    async (
+      files: File[],
+      targetPath: string | undefined,
+      overwrite: boolean
+    ) => {
       if (files.length === 0) return;
       setIsUploading(true);
       setUploadError(null);
       try {
+        // Empty targetPath => server drops into the .vibe-uploads folder.
         await workspaceFilesApi.upload(workspaceId, files, {
-          // Empty path => server drops into the .vibe-uploads folder.
-          path: uploadTarget === 'current' ? path : undefined,
+          path: targetPath,
           overwrite,
         });
-        setConflictFiles(null);
+        setConflict(null);
         invalidate();
       } catch (err) {
         if (err instanceof ApiError && err.status === 409) {
-          // Stash the files so the inline confirm can retry with overwrite.
-          setConflictFiles(files);
+          // Stash files + destination so the confirm retries the same target.
+          setConflict({ files, targetPath });
         } else {
           setUploadError(err instanceof Error ? err.message : 'Upload failed');
         }
@@ -89,14 +97,16 @@ export function WorkspaceFilesPanel({ workspaceId }: WorkspaceFilesPanelProps) {
         setIsUploading(false);
       }
     },
-    [workspaceId, uploadTarget, path, invalidate]
+    [workspaceId, invalidate]
   );
 
   const onDrop = useCallback(
     (accepted: File[]) => {
-      if (accepted.length > 0) runUpload(accepted, false);
+      if (accepted.length === 0) return;
+      const targetPath = uploadTarget === 'current' ? path : undefined;
+      runUpload(accepted, targetPath, false);
     },
-    [runUpload]
+    [runUpload, uploadTarget, path]
   );
 
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
@@ -109,7 +119,7 @@ export function WorkspaceFilesPanel({ workspaceId }: WorkspaceFilesPanelProps) {
   const navigateTo = useCallback((next: string) => {
     setPath(next);
     setUploadError(null);
-    setConflictFiles(null);
+    setConflict(null);
   }, []);
 
   const crumbTargetPath = (index: number) =>
@@ -218,13 +228,13 @@ export function WorkspaceFilesPanel({ workspaceId }: WorkspaceFilesPanelProps) {
       </div>
 
       {/* Conflict / error banners */}
-      {conflictFiles && (
+      {conflict && (
         <div className="flex items-center gap-half px-base py-half border-b bg-panel text-normal">
           <WarningIcon className="size-icon-xs shrink-0 text-brand" />
           <span className="flex-1 truncate">File exists — replace?</span>
           <button
             type="button"
-            onClick={() => runUpload(conflictFiles, true)}
+            onClick={() => runUpload(conflict.files, conflict.targetPath, true)}
             disabled={isUploading}
             className="flex items-center gap-half text-brand hover:opacity-80 disabled:opacity-50"
           >
@@ -233,7 +243,7 @@ export function WorkspaceFilesPanel({ workspaceId }: WorkspaceFilesPanelProps) {
           </button>
           <button
             type="button"
-            onClick={() => setConflictFiles(null)}
+            onClick={() => setConflict(null)}
             className="flex items-center gap-half text-low hover:text-normal"
           >
             <XIcon className="size-icon-xs" weight="bold" />
@@ -358,7 +368,7 @@ function FileRow({ workspaceId, entry, onOpenDir }: FileRowProps) {
           href={workspaceFilesApi.downloadUrl(workspaceId, entry.path)}
           download
           onClick={(e) => e.stopPropagation()}
-          className="shrink-0 text-low opacity-0 group-hover:opacity-100 hover:text-normal"
+          className="shrink-0 text-low opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 hover:text-normal focus-visible:text-normal"
           title={`Download ${entry.name}`}
         >
           <DownloadSimpleIcon className="size-icon-xs" weight="bold" />

@@ -40,13 +40,19 @@ pub const MAX_ZIP_UNCOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// True if a path component must never be traversed/listed/written
 /// (`.git`, `node_modules`, …). Reuses the shared worktree denylist.
+///
+/// Matched case-insensitively: on macOS/Windows default (case-insensitive)
+/// filesystems `.Git` resolves to `.git`, so an exact match would be bypassable.
 pub fn is_denied_component(name: &str) -> bool {
-    ALWAYS_SKIP_DIRS.contains(&name)
+    ALWAYS_SKIP_DIRS
+        .iter()
+        .any(|denied| denied.eq_ignore_ascii_case(name))
 }
 
-/// True for dotfiles/dot-dirs, which are hidden from listings by default.
+/// True for dotfiles/dot-dirs, which are hidden from listings by default. The
+/// default upload drop folder is exempt so users can browse what they uploaded.
 pub fn is_hidden(name: &str) -> bool {
-    name.starts_with('.')
+    name.starts_with('.') && name != VIBE_UPLOADS_DIR
 }
 
 /// Validate a caller-supplied relative path string. Rejects absolute paths,
@@ -83,6 +89,11 @@ fn validate_relative(rel: &str) -> Result<PathBuf, ApiError> {
 /// exist. Canonicalizes both sides and enforces containment. Any canonicalize
 /// error is a hard reject (never falls back to the raw join). Returns the
 /// canonical absolute path.
+///
+/// A residual check-then-open symlink TOCTOU remains (a worktree process could
+/// swap a component to an escaping symlink after this returns). This is accepted
+/// for the local single-user threat model — the user already owns the machine
+/// and worktree, so escaping it grants no access they don't already have.
 pub fn resolve_existing_path(base: &Path, rel: &str) -> Result<PathBuf, ApiError> {
     let cleaned = validate_relative(rel)?;
     let joined = base.join(cleaned);

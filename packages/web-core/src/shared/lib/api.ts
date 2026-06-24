@@ -837,7 +837,9 @@ export const workspaceFilesApi = {
     path?: string
   ): Promise<WorkspaceDirListing> => {
     const queryParam = path ? `?path=${encodeURIComponent(path)}` : '';
-    const response = await makeRequest(
+    // Local-only routes: enforce the local transport rather than relying on the
+    // UI's !hostId gate, so a relayed caller can't accidentally reuse this.
+    const response = await makeLocalApiRequest(
       `/api/workspaces/${workspaceId}/files/list${queryParam}`
     );
     return handleApiResponse<WorkspaceDirListing>(response);

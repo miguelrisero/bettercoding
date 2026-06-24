@@ -43,7 +43,7 @@ New module `crates/server/src/routes/workspaces/files.rs`, nested at
 `reject_relay_requests` guard (403 if the `x-vibe-relay` header is present) so the
 surface is local-direct only. Paths passed as `?path=` query params.
 
-### 5.2 Policy helper (`crates/utils/src/path.rs` or `crates/utils/src/file_policy.rs`)
+### 5.2 Policy helper (`crates/server/src/routes/workspaces/file_policy.rs`)
 
 - `resolve_safe_path(base, rel) -> Result<PathBuf, FilePolicyError>` — reject `..`/absolute components; reject any component in `ALWAYS_SKIP_DIRS` or equal to `.git`; join; `canonicalize`; assert `starts_with(canonicalize(base))`. **Any `canonicalize` error = hard reject** (never fall back to the raw join — guards against the existing `path.rs` raw-fallback antipattern).
 - `safe_basename(name) -> Result<String, _>` — strip directory components, reject empty / `..` / path separators / over-long (>255).
@@ -71,8 +71,10 @@ Reuse `ApiError`/`FileError`: `404` not-found/outside-base, `400` malformed path
 
 ## 6. Shared types
 
-`crates/api-types/src/workspace_files.rs` (`#[derive(Debug, Clone, Serialize, Deserialize, TS)]`),
-re-export in `lib.rs`, register both in `crates/server/src/bin/generate_types.rs`:
+Defined in `crates/server/src/routes/workspaces/files.rs`
+(`#[derive(Debug, Clone, Serialize, Deserialize, TS)]`, mirroring the existing
+`AttachmentResponse` pattern) and registered in
+`crates/server/src/bin/generate_types.rs` (ts-rs maps `i64` → `bigint`):
 
 ```rust
 pub struct WorkspaceFileEntry { name: String, path: String, is_dir: bool, is_symlink: bool, size_bytes: i64, modified: Option<DateTime<Utc>> }
