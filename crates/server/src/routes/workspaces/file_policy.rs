@@ -106,6 +106,26 @@ pub fn resolve_existing_path(base: &Path, rel: &str) -> Result<PathBuf, ApiError
     if !canonical.starts_with(&canonical_base) {
         return Err(ApiError::File(FileError::NotFound));
     }
+
+    // Re-check the *canonical* (symlink-resolved) components against the
+    // denylist: a symlink under the worktree could resolve to `.git`/`node_modules`
+    // while staying under canonical_base, bypassing the validate_relative check.
+    let canonical_rel = canonical
+        .strip_prefix(&canonical_base)
+        .map_err(|_| ApiError::File(FileError::NotFound))?;
+    for comp in canonical_rel.components() {
+        if let Component::Normal(seg) = comp {
+            let s = seg
+                .to_str()
+                .ok_or_else(|| ApiError::BadRequest("Invalid path encoding".to_string()))?;
+            if is_denied_component(s) {
+                return Err(ApiError::Forbidden(format!(
+                    "Access to '{s}' is not allowed"
+                )));
+            }
+        }
+    }
+
     Ok(canonical)
 }
 
@@ -247,5 +267,19 @@ mod tests {
         fs::write(dir.path().join("f.txt"), b"x").unwrap();
         assert!(resolve_existing_dir(dir.path(), "f.txt").is_err());
         assert!(resolve_existing_dir(dir.path(), "").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_to_denied_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        fs::create_dir_all(base.join(".git")).unwrap();
+        fs::write(base.join(".git/config"), b"x").unwrap();
+        // A symlink under the worktree pointing at .git must not become a read
+        // path just because its canonical target stays under the base.
+        std::os::unix::fs::symlink(base.join(".git"), base.join("link")).unwrap();
+        let err = resolve_existing_path(base, "link/config").unwrap_err();
+        assert!(is_forbidden(&err));
     }
 }
