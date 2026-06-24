@@ -389,6 +389,26 @@ export type AttachmentResponse = { id: string, file_path: string, original_name:
 
 export type AttachmentMetadata = { exists: boolean, file_name: string | null, path: string | null, size_bytes: bigint | null, format: string | null, proxy_url: string | null, };
 
+export type WorkspaceFileEntry = { 
+/**
+ * File or directory name (no path separators).
+ */
+name: string, 
+/**
+ * Path relative to the worktree root (forward slashes).
+ */
+path: string, is_dir: boolean, is_symlink: boolean, size_bytes: bigint, modified: string | null, };
+
+export type WorkspaceDirListing = { 
+/**
+ * The directory that was listed, relative to the worktree root.
+ */
+path: string, entries: Array<WorkspaceFileEntry>, 
+/**
+ * True if the directory had more than `MAX_LIST_ENTRIES` entries.
+ */
+truncated: boolean, };
+
 export type WorkspaceRepoInput = { repo_id: string, target_branch: string, };
 
 export type RunAgentSetupRequest = { executor_profile_id: ExecutorProfileId, };

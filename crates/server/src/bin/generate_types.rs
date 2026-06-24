@@ -138,6 +138,8 @@ fn generate_types_content() -> String {
         server::routes::workspaces::pr::CreatePrApiRequest::decl(),
         server::routes::attachments::AttachmentResponse::decl(),
         server::routes::attachments::AttachmentMetadata::decl(),
+        server::routes::workspaces::files::WorkspaceFileEntry::decl(),
+        server::routes::workspaces::files::WorkspaceDirListing::decl(),
         db::models::requests::WorkspaceRepoInput::decl(),
         server::routes::workspaces::integration::RunAgentSetupRequest::decl(),
         server::routes::workspaces::integration::RunAgentSetupResponse::decl(),

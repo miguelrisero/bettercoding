@@ -100,6 +100,8 @@ import {
   OpenRemoteWorkspaceInEditorRequest,
   OpenRemoteEditorResponse,
   ProfileResponse,
+  WorkspaceDirListing,
+  WorkspaceFileEntry,
 } from 'shared/types';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
 import { createWorkspaceWithSession } from '@/shared/types/attempt';
@@ -823,6 +825,69 @@ export const fileSystemApi = {
       `/api/filesystem/git-repos${queryParam}`
     );
     return handleApiResponse<DirectoryEntry[]>(response);
+  },
+};
+
+// Workspace Files API (local-only): browse, download, and upload files within
+// a workspace's working tree. All requests go through the local transport.
+export const workspaceFilesApi = {
+  /** List the entries of a directory (relative `path`) inside the workspace. */
+  list: async (
+    workspaceId: string,
+    path?: string
+  ): Promise<WorkspaceDirListing> => {
+    const queryParam = path ? `?path=${encodeURIComponent(path)}` : '';
+    // Local-only routes: enforce the local transport rather than relying on the
+    // UI's !hostId gate, so a relayed caller can't accidentally reuse this.
+    const response = await makeLocalApiRequest(
+      `/api/workspaces/${workspaceId}/files/list${queryParam}`
+    );
+    return handleApiResponse<WorkspaceDirListing>(response);
+  },
+
+  /** Raw URL that streams a single file as an attachment download. */
+  downloadUrl: (workspaceId: string, path: string): string =>
+    `/api/workspaces/${workspaceId}/files/download?path=${encodeURIComponent(
+      path
+    )}`,
+
+  /** Raw URL that streams a `.zip` of the subtree rooted at `path`. */
+  downloadZipUrl: (workspaceId: string, path: string): string =>
+    `/api/workspaces/${workspaceId}/files/download-zip?path=${encodeURIComponent(
+      path
+    )}`,
+
+  /**
+   * Upload one or more files into the workspace. When `opts.path` is empty the
+   * server drops the files into a `.vibe-uploads/` folder. Throws an
+   * {@link ApiError} with `status === 409` when a file already exists and
+   * `overwrite` is not set, letting the caller offer to replace it.
+   */
+  upload: async (
+    workspaceId: string,
+    files: File[],
+    opts?: { path?: string; overwrite?: boolean }
+  ): Promise<WorkspaceFileEntry[]> => {
+    const formData = new FormData();
+    for (const file of files) {
+      formData.append('file', file, file.name);
+    }
+
+    const params = new URLSearchParams();
+    if (opts?.path) params.set('path', opts.path);
+    if (opts?.overwrite) params.set('overwrite', 'true');
+    const query = params.toString();
+
+    const response = await makeLocalApiRequest(
+      `/api/workspaces/${workspaceId}/files/upload${query ? `?${query}` : ''}`,
+      {
+        method: 'POST',
+        body: formData,
+        credentials: 'include',
+      }
+    );
+
+    return handleApiResponse<WorkspaceFileEntry[]>(response);
   },
 };
 

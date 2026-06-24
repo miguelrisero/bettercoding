@@ -4,6 +4,8 @@ pub mod core;
 pub mod create;
 pub mod cursor_setup;
 pub mod execution;
+pub mod file_policy;
+pub mod files;
 pub mod gh_cli_setup;
 pub mod git;
 pub mod integration;
@@ -55,6 +57,7 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
         )
         .nest("/{id}", workspace_id_router)
         .nest("/{id}/attachments", attachments::router(deployment))
+        .nest("/{id}/files", files::router(deployment))
         .nest("/{id}/links", links::router(deployment));
 
     Router::new().nest("/workspaces", workspaces_router)
