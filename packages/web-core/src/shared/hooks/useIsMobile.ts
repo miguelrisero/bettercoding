@@ -70,8 +70,15 @@ export function isTouchDevice(): boolean {
   return coarsePointer || navigator.maxTouchPoints > 0;
 }
 
-/** React hook version of isTouchDevice — stable, computed once. */
+// No-op subscribe: touch capability doesn't change within a session, so the
+// value is read once and the store is never re-subscribed.
+const subscribeTouchDevice = () => () => {};
+
+/**
+ * React hook version of isTouchDevice. Reads via useSyncExternalStore with a
+ * `false` server snapshot so SSR/hydration stays stable, then reflects the real
+ * capability after mount — mirroring how useIsMobile reads a browser-only value.
+ */
 export function useIsTouchDevice(): boolean {
-  const [touch] = useState(isTouchDevice);
-  return touch;
+  return useSyncExternalStore(subscribeTouchDevice, isTouchDevice, () => false);
 }
