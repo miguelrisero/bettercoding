@@ -470,41 +470,22 @@ fn parse_cli_session_line(line: &str, now: i64) -> Option<(Uuid, bool, i64)> {
 }
 
 /// Fresh `(attached, idle_secs)` for one CLI session, or `None` if it no longer
-/// exists. The reaper calls this immediately before killing as a TOCTOU
-/// recheck, so a session that was attached or became active between the list
-/// snapshot and the kill is spared. `=` forces exact-name matching.
+/// exists. The reaper calls this immediately before killing as a TOCTOU recheck,
+/// so a session that was attached or became active since the list snapshot is
+/// spared.
+///
+/// Implemented by re-listing rather than `tmux display-message`: display-message
+/// resolves formats in a client/pane context and returns EMPTY for the
+/// session-scoped `#{session_attached}` / `#{session_activity}` there, which made
+/// this recheck always parse to `None` and silently disabled the whole reaper.
+/// `list-sessions` (used here) populates those fields correctly, and already
+/// no-ops cleanly when tmux is unavailable.
 pub async fn cli_tmux_session_liveness(workspace_id: Uuid) -> Option<(bool, i64)> {
-    if !tmux_available() {
-        return None;
-    }
-    let session_name = cli_tmux_session_name(workspace_id);
-    let output = tokio::process::Command::new("tmux")
-        .args([
-            "-L",
-            CLI_TMUX_SOCKET,
-            "display-message",
-            "-p",
-            "-t",
-            &format!("={session_name}"),
-            "-F",
-            "#{session_attached}\t#{session_activity}",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
+    list_cli_tmux_sessions()
         .await
-        .ok()?;
-    if !output.status.success() {
-        return None; // session gone
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_cli_session_line(
-        // display-message has no name field; prefix a dummy so the shared parser
-        // can reuse its attached/activity columns.
-        &format!("vk_{}\t{}", workspace_id.simple(), stdout.lines().next()?),
-        now_unix_secs(),
-    )
-    .map(|(_, attached, idle)| (attached, idle))
+        .into_iter()
+        .find(|(id, _, _)| *id == workspace_id)
+        .map(|(_, attached, idle)| (attached, idle))
 }
 
 /// Whether tmux is on PATH. Checked once per process; when unavailable
@@ -1022,5 +1003,30 @@ mod tests {
         assert!(CLI_TMUX_CONF.contains("set -s set-clipboard on"));
         assert!(CLI_TMUX_CONF.contains("clipboard"));
         assert!(CLI_TMUX_CONF.contains("unbind-key -n MouseDown3Pane"));
+    }
+
+    #[test]
+    fn parse_cli_session_line_reads_attached_and_idle() {
+        let id = "vk_00000000000000000000000000000001";
+        // activity 900, now 1000 -> idle 100; attached "0" -> false
+        let (_, attached, idle) =
+            parse_cli_session_line(&format!("{id}\t0\t900"), 1000).expect("valid line parses");
+        assert!(!attached);
+        assert_eq!(idle, 100);
+        // attached count > 0 -> true
+        let (_, attached, _) = parse_cli_session_line(&format!("{id}\t1\t900"), 1000).unwrap();
+        assert!(attached);
+    }
+
+    #[test]
+    fn parse_cli_session_line_rejects_malformed() {
+        let id = "vk_00000000000000000000000000000001";
+        // Empty fields — the `tmux display-message` failure mode that silently
+        // disabled the reaper — must NOT parse to a bogus liveness value.
+        assert!(parse_cli_session_line(&format!("{id}\t\t"), 1000).is_none());
+        // Missing columns.
+        assert!(parse_cli_session_line(id, 1000).is_none());
+        // Non-vk session names are ignored entirely.
+        assert!(parse_cli_session_line("misc\t0\t900", 1000).is_none());
     }
 }
