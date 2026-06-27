@@ -9,7 +9,9 @@ import {
   getTerminalTheme,
 } from '@/shared/lib/terminalTheme';
 import { buildTerminalWsUrl } from '@/shared/lib/terminalWsUrl';
+import { installTerminalTouchScroll } from '@/shared/lib/terminalTouchScroll';
 import { useTerminal } from '@/shared/hooks/useTerminal';
+import { TerminalMobileControls } from './TerminalMobileControls';
 
 interface XTermInstanceProps {
   tabId: string;
@@ -188,6 +190,14 @@ export function XTermInstance({
             });
         }
       });
+
+      // Mobile/touch: bridge vertical swipes to the SAME wheel events xterm
+      // already handles for a desktop mouse wheel (see terminalTouchScroll).
+      // Attached once on the freshly created element and intentionally NOT
+      // removed in the mount cleanup below — like the listeners above it lives
+      // with the element and tears down on terminal.dispose(). Removing it per
+      // unmount would leave reattached terminals without mobile scrolling.
+      installTerminalTouchScroll(terminal);
     }
 
     terminalRef.current = terminal;
@@ -258,10 +268,11 @@ export function XTermInstance({
     // theme.
     <div
       ref={resizeRef}
-      className="w-full h-full px-2 py-1"
+      className="relative w-full h-full px-2 py-1 overscroll-contain"
       style={{ background: TERMINAL_BACKGROUND }}
     >
       <div ref={containerRef} className="w-full h-full" />
+      <TerminalMobileControls getTerminal={() => terminalRef.current} />
     </div>
   );
 }
