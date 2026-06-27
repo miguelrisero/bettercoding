@@ -13,11 +13,11 @@ import type { Terminal } from '@xterm/xterm';
  *   - mouse tracking inactive → we stay out of the way so xterm's native touch
  *     handler scrolls local scrollback (no double-scroll).
  *
- * xterm 5.5 coupling — RE-VALIDATE ON UPGRADE (pinned by a Playwright contract
- * check, see tmp ship-it spec): the wheel listener is on `terminal.element`;
- * `deltaMode: 1` (DOM_DELTA_LINE) + `deltaY: ±1` bypasses xterm's private
- * pixel→row accumulator and deterministically scrolls exactly one line; the
- * pointer coords must land inside `.xterm-screen` or xterm drops the report.
+ * xterm 5.5 coupling — RE-VALIDATE ON UPGRADE (verified in-browser against xterm
+ * 5.5; this DOM surface is not covered by the unit tests): the wheel listener is
+ * on `terminal.element`; `deltaMode: 1` (DOM_DELTA_LINE) + `deltaY: ±1` bypasses
+ * xterm's private pixel→row accumulator and deterministically scrolls exactly one
+ * line; the pointer coords must land inside `.xterm-screen` or xterm drops the report.
  *
  * The DOM-free `createTouchScrollController` is the unit-tested seam;
  * `installTerminalTouchScroll` is a thin adapter that wires real touch events to it.
@@ -88,6 +88,7 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
 
   return {
     onTouchStart(p: TouchPoint): void {
+      accumulated = 0;
       if (p.touches !== 1) {
         axis = 'ignore'; // pinch / multi-touch — leave it to the browser
         return;
@@ -96,11 +97,17 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
       startX = p.clientX;
       startY = p.clientY;
       lastY = p.clientY;
-      accumulated = 0;
     },
 
     onTouchMove(p: TouchPoint): TouchMoveResult {
-      if (p.touches !== 1 || axis === 'ignore') return { prevent: false };
+      if (p.touches !== 1) {
+        // A second finger landed mid-gesture — abandon scrolling for the rest
+        // of this touch sequence so a pinch never bridges to wheel scrolling.
+        axis = 'ignore';
+        accumulated = 0;
+        return { prevent: false };
+      }
+      if (axis === 'ignore') return { prevent: false };
 
       if (axis === 'undecided') {
         axis = decideAxis(p.clientX - startX, p.clientY - startY);
@@ -130,9 +137,11 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
       return { prevent: true };
     },
 
-    onTouchEnd(): void {
-      axis = 'undecided';
+    onTouchEnd(remainingTouches = 0): void {
       accumulated = 0;
+      // Only re-arm once every finger is up; a partial lift from a pinch must
+      // not let the remaining finger resume a bridged scroll from stale state.
+      axis = remainingTouches === 0 ? 'undecided' : 'ignore';
     },
   };
 }
@@ -148,24 +157,35 @@ export function installTerminalTouchScroll(terminal: Terminal): () => void {
   const el = terminal.element;
   if (!el) return () => {};
 
-  const getScreenRect = (): Rect => {
-    const screen = el.querySelector('.xterm-screen') as HTMLElement | null;
-    const r = (screen ?? el).getBoundingClientRect();
-    return { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
-  };
+  // `.xterm-screen` is created by terminal.open() and is stable for the element's
+  // life, so resolve it once. The coords are constant across all wheels drained
+  // from a single touchmove, so memoize the clamp and only re-measure when they
+  // change — keeps repeated querySelector/getBoundingClientRect off the hot path.
+  const screen =
+    (el.querySelector('.xterm-screen') as HTMLElement | null) ?? el;
+  let lastKey = '';
+  let lastPoint = { x: 0, y: 0 };
 
   const controller = createTouchScrollController({
     getMouseTrackingMode: () => terminal.modes.mouseTrackingMode,
     dispatchWheel: (direction, clientX, clientY) => {
-      const { x, y } = clampToRect(clientX, clientY, getScreenRect());
+      const key = `${clientX},${clientY}`;
+      if (key !== lastKey) {
+        lastPoint = clampToRect(
+          clientX,
+          clientY,
+          screen.getBoundingClientRect()
+        );
+        lastKey = key;
+      }
       el.dispatchEvent(
         new WheelEvent('wheel', {
           deltaY: direction,
           deltaMode: 1, // DOM_DELTA_LINE — bypasses xterm's private px→row accumulator
           bubbles: true,
           cancelable: true,
-          clientX: x,
-          clientY: y,
+          clientX: lastPoint.x,
+          clientY: lastPoint.y,
         })
       );
     },
@@ -186,7 +206,7 @@ export function installTerminalTouchScroll(terminal: Terminal): () => void {
       e.preventDefault();
     }
   };
-  const onEnd = () => controller.onTouchEnd();
+  const onEnd = (e: TouchEvent) => controller.onTouchEnd(e.touches.length);
 
   el.addEventListener('touchstart', onStart, { passive: true });
   el.addEventListener('touchmove', onMove, { passive: false });

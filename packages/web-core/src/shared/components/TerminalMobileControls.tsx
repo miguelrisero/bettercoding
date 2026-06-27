@@ -9,7 +9,7 @@ import {
 } from '@phosphor-icons/react';
 
 import { cn } from '@/shared/lib/utils';
-import { useIsTouchDevice } from '@/shared/hooks/useIsTouchDevice';
+import { useIsTouchDevice } from '@/shared/hooks/useIsMobile';
 import { extractViewportText } from '@/shared/lib/terminalViewportText';
 
 interface TerminalMobileControlsProps {
@@ -18,6 +18,10 @@ interface TerminalMobileControlsProps {
 }
 
 const STATUS_MS = 1600;
+
+const BUTTON_CLASS =
+  'flex items-center justify-center size-11 rounded-md bg-secondary border ' +
+  'text-low hover:text-normal active:bg-primary transition-colors';
 
 /**
  * Touch-only Copy / Paste / Keyboard affordances for the terminal. Desktop keeps
@@ -59,8 +63,14 @@ export function TerminalMobileControls({
   const handlePaste = async () => {
     const term = getTerminal();
     if (!term) return;
+    // Insecure contexts / some WebViews have no Clipboard API at all — optional
+    // chaining would otherwise resolve to undefined and look like "empty".
+    if (!navigator.clipboard?.readText) {
+      flash('Paste unavailable');
+      return;
+    }
     try {
-      const text = await navigator.clipboard?.readText();
+      const text = await navigator.clipboard.readText();
       if (!text) {
         flash('Clipboard empty');
         return;
@@ -75,6 +85,11 @@ export function TerminalMobileControls({
   const handleCopy = async () => {
     const term = getTerminal();
     if (!term) return;
+    // Guard the write API up front so we never flash "Copied" without copying.
+    if (!navigator.clipboard?.writeText) {
+      flash('Copy unavailable');
+      return;
+    }
     let text: string;
     let label: string;
     if (term.hasSelection()) {
@@ -90,19 +105,25 @@ export function TerminalMobileControls({
       return;
     }
     try {
-      await navigator.clipboard?.writeText(text);
+      await navigator.clipboard.writeText(text);
       flash(label);
     } catch {
       flash('Copy blocked');
     }
   };
 
+  const actions = [
+    { label: 'Copy from terminal', Icon: CopyIcon, onClick: handleCopy },
+    {
+      label: 'Paste into terminal',
+      Icon: ClipboardTextIcon,
+      onClick: handlePaste,
+    },
+    { label: 'Show keyboard', Icon: KeyboardIcon, onClick: handleKeyboard },
+  ];
+
   // Belt-and-suspenders: keep taps on the controls from reaching the terminal.
   const stop = (e: { stopPropagation: () => void }) => e.stopPropagation();
-
-  const button =
-    'flex items-center justify-center size-11 rounded-md bg-secondary border ' +
-    'text-low hover:text-normal active:bg-primary transition-colors';
 
   return (
     <div
@@ -125,49 +146,21 @@ export function TerminalMobileControls({
           {status}
         </span>
       )}
-      {expanded && (
-        <>
+      {expanded &&
+        actions.map(({ label, Icon, onClick }) => (
           <button
+            key={label}
             type="button"
-            className={button}
-            aria-label="Copy from terminal"
-            onClick={handleCopy}
+            className={BUTTON_CLASS}
+            aria-label={label}
+            onClick={onClick}
           >
-            <CopyIcon
-              className="size-icon-sm"
-              weight="bold"
-              aria-hidden="true"
-            />
+            <Icon className="size-icon-sm" weight="bold" aria-hidden="true" />
           </button>
-          <button
-            type="button"
-            className={button}
-            aria-label="Paste into terminal"
-            onClick={handlePaste}
-          >
-            <ClipboardTextIcon
-              className="size-icon-sm"
-              weight="bold"
-              aria-hidden="true"
-            />
-          </button>
-          <button
-            type="button"
-            className={button}
-            aria-label="Show keyboard"
-            onClick={handleKeyboard}
-          >
-            <KeyboardIcon
-              className="size-icon-sm"
-              weight="bold"
-              aria-hidden="true"
-            />
-          </button>
-        </>
-      )}
+        ))}
       <button
         type="button"
-        className={cn(button, 'opacity-80')}
+        className={cn(BUTTON_CLASS, 'opacity-80')}
         aria-label={
           expanded ? 'Hide terminal controls' : 'Show terminal controls'
         }

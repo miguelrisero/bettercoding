@@ -53,3 +53,25 @@ export function useIsRealMobile(): boolean {
   const [isReal] = useState(() => isRealMobileDevice());
   return isReal;
 }
+
+/**
+ * Capability-based touch detection (coarse pointer OR touch points).
+ *
+ * Distinct from the viewport (`useIsMobile`) and user-agent (`useIsRealMobile`)
+ * detectors above: this answers "can this device touch?", which also covers
+ * iPadOS with a desktop UA and hybrid touch laptops. Capability doesn't change
+ * within a session, so it is computed once.
+ */
+export function isTouchDevice(): boolean {
+  if (typeof window === 'undefined') return false;
+  const coarsePointer =
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(pointer: coarse)').matches;
+  return coarsePointer || navigator.maxTouchPoints > 0;
+}
+
+/** React hook version of isTouchDevice — stable, computed once. */
+export function useIsTouchDevice(): boolean {
+  const [touch] = useState(isTouchDevice);
+  return touch;
+}

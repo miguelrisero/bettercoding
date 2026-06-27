@@ -104,6 +104,27 @@ describe('createTouchScrollController (gesture guards)', () => {
     expect(r.prevent).toBe(false);
   });
 
+  it('stays ignored after a partial multi-touch lift until all fingers are up', () => {
+    const { ctrl, wheels } = controllerWith('vt200');
+    ctrl.onTouchStart({ touches: 1, clientX: 0, clientY: 0 });
+    // A second finger lands mid-gesture (pinch) — bridge must bail.
+    ctrl.onTouchMove({ touches: 2, clientX: 0, clientY: -50 });
+    // Lift one finger; one remains down — must NOT resume scrolling.
+    ctrl.onTouchEnd(1);
+    const stillIgnored = ctrl.onTouchMove({
+      touches: 1,
+      clientX: 0,
+      clientY: -100,
+    });
+    expect(stillIgnored.prevent).toBe(false);
+    expect(wheels.length).toBe(0);
+    // All fingers up — the next clean gesture works again.
+    ctrl.onTouchEnd(0);
+    ctrl.onTouchStart({ touches: 1, clientX: 0, clientY: 0 });
+    ctrl.onTouchMove({ touches: 1, clientX: 0, clientY: WHEEL_STEP_PX });
+    expect(wheels).toEqual([-1]);
+  });
+
   it('ignores a horizontal swipe', () => {
     const { ctrl, wheels } = controllerWith('vt200');
     ctrl.onTouchStart({ touches: 1, clientX: 0, clientY: 0 });
