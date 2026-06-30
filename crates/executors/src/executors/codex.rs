@@ -75,6 +75,7 @@ use crate::{
     executors::{
         AppendPrompt, AvailabilityInfo, BaseCodingAgent, ExecutorError, ExecutorExitResult,
         SlashCommandDescription, SpawnedChild, StandardCodingAgentExecutor,
+        cli::{CliContinue, CliLaunchSpec, CliPromptArg, CliResume},
     },
     logs::utils::patch,
     model_selector::{ModelInfo, ModelSelectorConfig, PermissionPolicy, ReasoningOption},
@@ -222,6 +223,63 @@ impl StandardCodingAgentExecutor for Codex {
 
     fn use_approvals(&mut self, approvals: Arc<dyn ExecutorApprovalService>) {
         self.approvals = Some(approvals);
+    }
+
+    fn interactive_cli_spec(&self, _cwd: &Path) -> Option<CliLaunchSpec> {
+        let mut args: Vec<String> = Vec::new();
+
+        // Model: strip the `-fast` suffix (the fast service tier isn't
+        // expressible as an interactive flag; the base model still applies).
+        let (model, _fast) = resolve_model(self.model.as_deref());
+        if let Some(model) = model {
+            args.push("-m".to_string());
+            args.push(model.to_string());
+        }
+
+        // Reasoning effort via a config override; codex parses the value as
+        // TOML and falls back to a literal string, so a bare word is fine.
+        if let Some(effort) = &self.model_reasoning_effort {
+            args.push("-c".to_string());
+            args.push(format!("model_reasoning_effort={}", effort.as_ref()));
+        }
+
+        // Sandbox: default to the managed default (danger-full-access) so an
+        // unattended loop isn't blocked by a restrictive sandbox. `-s` values
+        // match the kebab serde reprs except we map Auto onto the default.
+        let sandbox = match self.sandbox {
+            Some(SandboxMode::ReadOnly) => "read-only",
+            Some(SandboxMode::WorkspaceWrite) => "workspace-write",
+            Some(SandboxMode::DangerFullAccess) | Some(SandboxMode::Auto) | None => {
+                "danger-full-access"
+            }
+        };
+        args.push("-s".to_string());
+        args.push(sandbox.to_string());
+
+        // Approval: default to `never` (autonomous) for the loop; Plan /
+        // Supervised still flow in through `apply_overrides`. Note the CLI value
+        // for `UnlessTrusted` is `untrusted`, not the kebab serde repr.
+        let approval = match self.ask_for_approval {
+            Some(AskForApproval::UnlessTrusted) => "untrusted",
+            Some(AskForApproval::OnFailure) => "on-failure",
+            Some(AskForApproval::OnRequest) => "on-request",
+            Some(AskForApproval::Never) | None => "never",
+        };
+        args.push("-a".to_string());
+        args.push(approval.to_string());
+
+        // Inline mode keeps the TUI in the normal scrollback buffer so the tmux
+        // pane (and the loop-automation capture-pane poll) stays readable.
+        args.push("--no-alt-screen".to_string());
+
+        Some(
+            CliLaunchSpec::new("codex", args)
+                .with_resume(CliResume::Subcommand("resume".to_string()))
+                .with_prompt_arg(CliPromptArg::Positional)
+                .with_continue(CliContinue::ResumeLast {
+                    subcommand: "resume".to_string(),
+                }),
+        )
     }
 
     async fn spawn(
@@ -779,5 +837,76 @@ mod tests {
             (Some("gpt-5.4-mini"), false)
         );
         assert_eq!(resolve_model(None), (None, false));
+    }
+
+    use std::path::Path;
+
+    use super::Codex;
+    use crate::executors::{
+        StandardCodingAgentExecutor,
+        cli::{CliContinue, CliPromptArg, CliResume},
+    };
+
+    fn codex_from(json: serde_json::Value) -> Codex {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn has_pair(args: &[String], a: &str, b: &str) -> bool {
+        args.windows(2).any(|w| w[0] == a && w[1] == b)
+    }
+
+    #[test]
+    fn interactive_spec_maps_settings_to_flags() {
+        let codex = codex_from(serde_json::json!({
+            "model": "gpt-5.5",
+            "model_reasoning_effort": "high",
+            "sandbox": "danger-full-access",
+            "ask_for_approval": "never",
+        }));
+        let spec = codex.interactive_cli_spec(Path::new("/tmp")).unwrap();
+        assert_eq!(spec.program, "codex");
+        assert!(has_pair(&spec.base_args, "-m", "gpt-5.5"));
+        assert!(
+            spec.base_args
+                .iter()
+                .any(|a| a == "model_reasoning_effort=high")
+        );
+        assert!(has_pair(&spec.base_args, "-s", "danger-full-access"));
+        assert!(has_pair(&spec.base_args, "-a", "never"));
+        assert!(spec.base_args.iter().any(|a| a == "--no-alt-screen"));
+        assert_eq!(spec.resume, CliResume::Subcommand("resume".to_string()));
+        assert_eq!(spec.prompt_arg, CliPromptArg::Positional);
+        assert!(matches!(
+            spec.continue_fallback,
+            CliContinue::ResumeLast { .. }
+        ));
+    }
+
+    #[test]
+    fn interactive_spec_defaults_to_autonomous_full_access() {
+        let spec = codex_from(serde_json::json!({}))
+            .interactive_cli_spec(Path::new("/tmp"))
+            .unwrap();
+        // No model selected -> no -m; sandbox/approval default to the loop-safe
+        // autonomous pair.
+        assert!(!spec.base_args.iter().any(|a| a == "-m"));
+        assert!(has_pair(&spec.base_args, "-s", "danger-full-access"));
+        assert!(has_pair(&spec.base_args, "-a", "never"));
+    }
+
+    #[test]
+    fn interactive_spec_strips_fast_suffix() {
+        let spec = codex_from(serde_json::json!({ "model": "gpt-5.5-fast" }))
+            .interactive_cli_spec(Path::new("/tmp"))
+            .unwrap();
+        assert!(has_pair(&spec.base_args, "-m", "gpt-5.5"));
+    }
+
+    #[test]
+    fn interactive_spec_maps_unless_trusted_to_untrusted_cli_value() {
+        let spec = codex_from(serde_json::json!({ "ask_for_approval": "unless-trusted" }))
+            .interactive_cli_spec(Path::new("/tmp"))
+            .unwrap();
+        assert!(has_pair(&spec.base_args, "-a", "untrusted"));
     }
 }

@@ -9,6 +9,7 @@ use std::{
     thread,
 };
 
+use executors::executors::cli::{CliContinue, CliLaunchSpec, CliPromptArg, CliResume};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -31,83 +32,125 @@ pub enum PtyCommand {
         /// mode joins the *exact* conversation the chat UI is showing, and
         /// follow-ups from either side share one transcript.
         resume_session_id: Option<String>,
-        /// The workspace's initial prompt (CLI-first creation): handed to
-        /// interactive claude as its argument so the run happens visibly in
+        /// The workspace's initial prompt (CLI-first creation): handed to the
+        /// interactive agent as its argument so the run happens visibly in
         /// the terminal instead of a headless executor. Ignored when
         /// `resume_session_id` is set.
         initial_prompt: Option<String>,
-        /// Profile-derived flags for the interactive `claude` launch
-        /// (currently `--model`/`--effort`), pre-resolved from the session's
-        /// selected ExecutorConfig. Empty falls back to claude's own defaults;
-        /// the resolver defaults a fresh CLI start to Opus at max effort.
-        agent_args: Vec<String>,
+        /// How to launch the selected agent's interactive CLI — binary, flags
+        /// (model/effort/sandbox/approval pre-resolved from the session's
+        /// ExecutorConfig), and the resume/prompt/continue forms. Claude is the
+        /// default; codex and the other agents fill in their own spec.
+        spec: CliLaunchSpec,
     },
 }
 
 /// Build the initial window command for a new CLI tmux session. Runs the
-/// interactive `claude` TUI when installed, then drops to a shell instead of
-/// ending the session (so a crashed/exited claude leaves a usable pane).
-/// Ignored by `-A` attaches (only runs when the session is first created).
+/// selected agent's interactive TUI when installed (`spec.program`), then drops
+/// to a shell instead of ending the session (so a crashed/exited agent leaves a
+/// usable pane). Ignored by `-A` attaches (only runs on first creation).
 ///
-/// - `--resume <id>` (when `resume_session_id` is a valid UUID) joins claude's
+/// The launch form is chosen from the agent-supplied [`CliLaunchSpec`]:
+/// - resume by id (`resume_session_id`, a validated UUID) joins the agent's
 ///   exact session — the same transcript the headless executor created/uses —
-///   so the chat UI and CLI hand off the conversation in both directions.
-/// - With nothing to resume, claude starts a FRESH TUI. Never `--continue`:
-///   on a brand-new workspace it printed "No conversation found to continue"
-///   and dumped the pane into a bare shell (the resume target is resolved
-///   workspace-wide server-side, so a missing id really means there is no
-///   conversation yet).
-/// - `--dangerously-skip-permissions` skips per-tool approval prompts for this
-///   trusted worktree. claude's one-time folder-trust dialog is separate and
-///   has no flag/setting to suppress; we pre-accept it for the worktree in
-///   `ensure_claude_folder_trusted` (the workspace is app-created, so trusted)
-///   before this bootstrap runs.
-/// - `agent_args` carries profile-derived flags (`--model`/`--effort`) resolved
-///   from the session's selected ExecutorConfig, so CLI mode honors the same
-///   model + reasoning effort as the headless executor.
+///   so the chat UI and CLI hand off the conversation. The shape is per-agent:
+///   a flag (`claude --resume <id>`) or a subcommand (`codex resume <id>`).
+/// - with an `initial_prompt` (CLI-first creation) the workspace prompt is
+///   delivered as a positional arg or a flag value, per the spec.
+/// - otherwise the agent's continue-fallback runs (claude `--continue`, codex
+///   `resume --last`, or a fresh TUI), so a workspace whose tmux session died
+///   rejoins its conversation where possible.
 ///
-/// TODO(profile-integration): model/effort now flow through `agent_args`, but a
-/// full convergence on the executor profile system (`ExecutorProfileId`,
-/// alternate agent CLIs) is still future work — keep new options flowing as
-/// pre-resolved `agent_args` rather than bolting fields onto `PtyCommand`.
+/// Agent flags (model / effort / sandbox / approval / autonomy) are pre-resolved
+/// into `spec.base_args` from the session's selected `ExecutorConfig`, so CLI
+/// mode honors the same selection as the headless executor. Per-folder trust /
+/// onboarding dialogs the agent can't suppress are pre-accepted separately in
+/// [`maybe_seed_cli_trust`] before this bootstrap runs.
 fn cli_bootstrap(
+    spec: &CliLaunchSpec,
     resume_session_id: Option<&str>,
     initial_prompt: Option<&str>,
-    agent_args: &[String],
 ) -> String {
-    // Profile-derived flags (model/effort) applied to EVERY launch form below,
-    // shell-quoted so a model id can never break out of the command.
-    let flags: String = agent_args
+    // The program is a bare binary name from our own code; quote it anyway so
+    // it can never be anything but a single command word.
+    let prog = shell_single_quote(&spec.program);
+
+    // Agent flags (model/effort/sandbox/approval/autonomy) applied to every
+    // launch form except resume-by-subcommand, shell-quoted so a value can
+    // never break out of the command.
+    let flags: String = spec
+        .base_args
         .iter()
         .map(|arg| format!(" {}", shell_single_quote(arg)))
         .collect();
-    let base = format!("claude{flags} --dangerously-skip-permissions");
+    let base = format!("{prog}{flags}");
 
-    // Only a strict UUID may be interpolated into the shell string. claude
+    // Nothing explicit to run (a CLI-first workspace whose tmux session died):
+    // continue the most recent conversation in this cwd if the agent can,
+    // otherwise a fresh TUI.
+    let continue_launch = || match &spec.continue_fallback {
+        CliContinue::Flag(flag) => format!("{base} {flag} || {base}"),
+        CliContinue::ResumeLast { subcommand } => {
+            format!("{prog} {subcommand} --last || {prog}")
+        }
+        CliContinue::Fresh => base.clone(),
+    };
+
+    // Only a strict UUID may be interpolated into the shell string. Agent
     // session ids are UUIDs, so this both validates intent and forecloses
     // shell injection via the id.
     let launch = if let Some(id) = resume_session_id.filter(|id| is_uuid(id)) {
-        format!("{base} --resume {id}")
+        match &spec.resume {
+            // `<base> --resume <id>` — flags still apply (claude).
+            CliResume::Flag(flag) => format!("{base} {flag} {id}"),
+            // `<program> resume <id>` — a resume subcommand restores the
+            // session's own settings, so the base flags are NOT replayed (codex).
+            CliResume::Subcommand(sub) => format!("{prog} {sub} {id}"),
+            CliResume::Unsupported => continue_launch(),
+        }
     } else if let Some(prompt) = initial_prompt.map(str::trim).filter(|p| !p.is_empty()) {
-        // CLI-first creation: the workspace prompt becomes claude's argument
-        // (single-quote escaped — the prompt is arbitrary user text). A
-        // leading space neutralizes prompts that start with '-' so they can
-        // never parse as flags.
-        let guarded = if prompt.starts_with('-') {
-            format!(" {prompt}")
-        } else {
-            prompt.to_string()
-        };
-        format!("{base} {}", shell_single_quote(&guarded))
+        // CLI-first creation: the workspace prompt is delivered to the agent.
+        match &spec.prompt_arg {
+            // Trailing positional arg (single-quote escaped — arbitrary user
+            // text). A leading space neutralizes prompts starting with '-' so
+            // they can never parse as flags.
+            CliPromptArg::Positional => {
+                let guarded = if prompt.starts_with('-') {
+                    format!(" {prompt}")
+                } else {
+                    prompt.to_string()
+                };
+                format!("{base} {}", shell_single_quote(&guarded))
+            }
+            // Prompt as a flag value (e.g. copilot `-i '<prompt>'`); a leading
+            // '-' is harmless after the flag.
+            CliPromptArg::Flag(flag) => format!("{base} {flag} {}", shell_single_quote(prompt)),
+            // No CLI way to seed the prompt — start the TUI and rely on a
+            // post-launch keystroke delivery (loop automation / send-keys).
+            CliPromptArg::Unsupported => continue_launch(),
+        }
     } else {
-        // Nothing explicit to run: resume the most recent conversation in
-        // this cwd if one exists (a CLI-first workspace whose tmux session
-        // died), otherwise fall through to a fresh TUI — `--continue` exits
-        // non-zero when there is no conversation to continue.
-        format!("{base} --continue || {base}")
+        continue_launch()
     };
 
-    format!(r#"command -v claude >/dev/null 2>&1 && {launch}; exec "${{SHELL:-/bin/sh}}""#)
+    format!(r#"command -v {prog} >/dev/null 2>&1 && {launch}; exec "${{SHELL:-/bin/sh}}""#)
+}
+
+/// Pre-accept per-folder trust / first-run dialogs the selected agent's CLI
+/// would otherwise block on, for this app-created (trusted) worktree. Keyed by
+/// the launch program so each agent's local-environment friction is handled in
+/// one place. Best-effort: any failure just means the dialog shows as before.
+fn maybe_seed_cli_trust(program: &str, dir: &Path) {
+    match program {
+        "claude" => ensure_claude_folder_trusted(dir),
+        "codex" => {
+            ensure_codex_folder_trusted(dir);
+            ensure_codex_update_nag_dismissed();
+        }
+        // copilot / cursor / gemini / qwen onboarding seeding is added
+        // alongside each agent's CLI support.
+        _ => {}
+    }
 }
 
 /// POSIX single-quote escaping: the only character that needs handling
@@ -246,6 +289,208 @@ fn apply_trust_to_config(root: &mut serde_json::Value, project_keys: &[String]) 
         }
     }
     changed
+}
+
+/// `$CODEX_HOME/config.toml`, else `~/.codex/config.toml` — where codex records
+/// per-project trust.
+fn codex_config_path() -> Option<PathBuf> {
+    match std::env::var("CODEX_HOME") {
+        Ok(home) if !home.trim().is_empty() => Some(PathBuf::from(home).join("config.toml")),
+        _ => dirs::home_dir().map(|home| home.join(".codex").join("config.toml")),
+    }
+}
+
+/// Pre-accept codex's per-directory trust prompt for this app-created worktree
+/// by marking it `trusted` in `~/.codex/config.toml`, so the interactive launch
+/// never blocks on "Do you want to allow Codex to work in this folder?".
+/// Per-process memoized; best-effort (a failure just means the prompt shows).
+fn ensure_codex_folder_trusted(dir: &Path) {
+    static SEEDED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let seeded = SEEDED.get_or_init(|| Mutex::new(HashSet::new()));
+
+    if seeded
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(dir)
+    {
+        return;
+    }
+
+    match seed_codex_trust(dir) {
+        Ok(()) => {
+            seeded
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(dir.to_path_buf());
+        }
+        Err(e) => {
+            tracing::debug!(
+                "Could not pre-trust {} in codex config.toml (trust prompt may show): {e}",
+                dir.display()
+            );
+        }
+    }
+}
+
+/// Append `[projects."<dir>"] trust_level = "trusted"` blocks for `dir` (and its
+/// canonical form) to codex's `config.toml`, but only when absent. Non-destructive
+/// by design: it never rewrites the user's existing settings — it appends — and
+/// bails without writing if either the existing file or the result wouldn't parse
+/// as TOML, so a malformed merge can never corrupt the user's codex config.
+fn seed_codex_trust(dir: &Path) -> std::io::Result<()> {
+    static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
+    let Some(config_path) = codex_config_path() else {
+        return Ok(());
+    };
+
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+
+    // Never touch a config we can't parse — preserve the user's settings.
+    if !existing.trim().is_empty() && toml::from_str::<toml::Table>(&existing).is_err() {
+        return Ok(());
+    }
+
+    let additions = codex_trust_additions(&existing, dir);
+    if additions.is_empty() {
+        return Ok(());
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&additions);
+
+    // Final guard: only write if the merged document is valid TOML, so a stray
+    // duplicate table (e.g. codex stored the path in a different quoting) can
+    // never corrupt the config — worst case the trust prompt shows once.
+    if toml::from_str::<toml::Table>(&updated).is_err() {
+        return Ok(());
+    }
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = config_path.with_extension("toml.vk-trust-tmp");
+    std::fs::write(&tmp_path, updated.as_bytes())?;
+    std::fs::rename(&tmp_path, &config_path)?;
+    Ok(())
+}
+
+/// Pure helper: the `[projects."<key>"]` blocks to append for `dir` (and its
+/// canonical form) that aren't already present in `existing`. Split out so the
+/// "only add when absent" logic is unit-testable without touching real files.
+fn codex_trust_additions(existing: &str, dir: &Path) -> String {
+    let mut keys = vec![dir.to_string_lossy().into_owned()];
+    if let Ok(canonical) = dir.canonicalize() {
+        let canonical = canonical.to_string_lossy().into_owned();
+        if !keys.contains(&canonical) {
+            keys.push(canonical);
+        }
+    }
+
+    let mut additions = String::new();
+    for key in keys {
+        // codex writes the table as `[projects."<path>"]`; only append when that
+        // exact header is absent so we never create a duplicate table.
+        let header = format!("[projects.\"{key}\"]");
+        if !existing.contains(&header) {
+            additions.push_str(&format!(
+                "\n[projects.\"{key}\"]\ntrust_level = \"trusted\"\n"
+            ));
+        }
+    }
+    additions
+}
+
+/// Far-future sentinel written to codex's `version.json` `last_checked_at`, so
+/// codex's throttled update check treats the cached result as fresh and never
+/// re-checks (a re-check would re-surface the blocking "Update available" modal
+/// with a newer version).
+const CODEX_UPDATE_CHECK_FROZEN_AT: &str = "2099-01-01T00:00:00Z";
+
+/// `$CODEX_HOME/version.json`, else `~/.codex/version.json` — codex's cached
+/// update-check state.
+fn codex_version_json_path() -> Option<PathBuf> {
+    match std::env::var("CODEX_HOME") {
+        Ok(home) if !home.trim().is_empty() => Some(PathBuf::from(home).join("version.json")),
+        _ => dirs::home_dir().map(|home| home.join(".codex").join("version.json")),
+    }
+}
+
+/// Defuse codex's blocking "Update available — 1. Update now / 2. Skip / 3. Skip
+/// until next version · Press enter to continue" startup modal, which otherwise
+/// stalls an unattended launch whenever the user's codex is behind latest
+/// (verified live). We replicate codex's own "skip until next version" state in
+/// `version.json`: mark the cached latest as dismissed and freeze the check
+/// timestamp so codex won't re-check and re-prompt. Codex still shows a passive
+/// one-line banner, but the TUI proceeds straight to the prompt. Per-process
+/// memoized; best-effort (a failure just means the modal may show).
+fn ensure_codex_update_nag_dismissed() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        if let Err(e) = seed_codex_update_dismissal() {
+            tracing::debug!("Could not pre-dismiss codex update modal: {e}");
+        }
+    });
+}
+
+fn seed_codex_update_dismissal() -> std::io::Result<()> {
+    let Some(path) = codex_version_json_path() else {
+        return Ok(());
+    };
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        // Nothing cached yet (codex never ran) — nothing to pre-dismiss.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return Ok(());
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return Ok(());
+    };
+    // No known latest -> there's no modal to pre-dismiss.
+    let Some(latest) = obj
+        .get("latest_version")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+    else {
+        return Ok(());
+    };
+
+    let already_dismissed = obj.get("dismissed_version").and_then(|v| v.as_str()) == Some(&latest);
+    let already_frozen =
+        obj.get("last_checked_at").and_then(|v| v.as_str()) == Some(CODEX_UPDATE_CHECK_FROZEN_AT);
+    if already_dismissed && already_frozen {
+        return Ok(());
+    }
+
+    obj.insert(
+        "dismissed_version".to_string(),
+        serde_json::Value::String(latest),
+    );
+    obj.insert(
+        "last_checked_at".to_string(),
+        serde_json::Value::String(CODEX_UPDATE_CHECK_FROZEN_AT.to_string()),
+    );
+
+    let serialized = serde_json::to_vec(&value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp_path = path.with_extension("json.vk-upd-tmp");
+    std::fs::write(&tmp_path, &serialized)?;
+    std::fs::rename(&tmp_path, &path)?;
+    Ok(())
 }
 
 /// Configuration for the embedded tmux server, written next to the app's
@@ -585,21 +830,25 @@ impl PtyService {
 
             // CLI mode rides tmux when present; otherwise (and for the
             // default side terminal) spawn the user's shell directly.
-            let (tmux_session, tmux_resume_id, tmux_initial_prompt, tmux_agent_args) =
-                match &command {
-                    PtyCommand::TmuxCli {
-                        session_name,
-                        resume_session_id,
-                        initial_prompt,
-                        agent_args,
-                    } if tmux_available() => (
-                        Some(session_name.clone()),
-                        resume_session_id.clone(),
-                        initial_prompt.clone(),
-                        agent_args.clone(),
-                    ),
-                    _ => (None, None, None, Vec::new()),
-                };
+            let (tmux_session, tmux_resume_id, tmux_initial_prompt, tmux_spec): (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<CliLaunchSpec>,
+            ) = match &command {
+                PtyCommand::TmuxCli {
+                    session_name,
+                    resume_session_id,
+                    initial_prompt,
+                    spec,
+                } if tmux_available() => (
+                    Some(session_name.clone()),
+                    resume_session_id.clone(),
+                    initial_prompt.clone(),
+                    Some(spec.clone()),
+                ),
+                _ => (None, None, None, None),
+            };
 
             // Never silently break the persistence promise: if CLI mode was
             // requested but tmux is absent, say so in the pane itself.
@@ -615,84 +864,86 @@ impl PtyService {
                 }
             }
 
-            let (mut cmd, shell_name) = if let Some(session_name) = &tmux_session {
-                // Bring an already-running server in line with our config
-                // (options are server-wide; `-f` below only affects a fresh
-                // server start).
-                ensure_cli_tmux_server_options();
+            let (mut cmd, shell_name) =
+                if let (Some(session_name), Some(spec)) = (&tmux_session, &tmux_spec) {
+                    // Bring an already-running server in line with our config
+                    // (options are server-wide; `-f` below only affects a fresh
+                    // server start).
+                    ensure_cli_tmux_server_options();
 
-                // Pre-accept claude's per-directory folder-trust dialog for
-                // this app-created worktree so the launch never blocks on it.
-                ensure_claude_folder_trusted(&working_dir);
+                    // Pre-accept the agent's per-directory folder-trust / first-run
+                    // dialog for this app-created worktree so the launch never
+                    // blocks on it.
+                    maybe_seed_cli_trust(&spec.program, &working_dir);
 
-                let mut cmd = CommandBuilder::new("tmux");
-                // Our own config instead of the user's ~/.tmux.conf — the
-                // embedded terminal needs deterministic mouse/clipboard
-                // behavior (see CLI_TMUX_CONF); the user's personal tmux on
-                // the default socket is unaffected.
-                if let Some(conf) = cli_tmux_conf_path() {
-                    cmd.arg("-f");
-                    cmd.arg(conf);
-                }
-                // Dedicated socket isolates our sessions from the user's tmux.
-                cmd.arg("-L");
-                cmd.arg(CLI_TMUX_SOCKET);
-                cmd.arg("new-session");
-                // -A: attach if the session exists, else create.
-                //
-                // We deliberately do NOT pass -D (detach other clients): a new
-                // attach would detach the prior client, whose tmux process then
-                // exits → its PTY hits EOF → the WebSocket closes → the frontend
-                // reconnects → the new attach detaches it again, a self-
-                // sustaining reconnect loop that also resets the session to the
-                // attaching client's 80x24 default on every cycle. Without -D,
-                // reconnects simply attach; the prior client is cleaned up by
-                // close_session killing its PTY child. Two simultaneous browser
-                // windows would mirror (tmux sizes to the smaller) — a rare,
-                // benign trade vs. the loop.
-                cmd.arg("-A");
-                cmd.arg("-s");
-                cmd.arg(session_name);
-                cmd.arg("-c");
-                cmd.arg(&working_dir);
-                cmd.arg(cli_bootstrap(
-                    tmux_resume_id.as_deref(),
-                    tmux_initial_prompt.as_deref(),
-                    &tmux_agent_args,
-                ));
-                cmd.cwd(&working_dir);
-                // No shell-specific prompt configuration for the tmux client.
-                (cmd, String::new())
-            } else {
-                let mut cmd = CommandBuilder::new(&shell);
-                cmd.cwd(&working_dir);
-
-                // Configure shell-specific options
-                let shell_name = shell
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                if shell_name == "powershell.exe" || shell_name == "pwsh.exe" {
-                    // PowerShell: use -NoLogo for cleaner startup
-                    cmd.arg("-NoLogo");
-                } else if shell_name == "cmd.exe" {
-                    // cmd.exe: no special args needed
-                } else {
-                    // Unix shells
-                    cmd.env("VIBE_KANBAN_TERMINAL", "1");
-
-                    if shell_name == "bash" {
-                        cmd.env("PROMPT_COMMAND", r#"PS1='$ '; unset PROMPT_COMMAND"#);
-                    } else if shell_name == "zsh" {
-                        // PROMPT is set after spawning
-                    } else {
-                        cmd.env("PS1", "$ ");
+                    let mut cmd = CommandBuilder::new("tmux");
+                    // Our own config instead of the user's ~/.tmux.conf — the
+                    // embedded terminal needs deterministic mouse/clipboard
+                    // behavior (see CLI_TMUX_CONF); the user's personal tmux on
+                    // the default socket is unaffected.
+                    if let Some(conf) = cli_tmux_conf_path() {
+                        cmd.arg("-f");
+                        cmd.arg(conf);
                     }
-                }
-                (cmd, shell_name)
-            };
+                    // Dedicated socket isolates our sessions from the user's tmux.
+                    cmd.arg("-L");
+                    cmd.arg(CLI_TMUX_SOCKET);
+                    cmd.arg("new-session");
+                    // -A: attach if the session exists, else create.
+                    //
+                    // We deliberately do NOT pass -D (detach other clients): a new
+                    // attach would detach the prior client, whose tmux process then
+                    // exits → its PTY hits EOF → the WebSocket closes → the frontend
+                    // reconnects → the new attach detaches it again, a self-
+                    // sustaining reconnect loop that also resets the session to the
+                    // attaching client's 80x24 default on every cycle. Without -D,
+                    // reconnects simply attach; the prior client is cleaned up by
+                    // close_session killing its PTY child. Two simultaneous browser
+                    // windows would mirror (tmux sizes to the smaller) — a rare,
+                    // benign trade vs. the loop.
+                    cmd.arg("-A");
+                    cmd.arg("-s");
+                    cmd.arg(session_name);
+                    cmd.arg("-c");
+                    cmd.arg(&working_dir);
+                    cmd.arg(cli_bootstrap(
+                        spec,
+                        tmux_resume_id.as_deref(),
+                        tmux_initial_prompt.as_deref(),
+                    ));
+                    cmd.cwd(&working_dir);
+                    // No shell-specific prompt configuration for the tmux client.
+                    (cmd, String::new())
+                } else {
+                    let mut cmd = CommandBuilder::new(&shell);
+                    cmd.cwd(&working_dir);
+
+                    // Configure shell-specific options
+                    let shell_name = shell
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    if shell_name == "powershell.exe" || shell_name == "pwsh.exe" {
+                        // PowerShell: use -NoLogo for cleaner startup
+                        cmd.arg("-NoLogo");
+                    } else if shell_name == "cmd.exe" {
+                        // cmd.exe: no special args needed
+                    } else {
+                        // Unix shells
+                        cmd.env("VIBE_KANBAN_TERMINAL", "1");
+
+                        if shell_name == "bash" {
+                            cmd.env("PROMPT_COMMAND", r#"PS1='$ '; unset PROMPT_COMMAND"#);
+                        } else if shell_name == "zsh" {
+                            // PROMPT is set after spawning
+                        } else {
+                            cmd.env("PS1", "$ ");
+                        }
+                    }
+                    (cmd, shell_name)
+                };
 
             cmd.env("TERM", "xterm-256color");
             cmd.env("COLORTERM", "truecolor");
@@ -887,82 +1138,114 @@ mod tests {
         assert!(name.starts_with("vk_"));
     }
 
+    /// A claude-shaped spec (flag resume, positional prompt, `--continue`
+    /// fallback) — mirrors `ClaudeCode::interactive_cli_spec`.
+    fn claude_spec(base_args: &[&str]) -> CliLaunchSpec {
+        CliLaunchSpec::new("claude", base_args.iter().map(|s| s.to_string()).collect())
+            .with_resume(CliResume::Flag("--resume".to_string()))
+            .with_prompt_arg(CliPromptArg::Positional)
+            .with_continue(CliContinue::Flag("--continue".to_string()))
+    }
+
+    /// A codex-shaped spec (subcommand resume, positional prompt, `resume
+    /// --last` fallback) — mirrors `Codex::interactive_cli_spec`.
+    fn codex_spec(base_args: &[&str]) -> CliLaunchSpec {
+        CliLaunchSpec::new("codex", base_args.iter().map(|s| s.to_string()).collect())
+            .with_resume(CliResume::Subcommand("resume".to_string()))
+            .with_prompt_arg(CliPromptArg::Positional)
+            .with_continue(CliContinue::ResumeLast {
+                subcommand: "resume".to_string(),
+            })
+    }
+
     #[test]
-    fn cli_bootstrap_runs_claude_then_drops_to_shell() {
-        let b = cli_bootstrap(None, None, &[]);
-        assert!(b.contains("command -v claude"));
+    fn cli_bootstrap_runs_program_then_drops_to_shell() {
+        let b = cli_bootstrap(&claude_spec(&[]), None, None);
+        assert!(b.contains("command -v 'claude'"));
         assert!(
             b.ends_with(r#"exec "${SHELL:-/bin/sh}""#),
-            "bootstrap must keep the pane alive after claude exits"
+            "bootstrap must keep the pane alive after the agent exits"
         );
     }
 
     #[test]
     fn cli_bootstrap_resume_takes_precedence_and_rejects_non_uuids() {
-        // A valid claude session UUID -> --resume <id>, even if a prompt is
-        // also present (an existing conversation always wins).
+        // A valid session UUID -> --resume <id>, even if a prompt is also
+        // present (an existing conversation always wins).
         let id = "28b98f08-5f5f-4b1e-8c4e-41ae87c0c706";
-        let b = cli_bootstrap(Some(id), Some("do things"), &[]);
+        let b = cli_bootstrap(&claude_spec(&[]), Some(id), Some("do things"));
         assert!(b.contains(&format!("--resume {id}")));
         assert!(!b.contains("do things"));
         // Non-UUID (injection attempt) is rejected and never interpolated.
         let evil = "x; rm -rf ~";
-        let b = cli_bootstrap(Some(evil), None, &[]);
+        let b = cli_bootstrap(&claude_spec(&[]), Some(evil), None);
         assert!(!b.contains("rm -rf"));
         assert!(!b.contains("--resume"));
     }
 
     #[test]
+    fn cli_bootstrap_codex_resume_is_a_subcommand_without_base_flags() {
+        // codex resumes via a subcommand that restores the session's own
+        // settings, so the model/sandbox/approval flags are NOT replayed.
+        let id = "28b98f08-5f5f-4b1e-8c4e-41ae87c0c706";
+        let spec = codex_spec(&["-m", "gpt-5.5", "-s", "danger-full-access"]);
+        let b = cli_bootstrap(&spec, Some(id), None);
+        assert!(b.contains(&format!("'codex' resume {id}")));
+        assert!(
+            !b.contains("-m"),
+            "base flags must not ride the resume: {b}"
+        );
+        // Continue fallback uses `resume --last`, falling back to a fresh TUI.
+        let cont = cli_bootstrap(&spec, None, None);
+        assert!(cont.contains("'codex' resume --last || 'codex'"));
+    }
+
+    #[test]
     fn cli_bootstrap_passes_initial_prompt_injection_safe() {
-        let b = cli_bootstrap(None, Some("Fix the login bug"), &[]);
-        assert!(b.contains("claude --dangerously-skip-permissions 'Fix the login bug'"));
+        let spec = claude_spec(&["--dangerously-skip-permissions"]);
+        let b = cli_bootstrap(&spec, None, Some("Fix the login bug"));
+        assert!(b.contains("'--dangerously-skip-permissions' 'Fix the login bug'"));
 
         // Quotes and shell metacharacters stay inert inside the quoting.
         let evil = "'; rm -rf ~; echo '";
-        let b = cli_bootstrap(None, Some(evil), &[]);
+        let b = cli_bootstrap(&spec, None, Some(evil));
         // The single quotes in the prompt are escaped as '\'' — the raw
         // sequence `'; rm` can therefore never terminate the quoting.
         assert!(b.contains(r"'"), "quotes must be escaped: {b}");
         assert!(!b.contains("&& rm"), "injection must not escape: {b}");
 
-        // A prompt starting with '-' is space-guarded so claude can't parse
+        // A prompt starting with '-' is space-guarded so the agent can't parse
         // it as a flag.
-        let dashy = cli_bootstrap(None, Some("-rf is a flag-looking prompt"), &[]);
+        let dashy = cli_bootstrap(&spec, None, Some("-rf is a flag-looking prompt"));
         assert!(dashy.contains("' -rf is a flag-looking prompt'"));
 
         // Blank prompts fall through to the no-prompt path.
-        let blank = cli_bootstrap(None, Some("   "), &[]);
-        assert!(blank.contains("--continue || claude"));
+        let blank = cli_bootstrap(&spec, None, Some("   "));
+        assert!(blank.contains("--continue || 'claude'"));
     }
 
     #[test]
     fn cli_bootstrap_falls_back_to_continue_then_fresh() {
-        // With nothing explicit to run: resume the cwd's latest conversation
+        // With nothing explicit to run: continue the cwd's latest conversation
         // when one exists (CLI-first workspace after tmux death), else a
         // fresh TUI — never a stranded "No conversation found" pane.
-        let b = cli_bootstrap(None, None, &[]);
-        assert!(b.contains(
-            "claude --dangerously-skip-permissions --continue || claude --dangerously-skip-permissions"
-        ));
-    }
-
-    #[test]
-    fn cli_bootstrap_applies_model_and_effort_flags() {
-        let args = ["--model", "opus", "--effort", "max"].map(String::from);
-        let b = cli_bootstrap(None, None, &args);
-        assert!(
-            b.contains("claude '--model' 'opus' '--effort' 'max' --dangerously-skip-permissions")
+        let b = cli_bootstrap(
+            &claude_spec(&["--dangerously-skip-permissions"]),
+            None,
+            None,
         );
+        assert!(b.contains(
+            "'claude' '--dangerously-skip-permissions' --continue || 'claude' '--dangerously-skip-permissions'"
+        ));
     }
 
     #[test]
     fn cli_bootstrap_shell_quotes_agent_args_on_every_form() {
         // Glob/metacharacters in a model id stay inert (single-quoted)...
-        let args = ["--model".to_string(), "opus[1m]".to_string()];
-        let b = cli_bootstrap(None, None, &args);
+        let b = cli_bootstrap(&claude_spec(&["--model", "opus[1m]"]), None, None);
         assert!(b.contains("'--model' 'opus[1m]'"));
         // ...and the flags ride the continue/fresh fallback too.
-        assert!(b.contains("--dangerously-skip-permissions --continue"));
+        assert!(b.contains("'opus[1m]' --continue"));
     }
 
     #[test]
@@ -985,6 +1268,27 @@ mod tests {
         assert_eq!(root["projects"]["/existing"]["foo"], serde_json::json!(1));
         // Idempotent: re-applying to an already-trusted key changes nothing.
         assert!(!apply_trust_to_config(&mut root, &["/new/dir".to_string()]));
+    }
+
+    #[test]
+    fn codex_trust_additions_appends_only_when_absent() {
+        let dir = std::path::Path::new("/var/tmp/wt/abc-fresh-xyz");
+        // Empty config -> a trusted block for the dir is produced (the path
+        // appears, marked trusted). Canonicalize fails for a non-existent path,
+        // so only the given key is emitted.
+        let add = codex_trust_additions("", dir);
+        assert!(add.contains(r#"[projects."/var/tmp/wt/abc-fresh-xyz"]"#));
+        assert!(add.contains(r#"trust_level = "trusted""#));
+        // The merged result must be valid TOML.
+        assert!(toml::from_str::<toml::Table>(&add).is_ok());
+
+        // Already-present header -> no duplicate table is appended (which would
+        // make codex's config invalid TOML).
+        let existing = format!(
+            "approval_policy = \"never\"\n\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            dir.display()
+        );
+        assert!(codex_trust_additions(&existing, dir).is_empty());
     }
 
     #[test]

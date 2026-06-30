@@ -1091,10 +1091,12 @@ pub trait ContainerService {
             .await?
             .ok_or(SqlxError::RowNotFound)?;
 
+        // Persist the workspace's selected agent so the CLI terminal launches
+        // that agent's interactive TUI (not always claude).
         let session = Session::create(
             &self.db().pool,
             &CreateSession {
-                executor: Some(executors::executors::BaseCodingAgent::ClaudeCode.to_string()),
+                executor: Some(executor_config.executor.to_string()),
                 name: None,
             },
             Uuid::new_v4(),

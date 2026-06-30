@@ -33,6 +33,7 @@ use crate::{
 pub mod acp;
 pub mod amp;
 pub mod claude;
+pub mod cli;
 pub mod codex;
 pub mod copilot;
 pub mod cursor;
@@ -223,6 +224,20 @@ pub trait StandardCodingAgentExecutor {
     fn apply_overrides(&mut self, _executor_config: &ExecutorConfig) {}
 
     fn use_approvals(&mut self, _approvals: Arc<dyn ExecutorApprovalService>) {}
+
+    /// Describe how to launch this agent's interactive CLI (TUI) in a tmux pane
+    /// for "CLI mode". Built from this agent's already-overridden config so the
+    /// CLI launch honors the same model / reasoning effort / sandbox / approval
+    /// selection as headless mode. Returns `None` for agents without interactive
+    /// CLI support (the default), in which case CLI mode falls back to claude.
+    ///
+    /// Pre-launch local-environment prep some agents need (pre-accepting a
+    /// per-folder trust dialog, seeding onboarding/theme/auth so the TUI doesn't
+    /// block) is handled in the deployment layer keyed off the spec's `program`,
+    /// keeping this a pure description of the launch command.
+    fn interactive_cli_spec(&self, _cwd: &Path) -> Option<cli::CliLaunchSpec> {
+        None
+    }
 
     async fn spawn(
         &self,

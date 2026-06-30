@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use axum::{
     Router,
@@ -12,7 +15,11 @@ use db::models::{
     workspace::Workspace, workspace_repo::WorkspaceRepo,
 };
 use deployment::Deployment;
-use executors::{actions::ExecutorActionType, executors::claude};
+use executors::{
+    actions::ExecutorActionType,
+    executors::{BaseCodingAgent, StandardCodingAgentExecutor, cli::CliLaunchSpec},
+    profile::{ExecutorConfig, ExecutorConfigs},
+};
 use local_deployment::pty::{
     PtyCommand, cli_tmux_available, cli_tmux_session_exists, cli_tmux_session_name,
 };
@@ -117,6 +124,43 @@ async fn resolve_cli_model_effort(
     }
 
     (None, None)
+}
+
+/// Resolve how to launch the workspace's selected agent in CLI mode. The agent
+/// type comes from the session's `executor` (defaulting to claude); the picked
+/// model/effort are folded in as overrides so the interactive launch honors the
+/// same selection as headless mode. Agents without their own interactive CLI
+/// support fall back to a default claude launch so CLI mode always works.
+fn resolve_cli_launch_spec(
+    session: Option<&Session>,
+    model_id: Option<String>,
+    reasoning_id: Option<String>,
+    dir: &Path,
+) -> CliLaunchSpec {
+    let executor = session
+        .and_then(|s| s.executor.as_deref())
+        .and_then(|e| BaseCodingAgent::from_str(e).ok())
+        .unwrap_or(BaseCodingAgent::ClaudeCode);
+
+    let profiles = ExecutorConfigs::get_cached();
+
+    let mut config = ExecutorConfig::new(executor);
+    config.model_id = model_id;
+    config.reasoning_id = reasoning_id;
+    let mut agent = profiles.get_coding_agent_or_default(&config.profile_id());
+    if config.has_overrides() {
+        agent.apply_overrides(&config);
+    }
+
+    agent.interactive_cli_spec(dir).unwrap_or_else(|| {
+        // The selected agent has no interactive CLI support (yet) — fall back to
+        // a default claude launch so the CLI pane is never left without an agent.
+        let claude = ExecutorConfig::new(BaseCodingAgent::ClaudeCode);
+        profiles
+            .get_coding_agent_or_default(&claude.profile_id())
+            .interactive_cli_spec(dir)
+            .expect("claude always provides an interactive CLI spec")
+    })
 }
 
 async fn terminal_ws(
@@ -259,11 +303,10 @@ async fn terminal_ws(
                 prompt_session_to_clear = session.as_ref().map(|s| s.id);
             }
 
-            // Honor the workspace's selected model/effort at launch (defaults
-            // to Opus at max effort when nothing was selected).
+            // Honor the workspace's selected agent + model/effort at launch
+            // (defaults to claude at Opus/max when nothing was selected).
             let (model_id, reasoning_id) = resolve_cli_model_effort(pool, session.as_ref()).await;
-            let agent_args =
-                claude::interactive_cli_args(model_id.as_deref(), reasoning_id.as_deref());
+            let spec = resolve_cli_launch_spec(session.as_ref(), model_id, reasoning_id, &dir);
 
             (
                 dir,
@@ -271,7 +314,7 @@ async fn terminal_ws(
                     session_name: cli_tmux_session_name(query.workspace_id),
                     resume_session_id,
                     initial_prompt,
-                    agent_args,
+                    spec,
                 },
             )
         }
