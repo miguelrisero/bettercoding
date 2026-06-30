@@ -9,6 +9,24 @@
     "setupRunningTitle": "Preparando el workspace",
     "setupRunningBody": "Se está ejecutando un script de configuración. La terminal se abrirá con tu prompt en cuanto termine."
   },
+  "loopAutomation": {
+    "label": "Continuar",
+    "tooltip": "Reanudar automáticamente esta sesión tras pausas por límite de tasa o de uso",
+    "settingsLabel": "Ajustes de continuación",
+    "settingsTitle": "Continuar",
+    "settingsDescription": "Continuar automáticamente esta sesión cuando Claude alcance un límite de tasa o de uso.",
+    "retryInterval": "Reintentar cada",
+    "minutes": "min",
+    "continuationPrompt": "Mensaje de continuación",
+    "continuationPromptPlaceholder": "Mensaje enviado para reanudar la sesión",
+    "maxAttempts": "Intentos máximos",
+    "save": "Guardar",
+    "saving": "Guardando…",
+    "retryingAt": "Reintentando a las {{time}}",
+    "wakingAt": "Reanudando a las {{time}} UTC",
+    "attempts": "intento {{used}}/{{max}}",
+    "cancelWakeup": "Cancelar reintento programado"
+  },
   "editorNames": {
     "custom": "Personalizado"
   },

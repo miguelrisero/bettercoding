@@ -9,6 +9,24 @@
     "setupRunningTitle": "Préparation de l'espace de travail",
     "setupRunningBody": "Un script d'installation est en cours d'exécution. Le terminal s'ouvrira avec votre prompt dès qu'il sera terminé."
   },
+  "loopAutomation": {
+    "label": "Continuer",
+    "tooltip": "Reprendre automatiquement cette session après des pauses dues aux limites de débit ou d'utilisation",
+    "settingsLabel": "Paramètres de continuation",
+    "settingsTitle": "Continuer",
+    "settingsDescription": "Continuer automatiquement cette session lorsque Claude atteint une limite de débit ou d'utilisation.",
+    "retryInterval": "Réessayer toutes les",
+    "minutes": "min",
+    "continuationPrompt": "Message de continuation",
+    "continuationPromptPlaceholder": "Message envoyé pour reprendre la session",
+    "maxAttempts": "Tentatives max",
+    "save": "Enregistrer",
+    "saving": "Enregistrement…",
+    "retryingAt": "Nouvelle tentative à {{time}}",
+    "wakingAt": "Reprise à {{time}} UTC",
+    "attempts": "tentative {{used}}/{{max}}",
+    "cancelWakeup": "Annuler la nouvelle tentative programmée"
+  },
   "editorNames": {
     "custom": "Personnalisé"
   },
