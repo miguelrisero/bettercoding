@@ -33,8 +33,12 @@ pub enum CliPromptArg {
     /// Trailing positional argument: `<program> <base_args> '<prompt>'`.
     Positional,
     /// First message passed as the value of a flag: `<program> <base_args>
-    /// <flag> '<prompt>'` (e.g. copilot `-i '<prompt>'`).
+    /// <flag> '<prompt>'` (e.g. gemini/copilot `-i '<prompt>'`).
     Flag(String),
+    /// First message piped on stdin: `printf '%s\n' '<prompt>' | <program>
+    /// <base_args>` (e.g. amp, which stays interactive as long as stdout is a
+    /// TTY — which the tmux pane provides).
+    StdinPipe,
     /// No command-line way to seed the first prompt; it must be delivered after
     /// launch (e.g. via tmux send-keys). The bootstrap starts a bare TUI.
     Unsupported,

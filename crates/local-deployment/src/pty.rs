@@ -122,9 +122,14 @@ fn cli_bootstrap(
                 };
                 format!("{base} {}", shell_single_quote(&guarded))
             }
-            // Prompt as a flag value (e.g. copilot `-i '<prompt>'`); a leading
-            // '-' is harmless after the flag.
+            // Prompt as a flag value (e.g. gemini/copilot `-i '<prompt>'`); a
+            // leading '-' is harmless after the flag.
             CliPromptArg::Flag(flag) => format!("{base} {flag} {}", shell_single_quote(prompt)),
+            // Prompt piped on stdin (e.g. amp); the TUI stays interactive
+            // because the tmux pane keeps stdout a TTY.
+            CliPromptArg::StdinPipe => {
+                format!("printf '%s\\n' {} | {base}", shell_single_quote(prompt))
+            }
             // No CLI way to seed the prompt — start the TUI and rely on a
             // post-launch keystroke delivery (loop automation / send-keys).
             CliPromptArg::Unsupported => continue_launch(),

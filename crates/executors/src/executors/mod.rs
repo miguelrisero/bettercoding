@@ -436,3 +436,69 @@ mod tests {
         assert_eq!(result.unwrap(), BaseCodingAgent::CursorAgent);
     }
 }
+
+#[cfg(test)]
+mod cli_spec_tests {
+    use std::path::Path;
+
+    use super::{BaseCodingAgent, StandardCodingAgentExecutor};
+    use crate::profile::{ExecutorConfigs, ExecutorProfileId};
+
+    fn default_spec_args(agent: BaseCodingAgent) -> Option<(String, Vec<String>)> {
+        ExecutorConfigs::from_defaults()
+            .get_coding_agent_or_default(&ExecutorProfileId::new(agent))
+            .interactive_cli_spec(Path::new("/tmp"))
+            .map(|s| (s.program, s.base_args))
+    }
+
+    /// Every supported agent advertises an interactive CLI launch via its
+    /// default profile, with the expected binary name.
+    #[test]
+    fn every_agent_has_a_cli_spec_with_the_right_binary() {
+        use BaseCodingAgent::*;
+        for (agent, program) in [
+            (ClaudeCode, "claude"),
+            (Codex, "codex"),
+            (Gemini, "gemini"),
+            (QwenCode, "qwen"),
+            (Opencode, "opencode"),
+            (CursorAgent, "cursor-agent"),
+            (Droid, "droid"),
+            (Amp, "amp"),
+            (Copilot, "copilot"),
+        ] {
+            let got = default_spec_args(agent);
+            assert_eq!(
+                got.as_ref().map(|(p, _)| p.as_str()),
+                Some(program),
+                "{agent:?} should launch `{program}`"
+            );
+        }
+    }
+
+    /// CLI mode runs each agent autonomously by default (worktrees are
+    /// app-created), so an unattended loop isn't stalled by approval prompts.
+    #[test]
+    fn agents_default_to_autonomous_flags() {
+        use BaseCodingAgent::*;
+        let has = |agent: BaseCodingAgent, needle: &str| {
+            default_spec_args(agent)
+                .map(|(_, args)| args.iter().any(|a| a == needle))
+                .unwrap_or(false)
+        };
+        assert!(
+            has(Gemini, "yolo"),
+            "gemini should default to yolo approval"
+        );
+        assert!(
+            has(QwenCode, "yolo"),
+            "qwen should default to yolo approval"
+        );
+        assert!(has(Copilot, "--allow-all-tools"));
+        assert!(has(CursorAgent, "--force"));
+        assert!(
+            has(Droid, "--skip-permissions-unsafe") || has(Droid, "--auto"),
+            "droid should default to an autonomous autonomy level"
+        );
+    }
+}

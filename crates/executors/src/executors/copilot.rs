@@ -16,6 +16,7 @@ use crate::{
     executors::{
         AppendPrompt, AvailabilityInfo, BaseCodingAgent, ExecutorError, SpawnedChild,
         StandardCodingAgentExecutor,
+        cli::{CliContinue, CliLaunchSpec, CliPromptArg, CliResume},
     },
     logs::utils::patch,
     model_selector::{ModelInfo, ModelSelectorConfig, PermissionPolicy},
@@ -102,6 +103,42 @@ impl StandardCodingAgentExecutor for Copilot {
                 crate::model_selector::PermissionPolicy::Auto
             ));
         }
+    }
+
+    fn interactive_cli_spec(&self, _cwd: &Path) -> Option<CliLaunchSpec> {
+        let mut args = Vec::new();
+        if let Some(model) = self.model.as_deref().filter(|m| !m.is_empty()) {
+            args.push("--model".to_string());
+            args.push(model.to_string());
+        }
+        // `--allow-all-tools` runs without per-tool approval (autonomous);
+        // Supervised disables it. Honor any explicit allow/deny/add-dir too.
+        if self.allow_all_tools != Some(false) {
+            args.push("--allow-all-tools".to_string());
+        }
+        if let Some(tool) = self.allow_tool.as_deref().filter(|t| !t.is_empty()) {
+            args.push("--allow-tool".to_string());
+            args.push(tool.to_string());
+        }
+        if let Some(tool) = self.deny_tool.as_deref().filter(|t| !t.is_empty()) {
+            args.push("--deny-tool".to_string());
+            args.push(tool.to_string());
+        }
+        if let Some(dirs) = &self.add_dir {
+            for dir in dirs.iter().filter(|d| !d.is_empty()) {
+                args.push("--add-dir".to_string());
+                args.push(dir.to_string());
+            }
+        }
+        // Skip the animated first-run banner for a clean automated launch.
+        args.push("--no-banner".to_string());
+        // `-i` starts interactive and submits the first prompt.
+        Some(
+            CliLaunchSpec::new("copilot", args)
+                .with_prompt_arg(CliPromptArg::Flag("-i".to_string()))
+                .with_resume(CliResume::Flag("--resume".to_string()))
+                .with_continue(CliContinue::Flag("--continue".to_string())),
+        )
     }
 
     async fn spawn(

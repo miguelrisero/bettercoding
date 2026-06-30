@@ -15,6 +15,7 @@ use crate::{
     executors::{
         AppendPrompt, AvailabilityInfo, BaseCodingAgent, ExecutorError, SpawnedChild,
         StandardCodingAgentExecutor,
+        cli::{CliContinue, CliLaunchSpec, CliPromptArg, CliResume},
     },
     logs::utils::{EntryIndexProvider, patch},
     model_selector::{ModelInfo, ModelSelectorConfig},
@@ -153,6 +154,44 @@ impl StandardCodingAgentExecutor for Droid {
                 | crate::model_selector::PermissionPolicy::Plan => Autonomy::Normal,
             };
         }
+    }
+
+    fn interactive_cli_spec(&self, _cwd: &Path) -> Option<CliLaunchSpec> {
+        let mut args = Vec::new();
+        if let Some(model) = self.model.as_deref().filter(|m| !m.is_empty()) {
+            args.push("--model".to_string());
+            args.push(model.to_string());
+        }
+        if let Some(effort) = &self.reasoning_effort {
+            // Long form: at interactive launch `-r` means --resume, not effort.
+            args.push("--reasoning-effort".to_string());
+            args.push(effort.as_ref().to_string());
+        }
+        // Autonomy mirrors the headless mapping; the default
+        // (SkipPermissionsUnsafe) runs fully autonomously for the loop.
+        match self.autonomy {
+            Autonomy::Low => {
+                args.push("--auto".to_string());
+                args.push("low".to_string());
+            }
+            Autonomy::Medium => {
+                args.push("--auto".to_string());
+                args.push("medium".to_string());
+            }
+            Autonomy::High => {
+                args.push("--auto".to_string());
+                args.push("high".to_string());
+            }
+            Autonomy::SkipPermissionsUnsafe => args.push("--skip-permissions-unsafe".to_string()),
+            Autonomy::Normal => {}
+        }
+        // `--resume` with no id continues the most recent session.
+        Some(
+            CliLaunchSpec::new("droid", args)
+                .with_prompt_arg(CliPromptArg::Positional)
+                .with_resume(CliResume::Flag("--resume".to_string()))
+                .with_continue(CliContinue::Flag("--resume".to_string())),
+        )
     }
 
     async fn spawn(
