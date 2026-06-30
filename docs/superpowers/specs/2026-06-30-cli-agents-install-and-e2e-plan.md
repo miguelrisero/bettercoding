@@ -8,6 +8,39 @@ can't run the live TUI check the way I did for Codex. This doc is the per-agent
 the e2e checklist** — nothing here installs anything; it waits for your
 approval.
 
+## ✅ Verification update (2026-06-30) — all 7 installed + launch-verified
+
+All seven were installed (npm: gemini/qwen/opencode/amp/copilot; curl:
+cursor-agent/droid) and **each was launched in a real tmux pane with the exact
+flags `interactive_cli_spec` generates**. Every binary resolved, **every coded
+flag was accepted (no flag errors)**, and each reached its own UI — the expected
+stopping point without an API key:
+
+| Agent | Version | Launch result |
+|---|---|---|
+| gemini | 0.49.0 | TUI rendered, prompt seeded (`--approval-mode yolo -i`) |
+| qwen | 0.19.3 | provider-connect menu |
+| opencode | 1.17.11 | **answered the prompt** on its free built-in model |
+| cursor-agent | 2026.06.26 | "Press any key to log in" |
+| droid | 0.161.0 | full TUI (`--auto high`) |
+| copilot | 1.0.65 | TUI + folder-trust dialog |
+| amp | 0.0.178x | login flow (stdin-piped prompt delivered) |
+
+**Flag drift fixed on the installed versions** (the specs in this branch reflect these):
+- **droid 0.161** dropped `--model` / `--reasoning-effort` / `--skip-permissions-unsafe`
+  from interactive launch → spec now emits only `--auto low|medium|high`
+  (SkipPermissionsUnsafe → `--auto high`); model/effort are set in-TUI (`/model`).
+- **copilot 1.0.65** has no `--no-banner` (banner is off by default) → removed.
+- **opencode** → confirmed long-form `--session` / `--continue`.
+
+**Remaining per-agent friction (only matters once a key is added):** copilot's
+folder-trust modal and gemini's "untrusted folder" notice still want a
+`maybe_seed_cli_trust` arm (like codex's); qwen/cursor/droid/amp/copilot/gemini
+need their auth key/login. None of this blocks the integration — it's the
+key/login step below.
+
+---
+
 > **What "done" means per agent below:** the launch recipe
 > (`interactive_cli_spec`) is written + unit-tested and the agent already works
 > end-to-end via the generic path (`terminal.rs` → `cli_bootstrap`). What's left

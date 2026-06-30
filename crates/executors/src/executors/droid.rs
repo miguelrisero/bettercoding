@@ -157,18 +157,11 @@ impl StandardCodingAgentExecutor for Droid {
     }
 
     fn interactive_cli_spec(&self, _cwd: &Path) -> Option<CliLaunchSpec> {
+        // droid's interactive TUI (verified on v0.161) only exposes the autonomy
+        // level — model and reasoning effort are NOT launch flags there (they're
+        // `droid exec`-only / set in-TUI via `/model`), so the spec carries only
+        // `--auto`. The positional prompt seeds the first message.
         let mut args = Vec::new();
-        if let Some(model) = self.model.as_deref().filter(|m| !m.is_empty()) {
-            args.push("--model".to_string());
-            args.push(model.to_string());
-        }
-        if let Some(effort) = &self.reasoning_effort {
-            // Long form: at interactive launch `-r` means --resume, not effort.
-            args.push("--reasoning-effort".to_string());
-            args.push(effort.as_ref().to_string());
-        }
-        // Autonomy mirrors the headless mapping; the default
-        // (SkipPermissionsUnsafe) runs fully autonomously for the loop.
         match self.autonomy {
             Autonomy::Low => {
                 args.push("--auto".to_string());
@@ -178,11 +171,12 @@ impl StandardCodingAgentExecutor for Droid {
                 args.push("--auto".to_string());
                 args.push("medium".to_string());
             }
-            Autonomy::High => {
+            // `high` is the most autonomous interactive level; the headless-only
+            // SkipPermissionsUnsafe maps onto it for the loop.
+            Autonomy::High | Autonomy::SkipPermissionsUnsafe => {
                 args.push("--auto".to_string());
                 args.push("high".to_string());
             }
-            Autonomy::SkipPermissionsUnsafe => args.push("--skip-permissions-unsafe".to_string()),
             Autonomy::Normal => {}
         }
         // `--resume` with no id continues the most recent session.

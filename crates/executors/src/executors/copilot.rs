@@ -130,8 +130,8 @@ impl StandardCodingAgentExecutor for Copilot {
                 args.push(dir.to_string());
             }
         }
-        // Skip the animated first-run banner for a clean automated launch.
-        args.push("--no-banner".to_string());
+        // (Copilot's startup banner is off by default — there's no `--no-banner`;
+        // `--banner` would opt back in.)
         // `-i` starts interactive and submits the first prompt.
         Some(
             CliLaunchSpec::new("copilot", args)

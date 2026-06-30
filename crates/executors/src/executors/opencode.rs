@@ -426,8 +426,8 @@ impl StandardCodingAgentExecutor for Opencode {
         Some(
             CliLaunchSpec::new("opencode", args)
                 .with_prompt_arg(CliPromptArg::Flag("--prompt".to_string()))
-                .with_resume(CliResume::Flag("-s".to_string()))
-                .with_continue(CliContinue::Flag("-c".to_string())),
+                .with_resume(CliResume::Flag("--session".to_string()))
+                .with_continue(CliContinue::Flag("--continue".to_string())),
         )
     }
 
