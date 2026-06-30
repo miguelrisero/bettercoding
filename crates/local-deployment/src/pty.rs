@@ -17,6 +17,10 @@ use utils::shell::get_interactive_shell;
 use uuid::Uuid;
 
 /// What to run on the PTY.
+// `TmuxCli` carries the resolved launch spec and is the common case (CLI mode is
+// the default pane); the size gap vs. the unit `Shell` variant is expected and
+// boxing the hot path would only add an allocation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum PtyCommand {
     /// The user's interactive shell (default side-terminal behavior).
