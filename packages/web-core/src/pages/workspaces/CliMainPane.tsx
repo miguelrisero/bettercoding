@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { ChatsTeardropIcon, CircleNotchIcon } from '@phosphor-icons/react';
 
 import { XTermInstance } from '@/shared/components/XTermInstance';
+import { LoopAutomationControl } from '@/shared/components/LoopAutomationControl';
 import { cliTabId, useTerminal } from '@/shared/hooks/useTerminal';
 
 interface CliMainPaneProps {
@@ -71,15 +72,18 @@ export function CliMainPane({
             {t('cliMode.persistentHint')}
           </span>
         </span>
-        <button
-          type="button"
-          onClick={onBackToChat}
-          className="flex items-center gap-1 text-low hover:text-normal transition-colors"
-          title={t('cliMode.backToChat')}
-        >
-          <ChatsTeardropIcon className="size-icon-sm" weight="bold" />
-          <span className="text-xs">{t('cliMode.backToChat')}</span>
-        </button>
+        <div className="flex items-center gap-3">
+          <LoopAutomationControl workspaceId={workspaceId} />
+          <button
+            type="button"
+            onClick={onBackToChat}
+            className="flex items-center gap-1 text-low hover:text-normal transition-colors"
+            title={t('cliMode.backToChat')}
+          >
+            <ChatsTeardropIcon className="size-icon-sm" weight="bold" />
+            <span className="text-xs">{t('cliMode.backToChat')}</span>
+          </button>
+        </div>
       </div>
       <div className="flex-1 min-h-0 border-t border-border">
         {executorRunning ? (

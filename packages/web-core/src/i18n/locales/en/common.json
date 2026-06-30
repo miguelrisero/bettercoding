@@ -9,6 +9,24 @@
     "setupRunningTitle": "Preparing the workspace",
     "setupRunningBody": "A setup script is running. The terminal will open with your prompt as soon as it finishes."
   },
+  "loopAutomation": {
+    "label": "Keep going",
+    "tooltip": "Automatically resume this session after rate-limit or usage-limit pauses",
+    "settingsLabel": "Keep going settings",
+    "settingsTitle": "Keep going",
+    "settingsDescription": "Automatically continue this session when Claude hits a rate or usage limit.",
+    "retryInterval": "Retry every",
+    "minutes": "min",
+    "continuationPrompt": "Continuation prompt",
+    "continuationPromptPlaceholder": "Message sent to resume the session",
+    "maxAttempts": "Max attempts",
+    "save": "Save",
+    "saving": "Saving…",
+    "retryingAt": "Retrying at {{time}}",
+    "wakingAt": "Waking at {{time}} UTC",
+    "attempts": "attempt {{used}}/{{max}}",
+    "cancelWakeup": "Cancel scheduled retry"
+  },
   "editorNames": {
     "custom": "Custom"
   },
