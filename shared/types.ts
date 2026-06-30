@@ -315,6 +315,8 @@ export type CheckEditorAvailabilityResponse = { available: boolean, };
 
 export type CheckAgentAvailabilityQuery = { executor: BaseCodingAgent, };
 
+export type CliAgentAvailability = { installed: Array<BaseCodingAgent>, };
+
 export type AgentPresetOptionsQuery = { executor: BaseCodingAgent, variant: string | null, };
 
 export type CurrentUserResponse = { user_id: string, };

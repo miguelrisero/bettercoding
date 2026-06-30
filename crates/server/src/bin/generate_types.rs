@@ -101,6 +101,7 @@ fn generate_types_content() -> String {
         server::routes::config::CheckEditorAvailabilityQuery::decl(),
         server::routes::config::CheckEditorAvailabilityResponse::decl(),
         server::routes::config::CheckAgentAvailabilityQuery::decl(),
+        server::routes::config::CliAgentAvailability::decl(),
         server::routes::config::AgentPresetOptionsQuery::decl(),
         server::routes::oauth::CurrentUserResponse::decl(),
         db::models::loop_automation::WakeupKind::decl(),

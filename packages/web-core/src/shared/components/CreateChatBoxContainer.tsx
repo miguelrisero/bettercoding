@@ -8,6 +8,7 @@ import WYSIWYGEditor from '@/shared/components/WYSIWYGEditor';
 import { useCreateWorkspace } from '@/shared/hooks/useCreateWorkspace';
 import { useCreateAttachments } from '@/shared/hooks/useCreateAttachments';
 import { useExecutorConfig } from '@/shared/hooks/useExecutorConfig';
+import { useCliAgentAvailability } from '@/shared/hooks/useCliAgentAvailability';
 import { saveProjectRepoDefaults } from '@/shared/hooks/useProjectRepoDefaults';
 import { getSortedExecutorVariantKeys } from '@/shared/lib/executor';
 import {
@@ -134,6 +135,24 @@ export function CreateChatBoxContainer({
     configExecutorProfile: config?.executor_profile,
     onPersist: (cfg) => setDraftConfig(cfg),
   });
+
+  // CLI mode runs the agent's own binary; flag (but don't hide) agents whose CLI
+  // isn't installed, and float installed ones to the top of the picker.
+  const { isInstalled } = useCliAgentAvailability();
+  const sortedExecutorOptions = useMemo(
+    () =>
+      [...executorOptions].sort(
+        (a, b) => Number(isInstalled(b)) - Number(isInstalled(a))
+      ),
+    [executorOptions, isInstalled]
+  );
+  const formatExecutorLabel = useCallback(
+    (executor: BaseCodingAgent) =>
+      isInstalled(executor)
+        ? toPrettyCase(executor)
+        : `${toPrettyCase(executor)} · not installed`,
+    [isInstalled]
+  );
 
   const repoId = repos.length === 1 ? repos[0]?.id : undefined;
   const repoSummaryLabel = useMemo(() => {
@@ -363,10 +382,10 @@ export function CreateChatBoxContainer({
                   disabled={!hasSelectedRepos}
                   executor={{
                     selected: effectiveExecutor,
-                    options: executorOptions,
+                    options: sortedExecutorOptions,
                     onChange: handleExecutorChange,
                   }}
-                  formatExecutorLabel={toPrettyCase}
+                  formatExecutorLabel={formatExecutorLabel}
                   error={displayError}
                   repoIds={repos.map((r) => r.id)}
                   repoId={repoId}

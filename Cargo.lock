@@ -8930,6 +8930,7 @@ dependencies = [
  "utils",
  "uuid",
  "walkdir",
+ "which",
  "workspace-manager",
  "worktree-manager",
  "ws-bridge",

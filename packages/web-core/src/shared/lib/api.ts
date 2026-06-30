@@ -36,6 +36,7 @@ import {
   RenameBranchResponse,
   CheckEditorAvailabilityResponse,
   AvailabilityInfo,
+  CliAgentAvailability,
   BaseCodingAgent,
   ExecutorConfig,
   DraftFollowUpData,
@@ -1083,6 +1084,11 @@ export const configApi = {
       `/api/agents/check-availability?executor=${encodeURIComponent(agent)}`
     );
     return handleApiResponse<AvailabilityInfo>(response);
+  },
+  // Which agents' interactive CLI binary is on PATH (for the CLI-mode picker).
+  cliAgentAvailability: async (): Promise<CliAgentAvailability> => {
+    const response = await makeRequest('/api/agents/cli-availability');
+    return handleApiResponse<CliAgentAvailability>(response);
   },
 };
 
