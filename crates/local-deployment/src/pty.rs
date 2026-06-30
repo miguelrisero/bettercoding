@@ -138,7 +138,39 @@ fn cli_bootstrap(
         continue_launch()
     };
 
-    format!(r#"command -v {prog} >/dev/null 2>&1 && {launch}; exec "${{SHELL:-/bin/sh}}""#)
+    // When the agent's binary isn't installed/on PATH, don't silently drop into
+    // a bare shell (the user picked an agent and would see no reason why) — print
+    // a clear, actionable notice first, then keep the pane usable as a shell so
+    // they can install it right there or switch agents.
+    let missing = match cli_install_hint(&spec.program) {
+        Some(hint) => format!(
+            "printf '\\n  [!] %s is not installed or not on PATH.\\n      Install: %s\\n      then reopen this terminal, or pick another agent.\\n\\n' {prog} {}",
+            shell_single_quote(hint)
+        ),
+        None => format!("printf '\\n  [!] %s is not installed or not on PATH.\\n\\n' {prog}"),
+    };
+
+    format!(
+        r#"if command -v {prog} >/dev/null 2>&1; then {launch}; else {missing}; fi; exec "${{SHELL:-/bin/sh}}""#
+    )
+}
+
+/// How to install each interactive-CLI agent, shown in the pane when its binary
+/// isn't on PATH. Kept here (next to the bootstrap that prints it) rather than on
+/// the spec so the message stays a deployment concern.
+fn cli_install_hint(program: &str) -> Option<&'static str> {
+    Some(match program {
+        "claude" => "npm i -g @anthropic-ai/claude-code",
+        "codex" => "npm i -g @openai/codex",
+        "gemini" => "npm i -g @google/gemini-cli",
+        "qwen" => "npm i -g @qwen-code/qwen-code",
+        "opencode" => "npm i -g opencode-ai",
+        "copilot" => "npm i -g @github/copilot",
+        "amp" => "npm i -g @sourcegraph/amp",
+        "cursor-agent" => "curl https://cursor.com/install -fsS | bash",
+        "droid" => "curl -fsSL https://app.factory.ai/cli | sh",
+        _ => return None,
+    })
 }
 
 /// Pre-accept per-folder trust / first-run dialogs the selected agent's CLI
@@ -1248,6 +1280,21 @@ mod tests {
             b.ends_with(r#"exec "${SHELL:-/bin/sh}""#),
             "bootstrap must keep the pane alive after the agent exits"
         );
+    }
+
+    #[test]
+    fn cli_bootstrap_warns_with_install_hint_when_agent_missing() {
+        // A not-installed agent must explain itself instead of silently dropping
+        // to a bare shell.
+        let b = cli_bootstrap(&claude_spec(&[]), None, None);
+        assert!(b.contains("if command -v 'claude'"));
+        assert!(b.contains("is not installed or not on PATH"));
+        assert!(
+            b.contains("npm i -g @anthropic-ai/claude-code"),
+            "missing-agent notice should carry the install hint: {b}"
+        );
+        // The pane is still left usable as a shell.
+        assert!(b.ends_with(r#"exec "${SHELL:-/bin/sh}""#));
     }
 
     #[test]
