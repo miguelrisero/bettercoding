@@ -13,6 +13,7 @@ use crate::{
     executors::{
         AppendPrompt, BaseCodingAgent, ExecutorError, SpawnedChild, StandardCodingAgentExecutor,
         claude::{ClaudeLogProcessor, HistoryStrategy},
+        cli::{CliContinue, CliLaunchSpec, CliPromptArg, CliResume},
     },
     logs::{stderr_processor::normalize_stderr_logs, utils::EntryIndexProvider},
     profile::ExecutorConfig,
@@ -45,6 +46,24 @@ impl Amp {
 
 #[async_trait]
 impl StandardCodingAgentExecutor for Amp {
+    fn interactive_cli_spec(&self, _cwd: &Path) -> Option<CliLaunchSpec> {
+        // Amp selects the model via a mode, not a raw id, and its autonomy is
+        // settings-driven (`amp.dangerouslyAllowAll`), so there are no model /
+        // autonomy launch flags. `--no-ide` keeps it from attaching to an IDE in
+        // a headless pane. The first message is piped on stdin (Amp stays
+        // interactive while stdout is a TTY); a thread is resumed via the
+        // `threads continue` subcommand.
+        let args = vec!["--no-ide".to_string()];
+        Some(
+            CliLaunchSpec::new("amp", args)
+                .with_prompt_arg(CliPromptArg::StdinPipe)
+                .with_resume(CliResume::Subcommand("threads continue".to_string()))
+                .with_continue(CliContinue::ResumeLast {
+                    subcommand: "threads continue".to_string(),
+                }),
+        )
+    }
+
     async fn spawn(
         &self,
         current_dir: &Path,

@@ -52,6 +52,7 @@ pub fn router() -> Router<DeploymentImpl> {
             get(check_editor_availability),
         )
         .route("/agents/check-availability", get(check_agent_availability))
+        .route("/agents/cli-availability", get(cli_agent_availability))
         .route("/agents/preset-options", get(get_agent_preset_options))
         .route(
             "/agents/discovered-options/ws",
@@ -558,6 +559,39 @@ async fn check_agent_availability(
     };
 
     ResponseJson(ApiResponse::success(info))
+}
+
+/// Which agents' interactive CLI binary is actually on PATH. CLI mode launches
+/// the agent's own binary (`command -v <prog>`), whereas managed mode runs via
+/// npx — so this is a CLI-specific signal the picker uses to flag agents that
+/// won't start in CLI mode (rather than the config-file-based `AvailabilityInfo`).
+#[derive(Debug, Serialize, TS)]
+#[ts(export)]
+pub struct CliAgentAvailability {
+    pub installed: Vec<BaseCodingAgent>,
+}
+
+async fn cli_agent_availability(
+    State(_deployment): State<DeploymentImpl>,
+) -> ResponseJson<ApiResponse<CliAgentAvailability>> {
+    let profiles = ExecutorConfigs::get_cached();
+    let cwd = std::env::temp_dir();
+
+    let mut installed: Vec<BaseCodingAgent> = profiles
+        .executors
+        .keys()
+        .copied()
+        .filter(|executor| {
+            profiles
+                .get_coding_agent(&ExecutorProfileId::new(*executor))
+                .and_then(|agent| agent.interactive_cli_spec(&cwd))
+                .map(|spec| which::which(&spec.program).is_ok())
+                .unwrap_or(false)
+        })
+        .collect();
+    installed.sort_by_key(|e| e.to_string());
+
+    ResponseJson(ApiResponse::success(CliAgentAvailability { installed }))
 }
 
 #[derive(Debug, Deserialize, TS)]

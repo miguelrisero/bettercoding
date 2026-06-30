@@ -15,6 +15,7 @@ use crate::{
     executors::{
         AppendPrompt, AvailabilityInfo, BaseCodingAgent, ExecutorError, SpawnedChild,
         StandardCodingAgentExecutor,
+        cli::{CliContinue, CliLaunchSpec, CliPromptArg, CliResume},
     },
     logs::utils::{EntryIndexProvider, patch},
     model_selector::{ModelInfo, ModelSelectorConfig},
@@ -153,6 +154,38 @@ impl StandardCodingAgentExecutor for Droid {
                 | crate::model_selector::PermissionPolicy::Plan => Autonomy::Normal,
             };
         }
+    }
+
+    fn interactive_cli_spec(&self, _cwd: &Path) -> Option<CliLaunchSpec> {
+        // droid's interactive TUI (verified on v0.161) only exposes the autonomy
+        // level — model and reasoning effort are NOT launch flags there (they're
+        // `droid exec`-only / set in-TUI via `/model`), so the spec carries only
+        // `--auto`. The positional prompt seeds the first message.
+        let mut args = Vec::new();
+        match self.autonomy {
+            Autonomy::Low => {
+                args.push("--auto".to_string());
+                args.push("low".to_string());
+            }
+            Autonomy::Medium => {
+                args.push("--auto".to_string());
+                args.push("medium".to_string());
+            }
+            // `high` is the most autonomous interactive level; the headless-only
+            // SkipPermissionsUnsafe maps onto it for the loop.
+            Autonomy::High | Autonomy::SkipPermissionsUnsafe => {
+                args.push("--auto".to_string());
+                args.push("high".to_string());
+            }
+            Autonomy::Normal => {}
+        }
+        // `--resume` with no id continues the most recent session.
+        Some(
+            CliLaunchSpec::new("droid", args)
+                .with_prompt_arg(CliPromptArg::Positional)
+                .with_resume(CliResume::Flag("--resume".to_string()))
+                .with_continue(CliContinue::Flag("--resume".to_string())),
+        )
     }
 
     async fn spawn(

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO scheduled_wakeups\n                 (id, workspace_id, fire_at, kind, prompt, attempt, created_at)\n               VALUES ($1, $2, $3, $4, $5, $6, datetime('now', 'subsec'))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "6147e567c16faf57f30a303c4e966516167768ab8026ceac3aba362d333899e6"
+}

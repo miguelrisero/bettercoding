@@ -47,6 +47,7 @@ pub mod cli_activity;
 mod command;
 pub mod container;
 mod copy;
+pub mod loop_supervisor;
 pub mod pty;
 
 #[derive(Clone)]
@@ -269,6 +270,10 @@ impl Deployment for LocalDeployment {
         // Surface CLI-mode tmux claude activity as workspace stage state
         // (Running / Needs Attention buckets in the sidebar).
         cli_activity::CliActivityMonitor::spawn(db.clone());
+
+        // Keep opted-in CLI loops going across usage/rate limits: detect the
+        // limit banner, schedule a wake-up, and re-prompt the agent.
+        loop_supervisor::LoopSupervisor::spawn(db.clone());
 
         let deployment = Self {
             config,

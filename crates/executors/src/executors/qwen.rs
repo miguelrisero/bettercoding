@@ -14,7 +14,9 @@ use crate::{
     executor_discovery::ExecutorDiscoveredOptions,
     executors::{
         AppendPrompt, AvailabilityInfo, BaseCodingAgent, ExecutorError, SpawnedChild,
-        StandardCodingAgentExecutor, gemini::AcpAgentHarness,
+        StandardCodingAgentExecutor,
+        cli::{CliContinue, CliLaunchSpec, CliPromptArg, CliResume},
+        gemini::AcpAgentHarness,
     },
     logs::utils::patch,
     model_selector::{ModelSelectorConfig, PermissionPolicy},
@@ -76,6 +78,26 @@ impl StandardCodingAgentExecutor for QwenCode {
 
     fn use_approvals(&mut self, approvals: Arc<dyn ExecutorApprovalService>) {
         self.approvals = Some(approvals);
+    }
+
+    fn interactive_cli_spec(&self, _cwd: &Path) -> Option<CliLaunchSpec> {
+        let mut args = Vec::new();
+        if let Some(model) = self.model.as_deref().filter(|m| !m.is_empty()) {
+            args.push("--model".to_string());
+            args.push(model.to_string());
+        }
+        // Autonomous by default; Supervised (yolo == Some(false)) leaves the
+        // default approval mode.
+        if self.yolo != Some(false) {
+            args.push("--approval-mode".to_string());
+            args.push("yolo".to_string());
+        }
+        Some(
+            CliLaunchSpec::new("qwen", args)
+                .with_prompt_arg(CliPromptArg::Flag("-i".to_string()))
+                .with_resume(CliResume::Flag("--resume".to_string()))
+                .with_continue(CliContinue::Flag("--continue".to_string())),
+        )
     }
 
     async fn spawn(

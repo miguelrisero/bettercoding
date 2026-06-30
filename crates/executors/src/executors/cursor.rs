@@ -22,6 +22,7 @@ use crate::{
     executors::{
         AppendPrompt, AvailabilityInfo, BaseCodingAgent, ExecutorError, SpawnedChild,
         StandardCodingAgentExecutor,
+        cli::{CliContinue, CliLaunchSpec, CliPromptArg, CliResume},
     },
     logs::{
         ActionType, FileChange, NormalizedEntry, NormalizedEntryError, NormalizedEntryType,
@@ -181,6 +182,27 @@ impl StandardCodingAgentExecutor for CursorAgent {
                 crate::model_selector::PermissionPolicy::Auto
             ));
         }
+    }
+
+    fn interactive_cli_spec(&self, _cwd: &Path) -> Option<CliLaunchSpec> {
+        let mut args = Vec::new();
+        if let Some(model) = self.model.as_deref().filter(|m| !m.is_empty()) {
+            // Cursor encodes reasoning in the model id (e.g. `sonnet-4.5-thinking`);
+            // reuse the same resolver the headless path uses.
+            let resolved = resolve_cursor_model_name(model, self.reasoning.as_deref());
+            args.push("--model".to_string());
+            args.push(resolved.to_string());
+        }
+        // `--force` auto-runs commands (autonomous); Supervised disables it.
+        if self.force != Some(false) {
+            args.push("--force".to_string());
+        }
+        Some(
+            CliLaunchSpec::new("cursor-agent", args)
+                .with_prompt_arg(CliPromptArg::Positional)
+                .with_resume(CliResume::Flag("--resume".to_string()))
+                .with_continue(CliContinue::Flag("--continue".to_string())),
+        )
     }
 
     async fn spawn(

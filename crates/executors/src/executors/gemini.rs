@@ -16,6 +16,7 @@ use crate::{
     executors::{
         AppendPrompt, AvailabilityInfo, BaseCodingAgent, ExecutorError, SpawnedChild,
         StandardCodingAgentExecutor,
+        cli::{CliLaunchSpec, CliPromptArg, CliResume},
     },
     logs::utils::patch,
     model_selector::{ModelInfo, ModelSelectorConfig, PermissionPolicy},
@@ -79,6 +80,28 @@ impl StandardCodingAgentExecutor for Gemini {
 
     fn use_approvals(&mut self, approvals: Arc<dyn ExecutorApprovalService>) {
         self.approvals = Some(approvals);
+    }
+
+    fn interactive_cli_spec(&self, _cwd: &Path) -> Option<CliLaunchSpec> {
+        let mut args = Vec::new();
+        if let Some(model) = self.model.as_deref().filter(|m| !m.is_empty()) {
+            args.push("--model".to_string());
+            args.push(model.to_string());
+        }
+        // Autonomous by default for the app-created worktree; Supervised
+        // (yolo == Some(false)) leaves the default approval mode in place.
+        if self.yolo != Some(false) {
+            args.push("--approval-mode".to_string());
+            args.push("yolo".to_string());
+        }
+        // `-i` starts interactive AND submits the first prompt; `--resume <id>`
+        // rejoins a session. Gemini has no `--continue`, so the fallback is a
+        // fresh TUI.
+        Some(
+            CliLaunchSpec::new("gemini", args)
+                .with_prompt_arg(CliPromptArg::Flag("-i".to_string()))
+                .with_resume(CliResume::Flag("--resume".to_string())),
+        )
     }
 
     async fn spawn(

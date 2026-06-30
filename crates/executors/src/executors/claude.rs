@@ -39,7 +39,10 @@ use crate::{
     env::ExecutionEnv,
     executors::{
         AppendPrompt, AvailabilityInfo, BaseCodingAgent, ExecutorError, SpawnedChild,
-        StandardCodingAgentExecutor, codex::client::LogWriter, utils::reorder_slash_commands,
+        StandardCodingAgentExecutor,
+        cli::{CliContinue, CliLaunchSpec, CliPromptArg, CliResume},
+        codex::client::LogWriter,
+        utils::reorder_slash_commands,
     },
     logs::{
         ActionType, AnsweredQuestion, AskUserQuestionItem, AskUserQuestionOption, FileChange,
@@ -457,6 +460,50 @@ mod cli_launch_tests {
             v(&["--model", "claude-opus-4-8", "--effort", "max"])
         );
     }
+
+    use std::path::Path;
+
+    use super::ClaudeCode;
+    use crate::executors::{
+        StandardCodingAgentExecutor,
+        cli::{CliContinue, CliPromptArg, CliResume},
+    };
+
+    fn claude_from(json: serde_json::Value) -> ClaudeCode {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn interactive_spec_carries_model_effort_and_skips_permissions() {
+        let claude = claude_from(serde_json::json!({ "model": "sonnet", "effort": "high" }));
+        let spec = claude.interactive_cli_spec(Path::new("/tmp")).unwrap();
+        assert_eq!(spec.program, "claude");
+        assert!(
+            spec.base_args
+                .windows(2)
+                .any(|w| w == ["--model", "sonnet"])
+        );
+        assert!(spec.base_args.windows(2).any(|w| w == ["--effort", "high"]));
+        assert!(
+            spec.base_args
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions")
+        );
+        assert_eq!(spec.resume, CliResume::Flag("--resume".to_string()));
+        assert_eq!(spec.prompt_arg, CliPromptArg::Positional);
+        assert_eq!(
+            spec.continue_fallback,
+            CliContinue::Flag("--continue".to_string())
+        );
+    }
+
+    #[test]
+    fn interactive_spec_defaults_to_opus_max() {
+        let claude = claude_from(serde_json::json!({}));
+        let spec = claude.interactive_cli_spec(Path::new("/tmp")).unwrap();
+        assert!(spec.base_args.windows(2).any(|w| w == ["--model", "opus"]));
+        assert!(spec.base_args.windows(2).any(|w| w == ["--effort", "max"]));
+    }
 }
 
 fn default_discovered_options() -> crate::executor_discovery::ExecutorDiscoveredOptions {
@@ -539,6 +586,25 @@ impl StandardCodingAgentExecutor for ClaudeCode {
 
     fn use_approvals(&mut self, approvals: Arc<dyn ExecutorApprovalService>) {
         self.approvals_service = Some(approvals);
+    }
+
+    fn interactive_cli_spec(&self, _cwd: &Path) -> Option<CliLaunchSpec> {
+        // `--model`/`--effort` mirror headless mode; unset falls back to Opus at
+        // max effort, and effort is omitted for models without effort support.
+        let mut base_args = interactive_cli_args(
+            self.model.as_deref(),
+            self.effort.as_ref().map(AsRef::as_ref),
+        );
+        // CLI mode skips per-tool approval for the app-created (trusted)
+        // worktree, matching the historical hardcoded launch. The separate
+        // one-time folder-trust dialog is pre-accepted in the deployment layer.
+        base_args.push("--dangerously-skip-permissions".to_string());
+        Some(
+            CliLaunchSpec::new("claude", base_args)
+                .with_resume(CliResume::Flag("--resume".to_string()))
+                .with_prompt_arg(CliPromptArg::Positional)
+                .with_continue(CliContinue::Flag("--continue".to_string())),
+        )
     }
 
     async fn spawn(

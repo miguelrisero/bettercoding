@@ -33,6 +33,7 @@ use crate::{
 pub mod acp;
 pub mod amp;
 pub mod claude;
+pub mod cli;
 pub mod codex;
 pub mod copilot;
 pub mod cursor;
@@ -223,6 +224,20 @@ pub trait StandardCodingAgentExecutor {
     fn apply_overrides(&mut self, _executor_config: &ExecutorConfig) {}
 
     fn use_approvals(&mut self, _approvals: Arc<dyn ExecutorApprovalService>) {}
+
+    /// Describe how to launch this agent's interactive CLI (TUI) in a tmux pane
+    /// for "CLI mode". Built from this agent's already-overridden config so the
+    /// CLI launch honors the same model / reasoning effort / sandbox / approval
+    /// selection as headless mode. Returns `None` for agents without interactive
+    /// CLI support (the default), in which case CLI mode falls back to claude.
+    ///
+    /// Pre-launch local-environment prep some agents need (pre-accepting a
+    /// per-folder trust dialog, seeding onboarding/theme/auth so the TUI doesn't
+    /// block) is handled in the deployment layer keyed off the spec's `program`,
+    /// keeping this a pure description of the launch command.
+    fn interactive_cli_spec(&self, _cwd: &Path) -> Option<cli::CliLaunchSpec> {
+        None
+    }
 
     async fn spawn(
         &self,
@@ -419,5 +434,71 @@ mod tests {
         let result: Result<BaseCodingAgent, _> = serde_json::from_str(r#""CURSOR""#);
         assert!(result.is_ok(), "CURSOR should deserialize via serde");
         assert_eq!(result.unwrap(), BaseCodingAgent::CursorAgent);
+    }
+}
+
+#[cfg(test)]
+mod cli_spec_tests {
+    use std::path::Path;
+
+    use super::{BaseCodingAgent, StandardCodingAgentExecutor};
+    use crate::profile::{ExecutorConfigs, ExecutorProfileId};
+
+    fn default_spec_args(agent: BaseCodingAgent) -> Option<(String, Vec<String>)> {
+        ExecutorConfigs::from_defaults()
+            .get_coding_agent_or_default(&ExecutorProfileId::new(agent))
+            .interactive_cli_spec(Path::new("/tmp"))
+            .map(|s| (s.program, s.base_args))
+    }
+
+    /// Every supported agent advertises an interactive CLI launch via its
+    /// default profile, with the expected binary name.
+    #[test]
+    fn every_agent_has_a_cli_spec_with_the_right_binary() {
+        use BaseCodingAgent::*;
+        for (agent, program) in [
+            (ClaudeCode, "claude"),
+            (Codex, "codex"),
+            (Gemini, "gemini"),
+            (QwenCode, "qwen"),
+            (Opencode, "opencode"),
+            (CursorAgent, "cursor-agent"),
+            (Droid, "droid"),
+            (Amp, "amp"),
+            (Copilot, "copilot"),
+        ] {
+            let got = default_spec_args(agent);
+            assert_eq!(
+                got.as_ref().map(|(p, _)| p.as_str()),
+                Some(program),
+                "{agent:?} should launch `{program}`"
+            );
+        }
+    }
+
+    /// CLI mode runs each agent autonomously by default (worktrees are
+    /// app-created), so an unattended loop isn't stalled by approval prompts.
+    #[test]
+    fn agents_default_to_autonomous_flags() {
+        use BaseCodingAgent::*;
+        let has = |agent: BaseCodingAgent, needle: &str| {
+            default_spec_args(agent)
+                .map(|(_, args)| args.iter().any(|a| a == needle))
+                .unwrap_or(false)
+        };
+        assert!(
+            has(Gemini, "yolo"),
+            "gemini should default to yolo approval"
+        );
+        assert!(
+            has(QwenCode, "yolo"),
+            "qwen should default to yolo approval"
+        );
+        assert!(has(Copilot, "--allow-all-tools"));
+        assert!(has(CursorAgent, "--force"));
+        assert!(
+            has(Droid, "--skip-permissions-unsafe") || has(Droid, "--auto"),
+            "droid should default to an autonomous autonomy level"
+        );
     }
 }

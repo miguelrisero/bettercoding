@@ -36,6 +36,7 @@ import {
   RenameBranchResponse,
   CheckEditorAvailabilityResponse,
   AvailabilityInfo,
+  CliAgentAvailability,
   BaseCodingAgent,
   ExecutorConfig,
   DraftFollowUpData,
@@ -102,6 +103,10 @@ import {
   ProfileResponse,
   WorkspaceDirListing,
   WorkspaceFileEntry,
+  LoopAutomationStatus,
+  UpsertLoopAutomationRequest,
+  ScheduledWakeup,
+  CreateWakeupRequest,
 } from 'shared/types';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
 import { createWorkspaceWithSession } from '@/shared/types/attempt';
@@ -1080,6 +1085,11 @@ export const configApi = {
     );
     return handleApiResponse<AvailabilityInfo>(response);
   },
+  // Which agents' interactive CLI binary is on PATH (for the CLI-mode picker).
+  cliAgentAvailability: async (): Promise<CliAgentAvailability> => {
+    const response = await makeRequest('/api/agents/cli-availability');
+    return handleApiResponse<CliAgentAvailability>(response);
+  },
 };
 
 // Task Tags APIs (all tags are global)
@@ -1112,6 +1122,54 @@ export const tagsApi = {
     const response = await makeRequest(`/api/tags/${tagId}`, {
       method: 'DELETE',
     });
+    return handleApiResponse<void>(response);
+  },
+};
+
+// Loop automation ("Keep going") API for CLI mode
+export const loopAutomationApi = {
+  getStatus: async (workspaceId: string): Promise<LoopAutomationStatus> => {
+    const response = await makeRequest(
+      `/api/workspaces/${workspaceId}/loop-automation`
+    );
+    return handleApiResponse<LoopAutomationStatus>(response);
+  },
+
+  updatePolicy: async (
+    workspaceId: string,
+    data: UpsertLoopAutomationRequest
+  ): Promise<LoopAutomationStatus> => {
+    const response = await makeRequest(
+      `/api/workspaces/${workspaceId}/loop-automation`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }
+    );
+    return handleApiResponse<LoopAutomationStatus>(response);
+  },
+
+  createWakeup: async (
+    workspaceId: string,
+    data: CreateWakeupRequest
+  ): Promise<ScheduledWakeup> => {
+    const response = await makeRequest(
+      `/api/workspaces/${workspaceId}/loop-automation/wakeups`,
+      {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }
+    );
+    return handleApiResponse<ScheduledWakeup>(response);
+  },
+
+  deleteWakeup: async (wakeupId: string): Promise<void> => {
+    const response = await makeRequest(
+      `/api/loop-automation/wakeups/${wakeupId}`,
+      {
+        method: 'DELETE',
+      }
+    );
     return handleApiResponse<void>(response);
   },
 };

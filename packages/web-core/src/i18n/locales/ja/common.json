@@ -9,6 +9,24 @@
     "setupRunningTitle": "ワークスペースを準備しています",
     "setupRunningBody": "セットアップスクリプトを実行中です。完了するとターミナルがプロンプトとともに開きます。"
   },
+  "loopAutomation": {
+    "label": "継続",
+    "tooltip": "レート制限または使用量制限による一時停止後にこのセッションを自動的に再開します",
+    "settingsLabel": "継続の設定",
+    "settingsTitle": "継続",
+    "settingsDescription": "Claude がレート制限または使用量制限に達したときに、このセッションを自動的に継続します。",
+    "retryInterval": "再試行間隔",
+    "minutes": "分",
+    "continuationPrompt": "継続プロンプト",
+    "continuationPromptPlaceholder": "セッションを再開するために送信されるメッセージ",
+    "maxAttempts": "最大試行回数",
+    "save": "保存",
+    "saving": "保存中…",
+    "retryingAt": "{{time}} に再試行",
+    "wakingAt": "{{time}} UTC に再開",
+    "attempts": "試行 {{used}}/{{max}}",
+    "cancelWakeup": "予約された再試行をキャンセル"
+  },
   "editorNames": {
     "custom": "カスタム"
   },

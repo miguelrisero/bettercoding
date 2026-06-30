@@ -9,6 +9,24 @@
     "setupRunningTitle": "正在準備工作區",
     "setupRunningBody": "安裝腳本正在執行。完成後終端將帶著你的提示開啟。"
   },
+  "loopAutomation": {
+    "label": "繼續執行",
+    "tooltip": "在速率限制或用量限制暫停後自動恢復此工作階段",
+    "settingsLabel": "繼續執行設定",
+    "settingsTitle": "繼續執行",
+    "settingsDescription": "當 Claude 達到速率或用量限制時自動繼續此工作階段。",
+    "retryInterval": "重試間隔",
+    "minutes": "分鐘",
+    "continuationPrompt": "繼續提示詞",
+    "continuationPromptPlaceholder": "用於恢復工作階段的訊息",
+    "maxAttempts": "最大嘗試次數",
+    "save": "儲存",
+    "saving": "儲存中…",
+    "retryingAt": "將在 {{time}} 重試",
+    "wakingAt": "將在 {{time}} UTC 恢復",
+    "attempts": "嘗試 {{used}}/{{max}}",
+    "cancelWakeup": "取消已排程的重試"
+  },
   "editorNames": {
     "custom": "自訂"
   },

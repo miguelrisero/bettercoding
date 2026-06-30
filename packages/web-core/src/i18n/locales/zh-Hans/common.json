@@ -9,6 +9,24 @@
     "setupRunningTitle": "正在准备工作区",
     "setupRunningBody": "安装脚本正在运行。完成后终端将带着你的提示打开。"
   },
+  "loopAutomation": {
+    "label": "继续运行",
+    "tooltip": "在速率限制或用量限制暂停后自动恢复此会话",
+    "settingsLabel": "继续运行设置",
+    "settingsTitle": "继续运行",
+    "settingsDescription": "当 Claude 达到速率或用量限制时自动继续此会话。",
+    "retryInterval": "重试间隔",
+    "minutes": "分钟",
+    "continuationPrompt": "继续提示词",
+    "continuationPromptPlaceholder": "用于恢复会话的消息",
+    "maxAttempts": "最大尝试次数",
+    "save": "保存",
+    "saving": "保存中…",
+    "retryingAt": "将在 {{time}} 重试",
+    "wakingAt": "将在 {{time}} UTC 恢复",
+    "attempts": "尝试 {{used}}/{{max}}",
+    "cancelWakeup": "取消已计划的重试"
+  },
   "editorNames": {
     "custom": "自定义"
   },

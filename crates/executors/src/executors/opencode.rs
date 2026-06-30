@@ -19,7 +19,9 @@ use crate::{
     executors::{
         AppendPrompt, AvailabilityInfo, BaseCodingAgent, ExecutorError, ExecutorExitResult,
         SlashCommandDescription, SpawnedChild, StandardCodingAgentExecutor,
-        opencode::types::OpencodeExecutorEvent, utils::reorder_slash_commands,
+        cli::{CliContinue, CliLaunchSpec, CliPromptArg, CliResume},
+        opencode::types::OpencodeExecutorEvent,
+        utils::reorder_slash_commands,
     },
     logs::utils::patch,
     model_selector::{AgentInfo, ModelInfo, ModelProvider, PermissionPolicy, ReasoningOption},
@@ -409,6 +411,24 @@ impl StandardCodingAgentExecutor for Opencode {
 
     fn use_approvals(&mut self, approvals: Arc<dyn ExecutorApprovalService>) {
         self.approvals = Some(approvals);
+    }
+
+    fn interactive_cli_spec(&self, _cwd: &Path) -> Option<CliLaunchSpec> {
+        let mut args = Vec::new();
+        if let Some(model) = self.model.as_deref().filter(|m| !m.is_empty()) {
+            args.push("-m".to_string());
+            args.push(model.to_string());
+        }
+        // opencode's stable TUI has no autonomy flag — auto-approve is driven by
+        // the `permission` block in opencode.json (see the install plan), so
+        // there's nothing to emit here. `--prompt` seeds the first message; `-s`
+        // resumes a session id; `-c` continues the last session.
+        Some(
+            CliLaunchSpec::new("opencode", args)
+                .with_prompt_arg(CliPromptArg::Flag("--prompt".to_string()))
+                .with_resume(CliResume::Flag("--session".to_string()))
+                .with_continue(CliContinue::Flag("--continue".to_string())),
+        )
     }
 
     async fn spawn(
