@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM scheduled_wakeups WHERE workspace_id = $1 AND fired_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "8ae6657138bcaa4bf5c5d5791f7b19e1c0cfd6d469aab98cbc12e3e33fcefa94"
+}

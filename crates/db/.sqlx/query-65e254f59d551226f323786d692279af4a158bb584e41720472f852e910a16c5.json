@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE loop_automations\n               SET attempts_used = attempts_used + 1,\n                   updated_at = datetime('now', 'subsec')\n               WHERE workspace_id = $1\n               RETURNING attempts_used",
+  "describe": {
+    "columns": [
+      {
+        "name": "attempts_used",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "65e254f59d551226f323786d692279af4a158bb584e41720472f852e910a16c5"
+}

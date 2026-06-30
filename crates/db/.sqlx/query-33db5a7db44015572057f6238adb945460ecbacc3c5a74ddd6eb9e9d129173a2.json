@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COUNT(*) as \"count!: i64\"\n               FROM scheduled_wakeups\n               WHERE workspace_id = $1 AND kind = $2 AND fired_at IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "count!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "33db5a7db44015572057f6238adb945460ecbacc3c5a74ddd6eb9e9d129173a2"
+}

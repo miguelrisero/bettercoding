@@ -319,6 +319,30 @@ export type AgentPresetOptionsQuery = { executor: BaseCodingAgent, variant: stri
 
 export type CurrentUserResponse = { user_id: string, };
 
+export type WakeupKind = "rate_limit_retry" | "usage_limit_wake" | "manual";
+
+export type LoopAutomation = { workspace_id: string, enabled: boolean, retry_interval_secs: bigint, continuation_prompt: string, max_attempts: bigint, attempts_used: bigint, updated_at: string, };
+
+export type ScheduledWakeup = { id: string, workspace_id: string, fire_at: string, kind: WakeupKind, prompt: string | null, attempt: bigint, fired_at: string | null, created_at: string, };
+
+export type LoopAutomationStatus = { 
+/**
+ * `None` when the workspace has never been configured (treated as disabled).
+ */
+policy: LoopAutomation | null, pending_wakeups: Array<ScheduledWakeup>, };
+
+export type UpsertLoopAutomationRequest = { enabled: boolean, retry_interval_secs: bigint | null, continuation_prompt: string | null, max_attempts: bigint | null, };
+
+export type CreateWakeupRequest = { 
+/**
+ * When to fire (UTC). The supervisor delivers the prompt into the CLI pane.
+ */
+fire_at: string, 
+/**
+ * Message to deliver; falls back to the policy's continuation prompt.
+ */
+prompt: string | null, };
+
 export type StartSpake2EnrollmentRequest = { enrollment_code: string, client_message_b64: string, };
 
 export type FinishSpake2EnrollmentRequest = { enrollment_id: string, client_id: string, client_name: string, client_browser: string, client_os: string, client_device: string, public_key_b64: string, client_proof_b64: string, };

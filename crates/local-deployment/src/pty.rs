@@ -662,6 +662,83 @@ pub async fn kill_cli_tmux_session(workspace_id: Uuid) {
     }
 }
 
+/// Capture the visible content of a workspace's CLI tmux pane (best-effort).
+/// Returns `None` when tmux is down or the session doesn't exist. The loop
+/// supervisor uses this to spot usage/rate-limit banners and to tell whether
+/// the agent is idle — CLI pane output is otherwise ephemeral (streamed to the
+/// browser, never persisted), so this is the only server-side view of it.
+pub async fn capture_cli_pane(workspace_id: Uuid) -> Option<String> {
+    if !tmux_available() {
+        return None;
+    }
+    // Pane-targeting commands (capture-pane / send-keys) reject the `=exact`
+    // session-target syntax; they take a pane target. The full 32-hex session
+    // name can't be a prefix of any other `vk_*` session, so the bare name
+    // resolves unambiguously to this session's (sole) pane.
+    let session_name = cli_tmux_session_name(workspace_id);
+    let output = tokio::process::Command::new("tmux")
+        .args([
+            "-L",
+            CLI_TMUX_SOCKET,
+            "capture-pane",
+            "-p",
+            "-t",
+            &session_name,
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Type `text` into a workspace's CLI tmux pane and submit it (Enter), as if the
+/// user typed it. This is the only way to re-prompt a LIVE, detached agent: the
+/// parked `pending_cli_prompt` path only fires when a fresh tmux session is
+/// created, so an already-running pane needs keystroke injection. `-l` sends the
+/// text literally so it can never be interpreted as tmux key names; Enter is a
+/// separate call so it submits rather than being typed verbatim. Best-effort.
+pub async fn send_cli_keys(workspace_id: Uuid, text: &str) -> bool {
+    if !tmux_available() {
+        return false;
+    }
+    // Bare name (not `=exact`): send-keys takes a pane target, for which the
+    // `=` session-target syntax is rejected. Unambiguous given full-hex names.
+    let target = cli_tmux_session_name(workspace_id);
+
+    let typed = tokio::process::Command::new("tmux")
+        .args([
+            "-L",
+            CLI_TMUX_SOCKET,
+            "send-keys",
+            "-t",
+            &target,
+            "-l",
+            text,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !typed {
+        return false;
+    }
+
+    tokio::process::Command::new("tmux")
+        .args(["-L", CLI_TMUX_SOCKET, "send-keys", "-t", &target, "Enter"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Seconds since the Unix epoch (best-effort; 0 if the system clock is before
 /// the epoch). Used to turn tmux's `session_activity` epoch into an idle age.
 fn now_unix_secs() -> i64 {

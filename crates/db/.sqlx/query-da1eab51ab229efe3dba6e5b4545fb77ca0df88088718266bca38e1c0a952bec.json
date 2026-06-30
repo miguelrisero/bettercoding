@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                 id as \"id!: Uuid\",\n                 workspace_id as \"workspace_id!: Uuid\",\n                 fire_at as \"fire_at!: DateTime<Utc>\",\n                 kind,\n                 prompt,\n                 attempt,\n                 fired_at as \"fired_at?: DateTime<Utc>\",\n                 created_at as \"created_at!: DateTime<Utc>\"\n               FROM scheduled_wakeups\n               WHERE fired_at IS NULL AND datetime(fire_at) <= datetime('now')\n               ORDER BY fire_at ASC",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "workspace_id!: Uuid",
+        "ordinal": 1,
+        "type_info": "Blob"
+      },
+      {
+        "name": "fire_at!: DateTime<Utc>",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "kind",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "prompt",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "attempt",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "fired_at?: DateTime<Utc>",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at!: DateTime<Utc>",
+        "ordinal": 7,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "da1eab51ab229efe3dba6e5b4545fb77ca0df88088718266bca38e1c0a952bec"
+}

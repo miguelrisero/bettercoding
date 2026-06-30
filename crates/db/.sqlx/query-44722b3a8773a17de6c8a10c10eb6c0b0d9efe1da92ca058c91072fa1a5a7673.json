@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO loop_automations\n                 (workspace_id, enabled, retry_interval_secs, continuation_prompt,\n                  max_attempts, attempts_used, updated_at)\n               VALUES ($1, $2, $3, $4, $5, 0, datetime('now', 'subsec'))\n               ON CONFLICT(workspace_id) DO UPDATE SET\n                 enabled = excluded.enabled,\n                 retry_interval_secs = excluded.retry_interval_secs,\n                 continuation_prompt = excluded.continuation_prompt,\n                 max_attempts = excluded.max_attempts,\n                 attempts_used = 0,\n                 updated_at = excluded.updated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "44722b3a8773a17de6c8a10c10eb6c0b0d9efe1da92ca058c91072fa1a5a7673"
+}
