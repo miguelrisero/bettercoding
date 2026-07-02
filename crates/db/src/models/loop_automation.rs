@@ -21,7 +21,12 @@ pub enum WakeupKind {
     /// Transient "Server is temporarily limiting requests · Rate limited" — a
     /// short backoff retry (every `retry_interval_secs`).
     RateLimitRetry,
-    /// A usage-window limit ("usage limit reached") — wake at the reset time.
+    /// Anthropic "API Error: 529 Overloaded" — a transient server-side error;
+    /// retry a few minutes out (distinct from `RateLimitRetry` so the two
+    /// dedupe and back off independently).
+    OverloadRetry,
+    /// A usage- or session-window limit ("usage limit reached", "You've hit
+    /// your session limit · resets 3:10pm") — wake shortly after the reset time.
     UsageLimitWake,
     /// User-scheduled ("ping at 05:00 UTC", next-day).
     Manual,
@@ -31,6 +36,7 @@ impl WakeupKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             WakeupKind::RateLimitRetry => "rate_limit_retry",
+            WakeupKind::OverloadRetry => "overload_retry",
             WakeupKind::UsageLimitWake => "usage_limit_wake",
             WakeupKind::Manual => "manual",
         }
@@ -39,6 +45,7 @@ impl WakeupKind {
     pub fn parse(s: &str) -> Self {
         match s {
             "rate_limit_retry" => WakeupKind::RateLimitRetry,
+            "overload_retry" => WakeupKind::OverloadRetry,
             "usage_limit_wake" => WakeupKind::UsageLimitWake,
             _ => WakeupKind::Manual,
         }
