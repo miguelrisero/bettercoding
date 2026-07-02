@@ -18,7 +18,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, FixedOffset, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, Local, Offset, TimeZone, Utc};
 use db::{
     DBService,
     models::{
@@ -69,14 +69,33 @@ pub enum LimitSignal {
     UsageLimited { reset_at: Option<DateTime<Utc>> },
 }
 
+impl LimitSignal {
+    /// The wake-up kind used to schedule (and dedupe) a retry for this signal,
+    /// and to check on delivery that the *same* limit is still showing.
+    fn wakeup_kind(&self) -> WakeupKind {
+        match self {
+            LimitSignal::RateLimited => WakeupKind::RateLimitRetry,
+            LimitSignal::Overloaded => WakeupKind::OverloadRetry,
+            LimitSignal::UsageLimited { .. } => WakeupKind::UsageLimitWake,
+        }
+    }
+}
+
+/// The machine's current UTC offset — CLI-agent banners render reset times in
+/// the host's local zone (the supervisor runs on the same host), so this is the
+/// default used to interpret a reset clock time that carries no explicit zone.
+fn local_offset() -> FixedOffset {
+    Local::now().offset().fix()
+}
+
 /// Classify a CLI pane's visible content. Rate-limit is checked first because
 /// the provider's rate-limit banner explicitly says "(not your usage limit)",
 /// which would otherwise trip the usage-limit matcher.
 pub fn detect_limit(pane: &str) -> Option<LimitSignal> {
-    detect_limit_at(pane, Utc::now())
+    detect_limit_at(pane, Utc::now(), local_offset())
 }
 
-fn detect_limit_at(pane: &str, now: DateTime<Utc>) -> Option<LimitSignal> {
+fn detect_limit_at(pane: &str, now: DateTime<Utc>, default_tz: FixedOffset) -> Option<LimitSignal> {
     let lower = pane.to_lowercase();
 
     // Transient rate limit — the user's exact phrasing: "Server is temporarily
@@ -85,18 +104,15 @@ fn detect_limit_at(pane: &str, now: DateTime<Utc>) -> Option<LimitSignal> {
         return Some(LimitSignal::RateLimited);
     }
 
-    // Transient "API Error: 529 Overloaded" — a server-side blip, not a usage
-    // cap. Checked before the usage matcher; "overloaded" is distinctive enough
-    // that a false positive would only cost one harmless retry.
-    if lower.contains("overloaded") {
-        return Some(LimitSignal::Overloaded);
-    }
-
-    // Usage-/session-window limit (5-hour / weekly / session). Checked after the
-    // transient cases so the rate-limit "(not your usage limit)" disclaimer and
-    // the 529 banner never land here.
+    // Usage-/session-window limit (5-hour / weekly / session). Checked before the
+    // 529 case: a pane can show a stale "overloaded" line above a current
+    // usage/session banner, and the window limit (with its concrete reset time)
+    // must win over a transient retry — otherwise we'd hammer a hard-capped agent
+    // every few minutes instead of waking once at its reset. "session limit" is
+    // narrowed to the actual banner phrasing ("hit your session limit") so it
+    // can't match chatter.
     if lower.contains("usage limit")
-        || lower.contains("session limit")
+        || lower.contains("hit your session limit")
         || lower.contains("limit reached")
         || lower.contains("limit will reset")
         || lower.contains("5-hour limit")
@@ -104,61 +120,79 @@ fn detect_limit_at(pane: &str, now: DateTime<Utc>) -> Option<LimitSignal> {
         || lower.contains("out of usage")
     {
         return Some(LimitSignal::UsageLimited {
-            reset_at: parse_reset_at(pane, now),
+            reset_at: parse_reset_at(pane, now, default_tz),
         });
+    }
+
+    // Transient "API Error: 529 Overloaded" — a server-side blip, not a usage
+    // cap. Require the 529 code and the word on the SAME line so ordinary pane
+    // text (code, logs, docs) that merely mentions either in passing isn't
+    // misread as a provider error.
+    if lower
+        .lines()
+        .any(|line| line.contains("overloaded") && line.contains("529"))
+    {
+        return Some(LimitSignal::Overloaded);
     }
 
     None
 }
 
 /// Best-effort parse of a reset time ("resets at 3:45pm", "limit will reset at
-/// 23:00", "resets 3:10pm (UTC)") into the next occurrence of that clock time
-/// at-or-after `now`, as a UTC instant (no post-reset buffer — the caller adds
-/// one). The clock is interpreted in whatever timezone the banner states
-/// (`(UTC)`, `(GMT)`, `Z`, or an explicit `±HH[:MM]` offset) and converted to
-/// UTC; when no timezone is stated it's read as UTC, and an imperfect guess
-/// self-corrects because re-detection at wake time reschedules while the limit
-/// persists. Returns None when no time is found.
-fn parse_reset_at(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+/// 23:00", "resets 3:10pm (UTC)") into the UTC instant for that clock time on
+/// *today's* date. The clock is interpreted in the timezone the banner states
+/// (`(UTC)`, `(GMT)`, `Z`, or an explicit `±HH[:MM]` offset); when no zone is
+/// stated it's read in `default_tz` — the host's local zone in production, since
+/// CLI agents render reset times in local time — then converted to UTC so
+/// scheduling (always in UTC) lands on the right absolute instant. An imperfect
+/// guess self-corrects because re-detection at wake time reschedules while the
+/// limit persists.
+///
+/// The result may be in the past (we detected the banner after its reset
+/// elapsed) — deciding whether that means "wake soon" or "the next reset is
+/// tomorrow" belongs to [`usage_wake_at`], not here, so the day-roll accounts
+/// for the post-reset buffer. Returns None when no time is found.
+fn parse_reset_at(
+    text: &str,
+    now: DateTime<Utc>,
+    default_tz: FixedOffset,
+) -> Option<DateTime<Utc>> {
     let lower = text.to_lowercase();
     let anchor = lower.find("reset")?;
     let after = &lower[anchor..];
     let (hour, minute, clock_end) = parse_clock_after(after)?;
 
-    // The banner states the reset clock time in some zone (often the machine's
-    // local zone, sometimes an explicit "(UTC)"); read that offset so scheduling
-    // — which is always in UTC — lands on the right absolute instant.
-    let offset_secs = parse_tz_offset_secs(&after[clock_end..]).unwrap_or(0);
-    let zone = FixedOffset::east_opt(offset_secs)?;
+    let zone = match parse_tz_offset_secs(&after[clock_end..]) {
+        Some(secs) => FixedOffset::east_opt(secs)?,
+        None => default_tz,
+    };
 
-    // Next occurrence of `hour:minute` in `zone`, at or after `now`.
     let today = now.with_timezone(&zone).date_naive();
-    let fire = next_occurrence(zone, today, hour, minute, now)?;
-    Some(fire)
+    let naive = today.and_hms_opt(hour, minute, 0)?;
+    Some(
+        zone.from_local_datetime(&naive)
+            .single()?
+            .with_timezone(&Utc),
+    )
 }
 
-/// The UTC instant for `hour:minute` on `date` in `zone`, rolled to the next day
-/// if that is already at/before `now`.
-fn next_occurrence(
-    zone: FixedOffset,
-    date: chrono::NaiveDate,
-    hour: u32,
-    minute: u32,
-    now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
-    let in_zone = |d: chrono::NaiveDate| -> Option<DateTime<Utc>> {
-        let naive = d.and_hms_opt(hour, minute, 0)?;
-        Some(
-            zone.from_local_datetime(&naive)
-                .single()?
-                .with_timezone(&Utc),
-        )
-    };
-    let today = in_zone(date)?;
-    if today <= now {
-        in_zone(date + chrono::Duration::days(1))
-    } else {
-        Some(today)
+/// When to actually re-prompt after a usage/session-window limit whose window
+/// resets at `reset_at` (None if the banner named no time). Adds the post-reset
+/// buffer to the stated reset; if that instant has *already elapsed* (we saw the
+/// banner well after its reset — e.g. after a supervisor restart), assume the
+/// next same-clock reset is a day out rather than hammering the provider
+/// immediately. Falls back to a coarse backoff when the banner named no time.
+fn usage_wake_at(reset_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> DateTime<Utc> {
+    match reset_at {
+        Some(reset) => {
+            let fire = reset + chrono::Duration::seconds(USAGE_POST_RESET_BUFFER_SECS);
+            if fire <= now {
+                fire + chrono::Duration::days(1)
+            } else {
+                fire
+            }
+        }
+        None => now + chrono::Duration::seconds(USAGE_BACKOFF_SECS),
     }
 }
 
@@ -222,14 +256,16 @@ fn parse_clock_after(s: &str) -> Option<(u32, u32, usize)> {
 }
 
 /// Advance past an `am`/`pm` marker starting at/after `i`, tolerating a leading
-/// space and interspersed dots ("a.m."). Consumes at most the two meridiem
-/// letters plus their spacing.
+/// space and interspersed/trailing dots ("a.m."). Consumes the two meridiem
+/// letters plus surrounding dots and spaces, so a following timezone token
+/// (`(UTC-5)`) is left cleanly for the caller. The two-letter cap keeps it from
+/// eating into a trailing word (e.g. the "m" of a later "may").
 fn advance_past_ampm(s: &str, mut i: usize) -> usize {
     let bytes = s.as_bytes();
     let mut letters = 0;
-    while i < bytes.len() && letters < 2 {
+    while i < bytes.len() {
         match bytes[i] {
-            b'a' | b'p' | b'm' => {
+            b'a' | b'p' | b'm' if letters < 2 => {
                 letters += 1;
                 i += 1;
             }
@@ -372,15 +408,19 @@ async fn deliver_due_wakeups(db: &DBService, _now: DateTime<Utc>) -> Result<(), 
             continue;
         }
 
-        // For a limit-kind wake, only re-prompt if the limit banner is STILL
-        // showing — a manually-resumed agent must not be interrupted. Manual
-        // wake-ups are the user's explicit intent and always deliver.
+        // For a limit-kind wake, only re-prompt if the SAME kind of limit is
+        // still showing — a manually-resumed agent must not be interrupted, and
+        // an overload retry must not fire into a now-different (usage/rate)
+        // limit, which would waste an attempt and re-hit a real cap. Matching
+        // the visible signal's kind also makes an `Unknown` wake (no signal maps
+        // to it) skip itself. Manual wake-ups are the user's explicit intent and
+        // always deliver.
         if is_limit {
-            let still_limited = capture_cli_pane(wid)
+            let still_matches = capture_cli_pane(wid)
                 .await
-                .map(|pane| detect_limit(&pane).is_some())
-                .unwrap_or(false);
-            if !still_limited {
+                .and_then(|pane| detect_limit(&pane))
+                .is_some_and(|sig| sig.wakeup_kind() == wakeup.kind);
+            if !still_matches {
                 ScheduledWakeup::mark_fired(pool, wakeup.id).await?;
                 continue;
             }
@@ -417,60 +457,28 @@ async fn detect_and_schedule(db: &DBService, now: DateTime<Utc>) -> Result<(), s
             continue;
         };
 
-        match detect_limit_at(&pane, now) {
-            Some(LimitSignal::RateLimited) => {
-                if !ScheduledWakeup::has_pending(pool, wid, WakeupKind::RateLimitRetry).await? {
-                    let fire_at =
-                        now + chrono::Duration::seconds(policy.retry_interval_secs.max(1));
-                    ScheduledWakeup::create(
-                        pool,
-                        wid,
-                        fire_at,
-                        WakeupKind::RateLimitRetry,
-                        None,
-                        policy.attempts_used + 1,
-                    )
-                    .await?;
-                    tracing::info!("loop: rate limit on workspace {wid}; retry at {fire_at}");
-                }
-            }
-            Some(LimitSignal::Overloaded) => {
-                if !ScheduledWakeup::has_pending(pool, wid, WakeupKind::OverloadRetry).await? {
-                    let fire_at = now + chrono::Duration::seconds(OVERLOAD_BACKOFF_SECS);
-                    ScheduledWakeup::create(
-                        pool,
-                        wid,
-                        fire_at,
-                        WakeupKind::OverloadRetry,
-                        None,
-                        policy.attempts_used + 1,
-                    )
-                    .await?;
-                    tracing::info!("loop: 529 overloaded on workspace {wid}; retry at {fire_at}");
-                }
-            }
-            Some(LimitSignal::UsageLimited { reset_at }) => {
-                if !ScheduledWakeup::has_pending(pool, wid, WakeupKind::UsageLimitWake).await? {
-                    // Wake a few minutes after the stated reset so the window has
-                    // rolled; if we couldn't parse a reset time, re-check on a
-                    // coarse backoff instead.
-                    let fire_at = reset_at
-                        .map(|r| r + chrono::Duration::seconds(USAGE_POST_RESET_BUFFER_SECS))
-                        .unwrap_or_else(|| now + chrono::Duration::seconds(USAGE_BACKOFF_SECS));
-                    ScheduledWakeup::create(
-                        pool,
-                        wid,
-                        fire_at,
-                        WakeupKind::UsageLimitWake,
-                        None,
-                        policy.attempts_used + 1,
-                    )
-                    .await?;
-                    tracing::info!("loop: usage limit on workspace {wid}; wake at {fire_at}");
-                }
-            }
-            None => {}
+        // All three limit kinds schedule the same way — dedupe by kind, then
+        // create one wake-up — differing only in when to fire, so compute the
+        // kind + fire time and share the insert.
+        let Some(signal) = detect_limit_at(&pane, now, local_offset()) else {
+            continue;
+        };
+        let kind = signal.wakeup_kind();
+        if ScheduledWakeup::has_pending(pool, wid, kind).await? {
+            continue;
         }
+        let fire_at = match &signal {
+            LimitSignal::RateLimited => {
+                now + chrono::Duration::seconds(policy.retry_interval_secs.max(1))
+            }
+            LimitSignal::Overloaded => now + chrono::Duration::seconds(OVERLOAD_BACKOFF_SECS),
+            LimitSignal::UsageLimited { reset_at } => usage_wake_at(*reset_at, now),
+        };
+        ScheduledWakeup::create(pool, wid, fire_at, kind, None, policy.attempts_used + 1).await?;
+        tracing::info!(
+            "loop: {} on workspace {wid}; wake at {fire_at}",
+            kind.as_str()
+        );
     }
     Ok(())
 }
@@ -483,6 +491,22 @@ mod tests {
 
     fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+    }
+
+    /// A fixed UTC offset for the `default_tz` slot — keeps banner-parsing tests
+    /// deterministic regardless of the host's actual local zone.
+    fn utc() -> FixedOffset {
+        FixedOffset::east_opt(0).unwrap()
+    }
+
+    /// `detect_limit_at` with a deterministic (UTC) default zone.
+    fn detect(pane: &str, now: DateTime<Utc>) -> Option<LimitSignal> {
+        detect_limit_at(pane, now, utc())
+    }
+
+    /// `parse_reset_at` with a deterministic (UTC) default zone.
+    fn reset_at(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        parse_reset_at(text, now, utc())
     }
 
     #[test]
@@ -502,7 +526,7 @@ mod tests {
     #[test]
     fn usage_limit_banner_is_classified() {
         let now = at(2026, 6, 30, 9, 0);
-        let got = detect_limit_at("You've reached your usage limit.", now);
+        let got = detect("You've reached your usage limit.", now);
         assert!(matches!(got, Some(LimitSignal::UsageLimited { .. })));
     }
 
@@ -513,33 +537,34 @@ mod tests {
     }
 
     #[test]
-    fn parses_12h_reset_time_to_next_occurrence() {
-        // now 09:00 UTC, "resets at 3:45pm" -> today 15:45 (raw; buffer added by
-        // the scheduler, not this parser).
+    fn parses_12h_reset_time() {
+        // now 09:00 UTC, "resets at 3:45pm" -> today 15:45 (raw; buffer + any
+        // day-roll are the scheduler's job, not this parser's).
         let now = at(2026, 6, 30, 9, 0);
-        let got = parse_reset_at("Your limit will reset at 3:45pm", now).unwrap();
+        let got = reset_at("Your limit will reset at 3:45pm", now).unwrap();
         assert_eq!(got, at(2026, 6, 30, 15, 45));
     }
 
     #[test]
     fn parses_24h_reset_time() {
         let now = at(2026, 6, 30, 9, 0);
-        let got = parse_reset_at("limit will reset at 23:00", now).unwrap();
+        let got = reset_at("limit will reset at 23:00", now).unwrap();
         assert_eq!(got, at(2026, 6, 30, 23, 0));
     }
 
     #[test]
-    fn reset_time_already_past_rolls_to_tomorrow() {
-        // now 16:00, "resets 3pm" -> 15:00 already past -> tomorrow 15:00.
+    fn parse_reset_at_returns_todays_clock_even_when_past() {
+        // now 16:00, "resets 3pm" -> today 15:00 (already past). The parser does
+        // NOT roll to tomorrow; usage_wake_at owns that decision.
         let now = at(2026, 6, 30, 16, 0);
-        let got = parse_reset_at("resets 3pm", now).unwrap();
-        assert_eq!(got, at(2026, 7, 1, 15, 0));
+        let got = reset_at("resets 3pm", now).unwrap();
+        assert_eq!(got, at(2026, 6, 30, 15, 0));
     }
 
     #[test]
     fn usage_limit_without_a_time_has_no_reset() {
         let now = at(2026, 6, 30, 9, 0);
-        match detect_limit_at("You are out of usage for now.", now) {
+        match detect("You are out of usage for now.", now) {
             Some(LimitSignal::UsageLimited { reset_at }) => assert!(reset_at.is_none()),
             other => panic!("expected usage limit, got {other:?}"),
         }
@@ -558,7 +583,7 @@ mod tests {
         // The exact Claude Code banner, reset time stated in UTC.
         let now = at(2026, 6, 30, 9, 0);
         let banner = "You've hit your session limit · resets 3:10pm (UTC)";
-        match detect_limit_at(banner, now) {
+        match detect(banner, now) {
             Some(LimitSignal::UsageLimited { reset_at }) => {
                 assert_eq!(reset_at, Some(at(2026, 6, 30, 15, 10)));
             }
@@ -570,29 +595,129 @@ mod tests {
     fn overloaded_529_is_transient() {
         let now = at(2026, 6, 30, 9, 0);
         let banner = "API Error: 529 Overloaded. This is a server-side issue, usually temporary - try again in a moment.";
-        assert_eq!(detect_limit_at(banner, now), Some(LimitSignal::Overloaded));
+        assert_eq!(detect(banner, now), Some(LimitSignal::Overloaded));
+    }
+
+    #[test]
+    fn usage_limit_wins_over_a_stale_overloaded_line() {
+        // A pane showing a lingering 529 line ABOVE a current session-limit banner
+        // must classify as the usage window (wake once at reset), not as a
+        // transient overload (which would hammer the capped agent every 4 min).
+        let now = at(2026, 6, 30, 9, 0);
+        let pane = "API Error: 529 Overloaded\n<retried>\nYou've hit your session limit · resets 3:10pm (UTC)";
+        match detect(pane, now) {
+            Some(LimitSignal::UsageLimited { reset_at }) => {
+                assert_eq!(reset_at, Some(at(2026, 6, 30, 15, 10)));
+            }
+            other => panic!("expected usage limit to win, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tightened_matchers_reject_casual_mentions() {
+        let now = at(2026, 6, 30, 9, 0);
+        // "overloaded" without the 529 code is ordinary output, not a provider error.
+        assert_eq!(detect("the worker pool looks overloaded", now), None);
+        // A bare "session limit" mention (e.g. discussing the feature) is not a cap.
+        assert_eq!(
+            detect("TODO: document the session limit behavior", now),
+            None
+        );
+        // 529 and overloaded on DIFFERENT lines is not the provider banner.
+        assert_eq!(
+            detect("saw error 529 earlier\nthe queue looked overloaded", now),
+            None
+        );
     }
 
     #[test]
     fn reset_time_with_explicit_offset_converts_to_utc() {
         let now = at(2026, 6, 30, 9, 0);
         // 3:10pm in UTC-5 == 20:10 UTC.
-        let got = parse_reset_at("resets 3:10pm (UTC-5)", now).unwrap();
-        assert_eq!(got, at(2026, 6, 30, 20, 10));
+        assert_eq!(
+            reset_at("resets 3:10pm (UTC-5)", now),
+            Some(at(2026, 6, 30, 20, 10))
+        );
+        // 20:00 in UTC+05:30 == 14:30 UTC.
+        assert_eq!(
+            reset_at("limit will reset at 20:00 (UTC+05:30)", now),
+            Some(at(2026, 6, 30, 14, 30))
+        );
+    }
 
-        // 09:00 in UTC+05:30 == 03:30 UTC (already past 09:00 UTC now → rolls to
-        // tomorrow).
-        let got = parse_reset_at("limit will reset at 09:00 (UTC+05:30)", now).unwrap();
-        assert_eq!(got, at(2026, 7, 1, 3, 30));
+    #[test]
+    fn dotted_meridiem_keeps_explicit_offset() {
+        // "3:00 p.m." must not swallow/block the trailing "(UTC+2)".
+        let now = at(2026, 6, 30, 9, 0);
+        // 15:00 in UTC+2 == 13:00 UTC.
+        assert_eq!(
+            reset_at("limit will reset at 3:00 p.m. (UTC+2)", now),
+            Some(at(2026, 6, 30, 13, 0))
+        );
+    }
+
+    #[test]
+    fn bare_time_uses_the_default_timezone() {
+        // No explicit zone → interpret in default_tz (the host's local zone in
+        // production). 3:10pm in UTC-7 == 22:10 UTC.
+        let now = at(2026, 6, 30, 9, 0);
+        let pdt = FixedOffset::east_opt(-7 * 3600).unwrap();
+        assert_eq!(
+            parse_reset_at("resets 3:10pm", now, pdt),
+            Some(at(2026, 6, 30, 22, 10))
+        );
     }
 
     #[test]
     fn utc_label_matches_bare_utc_interpretation() {
+        // With a UTC default, a bare time and an explicit "(UTC)" agree.
         let now = at(2026, 6, 30, 9, 0);
-        let labeled = parse_reset_at("resets 3:10pm (UTC)", now).unwrap();
-        let bare = parse_reset_at("resets 3:10pm", now).unwrap();
+        let labeled = reset_at("resets 3:10pm (UTC)", now).unwrap();
+        let bare = reset_at("resets 3:10pm", now).unwrap();
         assert_eq!(labeled, bare);
         assert_eq!(labeled, at(2026, 6, 30, 15, 10));
+    }
+
+    #[test]
+    fn usage_wake_at_applies_buffer_and_rolls_only_when_elapsed() {
+        let buffer = chrono::Duration::seconds(USAGE_POST_RESET_BUFFER_SECS);
+        let reset = at(2026, 6, 30, 15, 10);
+        // Reset ahead of now → wake reset+buffer today.
+        assert_eq!(
+            usage_wake_at(Some(reset), at(2026, 6, 30, 9, 0)),
+            reset + buffer
+        );
+        // Reset a minute ago but within the buffer → still today (NOT tomorrow).
+        assert_eq!(
+            usage_wake_at(Some(reset), at(2026, 6, 30, 15, 12)),
+            reset + buffer
+        );
+        // Reset elapsed beyond the buffer → assume next same-clock reset tomorrow.
+        assert_eq!(
+            usage_wake_at(Some(reset), at(2026, 6, 30, 15, 30)),
+            reset + buffer + chrono::Duration::days(1)
+        );
+        // No parsed time → coarse backoff from now.
+        assert_eq!(
+            usage_wake_at(None, at(2026, 6, 30, 9, 0)),
+            at(2026, 6, 30, 9, 0) + chrono::Duration::seconds(USAGE_BACKOFF_SECS)
+        );
+    }
+
+    #[test]
+    fn signal_maps_to_expected_wakeup_kind() {
+        assert_eq!(
+            LimitSignal::RateLimited.wakeup_kind(),
+            WakeupKind::RateLimitRetry
+        );
+        assert_eq!(
+            LimitSignal::Overloaded.wakeup_kind(),
+            WakeupKind::OverloadRetry
+        );
+        assert_eq!(
+            LimitSignal::UsageLimited { reset_at: None }.wakeup_kind(),
+            WakeupKind::UsageLimitWake
+        );
     }
 
     #[test]
@@ -609,5 +734,31 @@ mod tests {
         assert_eq!(parse_tz_offset_secs("+0800"), Some(8 * 3600));
         assert_eq!(parse_tz_offset_secs(" reset soon"), None);
         assert_eq!(parse_tz_offset_secs(""), None);
+    }
+
+    #[test]
+    fn parses_bare_hhmm_offset_minutes() {
+        // "HHMM" form with non-zero minutes must not be truncated to the hour.
+        assert_eq!(parse_tz_offset_secs("+0530"), Some(5 * 3600 + 30 * 60));
+        assert_eq!(
+            parse_tz_offset_secs("(utc-0830)"),
+            Some(-(8 * 3600 + 30 * 60))
+        );
+    }
+
+    #[test]
+    fn parse_clock_after_is_utf8_boundary_safe() {
+        // Multi-byte chars (middot, em dash, accented letter) around the clock
+        // must never slice on a non-char boundary.
+        let hm = |s| parse_clock_after(s).map(|(h, m, _)| (h, m));
+        assert_eq!(hm("reset · 3:10pm"), Some((15, 10)));
+        assert_eq!(hm("reset — 9am"), Some((9, 0)));
+        assert_eq!(hm("résets 23:00"), Some((23, 0)));
+        // Full pipeline on the real banner (leading apostrophe + middot).
+        let now = at(2026, 6, 30, 9, 0);
+        assert_eq!(
+            reset_at("You've hit your session limit · resets 3:10pm (UTC)", now),
+            Some(at(2026, 6, 30, 15, 10))
+        );
     }
 }

@@ -321,7 +321,7 @@ export type AgentPresetOptionsQuery = { executor: BaseCodingAgent, variant: stri
 
 export type CurrentUserResponse = { user_id: string, };
 
-export type WakeupKind = "rate_limit_retry" | "overload_retry" | "usage_limit_wake" | "manual";
+export type WakeupKind = "rate_limit_retry" | "overload_retry" | "usage_limit_wake" | "manual" | "unknown";
 
 export type LoopAutomation = { workspace_id: string, enabled: boolean, retry_interval_secs: bigint, continuation_prompt: string, max_attempts: bigint, attempts_used: bigint, updated_at: string, };
 

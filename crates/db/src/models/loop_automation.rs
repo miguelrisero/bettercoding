@@ -30,6 +30,12 @@ pub enum WakeupKind {
     UsageLimitWake,
     /// User-scheduled ("ping at 05:00 UTC", next-day).
     Manual,
+    /// A kind this build doesn't recognize — e.g. a row written by a newer
+    /// version and read back after a rollback. Deliberately distinct from
+    /// `Manual` (which delivers unconditionally): an `Unknown` wake-up matches
+    /// no live limit signal, so the supervisor skips it rather than firing a
+    /// spurious prompt. Never produced by this build's own scheduling.
+    Unknown,
 }
 
 impl WakeupKind {
@@ -39,6 +45,7 @@ impl WakeupKind {
             WakeupKind::OverloadRetry => "overload_retry",
             WakeupKind::UsageLimitWake => "usage_limit_wake",
             WakeupKind::Manual => "manual",
+            WakeupKind::Unknown => "unknown",
         }
     }
 
@@ -47,7 +54,8 @@ impl WakeupKind {
             "rate_limit_retry" => WakeupKind::RateLimitRetry,
             "overload_retry" => WakeupKind::OverloadRetry,
             "usage_limit_wake" => WakeupKind::UsageLimitWake,
-            _ => WakeupKind::Manual,
+            "manual" => WakeupKind::Manual,
+            _ => WakeupKind::Unknown,
         }
     }
 }
@@ -381,5 +389,30 @@ impl ScheduledWakeup {
         .execute(pool)
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wakeup_kind_parse_roundtrips_known_variants() {
+        for kind in [
+            WakeupKind::RateLimitRetry,
+            WakeupKind::OverloadRetry,
+            WakeupKind::UsageLimitWake,
+            WakeupKind::Manual,
+        ] {
+            assert_eq!(WakeupKind::parse(kind.as_str()), kind);
+        }
+    }
+
+    #[test]
+    fn wakeup_kind_parse_maps_unknown_strings_to_unknown_not_manual() {
+        // A newer version's kind read back after a rollback must NOT become
+        // `Manual` (which delivers unconditionally) — it maps to `Unknown`.
+        assert_eq!(WakeupKind::parse("some_future_kind"), WakeupKind::Unknown);
+        assert_eq!(WakeupKind::parse(""), WakeupKind::Unknown);
     }
 }
