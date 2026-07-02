@@ -280,11 +280,24 @@ fn advance_past_ampm(s: &str, mut i: usize) -> usize {
 /// returning its offset from UTC in seconds. Recognizes `utc`/`gmt`/`z`
 /// (optionally followed by a `±HH[:MM]` offset) and bare numeric offsets like
 /// `+05:30`, `-0800`, `+2`, tolerating a leading space and `(`. Returns None
-/// when no timezone-like token is present, so the caller falls back to UTC.
+/// when no timezone-like token is present — or when a `utc`/`gmt` token is
+/// followed by a malformed offset (e.g. `UTC+99`, `UTCx`) — so the caller falls
+/// back to its default zone rather than silently pretending it's UTC.
 fn parse_tz_offset_secs(s: &str) -> Option<i32> {
     let t = s.trim_start_matches([' ', '(']);
     if let Some(rest) = t.strip_prefix("utc").or_else(|| t.strip_prefix("gmt")) {
-        return Some(parse_signed_offset(rest).unwrap_or(0));
+        let rest = rest.trim_start();
+        if rest.starts_with(['+', '-']) {
+            // An explicit offset attached to UTC/GMT: honor it, or reject the
+            // whole token if it's out of range / unparseable.
+            return parse_signed_offset(rest);
+        }
+        // Bare `UTC`/`GMT` — allow only a trailing separator (closing paren,
+        // comma, period). Anything else is unrecognized, not UTC.
+        return rest
+            .trim_start_matches([')', ',', '.', ' '])
+            .is_empty()
+            .then_some(0);
     }
     if t.starts_with('z') {
         return Some(0);
@@ -416,10 +429,15 @@ async fn deliver_due_wakeups(db: &DBService, _now: DateTime<Utc>) -> Result<(), 
         // to it) skip itself. Manual wake-ups are the user's explicit intent and
         // always deliver.
         if is_limit {
-            let still_matches = capture_cli_pane(wid)
-                .await
-                .and_then(|pane| detect_limit(&pane))
-                .is_some_and(|sig| sig.wakeup_kind() == wakeup.kind);
+            // A failed capture is transient (the session still exists — that was
+            // checked above); leave the wake-up pending and retry next tick
+            // rather than marking it fired and losing the retry.
+            let Some(pane) = capture_cli_pane(wid).await else {
+                tracing::warn!("loop: pane capture failed for due wake-up on workspace {wid}");
+                continue;
+            };
+            let still_matches =
+                detect_limit(&pane).is_some_and(|sig| sig.wakeup_kind() == wakeup.kind);
             if !still_matches {
                 ScheduledWakeup::mark_fired(pool, wakeup.id).await?;
                 continue;
@@ -734,6 +752,10 @@ mod tests {
         assert_eq!(parse_tz_offset_secs("+0800"), Some(8 * 3600));
         assert_eq!(parse_tz_offset_secs(" reset soon"), None);
         assert_eq!(parse_tz_offset_secs(""), None);
+        // A malformed offset on UTC/GMT is rejected (→ caller's default zone),
+        // not silently collapsed to UTC.
+        assert_eq!(parse_tz_offset_secs("(utc+99)"), None);
+        assert_eq!(parse_tz_offset_secs("(utcx)"), None);
     }
 
     #[test]
