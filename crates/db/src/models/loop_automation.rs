@@ -21,26 +21,41 @@ pub enum WakeupKind {
     /// Transient "Server is temporarily limiting requests · Rate limited" — a
     /// short backoff retry (every `retry_interval_secs`).
     RateLimitRetry,
-    /// A usage-window limit ("usage limit reached") — wake at the reset time.
+    /// Anthropic "API Error: 529 Overloaded" — a transient server-side error;
+    /// retry a few minutes out (distinct from `RateLimitRetry` so the two
+    /// dedupe and back off independently).
+    OverloadRetry,
+    /// A usage- or session-window limit ("usage limit reached", "You've hit
+    /// your session limit · resets 3:10pm") — wake shortly after the reset time.
     UsageLimitWake,
     /// User-scheduled ("ping at 05:00 UTC", next-day).
     Manual,
+    /// A kind this build doesn't recognize — e.g. a row written by a newer
+    /// version and read back after a rollback. Deliberately distinct from
+    /// `Manual` (which delivers unconditionally): an `Unknown` wake-up matches
+    /// no live limit signal, so the supervisor skips it rather than firing a
+    /// spurious prompt. Never produced by this build's own scheduling.
+    Unknown,
 }
 
 impl WakeupKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             WakeupKind::RateLimitRetry => "rate_limit_retry",
+            WakeupKind::OverloadRetry => "overload_retry",
             WakeupKind::UsageLimitWake => "usage_limit_wake",
             WakeupKind::Manual => "manual",
+            WakeupKind::Unknown => "unknown",
         }
     }
 
     pub fn parse(s: &str) -> Self {
         match s {
             "rate_limit_retry" => WakeupKind::RateLimitRetry,
+            "overload_retry" => WakeupKind::OverloadRetry,
             "usage_limit_wake" => WakeupKind::UsageLimitWake,
-            _ => WakeupKind::Manual,
+            "manual" => WakeupKind::Manual,
+            _ => WakeupKind::Unknown,
         }
     }
 }
@@ -374,5 +389,30 @@ impl ScheduledWakeup {
         .execute(pool)
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wakeup_kind_parse_roundtrips_known_variants() {
+        for kind in [
+            WakeupKind::RateLimitRetry,
+            WakeupKind::OverloadRetry,
+            WakeupKind::UsageLimitWake,
+            WakeupKind::Manual,
+        ] {
+            assert_eq!(WakeupKind::parse(kind.as_str()), kind);
+        }
+    }
+
+    #[test]
+    fn wakeup_kind_parse_maps_unknown_strings_to_unknown_not_manual() {
+        // A newer version's kind read back after a rollback must NOT become
+        // `Manual` (which delivers unconditionally) — it maps to `Unknown`.
+        assert_eq!(WakeupKind::parse("some_future_kind"), WakeupKind::Unknown);
+        assert_eq!(WakeupKind::parse(""), WakeupKind::Unknown);
     }
 }
