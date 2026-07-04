@@ -154,3 +154,40 @@ describe('createTouchScrollController (gesture guards)', () => {
     expect(wheels).toEqual([-1]); // only the first gesture's single step
   });
 });
+
+describe('suppression (gesture layer / select mode)', () => {
+  function suppressibleController() {
+    const wheels: Array<1 | -1> = [];
+    let suppressed = false;
+    const ctrl = createTouchScrollController({
+      getMouseTrackingMode: () => 'vt200',
+      dispatchWheel: (dir) => wheels.push(dir),
+      isSuppressed: () => suppressed,
+    });
+    return { ctrl, wheels, setSuppressed: (v: boolean) => (suppressed = v) };
+  }
+
+  it('stands down while suppressed and stays down for the whole sequence', () => {
+    const { ctrl, wheels, setSuppressed } = suppressibleController();
+    ctrl.onTouchStart({ touches: 1, clientX: 0, clientY: 0 });
+    // D-pad engaged after a long press: the bridge must not turn the drag
+    // into wheel scrolling…
+    setSuppressed(true);
+    const r = ctrl.onTouchMove({
+      touches: 1,
+      clientX: 0,
+      clientY: 3 * WHEEL_STEP_PX,
+    });
+    expect(r.prevent).toBe(false);
+    expect(wheels.length).toBe(0);
+    // …even if suppression lifts mid-sequence (finger still down).
+    setSuppressed(false);
+    ctrl.onTouchMove({ touches: 1, clientX: 0, clientY: 6 * WHEEL_STEP_PX });
+    expect(wheels.length).toBe(0);
+    // A fresh gesture after all fingers lift scrolls again.
+    ctrl.onTouchEnd(0);
+    ctrl.onTouchStart({ touches: 1, clientX: 0, clientY: 0 });
+    ctrl.onTouchMove({ touches: 1, clientX: 0, clientY: WHEEL_STEP_PX });
+    expect(wheels).toEqual([-1]);
+  });
+});

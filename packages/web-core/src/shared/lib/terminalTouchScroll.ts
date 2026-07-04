@@ -1,5 +1,7 @@
 import type { Terminal } from '@xterm/xterm';
 
+import { getTerminalMobileState } from './terminalMobileState';
+
 /**
  * Touch → wheel scroll bridge for xterm.js 5.5.
  *
@@ -69,6 +71,12 @@ export interface TouchScrollDeps {
   getMouseTrackingMode: () => string;
   /** Dispatch one line-wheel: +1 = scroll down (toward newer), -1 = scroll up. */
   dispatchWheel: (direction: 1 | -1, clientX: number, clientY: number) => void;
+  /**
+   * Another touch consumer owns the gesture (D-pad after a long-press, select
+   * mode). Checked per move; once true the bridge stands down for the rest of
+   * the touch sequence.
+   */
+  isSuppressed?: () => boolean;
 }
 
 export interface TouchMoveResult {
@@ -108,6 +116,14 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
         return { prevent: false };
       }
       if (axis === 'ignore') return { prevent: false };
+
+      if (deps.isSuppressed?.()) {
+        // The gesture layer (D-pad) or select mode took this touch sequence —
+        // never turn its drag into wheel scrolling.
+        axis = 'ignore';
+        accumulated = 0;
+        return { prevent: false };
+      }
 
       if (axis === 'undecided') {
         axis = decideAxis(p.clientX - startX, p.clientY - startY);
@@ -168,6 +184,10 @@ export function installTerminalTouchScroll(terminal: Terminal): () => void {
 
   const controller = createTouchScrollController({
     getMouseTrackingMode: () => terminal.modes.mouseTrackingMode,
+    isSuppressed: () => {
+      const state = getTerminalMobileState(terminal);
+      return state.dpadActive || state.selectMode;
+    },
     dispatchWheel: (direction, clientX, clientY) => {
       const key = `${clientX},${clientY}`;
       if (key !== lastKey) {

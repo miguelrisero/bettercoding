@@ -62,12 +62,19 @@ export function useIsRealMobile(): boolean {
  * iPadOS with a desktop UA and hybrid touch laptops. Capability doesn't change
  * within a session, so it is computed once.
  */
+let touchDeviceCache: boolean | null = null;
+
 export function isTouchDevice(): boolean {
   if (typeof window === 'undefined') return false;
-  const coarsePointer =
-    typeof window.matchMedia === 'function' &&
-    window.matchMedia('(pointer: coarse)').matches;
-  return coarsePointer || navigator.maxTouchPoints > 0;
+  // Capability is session-constant, and this now runs on hot paths (store
+  // snapshots, per-viewport-event) — evaluate the media query once.
+  if (touchDeviceCache === null) {
+    const coarsePointer =
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(pointer: coarse)').matches;
+    touchDeviceCache = coarsePointer || navigator.maxTouchPoints > 0;
+  }
+  return touchDeviceCache;
 }
 
 // No-op subscribe: touch capability doesn't change within a session, so the
