@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { Outlet } from '@tanstack/react-router';
 import { SyncErrorProvider } from '@/shared/providers/SyncErrorProvider';
 import { useIsMobile } from '@/shared/hooks/useIsMobile';
+import { useVisualViewportHeight } from '@/shared/hooks/useVisualViewportHeight';
 import { useUiPreferencesStore } from '@/shared/stores/useUiPreferencesStore';
 import { cn } from '@/shared/lib/utils';
 
@@ -17,6 +18,7 @@ import { WorkspacesSidebarReopenTag } from '@vibe/ui/components/WorkspacesSideba
 export function SharedAppLayout() {
   const currentDestination = useCurrentAppDestination();
   const isMobile = useIsMobile();
+  const visualViewportHeight = useVisualViewportHeight();
   const mobileFontScale = useUiPreferencesStore((s) => s.mobileFontScale);
   const isLeftSidebarVisible = useUiPreferencesStore(
     (s) => s.isLeftSidebarVisible
@@ -54,9 +56,21 @@ export function SharedAppLayout() {
         className={cn(
           'bg-primary',
           isMobile
-            ? 'flex fixed inset-0 pb-[env(safe-area-inset-bottom)]'
+            ? 'flex fixed inset-x-0 top-0 pb-[env(safe-area-inset-bottom)]'
             : 'grid grid-rows-[auto_1fr] h-screen'
         )}
+        style={
+          isMobile
+            ? {
+                // Track the VISUAL viewport so the app (and the terminal's
+                // input line) ends above the on-screen keyboard instead of
+                // underneath it — iOS never shrinks the layout viewport (see
+                // useVisualViewportHeight). Falls back to the layout viewport
+                // when visualViewport is unavailable.
+                height: visualViewportHeight ?? '100dvh',
+              }
+            : undefined
+        }
       >
         {!isMobile && (
           <>
