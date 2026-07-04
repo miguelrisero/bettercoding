@@ -56,19 +56,18 @@ export function SharedAppLayout() {
         className={cn(
           'bg-primary',
           isMobile
-            ? 'flex fixed inset-x-0 top-0 pb-[env(safe-area-inset-bottom)]'
+            ? 'flex fixed inset-0 pb-[env(safe-area-inset-bottom)]'
             : 'grid grid-rows-[auto_1fr] h-screen'
         )}
         style={
-          isMobile
-            ? {
-                // Track the VISUAL viewport so the app (and the terminal's
-                // input line) ends above the on-screen keyboard instead of
-                // underneath it — iOS never shrinks the layout viewport (see
-                // useVisualViewportHeight). Falls back to the layout viewport
-                // when visualViewport is unavailable.
-                height: visualViewportHeight ?? '100dvh',
-              }
+          // Track the VISUAL viewport so the app (and the terminal's input
+          // line) ends above the on-screen keyboard instead of underneath it —
+          // iOS never shrinks the layout viewport (see useVisualViewportHeight).
+          // The explicit height wins over the class's `bottom: 0`; when the
+          // hook has no value (no touch / no visualViewport) the class alone
+          // keeps the exact pre-existing inset-0 behavior.
+          isMobile && visualViewportHeight !== null
+            ? { height: visualViewportHeight, bottom: 'auto' }
             : undefined
         }
       >
