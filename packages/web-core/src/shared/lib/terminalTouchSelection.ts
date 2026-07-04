@@ -115,7 +115,9 @@ export function installTerminalTouchSelection(terminal: Terminal): () => void {
     e.stopPropagation();
     if (e.cancelable) e.preventDefault();
     if (e.touches.length !== 1) {
-      anchor = null;
+      // Either a fresh multi-finger gesture (anchor is already null) or a
+      // stray extra finger mid-drag (palm contact) — keep the anchor and
+      // ignore it; the drag resumes when the stray finger lifts.
       return;
     }
     anchor = cellFromTouch(e.touches[0]);
@@ -145,7 +147,8 @@ export function installTerminalTouchSelection(terminal: Terminal): () => void {
     terminal.select(sel.col, sel.row, sel.length);
   };
 
-  const onEnd = () => {
+  const onEnd = (e: TouchEvent) => {
+    if (e.touches.length > 0) return; // wait for the last finger
     // Copy exactly once, on release. Direct clipboard only — deliberately
     // NOT writeClipboardViaBridge: its fallback posts the text to
     // window.parent with targetOrigin '*', and terminal selections can hold
