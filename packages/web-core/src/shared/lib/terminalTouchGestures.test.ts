@@ -281,3 +281,41 @@ describe('timer starvation + cancellation (council round 1)', () => {
     expect(dpad.at(-1)).toEqual({ active: false, dir: null });
   });
 });
+
+describe('coalesced multi-touch + cancellation semantics (review round 1)', () => {
+  it('three-finger tap works when all fingers land in ONE touchstart', () => {
+    const { ctrl, events } = harness();
+    // Previous gesture long ago — pressAt must not leak from it.
+    ctrl.onTouchStart(p(50, 50), 0);
+    ctrl.onTouchEnd(0, 30);
+    ctrl.onTouchStart(p(100, 100, 3), 10_000);
+    ctrl.onTouchEnd(0, 10_080);
+    expect(events).toEqual(['paste']);
+  });
+
+  it('coalesced multi-start respects the select-mode gate', () => {
+    const { ctrl, events } = harness({ enabled: false });
+    ctrl.onTouchStart(p(100, 100, 3), 0);
+    ctrl.onTouchEnd(0, 80);
+    expect(events).toEqual([]);
+  });
+
+  it('a travelling three-finger gesture (system swipe) does not paste', () => {
+    const { ctrl, events } = harness();
+    ctrl.onTouchStart(p(100, 100, 3), 0);
+    ctrl.onTouchMove(p(100 + 3 * TAP_SLOP_PX, 100, 3), 40);
+    ctrl.onTouchEnd(0, 90);
+    expect(events).toEqual([]);
+  });
+
+  it('cancel() wipes double-tap history — a cancelled tap is not tap #1', () => {
+    const { ctrl, events } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    ctrl.onTouchEnd(0, 30); // clean tap #1
+    ctrl.onTouchStart(p(100, 100), 100);
+    ctrl.cancel(); // browser claimed the second touch
+    ctrl.onTouchStart(p(100, 100), 200);
+    ctrl.onTouchEnd(0, 230);
+    expect(events).toEqual([]); // cancelled sequence must not complete a pair
+  });
+});

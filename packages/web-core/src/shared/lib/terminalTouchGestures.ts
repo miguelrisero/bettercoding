@@ -21,7 +21,10 @@ import {
  *
  * `createTouchGestureController` is pure and time-injected (every method takes
  * `now`; scheduling is pull-based via `nextTimerAt`) — the unit-tested seam.
- * `installTerminalTouchGestures` binds real events and one timer to it.
+ * `installTerminalTouchGestures` binds real events and one timer to it, using
+ * event timestamps (not handler-delivery time) so a busy main thread can't
+ * misclassify a fast swipe as a dwell, and the monotonic clock so NTP steps
+ * can't stall repeats mid-gesture.
  */
 
 export const LONG_PRESS_MS = 350;
@@ -84,19 +87,24 @@ export function createTouchGestureController(deps: GestureDeps) {
   let startY = 0;
   let pressAt = 0;
   let maxTouches = 0;
+  /** A multi-touch gesture travelled beyond slop — it's a swipe, not a tap. */
+  let multiMoved = false;
   // D-pad repeat state.
   let dir: ArrowKey | null = null;
   let interval = DPAD_TIERS[0].interval;
   let nextRepeatAt = 0;
   // Double-tap tracking.
-  let lastTapAt = 0;
-  let lastTapX = 0;
-  let lastTapY = 0;
-  let hasLastTap = false;
+  let lastTap: { at: number; x: number; y: number } | null = null;
 
   const exitDpad = () => {
     if (phase === 'dpad') deps.setDpad(false, null);
     dir = null;
+  };
+
+  const promoteToDpad = () => {
+    phase = 'dpad';
+    dir = null;
+    deps.setDpad(true, null);
   };
 
   return {
@@ -111,31 +119,56 @@ export function createTouchGestureController(deps: GestureDeps) {
         startY = p.clientY;
         pressAt = now;
         maxTouches = 1;
+        multiMoved = false;
         return;
       }
-      // Additional finger landed. A D-pad in progress is cancelled; otherwise
-      // start tracking a potential three-finger tap.
+      if (phase === 'idle') {
+        // The whole gesture arrived as one multi-finger touchstart (fingers
+        // landing within the same frame — the normal case for a deliberate
+        // three-finger tap). Initialize here or `pressAt` would be stale
+        // from the previous gesture and the select-mode gate skipped.
+        if (!deps.isEnabled()) {
+          phase = 'ignored';
+          return;
+        }
+        phase = 'multi';
+        startX = p.clientX;
+        startY = p.clientY;
+        pressAt = now;
+        maxTouches = p.touches;
+        multiMoved = false;
+        return;
+      }
+      // Additional finger landed mid-gesture. A D-pad in progress is
+      // cancelled; otherwise keep tracking a potential three-finger tap.
       exitDpad();
       maxTouches = Math.max(maxTouches, p.touches);
       phase = phase === 'ignored' ? 'ignored' : 'multi';
     },
 
     onTouchMove(p: GesturePoint, now: number): GestureMoveResult {
+      const movedPastSlop =
+        Math.abs(p.clientX - startX) > TAP_SLOP_PX ||
+        Math.abs(p.clientY - startY) > TAP_SLOP_PX;
+
+      if (phase === 'multi') {
+        // A travelling multi-touch is a swipe/pinch (e.g. iPadOS three-finger
+        // system gestures) — it must never count as a three-finger TAP.
+        if (movedPastSlop) multiMoved = true;
+        return { prevent: false };
+      }
+
       if (phase === 'pressed') {
         if (now - pressAt >= LONG_PRESS_MS) {
           // The promotion timer can be starved by a busy main thread (TUI
-          // redraw, keyboard resize). The finger DID dwell long enough, so
-          // promote here — before the slop check — or the first delayed
-          // move would hand a held press to the scroll bridge.
-          phase = 'dpad';
-          dir = null;
-          deps.setDpad(true, null);
+          // redraw, keyboard resize). The finger DID dwell long enough
+          // (`now` is the event's own timestamp, so a late-DELIVERED fast
+          // swipe doesn't land here) — promote before the slop check, or
+          // this move would hand a held press to the scroll bridge.
+          promoteToDpad();
           // fall through to D-pad handling of this same move
         } else {
-          const moved =
-            Math.abs(p.clientX - startX) > TAP_SLOP_PX ||
-            Math.abs(p.clientY - startY) > TAP_SLOP_PX;
-          if (moved) {
+          if (movedPastSlop) {
             // Moving before the long-press delay = scroll; the bridge owns it.
             phase = 'ignored';
           }
@@ -165,48 +198,50 @@ export function createTouchGestureController(deps: GestureDeps) {
     onTouchEnd(remainingTouches: number, now: number): void {
       if (remainingTouches > 0) return; // wait for the last finger
       const wasPhase = phase;
-      const wasMulti = maxTouches > 1;
+      const touchCount = maxTouches;
+      const wasMultiMoved = multiMoved;
       exitDpad();
       phase = 'idle';
-      const touchCount = maxTouches;
       maxTouches = 0;
+      multiMoved = false;
 
       if (wasPhase === 'ignored' || wasPhase === 'dpad') {
-        hasLastTap = false;
+        lastTap = null;
         return;
       }
-      if (wasMulti) {
-        if (touchCount === 3 && now - pressAt <= MULTI_TAP_MS) deps.paste();
-        hasLastTap = false;
+      if (touchCount > 1) {
+        if (
+          touchCount === 3 &&
+          !wasMultiMoved &&
+          now - pressAt <= MULTI_TAP_MS
+        ) {
+          deps.paste();
+        }
+        lastTap = null;
         return;
       }
       if (wasPhase !== 'pressed' || now - pressAt >= LONG_PRESS_MS) {
-        hasLastTap = false;
+        lastTap = null;
         return;
       }
       // A clean quick tap. Second one in time + place = Tab.
       if (
-        hasLastTap &&
-        now - lastTapAt <= DOUBLE_TAP_MS &&
-        Math.abs(startX - lastTapX) <= 2 * TAP_SLOP_PX &&
-        Math.abs(startY - lastTapY) <= 2 * TAP_SLOP_PX
+        lastTap &&
+        now - lastTap.at <= DOUBLE_TAP_MS &&
+        Math.abs(startX - lastTap.x) <= 2 * TAP_SLOP_PX &&
+        Math.abs(startY - lastTap.y) <= 2 * TAP_SLOP_PX
       ) {
         deps.sendTab();
-        hasLastTap = false; // a triple tap is not two Tabs
+        lastTap = null; // a triple tap is not two Tabs
         return;
       }
-      hasLastTap = true;
-      lastTapAt = now;
-      lastTapX = startX;
-      lastTapY = startY;
+      lastTap = { at: now, x: startX, y: startY };
     },
 
     /** Run due work: long-press promotion and D-pad key repeats. */
     onTimer(now: number): void {
       if (phase === 'pressed' && now - pressAt >= LONG_PRESS_MS) {
-        phase = 'dpad';
-        dir = null;
-        deps.setDpad(true, null);
+        promoteToDpad();
         return;
       }
       if (phase === 'dpad' && dir && now >= nextRepeatAt) {
@@ -223,15 +258,18 @@ export function createTouchGestureController(deps: GestureDeps) {
     },
 
     /**
-     * Abort whatever is in flight (React detach mid-gesture: touchend may
-     * never arrive once the element leaves the DOM). Releases the D-pad —
-     * clearing the scroll-bridge suppression — and stops key repeats.
+     * Abort whatever is in flight (touchcancel, or React detach mid-gesture:
+     * touchend may never arrive once the element leaves the DOM). Releases
+     * the D-pad — clearing the scroll-bridge suppression — and stops key
+     * repeats. Also the touchcancel path: a cancelled sequence must never
+     * count as a tap or three-finger paste.
      */
     cancel(): void {
       exitDpad();
       phase = 'idle';
       maxTouches = 0;
-      hasLastTap = false;
+      multiMoved = false;
+      lastTap = null;
     },
   };
 }
@@ -265,6 +303,8 @@ export function installTerminalTouchGestures(
   if (!el) return () => {};
 
   // Minimal D-pad overlay: a centered badge showing the active direction.
+  // Plain arrows/plus only — fancier key-glyph codepoints render as tofu on
+  // Android/Linux (same reason the key bar uses phosphor icons).
   const overlay = document.createElement('div');
   overlay.className = 'xterm-dpad-overlay';
   overlay.style.cssText =
@@ -272,17 +312,18 @@ export function installTerminalTouchGestures(
     'z-index:20;display:none;padding:10px 14px;border-radius:9999px;' +
     'background:rgba(0,0,0,0.55);color:#fff;font-size:20px;line-height:1;' +
     'pointer-events:none;user-select:none;';
-  overlay.textContent = '✛';
+  overlay.textContent = '+';
   el.appendChild(overlay);
 
   const DIR_GLYPH: Record<ArrowKey, string> = {
-    up: '▲',
-    down: '▼',
-    left: '◀',
-    right: '▶',
+    up: '↑',
+    down: '↓',
+    left: '←',
+    right: '→',
   };
 
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let timerTargetAt: number | null = null;
 
   const controller = createTouchGestureController({
     isEnabled: () => !getTerminalMobileState(terminal).selectMode,
@@ -292,23 +333,26 @@ export function installTerminalTouchGestures(
     setDpad: (active, dirNow) => {
       patchTerminalMobileState(terminal, { dpadActive: active });
       overlay.style.display = active ? 'block' : 'none';
-      overlay.textContent = dirNow ? DIR_GLYPH[dirNow] : '✛';
+      overlay.textContent = dirNow ? DIR_GLYPH[dirNow] : '+';
     },
   });
 
   const reschedule = () => {
+    const at = controller.nextTimerAt();
+    if (at === timerTargetAt) return; // same deadline — keep the timer
     if (timer) {
       clearTimeout(timer);
       timer = null;
     }
-    const at = controller.nextTimerAt();
+    timerTargetAt = at;
     if (at === null) return;
     timer = setTimeout(
       () => {
-        controller.onTimer(Date.now());
+        timerTargetAt = null;
+        controller.onTimer(performance.now());
         reschedule();
       },
-      Math.max(0, at - Date.now())
+      Math.max(0, at - performance.now())
     );
   };
 
@@ -321,13 +365,16 @@ export function installTerminalTouchGestures(
     };
   };
 
+  // e.timeStamp shares performance.now()'s monotonic origin and carries the
+  // moment the touch actually happened — not when a busy main thread got
+  // around to delivering it.
   const onStart = (e: TouchEvent) => {
-    controller.onTouchStart(toPoint(e), Date.now());
+    controller.onTouchStart(toPoint(e), e.timeStamp);
     reschedule();
   };
   const onMove = (e: TouchEvent) => {
     if (
-      controller.onTouchMove(toPoint(e), Date.now()).prevent &&
+      controller.onTouchMove(toPoint(e), e.timeStamp).prevent &&
       e.cancelable
     ) {
       e.preventDefault();
@@ -335,19 +382,23 @@ export function installTerminalTouchGestures(
     reschedule();
   };
   const onEnd = (e: TouchEvent) => {
-    controller.onTouchEnd(e.touches.length, Date.now());
+    controller.onTouchEnd(e.touches.length, e.timeStamp);
+    reschedule();
+  };
+  const onCancel = () => {
+    // A cancelled sequence (system gesture, palm rejection, browser
+    // interruption) must not fire tap/paste actions — and may never deliver
+    // another event for the remaining fingers, so don't wait for them.
+    controller.cancel();
     reschedule();
   };
 
   el.addEventListener('touchstart', onStart, { passive: true });
   el.addEventListener('touchmove', onMove, { passive: false });
   el.addEventListener('touchend', onEnd, { passive: true });
-  el.addEventListener('touchcancel', onEnd, { passive: true });
+  el.addEventListener('touchcancel', onCancel, { passive: true });
 
-  activeGestureCancels.set(terminal, () => {
-    controller.cancel();
-    reschedule(); // nextTimerAt() is now null → clears the pending timer
-  });
+  activeGestureCancels.set(terminal, onCancel);
 
   return () => {
     if (timer) clearTimeout(timer);
@@ -355,7 +406,7 @@ export function installTerminalTouchGestures(
     el.removeEventListener('touchstart', onStart);
     el.removeEventListener('touchmove', onMove);
     el.removeEventListener('touchend', onEnd);
-    el.removeEventListener('touchcancel', onEnd);
+    el.removeEventListener('touchcancel', onCancel);
     overlay.remove();
   };
 }

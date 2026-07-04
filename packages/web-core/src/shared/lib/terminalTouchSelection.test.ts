@@ -50,3 +50,13 @@ describe('linearSelection', () => {
     ).toEqual({ col: 4, row: 2, length: 1 });
   });
 });
+
+describe('touchToCell — degenerate rects (review round 1)', () => {
+  it('returns null instead of NaN cells for zero-sized rects', () => {
+    const zero = { left: 0, top: 0, width: 0, height: 0 };
+    expect(touchToCell(0, 0, zero, cols, rows)).toBeNull();
+    expect(touchToCell(10, 10, { ...rect, width: 0 }, cols, rows)).toBeNull();
+    expect(touchToCell(10, 10, { ...rect, height: 0 }, cols, rows)).toBeNull();
+    expect(touchToCell(10, 10, rect, 0, rows)).toBeNull();
+  });
+});

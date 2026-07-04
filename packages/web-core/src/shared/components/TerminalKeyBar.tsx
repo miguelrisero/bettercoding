@@ -1,4 +1,3 @@
-import { useCallback, useSyncExternalStore } from 'react';
 import type { Terminal } from '@xterm/xterm';
 import type { Icon } from '@phosphor-icons/react';
 import {
@@ -17,7 +16,7 @@ import { keySequence, type BarKey } from '@/shared/lib/terminalKeySequences';
 import {
   getTerminalMobileState,
   patchTerminalMobileState,
-  subscribeTerminalMobileState,
+  useTerminalMobileState,
 } from '@/shared/lib/terminalMobileState';
 
 interface TerminalKeyBarProps {
@@ -29,9 +28,10 @@ interface TerminalKeyBarProps {
 
 // Icons instead of key-glyph characters (⇥ ⇧⇥ ⏎): those codepoints are
 // missing from Android/Linux system fonts and render as tofu boxes; the
-// phosphor icons render identically everywhere.
+// phosphor icons render identically everywhere. 'ctrl' is the latching
+// modifier button, rendered specially at its position in this list.
 const KEYS: ReadonlyArray<{
-  key: BarKey;
+  key: BarKey | 'ctrl';
   label?: string;
   Icon?: Icon;
   aria: string;
@@ -40,7 +40,11 @@ const KEYS: ReadonlyArray<{
   { key: 'tab', Icon: ArrowLineRightIcon, aria: 'Tab' },
   { key: 'shift-tab', Icon: ArrowLineLeftIcon, aria: 'Shift+Tab' },
   { key: 'ctrl-c', label: '^C', aria: 'Control+C (interrupt)' },
-  // 'ctrl' is rendered between ^C and the arrows (special latching button).
+  {
+    key: 'ctrl',
+    label: 'ctrl',
+    aria: 'Control (sticky — next letter sends the combo)',
+  },
   { key: 'left', Icon: ArrowLeftIcon, aria: 'Arrow left' },
   { key: 'down', Icon: ArrowDownIcon, aria: 'Arrow down' },
   { key: 'up', Icon: ArrowUpIcon, aria: 'Arrow up' },
@@ -66,17 +70,7 @@ const KEY_CLASS =
  */
 export function TerminalKeyBar({ terminal, onSendKey }: TerminalKeyBarProps) {
   const isTouch = useIsTouchDevice();
-
-  const subscribe = useCallback(
-    (cb: () => void) =>
-      terminal ? subscribeTerminalMobileState(terminal, cb) : () => {},
-    [terminal]
-  );
-  const ctrlLatched = useSyncExternalStore(
-    subscribe,
-    () => (terminal ? getTerminalMobileState(terminal).ctrlLatched : false),
-    () => false
-  );
+  const { ctrlLatched } = useTerminalMobileState(terminal);
 
   if (!isTouch) return null;
 
@@ -100,46 +94,43 @@ export function TerminalKeyBar({ terminal, onSendKey }: TerminalKeyBarProps) {
     });
   };
 
-  const renderKey = ({ key, label, Icon, aria }: (typeof KEYS)[number]) => (
-    <button
-      key={key}
-      type="button"
-      className={KEY_CLASS}
-      aria-label={aria}
-      onPointerDown={keepFocus}
-      onMouseDown={keepFocus}
-      onClick={() => sendKey(key)}
-    >
-      {Icon ? (
-        <Icon className="size-icon-sm" weight="bold" aria-hidden="true" />
-      ) : (
-        label
-      )}
-    </button>
-  );
-
-  return (
-    <div
-      className="flex items-center gap-1 px-1 py-1 overflow-x-auto shrink-0"
-      role="toolbar"
-      aria-label="Terminal keys"
-    >
-      {KEYS.slice(0, 4).map(renderKey)}
+  const renderKey = ({ key, label, Icon, aria }: (typeof KEYS)[number]) => {
+    const isCtrl = key === 'ctrl';
+    return (
       <button
+        key={key}
         type="button"
         className={cn(
           KEY_CLASS,
-          ctrlLatched && 'bg-primary text-normal border-info'
+          isCtrl && ctrlLatched && 'bg-primary text-normal border-info'
         )}
-        aria-label="Control (sticky — next letter sends the combo)"
-        aria-pressed={ctrlLatched}
-        onPointerDown={keepFocus}
-        onMouseDown={keepFocus}
-        onClick={toggleCtrl}
+        aria-label={aria}
+        aria-pressed={isCtrl ? ctrlLatched : undefined}
+        onClick={isCtrl ? toggleCtrl : () => sendKey(key)}
       >
-        ctrl
+        {Icon ? (
+          <Icon className="size-icon-sm" weight="bold" aria-hidden="true" />
+        ) : (
+          label
+        )}
       </button>
-      {KEYS.slice(4).map(renderKey)}
+    );
+  };
+
+  return (
+    // preventDefault on pointer/mouse down at the toolbar level (events
+    // bubble) so no tap steals focus from xterm's textarea — the system
+    // keyboard stays open while sending keys.
+    // role="group", not "toolbar": the ARIA toolbar contract requires roving
+    // tabindex + arrow-key traversal, and arrow keys here are CONTENT.
+    <div
+      className="flex items-center gap-1 px-1 py-1 overflow-x-auto shrink-0"
+      role="group"
+      aria-label="Terminal keys"
+      onPointerDown={keepFocus}
+      onMouseDown={keepFocus}
+    >
+      {KEYS.map(renderKey)}
     </div>
   );
 }

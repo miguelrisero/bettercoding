@@ -1,3 +1,4 @@
+import { useCallback, useSyncExternalStore } from 'react';
 import type { Terminal } from '@xterm/xterm';
 
 /**
@@ -18,29 +19,19 @@ export interface TerminalMobileState {
   selectMode: boolean;
   /** A long-press D-pad gesture is running; the scroll bridge stands down. */
   dpadActive: boolean;
-  /**
-   * One-shot status message from a DOM-level installer (e.g. the paste
-   * gesture) for the React controls to flash. The nonce makes every emission
-   * a distinct value so repeated identical messages still notify.
-   */
-  flash: { nonce: number; message: string } | null;
 }
 
-let flashNonce = 0;
-
-/** Emit a one-shot status flash for this terminal's mobile controls. */
-export function flashTerminalMobileStatus(
-  terminal: Terminal,
-  message: string
-): void {
-  patchTerminalMobileState(terminal, {
-    flash: { nonce: ++flashNonce, message },
-  });
-}
+const EMPTY_STATE: TerminalMobileState = {
+  ctrlLatched: false,
+  selectMode: false,
+  dpadActive: false,
+};
 
 interface Entry {
   state: TerminalMobileState;
   listeners: Set<() => void>;
+  /** One-shot status listeners (flash pill) — events, not retained state. */
+  flashListeners: Set<(message: string) => void>;
 }
 
 const entries = new WeakMap<Terminal, Entry>();
@@ -49,13 +40,9 @@ function entryFor(terminal: Terminal): Entry {
   let entry = entries.get(terminal);
   if (!entry) {
     entry = {
-      state: {
-        ctrlLatched: false,
-        selectMode: false,
-        dpadActive: false,
-        flash: null,
-      },
+      state: { ...EMPTY_STATE },
       listeners: new Set(),
+      flashListeners: new Set(),
     };
     entries.set(terminal, entry);
   }
@@ -73,17 +60,13 @@ export function patchTerminalMobileState(
   patch: Partial<TerminalMobileState>
 ): void {
   const entry = entryFor(terminal);
-  // Drop explicit-undefined keys so a sloppy caller can't blank a field.
-  const defined = Object.fromEntries(
-    Object.entries(patch).filter(([, value]) => value !== undefined)
-  ) as Partial<TerminalMobileState>;
-  const changed = (Object.keys(defined) as (keyof TerminalMobileState)[]).some(
-    (key) => entry.state[key] !== defined[key]
+  const changed = (Object.keys(patch) as (keyof TerminalMobileState)[]).some(
+    (key) => patch[key] !== undefined && entry.state[key] !== patch[key]
   );
   if (!changed) return;
   // Snapshot object identity changes only on real transitions so React's
   // useSyncExternalStore consumers don't re-render on no-op patches.
-  entry.state = { ...entry.state, ...defined };
+  entry.state = { ...entry.state, ...patch };
   for (const listener of [...entry.listeners]) listener();
 }
 
@@ -94,4 +77,48 @@ export function subscribeTerminalMobileState(
   const entry = entryFor(terminal);
   entry.listeners.add(listener);
   return () => entry.listeners.delete(listener);
+}
+
+/**
+ * One-shot status message from a DOM-level installer (e.g. the paste gesture)
+ * to whichever mobile controls are currently mounted. Deliberately an EVENT,
+ * not a state field: retained flash state would replay a stale "Pasted" pill
+ * on every remount against a long-lived terminal.
+ */
+export function flashTerminalMobileStatus(
+  terminal: Terminal,
+  message: string
+): void {
+  for (const listener of [...entryFor(terminal).flashListeners]) {
+    listener(message);
+  }
+}
+
+export function subscribeTerminalMobileFlash(
+  terminal: Terminal,
+  listener: (message: string) => void
+): () => void {
+  const entry = entryFor(terminal);
+  entry.flashListeners.add(listener);
+  return () => entry.flashListeners.delete(listener);
+}
+
+/**
+ * React view of a terminal's mobile state. Snapshot identity only changes on
+ * real transitions (see patchTerminalMobileState), so consumers can safely
+ * destructure per-field without extra memoization.
+ */
+export function useTerminalMobileState(
+  terminal: Terminal | null
+): Readonly<TerminalMobileState> {
+  const subscribe = useCallback(
+    (cb: () => void) =>
+      terminal ? subscribeTerminalMobileState(terminal, cb) : () => {},
+    [terminal]
+  );
+  return useSyncExternalStore(
+    subscribe,
+    () => (terminal ? getTerminalMobileState(terminal) : EMPTY_STATE),
+    () => EMPTY_STATE
+  );
 }

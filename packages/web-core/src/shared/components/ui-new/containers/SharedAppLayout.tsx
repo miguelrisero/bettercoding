@@ -63,10 +63,13 @@ export function SharedAppLayout() {
           // Track the VISUAL viewport so the app (and the terminal's input
           // line) ends above the on-screen keyboard instead of underneath it —
           // iOS never shrinks the layout viewport (see useVisualViewportHeight).
-          // The explicit height wins over the class's `bottom: 0`; when the
-          // hook has no value (no touch / no visualViewport) the class alone
-          // keeps the exact pre-existing inset-0 behavior.
-          isMobile && visualViewportHeight !== null
+          // Applied on BOTH layout branches: the hook is non-null only on
+          // touch devices, which includes tablets wide enough for the desktop
+          // layout (their on-screen keyboard covers the terminal all the
+          // same). The explicit height wins over `bottom: 0` / `h-screen`;
+          // when the hook has no value (no touch / no visualViewport /
+          // pinch-zoomed) the classes alone keep the pre-existing behavior.
+          visualViewportHeight !== null
             ? { height: visualViewportHeight, bottom: 'auto' }
             : undefined
         }

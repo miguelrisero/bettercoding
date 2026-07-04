@@ -1,10 +1,4 @@
-import {
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Terminal } from '@xterm/xterm';
 import {
   CopyIcon,
@@ -26,8 +20,10 @@ import {
 import {
   getTerminalMobileState,
   patchTerminalMobileState,
-  subscribeTerminalMobileState,
+  subscribeTerminalMobileFlash,
+  useTerminalMobileState,
 } from '@/shared/lib/terminalMobileState';
+import { pasteIntoTerminal } from '@/shared/lib/terminalPaste';
 
 interface TerminalMobileControlsProps {
   /** Live terminal (null until the mount effect registers it). */
@@ -62,21 +58,7 @@ export function TerminalMobileControls({
   const [status, setStatus] = useState<string | null>(null);
   const statusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const subscribe = useCallback(
-    (cb: () => void) =>
-      terminal ? subscribeTerminalMobileState(terminal, cb) : () => {},
-    [terminal]
-  );
-  const selectMode = useSyncExternalStore(
-    subscribe,
-    () => (terminal ? getTerminalMobileState(terminal).selectMode : false),
-    () => false
-  );
-  const installerFlash = useSyncExternalStore(
-    subscribe,
-    () => (terminal ? getTerminalMobileState(terminal).flash : null),
-    () => null
-  );
+  const { selectMode } = useTerminalMobileState(terminal);
 
   useEffect(
     () => () => {
@@ -94,8 +76,9 @@ export function TerminalMobileControls({
   // Surface one-shot status messages emitted by the DOM-level installers
   // (e.g. the three-finger paste gesture) in the same flash pill.
   useEffect(() => {
-    if (installerFlash) flash(installerFlash.message);
-  }, [installerFlash, flash]);
+    if (!terminal) return;
+    return subscribeTerminalMobileFlash(terminal, flash);
+  }, [terminal, flash]);
 
   if (!isTouch) return null;
 
@@ -103,25 +86,9 @@ export function TerminalMobileControls({
     terminal?.focus();
   };
 
-  const handlePaste = async () => {
+  const handlePaste = () => {
     if (!terminal) return;
-    // Insecure contexts / some WebViews have no Clipboard API at all — optional
-    // chaining would otherwise resolve to undefined and look like "empty".
-    if (!navigator.clipboard?.readText) {
-      flash('Paste unavailable');
-      return;
-    }
-    try {
-      const text = await navigator.clipboard.readText();
-      if (!text) {
-        flash('Clipboard empty');
-        return;
-      }
-      terminal.paste(text);
-      flash('Pasted');
-    } catch {
-      flash('Paste blocked');
-    }
+    void pasteIntoTerminal(terminal, flash);
   };
 
   const handleCopy = async () => {

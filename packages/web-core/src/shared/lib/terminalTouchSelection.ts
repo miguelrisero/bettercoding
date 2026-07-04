@@ -1,5 +1,6 @@
 import type { Terminal } from '@xterm/xterm';
 
+import { writeClipboardViaBridge } from './clipboard';
 import { getTerminalMobileState } from './terminalMobileState';
 
 /**
@@ -13,7 +14,14 @@ import { getTerminalMobileState } from './terminalMobileState';
  *
  * Active only while `selectMode` is on (toggled from TerminalMobileControls);
  * the gesture layer and scroll bridge stand down for the same flag. The
- * existing `onSelectionChange` handler auto-copies the result.
+ * finished selection is copied exactly once on release — the per-change
+ * auto-copy in XTermInstance is suppressed during select mode so a drag
+ * doesn't hammer the clipboard with intermediate selections.
+ *
+ * Listeners are CAPTURE-phase and stop propagation while select mode is on:
+ * xterm's own viewport touch handlers (which scroll local scrollback when
+ * mouse tracking is off — plain shell terminals) live on child elements and
+ * would otherwise scroll the buffer underneath the selection drag.
  */
 
 export interface CellPoint {
@@ -21,14 +29,21 @@ export interface CellPoint {
   row: number;
 }
 
-/** Map a touch point to a 0-based cell within the screen rect (clamped). */
+/**
+ * Map a touch point to a 0-based cell within the screen rect (clamped).
+ * Returns null for a degenerate rect (hidden/zero-sized pane mid-layout) —
+ * dividing by it would produce NaN cells and corrupt xterm's selection.
+ */
 export function touchToCell(
   clientX: number,
   clientY: number,
   rect: { left: number; top: number; width: number; height: number },
   cols: number,
   rows: number
-): CellPoint {
+): CellPoint | null {
+  if (rect.width <= 0 || rect.height <= 0 || cols <= 0 || rows <= 0) {
+    return null;
+  }
   const cellW = rect.width / cols;
   const cellH = rect.height / rows;
   const col = Math.floor((clientX - rect.left) / cellW);
@@ -71,8 +86,12 @@ export function installTerminalTouchSelection(terminal: Terminal): () => void {
     (el.querySelector('.xterm-screen') as HTMLElement | null) ?? el;
 
   let anchor: CellPoint | null = null;
+  let lastSel: { col: number; row: number; length: number } | null = null;
 
-  const cellFromTouch = (t: { clientX: number; clientY: number }) => {
+  const cellFromTouch = (t: {
+    clientX: number;
+    clientY: number;
+  }): CellPoint | null => {
     const rect = screen.getBoundingClientRect();
     const cell = touchToCell(
       t.clientX,
@@ -81,6 +100,7 @@ export function installTerminalTouchSelection(terminal: Terminal): () => void {
       terminal.cols,
       terminal.rows
     );
+    if (!cell) return null;
     // Anchor rows to the ABSOLUTE buffer position at gesture time so the
     // selection targets what the user sees even with scrollback offset.
     return { col: cell.col, row: cell.row + terminal.buffer.active.viewportY };
@@ -88,54 +108,71 @@ export function installTerminalTouchSelection(terminal: Terminal): () => void {
 
   const onStart = (e: TouchEvent) => {
     if (!getTerminalMobileState(terminal).selectMode) return;
+    // Select mode owns the touch: keep it from xterm's own viewport touch
+    // scrolling (child listeners) and from browser default scrolling.
+    e.stopPropagation();
+    if (e.cancelable) e.preventDefault();
     if (e.touches.length !== 1) {
       anchor = null;
       return;
     }
     anchor = cellFromTouch(e.touches[0]);
+    lastSel = null;
     terminal.clearSelection();
-    // Don't let the tap refocus/scroll — in select mode the finger selects.
-    if (e.cancelable) e.preventDefault();
   };
 
   const onMove = (e: TouchEvent) => {
-    if (!anchor || !getTerminalMobileState(terminal).selectMode) return;
-    if (e.touches.length !== 1) return;
-    const focus = cellFromTouch(e.touches[0]);
-    const sel = linearSelection(anchor, focus, terminal.cols);
-    terminal.select(sel.col, sel.row, sel.length);
+    if (!getTerminalMobileState(terminal).selectMode) return;
+    e.stopPropagation();
     if (e.cancelable) e.preventDefault();
+    if (!anchor || e.touches.length !== 1) return;
+    const focus = cellFromTouch(e.touches[0]);
+    if (!focus) return;
+    const sel = linearSelection(anchor, focus, terminal.cols);
+    // Only touch xterm's selection service when the target cell changed —
+    // touchmove fires at 60-120Hz, cells change far less often.
+    if (
+      lastSel &&
+      lastSel.col === sel.col &&
+      lastSel.row === sel.row &&
+      lastSel.length === sel.length
+    ) {
+      return;
+    }
+    lastSel = sel;
+    terminal.select(sel.col, sel.row, sel.length);
   };
 
   const onEnd = () => {
-    // Copy exactly once, on release — the per-change auto-copy is suppressed
-    // in select mode so a drag doesn't overwrite the clipboard dozens of
-    // times with intermediate selections.
+    // Copy exactly once, on release. Bridge-aware helper: in the VSCode
+    // iframe navigator.clipboard rejects and the parent handles the copy.
     if (
       anchor !== null &&
       getTerminalMobileState(terminal).selectMode &&
       terminal.hasSelection()
     ) {
       const text = terminal.getSelection();
-      if (text) {
-        void navigator.clipboard?.writeText(text).catch(() => {
-          // Clipboard can be blocked; the selection itself still stands and
-          // the Copy button reports errors explicitly.
-        });
-      }
+      if (text) void writeClipboardViaBridge(text);
     }
     anchor = null;
+    lastSel = null;
   };
 
-  el.addEventListener('touchstart', onStart, { passive: false });
-  el.addEventListener('touchmove', onMove, { passive: false });
-  el.addEventListener('touchend', onEnd, { passive: true });
-  el.addEventListener('touchcancel', onEnd, { passive: true });
+  el.addEventListener('touchstart', onStart, {
+    passive: false,
+    capture: true,
+  });
+  el.addEventListener('touchmove', onMove, { passive: false, capture: true });
+  el.addEventListener('touchend', onEnd, { passive: true, capture: true });
+  el.addEventListener('touchcancel', onEnd, {
+    passive: true,
+    capture: true,
+  });
 
   return () => {
-    el.removeEventListener('touchstart', onStart);
-    el.removeEventListener('touchmove', onMove);
-    el.removeEventListener('touchend', onEnd);
-    el.removeEventListener('touchcancel', onEnd);
+    el.removeEventListener('touchstart', onStart, { capture: true });
+    el.removeEventListener('touchmove', onMove, { capture: true });
+    el.removeEventListener('touchend', onEnd, { capture: true });
+    el.removeEventListener('touchcancel', onEnd, { capture: true });
   };
 }
