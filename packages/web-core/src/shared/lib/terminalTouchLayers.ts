@@ -7,7 +7,7 @@ import {
   getTerminalMobileState,
   patchTerminalMobileState,
 } from './terminalMobileState';
-import { pasteIntoTerminal } from './terminalPaste';
+import { pasteIntoTerminal, pasteTextIntoTerminal } from './terminalPaste';
 import { installTerminalTouchGestures } from './terminalTouchGestures';
 import { installTerminalTouchScroll } from './terminalTouchScroll';
 import { installTerminalTouchSelection } from './terminalTouchSelection';
@@ -62,6 +62,17 @@ export function installTerminalTouchLayers(
     terminal.textarea?.addEventListener('focus', () =>
       terminal.scrollToBottom()
     );
+
+    // Route the OS paste callout / hardware Cmd+V through the provenance
+    // marker too — xterm's internal textarea paste handler would otherwise
+    // emit onData unmarked, and a 1-char clipboard while Ctrl is latched
+    // would be synthesized into a control code. Touch-only: the latch can
+    // only be armed here, and desktop keeps xterm's native paste path.
+    terminal.textarea?.addEventListener('paste', (e) => {
+      const text = e.clipboardData?.getData('text');
+      e.preventDefault();
+      if (text) pasteTextIntoTerminal(terminal, text);
+    });
   }
   installTerminalTouchScroll(terminal);
 }

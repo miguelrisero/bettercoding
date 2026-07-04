@@ -1,7 +1,9 @@
 import type { Terminal } from '@xterm/xterm';
 
-import { writeClipboardViaBridge } from './clipboard';
-import { getTerminalMobileState } from './terminalMobileState';
+import {
+  flashTerminalMobileStatus,
+  getTerminalMobileState,
+} from './terminalMobileState';
 
 /**
  * Touch drag-selection for select mode.
@@ -144,16 +146,32 @@ export function installTerminalTouchSelection(terminal: Terminal): () => void {
   };
 
   const onEnd = () => {
-    // Copy exactly once, on release. Bridge-aware helper: in the VSCode
-    // iframe navigator.clipboard rejects and the parent handles the copy.
+    // Copy exactly once, on release. Direct clipboard only — deliberately
+    // NOT writeClipboardViaBridge: its fallback posts the text to
+    // window.parent with targetOrigin '*', and terminal selections can hold
+    // secrets; an untrusted framing page must never receive them. Failure
+    // is surfaced instead (the selection stays — the Copy button retries).
     if (
       anchor !== null &&
       getTerminalMobileState(terminal).selectMode &&
       terminal.hasSelection()
     ) {
       const text = terminal.getSelection();
-      if (text) void writeClipboardViaBridge(text);
+      if (text && navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(text).then(
+          () => flashTerminalMobileStatus(terminal, 'Copied selection'),
+          () => flashTerminalMobileStatus(terminal, 'Copy blocked')
+        );
+      }
     }
+    anchor = null;
+    lastSel = null;
+  };
+
+  const onCancel = () => {
+    // A cancelled sequence (system gesture, palm rejection) fires nothing —
+    // clobbering the clipboard with a partial selection would be worse than
+    // no copy. The selection stays visible; Copy can still grab it.
     anchor = null;
     lastSel = null;
   };
@@ -164,7 +182,7 @@ export function installTerminalTouchSelection(terminal: Terminal): () => void {
   });
   el.addEventListener('touchmove', onMove, { passive: false, capture: true });
   el.addEventListener('touchend', onEnd, { passive: true, capture: true });
-  el.addEventListener('touchcancel', onEnd, {
+  el.addEventListener('touchcancel', onCancel, {
     passive: true,
     capture: true,
   });
@@ -173,6 +191,6 @@ export function installTerminalTouchSelection(terminal: Terminal): () => void {
     el.removeEventListener('touchstart', onStart, { capture: true });
     el.removeEventListener('touchmove', onMove, { capture: true });
     el.removeEventListener('touchend', onEnd, { capture: true });
-    el.removeEventListener('touchcancel', onEnd, { capture: true });
+    el.removeEventListener('touchcancel', onCancel, { capture: true });
   };
 }
