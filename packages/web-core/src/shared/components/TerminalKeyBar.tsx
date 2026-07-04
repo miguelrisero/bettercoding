@@ -1,5 +1,15 @@
 import { useCallback, useSyncExternalStore } from 'react';
 import type { Terminal } from '@xterm/xterm';
+import type { Icon } from '@phosphor-icons/react';
+import {
+  ArrowDownIcon,
+  ArrowElbowDownLeftIcon,
+  ArrowLeftIcon,
+  ArrowLineLeftIcon,
+  ArrowLineRightIcon,
+  ArrowRightIcon,
+  ArrowUpIcon,
+} from '@phosphor-icons/react';
 
 import { cn } from '@/shared/lib/utils';
 import { useIsTouchDevice } from '@/shared/hooks/useIsMobile';
@@ -17,17 +27,25 @@ interface TerminalKeyBarProps {
   onSendKey: (data: string) => void;
 }
 
-const KEYS: ReadonlyArray<{ key: BarKey; label: string; aria: string }> = [
+// Icons instead of key-glyph characters (⇥ ⇧⇥ ⏎): those codepoints are
+// missing from Android/Linux system fonts and render as tofu boxes; the
+// phosphor icons render identically everywhere.
+const KEYS: ReadonlyArray<{
+  key: BarKey;
+  label?: string;
+  Icon?: Icon;
+  aria: string;
+}> = [
   { key: 'esc', label: 'esc', aria: 'Escape' },
-  { key: 'tab', label: '⇥', aria: 'Tab' },
-  { key: 'shift-tab', label: '⇧⇥', aria: 'Shift+Tab' },
+  { key: 'tab', Icon: ArrowLineRightIcon, aria: 'Tab' },
+  { key: 'shift-tab', Icon: ArrowLineLeftIcon, aria: 'Shift+Tab' },
   { key: 'ctrl-c', label: '^C', aria: 'Control+C (interrupt)' },
   // 'ctrl' is rendered between ^C and the arrows (special latching button).
-  { key: 'left', label: '←', aria: 'Arrow left' },
-  { key: 'down', label: '↓', aria: 'Arrow down' },
-  { key: 'up', label: '↑', aria: 'Arrow up' },
-  { key: 'right', label: '→', aria: 'Arrow right' },
-  { key: 'enter', label: '⏎', aria: 'Enter' },
+  { key: 'left', Icon: ArrowLeftIcon, aria: 'Arrow left' },
+  { key: 'down', Icon: ArrowDownIcon, aria: 'Arrow down' },
+  { key: 'up', Icon: ArrowUpIcon, aria: 'Arrow up' },
+  { key: 'right', Icon: ArrowRightIcon, aria: 'Arrow right' },
+  { key: 'enter', Icon: ArrowElbowDownLeftIcon, aria: 'Enter' },
 ];
 
 const KEY_CLASS =
@@ -77,7 +95,7 @@ export function TerminalKeyBar({ terminal, onSendKey }: TerminalKeyBarProps) {
     });
   };
 
-  const renderKey = (key: BarKey, label: string, aria: string) => (
+  const renderKey = ({ key, label, Icon, aria }: (typeof KEYS)[number]) => (
     <button
       key={key}
       type="button"
@@ -87,7 +105,11 @@ export function TerminalKeyBar({ terminal, onSendKey }: TerminalKeyBarProps) {
       onMouseDown={keepFocus}
       onClick={() => sendKey(key)}
     >
-      {label}
+      {Icon ? (
+        <Icon className="size-icon-sm" weight="bold" aria-hidden="true" />
+      ) : (
+        label
+      )}
     </button>
   );
 
@@ -97,9 +119,7 @@ export function TerminalKeyBar({ terminal, onSendKey }: TerminalKeyBarProps) {
       role="toolbar"
       aria-label="Terminal keys"
     >
-      {KEYS.slice(0, 4).map(({ key, label, aria }) =>
-        renderKey(key, label, aria)
-      )}
+      {KEYS.slice(0, 4).map(renderKey)}
       <button
         type="button"
         className={cn(
@@ -114,7 +134,7 @@ export function TerminalKeyBar({ terminal, onSendKey }: TerminalKeyBarProps) {
       >
         ctrl
       </button>
-      {KEYS.slice(4).map(({ key, label, aria }) => renderKey(key, label, aria))}
+      {KEYS.slice(4).map(renderKey)}
     </div>
   );
 }
