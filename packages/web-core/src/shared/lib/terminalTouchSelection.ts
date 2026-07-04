@@ -108,6 +108,22 @@ export function installTerminalTouchSelection(terminal: Terminal): () => void {
   };
 
   const onEnd = () => {
+    // Copy exactly once, on release — the per-change auto-copy is suppressed
+    // in select mode so a drag doesn't overwrite the clipboard dozens of
+    // times with intermediate selections.
+    if (
+      anchor !== null &&
+      getTerminalMobileState(terminal).selectMode &&
+      terminal.hasSelection()
+    ) {
+      const text = terminal.getSelection();
+      if (text) {
+        void navigator.clipboard?.writeText(text).catch(() => {
+          // Clipboard can be blocked; the selection itself still stands and
+          // the Copy button reports errors explicitly.
+        });
+      }
+    }
     anchor = null;
   };
 

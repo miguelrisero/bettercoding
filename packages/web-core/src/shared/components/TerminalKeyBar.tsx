@@ -85,6 +85,11 @@ export function TerminalKeyBar({ terminal, onSendKey }: TerminalKeyBarProps) {
   const sendKey = (key: BarKey) => {
     const appCursor = terminal?.modes.applicationCursorKeysMode ?? false;
     onSendKey(keySequence(key, appCursor));
+    // A bar tap counts as the latch's "one keystroke" — otherwise ctrl,
+    // arrow, then a typed letter would surprise-fire a control combo.
+    if (terminal && getTerminalMobileState(terminal).ctrlLatched) {
+      patchTerminalMobileState(terminal, { ctrlLatched: false });
+    }
     terminal?.scrollToBottom();
   };
 

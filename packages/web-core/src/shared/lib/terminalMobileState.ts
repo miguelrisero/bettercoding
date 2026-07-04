@@ -18,6 +18,24 @@ export interface TerminalMobileState {
   selectMode: boolean;
   /** A long-press D-pad gesture is running; the scroll bridge stands down. */
   dpadActive: boolean;
+  /**
+   * One-shot status message from a DOM-level installer (e.g. the paste
+   * gesture) for the React controls to flash. The nonce makes every emission
+   * a distinct value so repeated identical messages still notify.
+   */
+  flash: { nonce: number; message: string } | null;
+}
+
+let flashNonce = 0;
+
+/** Emit a one-shot status flash for this terminal's mobile controls. */
+export function flashTerminalMobileStatus(
+  terminal: Terminal,
+  message: string
+): void {
+  patchTerminalMobileState(terminal, {
+    flash: { nonce: ++flashNonce, message },
+  });
 }
 
 interface Entry {
@@ -31,7 +49,12 @@ function entryFor(terminal: Terminal): Entry {
   let entry = entries.get(terminal);
   if (!entry) {
     entry = {
-      state: { ctrlLatched: false, selectMode: false, dpadActive: false },
+      state: {
+        ctrlLatched: false,
+        selectMode: false,
+        dpadActive: false,
+        flash: null,
+      },
       listeners: new Set(),
     };
     entries.set(terminal, entry);
@@ -50,18 +73,17 @@ export function patchTerminalMobileState(
   patch: Partial<TerminalMobileState>
 ): void {
   const entry = entryFor(terminal);
-  let changed = false;
-  for (const key of Object.keys(patch) as (keyof TerminalMobileState)[]) {
-    const value = patch[key];
-    if (value !== undefined && entry.state[key] !== value) {
-      entry.state[key] = value;
-      changed = true;
-    }
-  }
+  // Drop explicit-undefined keys so a sloppy caller can't blank a field.
+  const defined = Object.fromEntries(
+    Object.entries(patch).filter(([, value]) => value !== undefined)
+  ) as Partial<TerminalMobileState>;
+  const changed = (Object.keys(defined) as (keyof TerminalMobileState)[]).some(
+    (key) => entry.state[key] !== defined[key]
+  );
   if (!changed) return;
   // Snapshot object identity changes only on real transitions so React's
   // useSyncExternalStore consumers don't re-render on no-op patches.
-  entry.state = { ...entry.state };
+  entry.state = { ...entry.state, ...defined };
   for (const listener of [...entry.listeners]) listener();
 }
 

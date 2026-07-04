@@ -72,6 +72,11 @@ export function TerminalMobileControls({
     () => (terminal ? getTerminalMobileState(terminal).selectMode : false),
     () => false
   );
+  const installerFlash = useSyncExternalStore(
+    subscribe,
+    () => (terminal ? getTerminalMobileState(terminal).flash : null),
+    () => null
+  );
 
   useEffect(
     () => () => {
@@ -80,13 +85,19 @@ export function TerminalMobileControls({
     []
   );
 
-  if (!isTouch) return null;
-
-  const flash = (msg: string) => {
+  const flash = useCallback((msg: string) => {
     setStatus(msg);
     if (statusTimer.current) clearTimeout(statusTimer.current);
     statusTimer.current = setTimeout(() => setStatus(null), STATUS_MS);
-  };
+  }, []);
+
+  // Surface one-shot status messages emitted by the DOM-level installers
+  // (e.g. the three-finger paste gesture) in the same flash pill.
+  useEffect(() => {
+    if (installerFlash) flash(installerFlash.message);
+  }, [installerFlash, flash]);
+
+  if (!isTouch) return null;
 
   const handleKeyboard = () => {
     terminal?.focus();

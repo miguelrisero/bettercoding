@@ -77,3 +77,12 @@ describe('applyStickyCtrl', () => {
     });
   });
 });
+
+describe('toCtrlChar — non-ASCII safety (council round 1)', () => {
+  it('never maps non-ASCII letters (toUpperCase would turn ß into SS → ^S)', () => {
+    expect(toCtrlChar('ß')).toBeNull();
+    expect(toCtrlChar('é')).toBeNull();
+    expect(toCtrlChar('ñ')).toBeNull();
+    expect(toCtrlChar('～')).toBeNull();
+  });
+});

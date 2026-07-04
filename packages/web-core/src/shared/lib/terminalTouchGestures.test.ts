@@ -244,3 +244,40 @@ describe('select mode (disabled layer)', () => {
     expect(dpad).toEqual([]);
   });
 });
+
+describe('timer starvation + cancellation (council round 1)', () => {
+  it('promotes to D-pad inside onTouchMove when the timer never fired', () => {
+    const { ctrl, arrows, dpad } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    // No onTimer call at all — simulates a starved main thread. First move
+    // arrives well past the long-press threshold.
+    const r = ctrl.onTouchMove(
+      p(100, 100 + DPAD_DEAD_ZONE_PX + 10),
+      LONG_PRESS_MS + 200
+    );
+    expect(r.prevent).toBe(true);
+    expect(dpad[0]).toEqual({ active: true, dir: null });
+    expect(arrows).toEqual(['down']);
+  });
+
+  it('still hands an early move to the scroll bridge', () => {
+    const { ctrl, dpad } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    const r = ctrl.onTouchMove(p(100, 160), LONG_PRESS_MS - 50);
+    expect(r.prevent).toBe(false);
+    expect(dpad).toEqual([]);
+  });
+
+  it('cancel() releases an active D-pad and stops repeats', () => {
+    const { ctrl, dpad } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    runTimersUntil(ctrl, LONG_PRESS_MS);
+    ctrl.onTouchMove(p(100, 150), LONG_PRESS_MS + 10);
+    ctrl.cancel();
+    expect(dpad.at(-1)).toEqual({ active: false, dir: null });
+    expect(ctrl.nextTimerAt()).toBeNull();
+    // A stray touchend after cancel is a no-op.
+    ctrl.onTouchEnd(0, LONG_PRESS_MS + 100);
+    expect(dpad.at(-1)).toEqual({ active: false, dir: null });
+  });
+});

@@ -122,14 +122,25 @@ export function createTouchGestureController(deps: GestureDeps) {
 
     onTouchMove(p: GesturePoint, now: number): GestureMoveResult {
       if (phase === 'pressed') {
-        const moved =
-          Math.abs(p.clientX - startX) > TAP_SLOP_PX ||
-          Math.abs(p.clientY - startY) > TAP_SLOP_PX;
-        if (moved) {
-          // Moving before the long-press delay = scroll; the bridge owns it.
-          phase = 'ignored';
+        if (now - pressAt >= LONG_PRESS_MS) {
+          // The promotion timer can be starved by a busy main thread (TUI
+          // redraw, keyboard resize). The finger DID dwell long enough, so
+          // promote here — before the slop check — or the first delayed
+          // move would hand a held press to the scroll bridge.
+          phase = 'dpad';
+          dir = null;
+          deps.setDpad(true, null);
+          // fall through to D-pad handling of this same move
+        } else {
+          const moved =
+            Math.abs(p.clientX - startX) > TAP_SLOP_PX ||
+            Math.abs(p.clientY - startY) > TAP_SLOP_PX;
+          if (moved) {
+            // Moving before the long-press delay = scroll; the bridge owns it.
+            phase = 'ignored';
+          }
+          return { prevent: false };
         }
-        return { prevent: false };
       }
       if (phase !== 'dpad') return { prevent: false };
 
@@ -210,6 +221,18 @@ export function createTouchGestureController(deps: GestureDeps) {
       if (phase === 'dpad' && dir) return nextRepeatAt;
       return null;
     },
+
+    /**
+     * Abort whatever is in flight (React detach mid-gesture: touchend may
+     * never arrive once the element leaves the DOM). Releases the D-pad —
+     * clearing the scroll-bridge suppression — and stops key repeats.
+     */
+    cancel(): void {
+      exitDpad();
+      phase = 'idle';
+      maxTouches = 0;
+      hasLastTap = false;
+    },
   };
 }
 
@@ -217,6 +240,15 @@ export interface InstallGestureOptions {
   sendArrow: (dir: ArrowKey) => void;
   sendTab: () => void;
   paste: () => void;
+}
+
+// Live gesture cancellers, one per terminal. React unmount cleanup calls
+// cancelActiveTerminalGesture so a D-pad running at detach time can't keep
+// its repeat timer (and the scroll-bridge suppression) alive.
+const activeGestureCancels = new WeakMap<Terminal, () => void>();
+
+export function cancelActiveTerminalGesture(terminal: Terminal): void {
+  activeGestureCancels.get(terminal)?.();
 }
 
 /**
@@ -312,8 +344,14 @@ export function installTerminalTouchGestures(
   el.addEventListener('touchend', onEnd, { passive: true });
   el.addEventListener('touchcancel', onEnd, { passive: true });
 
+  activeGestureCancels.set(terminal, () => {
+    controller.cancel();
+    reschedule(); // nextTimerAt() is now null → clears the pending timer
+  });
+
   return () => {
     if (timer) clearTimeout(timer);
+    activeGestureCancels.delete(terminal);
     el.removeEventListener('touchstart', onStart);
     el.removeEventListener('touchmove', onMove);
     el.removeEventListener('touchend', onEnd);

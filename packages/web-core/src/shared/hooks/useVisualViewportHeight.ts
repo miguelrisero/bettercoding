@@ -33,7 +33,9 @@ function readHeight(): number | null {
 function onViewportChange() {
   // iOS pans the visual viewport to reveal a focused input near the bottom;
   // with the app sized to the visible area there is nothing to reveal, so
-  // undo the pan to keep the app chrome pinned to the top.
+  // undo the pan to keep the app chrome pinned to the top. Touch-only: on a
+  // desktop, offsetTop > 0 means the USER pinch-zoomed — never fight that.
+  if (!isTouchDevice()) return;
   if (window.visualViewport && window.visualViewport.offsetTop > 0) {
     window.scrollTo(0, 0);
   }
@@ -46,7 +48,9 @@ function onViewportChange() {
 function subscribe(listener: Listener) {
   listeners.push(listener);
   const vv = window.visualViewport;
-  if (vv && !attached) {
+  // Never attach on non-touch devices — the hook always snapshots null there,
+  // so listening would only risk desktop side effects for no consumer.
+  if (vv && !attached && isTouchDevice()) {
     attached = true;
     height = readHeight();
     vv.addEventListener('resize', onViewportChange);

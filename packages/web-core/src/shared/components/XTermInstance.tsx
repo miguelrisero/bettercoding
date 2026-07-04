@@ -10,13 +10,17 @@ import {
 } from '@/shared/lib/terminalTheme';
 import { buildTerminalWsUrl } from '@/shared/lib/terminalWsUrl';
 import { installTerminalTouchScroll } from '@/shared/lib/terminalTouchScroll';
-import { installTerminalTouchGestures } from '@/shared/lib/terminalTouchGestures';
+import {
+  cancelActiveTerminalGesture,
+  installTerminalTouchGestures,
+} from '@/shared/lib/terminalTouchGestures';
 import { installTerminalTouchSelection } from '@/shared/lib/terminalTouchSelection';
 import {
   applyStickyCtrl,
   keySequence,
 } from '@/shared/lib/terminalKeySequences';
 import {
+  flashTerminalMobileStatus,
   getTerminalMobileState,
   patchTerminalMobileState,
 } from '@/shared/lib/terminalMobileState';
@@ -168,13 +172,21 @@ export function XTermInstance({
 
       registerTerminalInstance(tabId, terminal, fitAddon);
 
+      // Sticky Ctrl (mobile key bar) must act on KEYSTROKES only. onData also
+      // carries pastes and terminal query replies (DSR/DA), which must neither
+      // be transformed into control codes nor silently consume an armed latch.
+      // onKey fires right before the onData chunk a keystroke produces, so it
+      // marks the next chunk as keyboard-originated.
+      let nextChunkFromKeyboard = false;
+      terminal.onKey(() => {
+        nextChunkFromKeyboard = true;
+      });
       terminal.onData((data) => {
+        const fromKeyboard = nextChunkFromKeyboard;
+        nextChunkFromKeyboard = false;
         const conn = getTerminalConnection(tabId);
         if (!conn) return;
-        // Sticky Ctrl (mobile key bar): a latched ctrl turns the next single
-        // typed character into its control code. The latch always clears on
-        // the next chunk — multi-char bursts (paste/IME) pass through as-is.
-        if (getTerminalMobileState(terminal).ctrlLatched) {
+        if (fromKeyboard && getTerminalMobileState(terminal).ctrlLatched) {
           patchTerminalMobileState(terminal, { ctrlLatched: false });
           conn.send(applyStickyCtrl(data).out);
           return;
@@ -188,6 +200,11 @@ export function XTermInstance({
       // terminal and live exactly as long as it does (the listener dies with
       // the element on dispose, the selection hook with the terminal).
       terminal.onSelectionChange(() => {
+        // Touch select mode fires a selection change per touchmove — copying
+        // here would hammer the clipboard with intermediate selections (and
+        // destroy whatever the user had copied the moment a drag starts).
+        // That mode copies exactly once on release (terminalTouchSelection).
+        if (getTerminalMobileState(terminal).selectMode) return;
         const text = terminal.getSelection();
         if (text) {
           void navigator.clipboard?.writeText(text).catch(() => {
@@ -218,46 +235,62 @@ export function XTermInstance({
         }
       });
 
+      // Touch gesture layer (long-press D-pad → arrows, double-tap → Tab,
+      // three-finger tap → paste) and select-mode drag selection. Same
+      // lifetime rule as the scroll bridge below: attach once, dies with the
+      // element. Gated on touch capability so a non-touch session carries
+      // zero new listeners — and the paste gesture cannot exist there.
+      // Attached BEFORE the scroll bridge on purpose: listener order is
+      // attach order, so when a starved long-press promotes to D-pad inside
+      // a touchmove, the suppression flag is already set by the time the
+      // scroll bridge sees that same event.
+      if (isTouchDevice()) {
+        const t = terminal;
+        const sendRaw = (data: string) =>
+          getTerminalConnection(tabId)?.send(data);
+        installTerminalTouchGestures(t, {
+          sendArrow: (dir) =>
+            sendRaw(keySequence(dir, t.modes.applicationCursorKeysMode)),
+          sendTab: () => sendRaw('\t'),
+          paste: () => {
+            // Same guarded clipboard path + explicit feedback as the Paste
+            // button — a silent clipboard read would be a pastejacking aid.
+            if (!navigator.clipboard?.readText) {
+              flashTerminalMobileStatus(t, 'Paste unavailable');
+              return;
+            }
+            void navigator.clipboard
+              .readText()
+              .then((text) => {
+                if (!text) {
+                  flashTerminalMobileStatus(t, 'Clipboard empty');
+                  return;
+                }
+                t.paste(text);
+                flashTerminalMobileStatus(t, 'Pasted');
+              })
+              .catch(() => {
+                flashTerminalMobileStatus(t, 'Paste blocked');
+              });
+          },
+        });
+        installTerminalTouchSelection(t);
+
+        // Keyboard-open ergonomics: focusing the terminal on a touch device
+        // pops the system keyboard — jump to the prompt so it isn't hidden
+        // in scrollback while the viewport shrinks around it.
+        t.textarea?.addEventListener('focus', () => t.scrollToBottom());
+      }
+
       // Mobile/touch: bridge vertical swipes to the SAME wheel events xterm
       // already handles for a desktop mouse wheel (see terminalTouchScroll).
       // Attached once on the freshly created element and intentionally NOT
       // removed in the mount cleanup below — like the listeners above it lives
       // with the element and tears down on terminal.dispose(). Removing it per
       // unmount would leave reattached terminals without mobile scrolling.
+      // (Kept unconditional like PR #22 — inert without touch events — but
+      // attached AFTER the gesture layer; see the ordering note above.)
       installTerminalTouchScroll(terminal);
-
-      // Touch gesture layer (long-press D-pad → arrows, double-tap → Tab,
-      // three-finger tap → paste) and select-mode drag selection. Same
-      // lifetime rule as the scroll bridge: attach once, dies with the
-      // element. All are inert without touch input, so no capability gate.
-      const t = terminal;
-      const sendRaw = (data: string) =>
-        getTerminalConnection(tabId)?.send(data);
-      installTerminalTouchGestures(t, {
-        sendArrow: (dir) =>
-          sendRaw(keySequence(dir, t.modes.applicationCursorKeysMode)),
-        sendTab: () => sendRaw('\t'),
-        paste: () => {
-          if (!navigator.clipboard?.readText) return;
-          void navigator.clipboard
-            .readText()
-            .then((text) => {
-              if (text) t.paste(text);
-            })
-            .catch(() => {
-              // Paste permission denied — the Paste button reports errors;
-              // the gesture stays silent.
-            });
-        },
-      });
-      installTerminalTouchSelection(t);
-
-      // Keyboard-open ergonomics: focusing the terminal on a touch device
-      // pops the system keyboard — jump to the prompt so it isn't hidden
-      // in scrollback while the viewport shrinks around it.
-      t.textarea?.addEventListener('focus', () => {
-        if (isTouchDevice()) t.scrollToBottom();
-      });
     }
 
     terminalRef.current = terminal;
@@ -286,6 +319,10 @@ export function XTermInstance({
     }
 
     return () => {
+      // A D-pad gesture running right now would never see its touchend once
+      // the element leaves the DOM — stop its repeat timer and release the
+      // scroll-bridge suppression before detaching.
+      cancelActiveTerminalGesture(terminal);
       if (terminal.element && terminal.element.parentNode) {
         terminal.element.parentNode.removeChild(terminal.element);
       }

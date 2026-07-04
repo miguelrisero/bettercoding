@@ -62,7 +62,10 @@ export function toCtrlChar(ch: string): string | null {
   if (ch.length !== 1) return null;
   if (ch === ' ') return '\x00';
   if (ch === '?') return '\x7f';
-  const code = ch.toUpperCase().charCodeAt(0);
+  // ASCII-only: String.toUpperCase would map ß→SS (→ ^S, XOFF freeze!) and
+  // other locale surprises, so uppercase by code point arithmetic instead.
+  let code = ch.charCodeAt(0);
+  if (code >= 0x61 && code <= 0x7a) code -= 0x20; // a-z → A-Z
   // @ A-Z [ \ ] ^ _  →  0x00-0x1f
   if (code >= 0x40 && code <= 0x5f) return String.fromCharCode(code & 0x1f);
   return null;
