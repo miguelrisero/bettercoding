@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
@@ -10,8 +10,21 @@ import {
 } from '@/shared/lib/terminalTheme';
 import { buildTerminalWsUrl } from '@/shared/lib/terminalWsUrl';
 import { installTerminalTouchScroll } from '@/shared/lib/terminalTouchScroll';
+import { installTerminalTouchGestures } from '@/shared/lib/terminalTouchGestures';
+import { installTerminalTouchSelection } from '@/shared/lib/terminalTouchSelection';
+import {
+  applyStickyCtrl,
+  keySequence,
+} from '@/shared/lib/terminalKeySequences';
+import {
+  getTerminalMobileState,
+  patchTerminalMobileState,
+} from '@/shared/lib/terminalMobileState';
+import { loadMobileTerminalFontSize } from '@/shared/lib/terminalFontSize';
+import { isTouchDevice } from '@/shared/hooks/useIsMobile';
 import { useTerminal } from '@/shared/hooks/useTerminal';
 import { TerminalMobileControls } from './TerminalMobileControls';
+import { TerminalKeyBar } from './TerminalKeyBar';
 
 interface XTermInstanceProps {
   tabId: string;
@@ -42,6 +55,9 @@ export function XTermInstance({
   const resizeRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  // State mirror of terminalRef for children that must re-render/subscribe
+  // when the live terminal (re)attaches (key bar latch highlight, controls).
+  const [liveTerminal, setLiveTerminal] = useState<Terminal | null>(null);
   const {
     registerTerminalInstance,
     getTerminalInstance,
@@ -102,7 +118,9 @@ export function XTermInstance({
     } else {
       terminal = new Terminal({
         cursorBlink: true,
-        fontSize: 12,
+        // Touch devices restore the persisted A−/A+ stepper choice; desktop
+        // keeps the fixed default.
+        fontSize: isTouchDevice() ? loadMobileTerminalFontSize() : 12,
         fontFamily: '"IBM Plex Mono", monospace',
         theme: getTerminalTheme(),
       });
@@ -152,7 +170,16 @@ export function XTermInstance({
 
       terminal.onData((data) => {
         const conn = getTerminalConnection(tabId);
-        conn?.send(data);
+        if (!conn) return;
+        // Sticky Ctrl (mobile key bar): a latched ctrl turns the next single
+        // typed character into its control code. The latch always clears on
+        // the next chunk — multi-char bursts (paste/IME) pass through as-is.
+        if (getTerminalMobileState(terminal).ctrlLatched) {
+          patchTerminalMobileState(terminal, { ctrlLatched: false });
+          conn.send(applyStickyCtrl(data).out);
+          return;
+        }
+        conn.send(data);
       });
 
       // Windows-console clipboard ergonomics. Selecting text copies it
@@ -198,10 +225,44 @@ export function XTermInstance({
       // with the element and tears down on terminal.dispose(). Removing it per
       // unmount would leave reattached terminals without mobile scrolling.
       installTerminalTouchScroll(terminal);
+
+      // Touch gesture layer (long-press D-pad → arrows, double-tap → Tab,
+      // three-finger tap → paste) and select-mode drag selection. Same
+      // lifetime rule as the scroll bridge: attach once, dies with the
+      // element. All are inert without touch input, so no capability gate.
+      const t = terminal;
+      const sendRaw = (data: string) =>
+        getTerminalConnection(tabId)?.send(data);
+      installTerminalTouchGestures(t, {
+        sendArrow: (dir) =>
+          sendRaw(keySequence(dir, t.modes.applicationCursorKeysMode)),
+        sendTab: () => sendRaw('\t'),
+        paste: () => {
+          if (!navigator.clipboard?.readText) return;
+          void navigator.clipboard
+            .readText()
+            .then((text) => {
+              if (text) t.paste(text);
+            })
+            .catch(() => {
+              // Paste permission denied — the Paste button reports errors;
+              // the gesture stays silent.
+            });
+        },
+      });
+      installTerminalTouchSelection(t);
+
+      // Keyboard-open ergonomics: focusing the terminal on a touch device
+      // pops the system keyboard — jump to the prompt so it isn't hidden
+      // in scrollback while the viewport shrinks around it.
+      t.textarea?.addEventListener('focus', () => {
+        if (isTouchDevice()) t.scrollToBottom();
+      });
     }
 
     terminalRef.current = terminal;
     fitAddonRef.current = fitAddon;
+    setLiveTerminal(terminal);
 
     // Ensure a backend connection exists for this tab — also on the reattach
     // path, so a tab whose connection died (e.g. reconnect gave up, server
@@ -230,6 +291,7 @@ export function XTermInstance({
       }
       terminalRef.current = null;
       fitAddonRef.current = null;
+      setLiveTerminal(null);
     };
   }, [
     tabId,
@@ -262,17 +324,30 @@ export function XTermInstance({
     if (isActive) terminalRef.current?.focus();
   }, [isActive]);
 
+  const sendKey = useCallback(
+    (data: string) => {
+      getTerminalConnection(tabId)?.send(data);
+    },
+    [tabId, getTerminalConnection]
+  );
+
   return (
     // The padding ring is painted terminal-black (not the app surface color)
     // so the always-dark terminal doesn't sit in a light frame on the light
     // theme.
     <div
       ref={resizeRef}
-      className="relative w-full h-full px-2 py-1 overscroll-contain"
+      className="w-full h-full flex flex-col px-2 py-1 overscroll-contain"
       style={{ background: TERMINAL_BACKGROUND }}
     >
-      <div ref={containerRef} className="w-full h-full" />
-      <TerminalMobileControls getTerminal={() => terminalRef.current} />
+      <div className="relative flex-1 min-h-0">
+        <div ref={containerRef} className="w-full h-full" />
+        <TerminalMobileControls terminal={liveTerminal} refit={fitTerminal} />
+      </div>
+      {/* Touch-only hotkey row (renders null off-touch). Sits at the pane's
+          bottom edge — the visual-viewport sizing keeps that edge above the
+          on-screen keyboard, Termius-style. */}
+      <TerminalKeyBar terminal={liveTerminal} onSendKey={sendKey} />
     </div>
   );
 }
