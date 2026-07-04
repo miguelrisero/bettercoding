@@ -66,13 +66,23 @@ export function installTerminalTouchLayers(
     // Route the OS paste callout / hardware Cmd+V through the provenance
     // marker too — xterm's internal textarea paste handler would otherwise
     // emit onData unmarked, and a 1-char clipboard while Ctrl is latched
-    // would be synthesized into a control code. Touch-only: the latch can
-    // only be armed here, and desktop keeps xterm's native paste path.
-    terminal.textarea?.addEventListener('paste', (e) => {
-      const text = e.clipboardData?.getData('text');
-      e.preventDefault();
-      if (text) pasteTextIntoTerminal(terminal, text);
-    });
+    // would be synthesized into a control code. Capture-phase on the ROOT
+    // element: at the textarea itself listeners run in registration order
+    // and xterm's (registered at open()) would fire first — both handlers
+    // running would paste twice. Ancestor capture runs before the target,
+    // and stopPropagation keeps the event from xterm's handler entirely.
+    // Touch-only: the latch can only be armed here, and desktop keeps
+    // xterm's native paste path.
+    terminal.element?.addEventListener(
+      'paste',
+      (e) => {
+        const text = e.clipboardData?.getData('text');
+        e.preventDefault();
+        e.stopPropagation();
+        if (text) pasteTextIntoTerminal(terminal, text);
+      },
+      { capture: true }
+    );
   }
   installTerminalTouchScroll(terminal);
 }
