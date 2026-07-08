@@ -43,8 +43,26 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// a title, and must not be stored verbatim as the workspace name.
 const HINT_ARROW_MAX_CHARS: usize = 100;
 
+/// Normalize a candidate title into the stored form shared by the hint and
+/// model paths: collapse whitespace, normalize the unicode arrow, cap at
+/// `max_chars`, and trim trailing sentence punctuation — a mid-word cut (or a
+/// model-emitted period) must never leave dangling punctuation/space at the
+/// tail. Length *policy* stays per-path (the hint path rejects overlong arrow
+/// lines up front; the model path caps at [`TITLE_MAX_CHARS`]).
+fn canonicalize_title(raw: &str, max_chars: usize) -> String {
+    raw.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(" → ", " -> ")
+        .chars()
+        .take(max_chars)
+        .collect::<String>()
+        .trim_end_matches(['.', ',', ':', ';', ' '])
+        .to_string()
+}
+
 /// If the user's first line already reads like a deliberate title, return it
-/// (lightly trimmed) so we keep it verbatim instead of asking the model.
+/// (lightly normalized) so we keep it verbatim instead of asking the model.
 ///
 /// Signals: contains " -> " (Miguel's explicit format) at a plausible title
 /// length, OR is short (<= 8 words AND <= 48 chars) AND the message has a body
@@ -70,12 +88,11 @@ pub fn first_line_title_hint(message: &str) -> Option<String> {
     if first.ends_with(':') || first.ends_with(',') || first.ends_with("...") {
         return None;
     }
-    Some(
-        first
-            .trim_end_matches('.')
-            .replace(" → ", " -> ")
-            .to_string(),
-    )
+    // Acceptance already bounds the line, so the cap here is a no-op backstop;
+    // canonicalization can strip a line down to nothing (e.g. "..."), so
+    // re-check emptiness before declaring it a title.
+    let title = canonicalize_title(first, HINT_ARROW_MAX_CHARS);
+    (!title.is_empty()).then_some(title)
 }
 
 /// Ask Claude Haiku for a concise title + branch slug describing `first_message`.
@@ -186,20 +203,7 @@ fn parse_workspace_names(stdout: &str) -> Option<WorkspaceNames> {
     }
     let raw: RawNames = serde_json::from_str(&stdout[start..=end]).ok()?;
 
-    let title: String = raw
-        .title
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace(" → ", " -> ")
-        .chars()
-        .take(TITLE_MAX_CHARS)
-        .collect::<String>()
-        // A mid-word cut (or a model-emitted period) must never leave dangling
-        // punctuation/space at the tail. Leading whitespace is impossible after
-        // the split/join above, so end-trimming alone suffices.
-        .trim_end_matches(['.', ',', ':', ';', ' '])
-        .to_string();
+    let title = canonicalize_title(&raw.title, TITLE_MAX_CHARS);
     if title.is_empty() {
         return None;
     }
@@ -307,6 +311,22 @@ mod tests {
     fn hint_rejects_empty() {
         assert!(first_line_title_hint("").is_none());
         assert!(first_line_title_hint("\n\n").is_none());
+        // Canonicalization can strip a line to nothing — never store "".
+        assert!(first_line_title_hint(".\n\nbody").is_none());
+    }
+
+    #[test]
+    fn hint_normalizes_like_the_model_path() {
+        // Whitespace collapse and trailing-punctuation trim match the stored
+        // form the Haiku path produces for the same string.
+        assert_eq!(
+            first_line_title_hint("bp   ->  runflow dogfood\n\nbody").as_deref(),
+            Some("bp -> runflow dogfood")
+        );
+        assert_eq!(
+            first_line_title_hint("Fix scroll bug;\n\nbody").as_deref(),
+            Some("Fix scroll bug")
+        );
     }
 
     #[test]
