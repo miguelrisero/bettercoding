@@ -8,7 +8,7 @@ import {
   TERMINAL_BACKGROUND,
   getTerminalTheme,
 } from '@/shared/lib/terminalTheme';
-import { buildTerminalWsUrl } from '@/shared/lib/terminalWsUrl';
+import { resolveTerminalEndpoint } from '@/shared/lib/terminalWsUrl';
 import { cancelActiveTerminalGesture } from '@/shared/lib/terminalTouchGestures';
 import { installTerminalTouchLayers } from '@/shared/lib/terminalTouchLayers';
 import { applyStickyCtrl } from '@/shared/lib/terminalKeySequences';
@@ -68,31 +68,77 @@ export function XTermInstance({
     getTerminalConnection,
   } = useTerminal();
 
-  // Built with the terminal's CURRENT grid size (see buildTerminalWsUrl): a
-  // fresh attach must open the PTY at the real size, not the 80x24 default, or
-  // claude reflows on the follow-up onopen resize and stacks blank lines every
-  // time the CLI pane is reopened.
-  const buildEndpoint = useCallback(
-    (cols: number, rows: number) =>
-      buildTerminalWsUrl({
+  // Re-fit and resolve the WS endpoint at the terminal's CURRENT grid. Returns
+  // null when the pane is unmeasurable (hidden / 0-height): FitAddon.fit() then
+  // silently no-ops and proposeDimensions() is undefined, so connecting would
+  // bake xterm's 80x24 constructor default into the URL and make claude reflow
+  // (stacking blank lines that read as a stray Enter) on the follow-up resize
+  // once the pane is shown. Called fresh on every (re)connect attempt so a
+  // reconnect attaches at the pane's present size, not the creation-time one.
+  const getEndpoint = useCallback((): string | null => {
+    const fitAddon = fitAddonRef.current;
+    const terminal = terminalRef.current;
+    if (!fitAddon || !terminal) return null;
+    fitAddon.fit();
+    return resolveTerminalEndpoint(
+      {
         workspaceId,
-        cols,
-        rows,
         protocol: window.location.protocol,
         host: window.location.host,
         mode,
         sessionId,
-      }),
-    [workspaceId, mode, sessionId]
-  );
+      },
+      fitAddon.proposeDimensions()
+    );
+  }, [workspaceId, mode, sessionId]);
+
+  // Open the backend connection for this tab — but only once the pane is
+  // actually measurable. A CLI pane can mount inside a hidden (display:none)
+  // mobile tab where fit() no-ops; connecting then bakes cols=80&rows=24 into
+  // the URL. When unmeasured we DEFER: fitTerminal() re-runs this on the first
+  // non-zero ResizeObserver tick (i.e. when the tab is shown). NEVER tears down
+  // a live connection — hidden side panes keep theirs by design; this only ever
+  // creates the INITIAL connection for a tab that has none.
+  const ensureConnection = useCallback(() => {
+    if (!terminalRef.current || !fitAddonRef.current) return;
+    if (getTerminalConnection(tabId)) return;
+    // Gate on measurability up front so no connection object (and no server-side
+    // PTY/tmux churn) is created for an invisible pane.
+    if (getEndpoint() === null) return;
+    createTerminalConnection(
+      tabId,
+      getEndpoint,
+      (data) => terminalRef.current?.write(data),
+      onClose,
+      () => {
+        // Re-fit and report the current grid so the PTY/tmux is sized to the
+        // pane on every (re)connect (see TerminalProvider ws.onopen).
+        fitAddonRef.current?.fit();
+        const t = terminalRef.current;
+        return t ? { cols: t.cols, rows: t.rows } : null;
+      }
+    );
+  }, [
+    tabId,
+    getEndpoint,
+    onClose,
+    getTerminalConnection,
+    createTerminalConnection,
+  ]);
 
   const fitTerminal = useCallback(() => {
     fitAddonRef.current?.fit();
-    if (terminalRef.current) {
-      const conn = getTerminalConnection(tabId);
-      conn?.resize(terminalRef.current.cols, terminalRef.current.rows);
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+    const conn = getTerminalConnection(tabId);
+    if (conn) {
+      conn.resize(terminal.cols, terminal.rows);
+    } else {
+      // The initial connect was deferred because the pane was unmeasured at
+      // mount; now that the ResizeObserver reports a real size, open it.
+      ensureConnection();
     }
-  }, [tabId, getTerminalConnection]);
+  }, [tabId, getTerminalConnection, ensureConnection]);
 
   // Terminal + connection lifecycle. Every run of this effect MUST register
   // the same cleanup: an early return without one leaves `terminalRef`
@@ -256,24 +302,10 @@ export function XTermInstance({
 
     // Ensure a backend connection exists for this tab — also on the reattach
     // path, so a tab whose connection died (e.g. reconnect gave up, server
-    // restarted) heals on the next mount instead of staying dead.
-    if (!getTerminalConnection(tabId)) {
-      // Connect at the fitted size (set by fit() above) so the backend opens
-      // the PTY at the real dimensions — no 80x24-then-resize reflow.
-      createTerminalConnection(
-        tabId,
-        buildEndpoint(terminal.cols, terminal.rows),
-        (data) => terminal.write(data),
-        onClose,
-        () => {
-          // Re-fit and report the current grid so the PTY/tmux is sized to the
-          // pane on every (re)connect (see TerminalProvider ws.onopen).
-          fitAddonRef.current?.fit();
-          const t = terminalRef.current;
-          return t ? { cols: t.cols, rows: t.rows } : null;
-        }
-      );
-    }
+    // restarted) heals on the next mount instead of staying dead. Connects at
+    // the fitted size, or defers if the pane isn't measurable yet (hidden tab);
+    // fitTerminal() opens it on the first non-zero resize once shown.
+    ensureConnection();
 
     return () => {
       // A D-pad gesture running right now would never see its touchend once
@@ -297,11 +329,9 @@ export function XTermInstance({
     };
   }, [
     tabId,
-    buildEndpoint,
-    onClose,
+    ensureConnection,
     getTerminalInstance,
     registerTerminalInstance,
-    createTerminalConnection,
     getTerminalConnection,
   ]);
 

@@ -50,7 +50,11 @@ export interface TerminalContextType {
   unregisterTerminalInstance: (tabId: string) => void;
   createTerminalConnection: (
     tabId: string,
-    endpoint: string,
+    // Called fresh on every (re)connect attempt so the socket always attaches
+    // at the pane's CURRENT fitted grid. Returns null when the pane is not
+    // measurable yet (hidden/0-height); the provider reschedules instead of
+    // attaching at a wrong/placeholder size.
+    getEndpoint: () => string | null,
     onData: (data: string) => void,
     onExit?: () => void,
     getSize?: () => { cols: number; rows: number } | null

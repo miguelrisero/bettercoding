@@ -973,7 +973,8 @@ impl PtyService {
             if matches!(&command, PtyCommand::TmuxCli { .. }) {
                 match &tmux_session {
                     Some(session_name) => tracing::info!(
-                        "CLI terminal attaching tmux session {session_name} in {}",
+                        "CLI terminal attaching tmux session {session_name} at \
+                         {cols}x{rows} in {}",
                         working_dir.display()
                     ),
                     None => {

@@ -190,6 +190,22 @@ async fn terminal_ws(
 
     let (working_dir, command) = match query.mode {
         TerminalMode::Cli => {
+            // Regression tripwire for the stray-newline bug: a CLI attach must
+            // always carry the pane's real fitted grid. An absent-or-default
+            // 80x24 means the frontend connected while the terminal was
+            // unmeasured (hidden / 0-height), which makes claude reflow and
+            // stack blank lines on the follow-up resize. After the frontend fix
+            // (never connect at an unmeasured size) this must never fire.
+            if query.cols == default_cols() && query.rows == default_rows() {
+                tracing::warn!(
+                    "CLI terminal attaching at default {}x{} for workspace {} — \
+                     pane likely connected while unmeasured (stray-newline regression)",
+                    query.cols,
+                    query.rows,
+                    query.workspace_id
+                );
+            }
+
             let pool = &deployment.db().pool;
 
             // Resolve the uix session driving the handover. A mid-switch

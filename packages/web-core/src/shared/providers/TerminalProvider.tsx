@@ -15,7 +15,13 @@ interface TerminalConnection {
 }
 
 interface ConnectionGeneration {
-  endpoint: string;
+  /**
+   * Rebuilt on every (re)connect attempt so retries/reconnects attach at the
+   * pane's CURRENT fitted grid, not the size frozen when the tab was created.
+   * Returns null when the pane is not measurable yet (hidden/0-height) — the
+   * attempt is then rescheduled instead of attaching at a placeholder size.
+   */
+  getEndpoint: () => string | null;
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
   /** Cancelled (tab closed / superseded by a newer generation). */
@@ -306,7 +312,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
   const createTerminalConnection = useCallback(
     (
       tabId: string,
-      endpoint: string,
+      getEndpoint: () => string | null,
       onData: (data: string) => void,
       onExit?: () => void,
       getSize?: () => { cols: number; rows: number } | null
@@ -331,7 +337,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       connectionCallbacksRef.current.set(tabId, { onData, onExit, getSize });
 
       const generation: ConnectionGeneration = {
-        endpoint,
+        getEndpoint,
         retryCount: 0,
         retryTimer: null,
         closed: false,
@@ -375,6 +381,17 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
 
       const connectWebSocket = () => {
         if (generation.closed) {
+          return;
+        }
+
+        // Rebuild the endpoint at the CURRENT fitted grid on every attempt. A
+        // null means the pane isn't measurable yet (e.g. a hidden tab across an
+        // iOS background socket kill); reschedule rather than attach at a
+        // placeholder 80x24 that would make claude reflow on the follow-up
+        // resize.
+        const endpoint = generation.getEndpoint();
+        if (endpoint === null) {
+          scheduleReconnect();
           return;
         }
 

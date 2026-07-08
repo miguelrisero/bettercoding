@@ -40,3 +40,28 @@ export function buildTerminalWsUrl({
     mode === 'cli' && sessionId ? `&session_id=${sessionId}` : '';
   return `${scheme}//${host}/api/terminal/ws?workspace_id=${workspaceId}&cols=${cols}&rows=${rows}${modeParam}${sessionParam}`;
 }
+
+/**
+ * Resolve the WS endpoint from a freshly measured grid, or `null` when the pane
+ * could not be measured.
+ *
+ * `dims` is `FitAddon.proposeDimensions()`, which returns `undefined` for a
+ * hidden (`display:none`) or 0-height container. Returning `null` in that case
+ * is the load-bearing invariant of the stray-newline fix: the caller must NEVER
+ * open the WS at a placeholder size (xterm's 80x24 constructor default), because
+ * the backend opens the PTY/tmux at exactly the URL size and claude then reflows
+ * — stacking blank lines that read as a stray Enter — on the follow-up resize
+ * once the pane becomes visible. A `null` here means "defer / reschedule the
+ * connect until the pane is measurable".
+ *
+ * Because it re-reads the CURRENT dims on every call, using it as the per-attempt
+ * endpoint source also makes reconnects attach at the pane's present grid rather
+ * than the size frozen when the tab was first created.
+ */
+export function resolveTerminalEndpoint(
+  params: Omit<TerminalWsUrlParams, 'cols' | 'rows'>,
+  dims: { cols: number; rows: number } | undefined | null
+): string | null {
+  if (!dims || dims.cols <= 0 || dims.rows <= 0) return null;
+  return buildTerminalWsUrl({ ...params, cols: dims.cols, rows: dims.rows });
+}
