@@ -130,15 +130,15 @@ export function LoopAutomationControl({
   const showAttempts = enabled && maxAttemptsCount > 0;
 
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex items-center gap-1.5 md:gap-2 min-w-0">
       {enabled && nextWakeup && (
-        <span className="flex items-center gap-1 text-xs text-low">
+        <span className="flex items-center gap-1 text-xs text-low whitespace-nowrap shrink-0">
           {nextWakeup.kind === 'usage_limit_wake' ? (
             <MoonIcon className="size-icon-sm" weight="bold" aria-hidden />
           ) : (
             <ClockIcon className="size-icon-sm" weight="bold" aria-hidden />
           )}
-          <span>
+          <span className="hidden md:inline">
             {nextWakeup.kind === 'usage_limit_wake'
               ? t('loopAutomation.wakingAt', {
                   time: formatUtcTime(nextWakeup.fire_at),
@@ -147,8 +147,13 @@ export function LoopAutomationControl({
                   time: formatLocalTime(nextWakeup.fire_at),
                 })}
           </span>
+          <span className="md:hidden">
+            {nextWakeup.kind === 'usage_limit_wake'
+              ? formatUtcTime(nextWakeup.fire_at)
+              : formatLocalTime(nextWakeup.fire_at)}
+          </span>
           {showAttempts && (
-            <span>
+            <span className="hidden md:inline">
               {'· '}
               {t('loopAutomation.attempts', {
                 used: attemptsUsed,
@@ -167,7 +172,7 @@ export function LoopAutomationControl({
       )}
 
       {showAttempts && !nextWakeup && (
-        <span className="text-xs text-low">
+        <span className="text-xs text-low hidden md:inline">
           {t('loopAutomation.attempts', {
             used: attemptsUsed,
             max: maxAttemptsCount,
@@ -176,13 +181,13 @@ export function LoopAutomationControl({
       )}
 
       <Tooltip content={t('loopAutomation.tooltip')} side="bottom">
-        <span className="flex items-center gap-1.5">
+        <span className="flex items-center gap-1.5 shrink-0">
           <ArrowsClockwiseIcon
             className="size-icon-sm text-low"
             weight="bold"
             aria-hidden
           />
-          <span className="text-xs text-normal select-none">
+          <span className="text-xs text-normal select-none hidden md:inline">
             {t('loopAutomation.label')}
           </span>
           <Switch
@@ -201,7 +206,7 @@ export function LoopAutomationControl({
               type="button"
               aria-label={t('loopAutomation.settingsLabel')}
               title={t('loopAutomation.settingsLabel')}
-              className="flex items-center justify-center p-half rounded-sm text-low hover:text-normal hover:bg-secondary/50 transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-brand"
+              className="flex items-center justify-center p-half rounded-sm text-low hover:text-normal hover:bg-secondary/50 transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-brand shrink-0"
             >
               <GearSixIcon className="size-icon-sm" weight="bold" aria-hidden />
             </button>

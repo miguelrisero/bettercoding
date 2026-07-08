@@ -1,6 +1,7 @@
 {
   "cliMode": {
     "title": "Claude CLI",
+    "titleShort": "CLI",
     "persistentHint": "지속되는 tmux 세션",
     "backToChat": "채팅으로 돌아가기",
     "agentRunningTitle": "Claude가 프롬프트를 처리하고 있습니다",

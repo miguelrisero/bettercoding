@@ -1,6 +1,7 @@
 {
   "cliMode": {
     "title": "Claude CLI",
+    "titleShort": "CLI",
     "persistentHint": "持久 tmux 工作階段",
     "backToChat": "返回聊天",
     "agentRunningTitle": "Claude 正在處理你的提示",
