@@ -416,7 +416,16 @@ async fn deliver_due_wakeups(db: &DBService, _now: DateTime<Utc>) -> Result<(), 
         // The tmux session may have been reaped before a long usage-window wake
         // came due — re-park the prompt so the next attach delivers it.
         if !cli_tmux_session_exists(wid).await {
-            repark_prompt(pool, wid, &prompt).await;
+            if repark_prompt(pool, wid, &prompt).await == ReparkOutcome::Failed {
+                // Transient DB error: leave the wake-up pending so the next
+                // tick retries rather than dropping it (marking it fired here
+                // would neither deliver nor park the prompt).
+                tracing::warn!(
+                    "loop: workspace {wid} session gone; re-park failed transiently, \
+                     leaving wake-up pending"
+                );
+                continue;
+            }
             tracing::info!("loop: workspace {wid} session gone; re-parked wake-up prompt");
             ScheduledWakeup::mark_fired(pool, wakeup.id).await?;
             continue;
@@ -470,40 +479,86 @@ async fn deliver_due_wakeups(db: &DBService, _now: DateTime<Utc>) -> Result<(), 
             // prompt so the next terminal attach delivers it rather than dropping
             // the wake-up — mirrors the session-gone branch above.
             tracing::warn!("loop: failed to deliver wake-up to workspace {wid}; re-parking");
-            repark_prompt(pool, wid, &prompt).await;
+            if repark_prompt(pool, wid, &prompt).await == ReparkOutcome::Failed {
+                // Transient DB error: leave the wake-up pending for the next
+                // tick instead of marking it fired and dropping it.
+                tracing::warn!(
+                    "loop: re-park failed transiently for workspace {wid}; \
+                     leaving wake-up pending"
+                );
+                continue;
+            }
         }
         ScheduledWakeup::mark_fired(pool, wakeup.id).await?;
     }
     Ok(())
 }
 
+/// Outcome of a [`repark_prompt`] attempt. Only `Failed` (a transient DB error)
+/// warrants leaving the wake-up pending for a retry; every other outcome is
+/// final and the caller may mark the wake-up fired.
+#[derive(Debug, PartialEq, Eq)]
+enum ReparkOutcome {
+    /// The prompt is parked (or a prompt is already parked for the workspace,
+    /// which delivers first) — handled, mark the wake-up fired.
+    Handled,
+    /// No session row exists to park on — nothing more the loop can do.
+    NoSession,
+    /// A transient DB error — leave the wake-up pending so the next tick retries
+    /// rather than silently dropping it.
+    Failed,
+}
+
 /// Best-effort: park `prompt` on the workspace's latest session so a terminal
 /// attach delivers it (the attach path pastes a parked prompt into a live
 /// agent pane, or hands it to the next fresh launch). Shared by both wake-up
-/// failure branches so the re-park policy has exactly one owner. Parks only
-/// into an EMPTY slot: continuation boilerplate must never overwrite a
-/// parked-but-undelivered user prompt (that prompt delivers first, and the
-/// loop re-detects its limit banner afterwards).
-async fn repark_prompt(pool: &sqlx::SqlitePool, wid: Uuid, prompt: &str) {
+/// failure branches so the re-park policy has exactly one owner.
+///
+/// Parks only when the workspace has NO undelivered prompt anywhere: attach
+/// delivery peeks the workspace's newest pending prompt across ALL its session
+/// rows ([`Session::peek_pending_cli_prompt_for_workspace`]), so parking
+/// continuation boilerplate onto a newer, empty session while an OLDER session
+/// still holds an undelivered user prompt would let the continuation be
+/// delivered first. Skipping keeps the user prompt ahead; the loop re-detects
+/// its limit banner afterwards.
+async fn repark_prompt(pool: &sqlx::SqlitePool, wid: Uuid, prompt: &str) -> ReparkOutcome {
+    // Workspace-scoped guard, matching the workspace-scoped delivery peek — not
+    // just the latest session row's slot (which `set_pending_cli_prompt_if_empty`
+    // checks): a prompt parked on ANY row means one is already queued to deliver.
+    match Session::peek_pending_cli_prompt_for_workspace(pool, wid).await {
+        Ok(Some(_)) => {
+            tracing::info!(
+                "loop: workspace {wid} already has a parked prompt; wake-up not re-parked"
+            );
+            return ReparkOutcome::Handled;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("loop: failed to check parked prompt for workspace {wid}: {e}");
+            return ReparkOutcome::Failed;
+        }
+    }
     match Session::find_latest_by_workspace_id(pool, wid).await {
         Ok(Some(session)) => {
             match Session::set_pending_cli_prompt_if_empty(pool, session.id, prompt).await {
-                Ok(true) => {}
-                Ok(false) => tracing::info!(
-                    "loop: workspace {wid} already has a parked prompt; wake-up not re-parked"
-                ),
+                // `false` = a prompt was parked between our check and here
+                // (raced an attach/another wake-up); either way one is queued.
+                Ok(_) => ReparkOutcome::Handled,
                 Err(e) => {
                     tracing::warn!(
                         "loop: failed to re-park wake-up prompt for workspace {wid}: {e}"
-                    )
+                    );
+                    ReparkOutcome::Failed
                 }
             }
         }
         Ok(None) => {
-            tracing::warn!("loop: no session to re-park wake-up prompt for workspace {wid}")
+            tracing::warn!("loop: no session to re-park wake-up prompt for workspace {wid}");
+            ReparkOutcome::NoSession
         }
         Err(e) => {
-            tracing::warn!("loop: failed to re-park wake-up prompt for workspace {wid}: {e}")
+            tracing::warn!("loop: failed to re-park wake-up prompt for workspace {wid}: {e}");
+            ReparkOutcome::Failed
         }
     }
 }
