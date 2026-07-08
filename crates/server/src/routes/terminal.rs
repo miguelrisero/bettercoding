@@ -503,14 +503,22 @@ async fn handle_terminal_ws(
     let _ = deployment.pty().close_session(session_id).await;
 }
 
-/// Space-separated lowercase hex of a byte slice (e.g. `0a 04`) for the
-/// attach-window input tripwire. The caller bounds the slice length, so this
+/// Space-separated redacted hex of a byte slice for the attach-window input
+/// tripwire: control bytes (< 0x20, or 0x7f) are shown verbatim (e.g. `0a 04`,
+/// `1b`) because they are the injection/escape-sequence signature; every other
+/// byte is masked as `..` so real keystrokes (passwords, pasted secrets) never
+/// reach the logs — only their count and timing do.
+/// The caller bounds the slice length, so this
 /// never allocates more than a fixed maximum.
 fn hex_dump(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 3);
     for byte in bytes {
-        let _ = write!(out, "{byte:02x} ");
+        if *byte < 0x20 || *byte == 0x7f {
+            let _ = write!(out, "{byte:02x} ");
+        } else {
+            out.push_str(".. ");
+        }
     }
     out.pop(); // trailing space
     out
@@ -528,4 +536,21 @@ async fn send_error(socket: &mut MaybeSignedWebSocket, message: &str) -> anyhow:
 
 pub(super) fn router() -> Router<DeploymentImpl> {
     Router::new().route("/terminal/ws", get(terminal_ws))
+}
+
+#[cfg(test)]
+mod tripwire_tests {
+    use super::hex_dump;
+
+    #[test]
+    fn hex_dump_shows_control_bytes_and_masks_printables() {
+        // The \n+EOT injection signature must stay fully visible…
+        assert_eq!(hex_dump(&[0x0a, 0x04]), "0a 04");
+        // …while printable payload (keystrokes, secrets) is masked to `..`,
+        // keeping only count and position.
+        assert_eq!(hex_dump(b"hi"), ".. ..");
+        assert_eq!(hex_dump(&[0x1b, b'[', b'A']), "1b .. ..");
+        assert_eq!(hex_dump(&[0x7f]), "7f");
+        assert_eq!(hex_dump(&[]), "");
+    }
 }
