@@ -17,7 +17,10 @@ use db::models::{
 use deployment::Deployment;
 use executors::{
     actions::ExecutorActionType,
-    executors::{BaseCodingAgent, StandardCodingAgentExecutor, cli::CliLaunchSpec},
+    executors::{
+        BaseCodingAgent, StandardCodingAgentExecutor,
+        cli::{CliLaunchSpec, CliPromptArg},
+    },
     profile::{ExecutorConfig, ExecutorConfigs},
 };
 use local_deployment::pty::{
@@ -361,12 +364,26 @@ async fn terminal_ws(
                         }
                     }
                     CliPromptRouting::Baked(prompt) => {
+                        // Argv agents (Positional/Flag) `rm` the staged file
+                        // before exec, so a file left on disk after
+                        // confirmation fails proves the bootstrap never ran and
+                        // the prompt can be safely pasted as a recovery.
+                        // StdinPipe carries no fallback (a lingering file can
+                        // mean `cat` is still streaming — pasting would
+                        // double-deliver).
+                        let baked_paste_fallback = match spec.prompt_arg {
+                            CliPromptArg::StdinPipe | CliPromptArg::Unsupported => None,
+                            CliPromptArg::Positional | CliPromptArg::Flag(_) => {
+                                Some(prompt.clone())
+                            }
+                        };
                         baked_prompt = Some(prompt);
                         prompt_delivery = Some(PromptDelivery {
                             workspace_id: query.workspace_id,
                             clear_session_id,
                             peeked,
                             deferred: None,
+                            baked_paste_fallback,
                             program: spec.program.clone(),
                             claim,
                         });
@@ -381,6 +398,7 @@ async fn terminal_ws(
                             clear_session_id,
                             peeked,
                             deferred: Some(prompt),
+                            baked_paste_fallback: None,
                             program: spec.program.clone(),
                             claim,
                         });
@@ -454,6 +472,16 @@ struct PromptDelivery {
     /// Prompt to paste once the agent owns the pane (`None` = baked into the
     /// launch's temp-file transport instead).
     deferred: Option<String>,
+    /// For a BAKED delivery only: the trimmed prompt to paste as a recovery
+    /// fallback if the baked bootstrap turns out never to have run (a racing
+    /// attach won `new-session -A` and created the pane with a promptless
+    /// launch, so our `-A` attach's baked bootstrap was ignored). `Some` only
+    /// for argv agents (`Positional`/`Flag`), whose bootstrap `rm`s the file
+    /// BEFORE exec — so a file still on disk proves the prompt was never
+    /// argv-delivered and pasting can't double-deliver. `None` for `StdinPipe`
+    /// (a lingering file there can mean `cat` is mid-stream) and for deferred
+    /// deliveries (which paste anyway).
+    baked_paste_fallback: Option<String>,
     /// The agent binary this launch runs — delivery is only ever confirmed
     /// against THIS process owning the pane, so a fallback shell (or anything
     /// the user runs inside it) can never satisfy the gate.
@@ -512,7 +540,14 @@ async fn handle_terminal_ws(
                     Some(text) => {
                         deliver_deferred_prompt(workspace_id, text, &delivery.program).await
                     }
-                    None => confirm_baked_prompt_consumed(workspace_id, &delivery.program).await,
+                    None => {
+                        confirm_or_recover_baked_prompt(
+                            workspace_id,
+                            &delivery.program,
+                            delivery.baked_paste_fallback.as_deref(),
+                        )
+                        .await
+                    }
                 };
                 if delivered {
                     match Session::clear_pending_cli_prompt(
@@ -643,15 +678,32 @@ async fn wait_for_cli_session(workspace_id: Uuid) -> bool {
     false
 }
 
-/// Confirm a baked prompt was actually handed to the agent: the staged file is
-/// gone (the bootstrap `rm`s it at hand-off — see [`cli_prompt_file_exists`])
-/// AND the expected agent process owns the pane. The second condition catches
-/// the consumed-but-never-executed window (`command -v` passed but the agent's
-/// exec failed: bad shebang, loader error, permissions) where file-gone alone
-/// would clear a prompt no agent ever received. An unconfirmed launch leaves
-/// the parked DB prompt for the next attach's paste/fresh-launch retry — and
-/// drops the never-consumed file so a later launch can't half-consume it.
-async fn confirm_baked_prompt_consumed(workspace_id: Uuid, program: &str) -> bool {
+/// Confirm a baked prompt reached the agent, recovering the racing-attach case.
+///
+/// Normal confirmation: the staged file is gone (the bootstrap `rm`s it at
+/// hand-off — see [`cli_prompt_file_exists`]) AND the expected agent owns the
+/// pane. The agent-running condition catches the consumed-but-never-executed
+/// window (`command -v` passed but the agent's exec failed: bad shebang, loader
+/// error, permissions) where file-gone alone would clear a prompt no agent ever
+/// received.
+///
+/// Recovery: if confirmation times out but the file is STILL on disk and
+/// `paste_fallback` is set (argv agents `rm` the file before exec, so a
+/// surviving file proves our baked bootstrap never ran — typically because a
+/// racing attach won `new-session -A` and created the pane with a promptless
+/// launch, leaving our `-A` attach's bootstrap ignored), paste the prompt into
+/// whatever agent now owns the pane instead of stranding it for a future
+/// attach. Pasting is safe precisely because the file survived: the prompt was
+/// never argv-delivered, so it can't double-deliver.
+///
+/// Either way the never-consumed file is dropped so a later launch can't
+/// half-consume it; an unconfirmed, unrecovered launch leaves the parked DB
+/// prompt for the next attach's retry.
+async fn confirm_or_recover_baked_prompt(
+    workspace_id: Uuid,
+    program: &str,
+    paste_fallback: Option<&str>,
+) -> bool {
     for _ in 0..30 {
         if !cli_prompt_file_exists(workspace_id)
             && cli_pane_agent_running(workspace_id, program).await == Some(true)
@@ -660,8 +712,17 @@ async fn confirm_baked_prompt_consumed(workspace_id: Uuid, program: &str) -> boo
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
+    // Confirmation exhausted. A surviving file + an argv agent means the baked
+    // bootstrap never ran (a racing attach created the session first): paste
+    // the prompt into the live agent as a recovery.
+    let recovered = match paste_fallback {
+        Some(text) if cli_prompt_file_exists(workspace_id) => {
+            deliver_deferred_prompt(workspace_id, text, program).await
+        }
+        _ => false,
+    };
     remove_cli_prompt_file(workspace_id);
-    false
+    recovered
 }
 
 /// Deliver a deferred prompt by paste once THE AGENT owns the pane. Pasting
