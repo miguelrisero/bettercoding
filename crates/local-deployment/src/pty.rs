@@ -44,6 +44,12 @@ pub enum PtyCommand {
         /// the terminal instead of a headless executor. Ignored when
         /// `resume_session_id` is set.
         initial_prompt: Option<String>,
+        /// A paste delivery will follow this launch (oversized or
+        /// launch-arg-less prompt). The bootstrap must start a FRESH TUI
+        /// instead of the `--continue || fresh` fallback: the doomed
+        /// `--continue` first leg of a brand-new workspace lives just long
+        /// enough to swallow the paste and exit, silently discarding it.
+        deferred_prompt_pending: bool,
         /// How to launch the selected agent's interactive CLI — binary, flags
         /// (model/effort/sandbox/approval pre-resolved from the session's
         /// ExecutorConfig), and the resume/prompt/continue forms. Claude is the
@@ -77,6 +83,7 @@ fn cli_bootstrap(
     spec: &CliLaunchSpec,
     resume_session_id: Option<&str>,
     prompt_file: Option<&Path>,
+    deferred_prompt_pending: bool,
 ) -> String {
     // The program is a bare binary name from our own code; quote it anyway so
     // it can never be anything but a single command word.
@@ -155,6 +162,12 @@ fn cli_bootstrap(
             // post-launch keystroke delivery (loop automation / send-keys).
             CliPromptArg::Unsupported => continue_launch(),
         }
+    } else if deferred_prompt_pending {
+        // A paste delivery follows: start a FRESH TUI. The usual
+        // `--continue || fresh` fallback would run a doomed `--continue`
+        // first leg on a brand-new workspace — alive just long enough to
+        // pass the readiness gate, swallow the pasted prompt, and exit.
+        base.clone()
     } else {
         continue_launch()
     };
@@ -239,6 +252,20 @@ pub fn route_initial_prompt(
         CliPromptRouting::None
     } else if cli_prompt_fits_inline(prompt_arg, trimmed.len()) {
         CliPromptRouting::Baked(trimmed.to_string())
+    } else {
+        CliPromptRouting::Deferred(trimmed.to_string())
+    }
+}
+
+/// Route a parked prompt that must arrive as a FOLLOW-UP — the tmux session
+/// already exists (an earlier delivery went unconfirmed, or a loop wake-up
+/// was re-parked) or a resume launch wins the boot: never baked, always
+/// pasted into the running agent. Blank prompts route to `None`. Pure for the
+/// same reason as [`route_initial_prompt`].
+pub fn route_followup_prompt(prompt: &str) -> CliPromptRouting {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        CliPromptRouting::None
     } else {
         CliPromptRouting::Deferred(trimmed.to_string())
     }
@@ -358,21 +385,29 @@ impl CliPromptDelivery {
     /// this process already holds it.
     pub fn try_claim(workspace_id: Uuid) -> Option<Self> {
         let set = CLI_PROMPT_DELIVERIES.get_or_init(Default::default);
+        // Recover from poisoning rather than propagating it: the set is a
+        // plain HashSet with no invariants a panicked holder could have
+        // broken, and treating poison as "already claimed" would silently
+        // disable prompt delivery for EVERY workspace until restart.
+        //
         // Release the registry guard BEFORE constructing the claim: an eagerly
         // built `Self` on the not-inserted path (`then_some`) would be dropped
         // while the guard is still alive, and `Drop` re-locks the same
         // (non-reentrant) mutex — a self-deadlock.
-        let inserted = set.lock().ok()?.insert(workspace_id);
+        let inserted = set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(workspace_id);
         inserted.then(|| Self(workspace_id))
     }
 }
 
 impl Drop for CliPromptDelivery {
     fn drop(&mut self) {
-        if let Some(set) = CLI_PROMPT_DELIVERIES.get()
-            && let Ok(mut set) = set.lock()
-        {
-            set.remove(&self.0);
+        if let Some(set) = CLI_PROMPT_DELIVERIES.get() {
+            set.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.0);
         }
     }
 }
@@ -766,12 +801,18 @@ fn seed_codex_update_dismissal() -> std::io::Result<()> {
 ///   no keystroke.
 /// - right-click is unbound from tmux's context menu so the web terminal can
 ///   use it for paste.
+/// - `default-shell /bin/sh`: window command strings (our launch bootstrap)
+///   are run via `default-shell -c`, and the bootstrap is POSIX sh
+///   (`vk_p="$(cat …)"`, `{ …; } | …`) — a fish/csh login shell would fail on
+///   it outright. The pane still ends in the USER'S shell: the bootstrap's
+///   final `exec "${SHELL:-/bin/sh}"` honors `$SHELL`.
 const CLI_TMUX_CONF: &str = "\
 # BetterCoding embedded terminal tmux server (socket: vibe-kanban).
 # Written by the backend before each CLI terminal attach - edits are overwritten.
 set -g mouse on
 set -s set-clipboard on
 set -as terminal-features ',xterm*:clipboard'
+set -g default-shell /bin/sh
 unbind-key -n MouseDown3Pane
 ";
 
@@ -800,6 +841,12 @@ fn ensure_cli_tmux_server_options() {
             .stderr(std::process::Stdio::null())
             .output()
     };
+
+    // default-shell governs how each NEW window command string (our POSIX-sh
+    // launch bootstrap) is parsed; apply unconditionally (idempotent, no-op
+    // without a running server) so servers started before this option joined
+    // the conf don't hand the bootstrap to a fish/csh login shell.
+    let _ = tmux(&["set-option", "-g", "default-shell", "/bin/sh"]);
 
     let Ok(probe) = tmux(&["show-options", "-s", "set-clipboard"]) else {
         return;
@@ -877,19 +924,21 @@ pub fn cli_tmux_available() -> bool {
     tmux_available()
 }
 
-/// Whether the AGENT (a non-shell process) currently owns a workspace's CLI
-/// pane. `None` when the pane itself can't be read (session gone).
+/// Whether THE EXPECTED AGENT (`program`, the spec's binary name) currently
+/// owns a workspace's CLI pane. `None` when the pane itself can't be read
+/// (session gone).
 ///
 /// tmux runs our bootstrap string via `default-shell -c`, and every launch
 /// stage shares that shell's process group — so `#{pane_current_command}`
 /// reports the outer shell for the pane's whole life (verified empirically)
 /// and can't distinguish "agent running" from "fallback shell". Instead this
 /// inspects the pane's process tree: the pane root (`#{pane_pid}`) or one of
-/// its direct children being a non-shell process means the agent is up. The
-/// bootstrap keeps the agent a direct child of the pane shell (it is not
-/// `exec`ed), and the missing-binary fallback `exec`s an interactive shell
-/// with no children — both shapes verified on a scratch socket.
-pub async fn cli_pane_agent_running(workspace_id: Uuid) -> Option<bool> {
+/// its direct children must BE the expected agent. Matching the exact program
+/// name (shebang exec sets the process comm to the script basename — verified
+/// on a scratch socket) rather than "any non-shell" means a user running
+/// vim/npm inside the missing-binary fallback shell can never satisfy the
+/// paste gate and receive a prompt meant for the agent.
+pub async fn cli_pane_agent_running(workspace_id: Uuid, program: &str) -> Option<bool> {
     if !tmux_available() {
         return None;
     }
@@ -933,7 +982,7 @@ pub async fn cli_pane_agent_running(workspace_id: Uuid) -> Option<bool> {
     if listing
         .lines()
         .filter_map(|line| line.split_whitespace().nth(1))
-        .any(|comm| !is_shell_command(comm))
+        .any(|comm| comm_matches_program(comm, program))
     {
         return Some(true);
     }
@@ -943,8 +992,19 @@ pub async fn cli_pane_agent_running(workspace_id: Uuid) -> Option<bool> {
     Some(
         process_comm(pane_pid)
             .await
-            .is_some_and(|comm| !is_shell_command(&comm)),
+            .is_some_and(|comm| comm_matches_program(&comm, program)),
     )
+}
+
+/// Whether a `ps`/`pgrep` process name is the expected agent binary. The
+/// kernel truncates comm to 15 bytes (`TASK_COMM_LEN` - 1), so long program
+/// names match on their truncated prefix; comparison happens on the
+/// normalized basename so `/usr/local/bin/claude` and `claude` agree.
+fn comm_matches_program(comm: &str, program: &str) -> bool {
+    let comm = normalize_comm(comm);
+    let program = normalize_comm(program);
+    comm == program
+        || (program.len() > 15 && program.get(..15).is_some_and(|prefix| comm == prefix))
 }
 
 /// Best-effort process name for a pid (`ps -o comm=`), raw (trimmed only —
@@ -963,33 +1023,11 @@ async fn process_comm(pid: u32) -> Option<String> {
     (!comm.is_empty()).then_some(comm)
 }
 
-/// Normalize a `ps`/`pgrep` process name for shell detection: login shells
-/// report as `-zsh`, and macOS `ps -o comm=` can report a full path.
+/// Normalize a `ps`/`pgrep` process name for comparison: login shells report
+/// as `-zsh`, and macOS `ps -o comm=` can report a full path.
 fn normalize_comm(comm: &str) -> &str {
     let comm = comm.trim().trim_start_matches('-');
     comm.rsplit('/').next().unwrap_or(comm)
-}
-
-/// Whether a process name is a shell — i.e. NOT the agent. Used to gate the
-/// deferred paste: pasting into a shell would execute/mangle the prompt as
-/// shell input (the bootstrap still starting up, or the missing-binary
-/// fallback shell), so delivery waits for a non-shell process in the pane.
-fn is_shell_command(cmd: &str) -> bool {
-    matches!(
-        normalize_comm(cmd),
-        "sh" | "bash"
-            | "zsh"
-            | "dash"
-            | "ash"
-            | "ksh"
-            | "mksh"
-            | "csh"
-            | "tcsh"
-            | "fish"
-            | "nu"
-            | "busybox"
-            | "login"
-    )
 }
 
 /// Inverse of [`cli_tmux_session_name`]: recover the workspace id from one of
@@ -1007,30 +1045,33 @@ pub(crate) fn workspace_id_from_cli_session_name(name: &str) -> Option<Uuid> {
 /// cleanup so sessions don't outlive their worktree). `=` forces exact-name
 /// matching — tmux `-t` is otherwise a prefix match.
 pub async fn kill_cli_tmux_session(workspace_id: Uuid) {
-    // Drop any transient prompt file alongside the session (covers the
+    if tmux_available() {
+        let session_name = cli_tmux_session_name(workspace_id);
+        match tokio::process::Command::new("tmux")
+            .args([
+                "-L",
+                CLI_TMUX_SOCKET,
+                "kill-session",
+                "-t",
+                &format!("={session_name}"),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+        {
+            // Non-success simply means no such session — the common case.
+            Ok(_) => {}
+            Err(e) => tracing::debug!("Failed to run tmux kill-session for {session_name}: {e}"),
+        }
+    }
+    // Drop any transient prompt file AFTER the session is dead (covers the
     // never-attached case where the bootstrap never ran to self-delete it).
+    // Order matters: removing the file first could yank it from under a
+    // bootstrap that is between `command -v` and `cat` — launching the agent
+    // with an empty prompt while a concurrent delivery confirmation reads
+    // "file gone + agent up" as delivered and clears the parked DB copy.
     remove_cli_prompt_file(workspace_id);
-    if !tmux_available() {
-        return;
-    }
-    let session_name = cli_tmux_session_name(workspace_id);
-    match tokio::process::Command::new("tmux")
-        .args([
-            "-L",
-            CLI_TMUX_SOCKET,
-            "kill-session",
-            "-t",
-            &format!("={session_name}"),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-    {
-        // Non-success simply means no such session — the common case.
-        Ok(_) => {}
-        Err(e) => tracing::debug!("Failed to run tmux kill-session for {session_name}: {e}"),
-    }
 }
 
 /// Capture the visible content of a workspace's CLI tmux pane (best-effort).
@@ -1084,13 +1125,23 @@ async fn tmux_ok(args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `text` must ride the buffer/bracketed-paste transport instead of
+/// plain `send-keys -l`: oversized texts hit tmux's ~16KB client-command
+/// ceiling, and MULTI-LINE texts sent as literal keystrokes would submit at
+/// the first newline (each `\n` acts as Enter to the TUI) — mangling the
+/// message while still reporting success. Single-line small texts keep the
+/// live-verified `send-keys -l` path.
+fn needs_paste_transport(text: &str) -> bool {
+    text.len() >= SEND_KEYS_PASTE_THRESHOLD || text.contains('\n')
+}
+
 /// Type `text` into a workspace's CLI tmux pane and submit it (Enter), as if the
 /// user typed it. This is the only way to re-prompt a LIVE, detached agent: the
 /// parked `pending_cli_prompt` path only fires when a fresh tmux session is
-/// created, so an already-running pane needs keystroke injection. Small texts go
-/// via `send-keys -l` (literal, so never interpreted as tmux key names); larger
-/// texts are staged through a namespaced tmux buffer and bracketed-pasted (no
-/// argv-length ceiling; embedded newlines don't submit early). Enter is a
+/// created, so an already-running pane needs keystroke injection. Small
+/// single-line texts go via `send-keys -l` (literal, so never interpreted as
+/// tmux key names); larger or multi-line texts are staged through a namespaced
+/// tmux buffer and bracketed-pasted ([`needs_paste_transport`]). Enter is a
 /// separate call so it submits rather than being typed verbatim. Best-effort.
 pub async fn send_cli_keys(workspace_id: Uuid, text: &str) -> bool {
     if !tmux_available() {
@@ -1101,7 +1152,9 @@ pub async fn send_cli_keys(workspace_id: Uuid, text: &str) -> bool {
     // full-hex names.
     let target = cli_tmux_session_name(workspace_id);
 
-    let delivered = if text.len() < SEND_KEYS_PASTE_THRESHOLD {
+    let delivered = if needs_paste_transport(text) {
+        paste_via_tmux_buffer(workspace_id, &target, text).await
+    } else {
         tmux_ok(&[
             "-L",
             CLI_TMUX_SOCKET,
@@ -1112,14 +1165,26 @@ pub async fn send_cli_keys(workspace_id: Uuid, text: &str) -> bool {
             text,
         ])
         .await
-    } else {
-        paste_via_tmux_buffer(workspace_id, &target, text).await
     };
     if !delivered {
         return false;
     }
 
-    tmux_ok(&["-L", CLI_TMUX_SOCKET, "send-keys", "-t", &target, "Enter"]).await
+    // The text is already IN the pane; failing the whole send over a flaky
+    // Enter would make the caller re-deliver the text on top of the residue
+    // (a doubled prompt). Retry the Enter once, then accept: delivered (the
+    // user can press Enter themselves), submission best-effort.
+    for _ in 0..2 {
+        if tmux_ok(&["-L", CLI_TMUX_SOCKET, "send-keys", "-t", &target, "Enter"]).await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    tracing::warn!(
+        "CLI send to workspace {workspace_id}: text delivered but Enter failed; \
+         left unsubmitted in the pane"
+    );
+    true
 }
 
 /// Stage `text` into a per-workspace tmux buffer via `load-buffer -` (text on
@@ -1378,24 +1443,27 @@ impl PtyService {
 
             // CLI mode rides tmux when present; otherwise (and for the
             // default side terminal) spawn the user's shell directly.
-            let (tmux_workspace, tmux_resume_id, tmux_initial_prompt, tmux_spec): (
+            let (tmux_workspace, tmux_resume_id, tmux_initial_prompt, tmux_deferred, tmux_spec): (
                 Option<Uuid>,
                 Option<String>,
                 Option<String>,
+                bool,
                 Option<CliLaunchSpec>,
             ) = match &command {
                 PtyCommand::TmuxCli {
                     workspace_id,
                     resume_session_id,
                     initial_prompt,
+                    deferred_prompt_pending,
                     spec,
                 } if tmux_available() => (
                     Some(*workspace_id),
                     resume_session_id.clone(),
                     initial_prompt.clone(),
+                    *deferred_prompt_pending,
                     Some(spec.clone()),
                 ),
-                _ => (None, None, None, None),
+                _ => (None, None, None, false, None),
             };
 
             // Never silently break the persistence promise: if CLI mode was
@@ -1497,6 +1565,7 @@ impl PtyService {
                     spec,
                     tmux_resume_id.as_deref(),
                     prompt_file.as_deref(),
+                    tmux_deferred,
                 ));
                 cmd.cwd(&working_dir);
                 // No shell-specific prompt configuration for the tmux client.
@@ -1747,7 +1816,7 @@ mod tests {
 
     #[test]
     fn cli_bootstrap_runs_program_then_drops_to_shell() {
-        let b = cli_bootstrap(&claude_spec(&[]), None, None);
+        let b = cli_bootstrap(&claude_spec(&[]), None, None, false);
         assert!(b.contains("command -v 'claude'"));
         assert!(
             b.ends_with(r#"exec "${SHELL:-/bin/sh}""#),
@@ -1759,7 +1828,7 @@ mod tests {
     fn cli_bootstrap_warns_with_install_hint_when_agent_missing() {
         // A not-installed agent must explain itself instead of silently dropping
         // to a bare shell.
-        let b = cli_bootstrap(&claude_spec(&[]), None, None);
+        let b = cli_bootstrap(&claude_spec(&[]), None, None, false);
         assert!(b.contains("if command -v 'claude'"));
         assert!(b.contains("is not installed or not on PATH"));
         assert!(
@@ -1779,6 +1848,7 @@ mod tests {
             &claude_spec(&[]),
             Some(id),
             Some(Path::new("/tmp/vk/prompt.txt")),
+            false,
         );
         assert!(b.contains(&format!("--resume {id}")));
         // The prompt file is ignored entirely when resuming.
@@ -1786,7 +1856,7 @@ mod tests {
         assert!(!b.contains("vk_p="));
         // Non-UUID (injection attempt) is rejected and never interpolated.
         let evil = "x; rm -rf ~";
-        let b = cli_bootstrap(&claude_spec(&[]), Some(evil), None);
+        let b = cli_bootstrap(&claude_spec(&[]), Some(evil), None, false);
         assert!(!b.contains("rm -rf"));
         assert!(!b.contains("--resume"));
     }
@@ -1797,14 +1867,14 @@ mod tests {
         // settings, so the model/sandbox/approval flags are NOT replayed.
         let id = "28b98f08-5f5f-4b1e-8c4e-41ae87c0c706";
         let spec = codex_spec(&["-m", "gpt-5.5", "-s", "danger-full-access"]);
-        let b = cli_bootstrap(&spec, Some(id), None);
+        let b = cli_bootstrap(&spec, Some(id), None, false);
         assert!(b.contains(&format!("'codex' resume {id}")));
         assert!(
             !b.contains("-m"),
             "base flags must not ride the resume: {b}"
         );
         // Continue fallback uses `resume --last`, falling back to a fresh TUI.
-        let cont = cli_bootstrap(&spec, None, None);
+        let cont = cli_bootstrap(&spec, None, None, false);
         assert!(cont.contains("'codex' resume --last || 'codex'"));
     }
 
@@ -1817,7 +1887,7 @@ mod tests {
         // word-split or parsed as shell (injection-safe by construction).
         let spec = claude_spec(&["--dangerously-skip-permissions"]);
         let file = Path::new("/tmp/vk/cli-prompts/abc.txt");
-        let b = cli_bootstrap(&spec, None, Some(file));
+        let b = cli_bootstrap(&spec, None, Some(file), false);
         assert!(
             b.len() < 2048,
             "bootstrap must stay small regardless of prompt size: {} bytes",
@@ -1836,7 +1906,7 @@ mod tests {
         // embedded quote is POSIX-escaped as `'\''`, so the dangerous run stays
         // inert data inside the quoting rather than terminating it.
         let evil = Path::new("/tmp/'; rm -rf ~; echo '.txt");
-        let b = cli_bootstrap(&spec, None, Some(evil));
+        let b = cli_bootstrap(&spec, None, Some(evil), false);
         assert!(
             b.contains(r"'\''; rm -rf ~; echo '\''"),
             "path quote must be escaped, not terminated: {b}"
@@ -1857,7 +1927,7 @@ mod tests {
         // the flag itself is quoted like every other word we emit.
         let flag_spec = CliLaunchSpec::new("gemini", vec![])
             .with_prompt_arg(CliPromptArg::Flag("-i".to_string()));
-        let b = cli_bootstrap(&flag_spec, None, Some(file));
+        let b = cli_bootstrap(&flag_spec, None, Some(file), false);
         assert!(b.contains("rm -f -- '/tmp/vk/p.txt'; 'gemini' '-i' \"$vk_p\""));
 
         // StdinPipe agents pipe the file into the program — no argv ceiling.
@@ -1865,7 +1935,7 @@ mod tests {
         // the file, so consumption is acknowledged (file gone) immediately —
         // not when the agent eventually exits.
         let pipe_spec = CliLaunchSpec::new("amp", vec![]).with_prompt_arg(CliPromptArg::StdinPipe);
-        let b = cli_bootstrap(&pipe_spec, None, Some(file));
+        let b = cli_bootstrap(&pipe_spec, None, Some(file), false);
         assert!(b.contains("{ cat '/tmp/vk/p.txt'; rm -f -- '/tmp/vk/p.txt'; } | 'amp'"));
     }
 
@@ -1874,9 +1944,45 @@ mod tests {
         // No prompt file (blank prompt filtered out by the caller) -> the
         // no-prompt continue/fresh path, exactly as before.
         let spec = claude_spec(&["--dangerously-skip-permissions"]);
-        let b = cli_bootstrap(&spec, None, None);
+        let b = cli_bootstrap(&spec, None, None, false);
         assert!(b.contains("--continue || 'claude'"));
         assert!(!b.contains("vk_p="));
+    }
+
+    #[test]
+    fn cli_bootstrap_deferred_prompt_launches_fresh_tui() {
+        // A paste delivery follows this launch: NO `--continue` (its doomed
+        // first leg on a brand-new workspace would live just long enough to
+        // swallow the paste and exit), just the bare agent TUI.
+        let spec = claude_spec(&["--dangerously-skip-permissions"]);
+        let b = cli_bootstrap(&spec, None, None, true);
+        assert!(!b.contains("--continue"), "no doomed continue leg: {b}");
+        assert!(b.contains("'claude' '--dangerously-skip-permissions'"));
+        // Resume still wins over a pending deferred paste at launch time.
+        let id = "28b98f08-5f5f-4b1e-8c4e-41ae87c0c706";
+        let b = cli_bootstrap(&spec, Some(id), None, true);
+        assert!(b.contains(&format!("--resume {id}")));
+    }
+
+    #[test]
+    fn route_followup_prompt_always_pastes_or_drops() {
+        // Follow-up delivery (live session / post-resume) is never baked.
+        assert_eq!(
+            route_followup_prompt("  keep going  "),
+            CliPromptRouting::Deferred("keep going".to_string())
+        );
+        assert_eq!(route_followup_prompt("   \n\t"), CliPromptRouting::None);
+    }
+
+    #[test]
+    fn multiline_or_oversized_text_takes_the_paste_transport() {
+        // `send-keys -l` types newlines as Enter keystrokes — a multi-line
+        // text would submit at its first line — so anything with a newline
+        // rides the bracketed-paste buffer path regardless of size.
+        assert!(!needs_paste_transport("single line"));
+        assert!(needs_paste_transport("two\nlines"));
+        assert!(needs_paste_transport(&"x".repeat(4096)));
+        assert!(!needs_paste_transport(&"x".repeat(4095)));
     }
 
     #[test]
@@ -2018,22 +2124,32 @@ mod tests {
     }
 
     #[test]
-    fn shell_commands_are_recognized_for_paste_gating() {
-        // The deferred paste must never target a pane whose process tree is
-        // all shells (bootstrap still starting, or the missing-binary
-        // fallback shell).
-        for shell in ["sh", "bash", "zsh", "dash", "fish"] {
-            assert!(is_shell_command(shell), "{shell} must gate the paste");
+    fn comm_matching_gates_paste_on_the_expected_agent_only() {
+        // The paste gate matches THE agent we launched, so a shell (bootstrap
+        // still starting / missing-binary fallback) — or an unrelated program
+        // the user ran in that fallback shell (vim, npm→node) — can never
+        // receive a prompt meant for the agent.
+        assert!(comm_matches_program("claude", "claude"));
+        assert!(comm_matches_program("codex", "codex"));
+        for not_agent in ["sh", "bash", "zsh", "vim", "node", "npm", "htop"] {
+            assert!(
+                !comm_matches_program(not_agent, "claude"),
+                "{not_agent} must not satisfy the claude gate"
+            );
         }
-        // Login-shell (`-zsh`) and full-path (`/bin/zsh`, macOS ps) spellings
-        // normalize to the same shell names.
-        assert!(is_shell_command("-zsh"));
-        assert!(is_shell_command("/bin/bash"));
-        assert!(is_shell_command(" -/usr/bin/fish".trim()));
-        // Agent TUIs (binary or interpreter names) unblock the paste.
-        for agent in ["claude", "codex", "node", "amp", "gemini"] {
-            assert!(!is_shell_command(agent), "{agent} must allow the paste");
-        }
+        // Full-path (macOS ps) and login-dash spellings normalize away.
+        assert!(comm_matches_program("/usr/local/bin/claude", "claude"));
+        assert!(comm_matches_program("-claude", "claude"));
+        // The kernel truncates comm to 15 bytes; long program names match on
+        // the truncated prefix.
+        assert!(comm_matches_program(
+            "verylongagentna",
+            "verylongagentname-cli"
+        ));
+        assert!(!comm_matches_program(
+            "verylongagentXX",
+            "verylongagentname-cli"
+        ));
     }
 
     #[test]
@@ -2045,6 +2161,7 @@ mod tests {
             &claude_spec(&["--dangerously-skip-permissions"]),
             None,
             None,
+            false,
         );
         assert!(b.contains(
             "'claude' '--dangerously-skip-permissions' --continue || 'claude' '--dangerously-skip-permissions'"
@@ -2054,7 +2171,7 @@ mod tests {
     #[test]
     fn cli_bootstrap_shell_quotes_agent_args_on_every_form() {
         // Glob/metacharacters in a model id stay inert (single-quoted)...
-        let b = cli_bootstrap(&claude_spec(&["--model", "opus[1m]"]), None, None);
+        let b = cli_bootstrap(&claude_spec(&["--model", "opus[1m]"]), None, None, false);
         assert!(b.contains("'--model' 'opus[1m]'"));
         // ...and the flags ride the continue/fresh fallback too.
         assert!(b.contains("'opus[1m]' --continue"));
@@ -2119,6 +2236,9 @@ mod tests {
         assert!(CLI_TMUX_CONF.contains("set -s set-clipboard on"));
         assert!(CLI_TMUX_CONF.contains("clipboard"));
         assert!(CLI_TMUX_CONF.contains("unbind-key -n MouseDown3Pane"));
+        // Window command strings (the POSIX-sh launch bootstrap) are parsed by
+        // default-shell; a fish/csh login shell would reject them outright.
+        assert!(CLI_TMUX_CONF.contains("set -g default-shell /bin/sh"));
     }
 
     #[test]

@@ -28,7 +28,9 @@ use db::{
 };
 use uuid::Uuid;
 
-use crate::pty::{capture_cli_pane, cli_tmux_available, cli_tmux_session_exists, send_cli_keys};
+use crate::pty::{
+    CliPromptDelivery, capture_cli_pane, cli_tmux_available, cli_tmux_session_exists, send_cli_keys,
+};
 
 /// How often to poll panes for limit banners and check for due wake-ups.
 const POLL_INTERVAL: Duration = Duration::from_secs(20);
@@ -443,6 +445,18 @@ async fn deliver_due_wakeups(db: &DBService, _now: DateTime<Utc>) -> Result<(), 
             }
         }
 
+        // Serialize with any in-flight parked-prompt delivery (terminal
+        // attach): two concurrent paste+Enter pairs into the same pane would
+        // interleave into one garbled submission. If a delivery holds the
+        // claim, leave the wake-up pending — the next tick retries after the
+        // delivery window closes.
+        let Some(_claim) = CliPromptDelivery::try_claim(wid) else {
+            tracing::debug!(
+                "loop: prompt delivery in flight for workspace {wid}; deferring wake-up"
+            );
+            continue;
+        };
+
         if send_cli_keys(wid, &prompt).await {
             if is_limit {
                 let _ = LoopAutomation::increment_attempts(pool, wid).await;
@@ -466,12 +480,23 @@ async fn deliver_due_wakeups(db: &DBService, _now: DateTime<Utc>) -> Result<(), 
 /// Best-effort: park `prompt` on the workspace's latest session so a terminal
 /// attach delivers it (the attach path pastes a parked prompt into a live
 /// agent pane, or hands it to the next fresh launch). Shared by both wake-up
-/// failure branches so the re-park policy has exactly one owner.
+/// failure branches so the re-park policy has exactly one owner. Parks only
+/// into an EMPTY slot: continuation boilerplate must never overwrite a
+/// parked-but-undelivered user prompt (that prompt delivers first, and the
+/// loop re-detects its limit banner afterwards).
 async fn repark_prompt(pool: &sqlx::SqlitePool, wid: Uuid, prompt: &str) {
     match Session::find_latest_by_workspace_id(pool, wid).await {
         Ok(Some(session)) => {
-            if let Err(e) = Session::set_pending_cli_prompt(pool, session.id, prompt).await {
-                tracing::warn!("loop: failed to re-park wake-up prompt for workspace {wid}: {e}");
+            match Session::set_pending_cli_prompt_if_empty(pool, session.id, prompt).await {
+                Ok(true) => {}
+                Ok(false) => tracing::info!(
+                    "loop: workspace {wid} already has a parked prompt; wake-up not re-parked"
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        "loop: failed to re-park wake-up prompt for workspace {wid}: {e}"
+                    )
+                }
             }
         }
         Ok(None) => {
