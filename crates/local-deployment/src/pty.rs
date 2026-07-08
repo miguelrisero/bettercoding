@@ -186,6 +186,47 @@ pub fn cli_prompt_fits_inline(prompt_arg: &CliPromptArg, byte_len: usize) -> boo
     }
 }
 
+/// How a workspace's parked initial prompt should be delivered to the freshly
+/// launched CLI agent — decided from the raw prompt and the agent's
+/// `prompt_arg`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CliPromptRouting {
+    /// Nothing to deliver: no prompt was carried, or it was blank after trim.
+    None,
+    /// Small enough to bake into the launch command's temp-file transport.
+    /// Carries the ORIGINAL (untrimmed) text — the bootstrap's
+    /// [`cli_prompt_file_content`] step re-trims and applies the leading-dash
+    /// guard, so downstream behavior is byte-identical to passing it straight
+    /// through.
+    Baked(String),
+    /// Too large to pass as one argv entry, or an agent with no launch-time
+    /// prompt arg: deliver by paste ([`send_cli_keys`]) after the pane is
+    /// confirmed up. Carries the trimmed text (what actually gets pasted).
+    Deferred(String),
+}
+
+/// Decide how to deliver a CLI-first workspace's initial prompt. Pure so the
+/// baked-vs-deferred routing that gates the deferred-clear recovery path is unit
+/// testable without a live tmux/socket. Blank prompts route to `None` (the
+/// caller carries no prompt and clears nothing); anything that fits inline is
+/// `Baked`, everything else `Deferred`.
+pub fn route_initial_prompt(
+    initial_prompt: Option<String>,
+    prompt_arg: &CliPromptArg,
+) -> CliPromptRouting {
+    let Some(prompt) = initial_prompt else {
+        return CliPromptRouting::None;
+    };
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        CliPromptRouting::None
+    } else if cli_prompt_fits_inline(prompt_arg, trimmed.len()) {
+        CliPromptRouting::Baked(prompt)
+    } else {
+        CliPromptRouting::Deferred(trimmed.to_string())
+    }
+}
+
 /// The exact bytes to write to a workspace's CLI prompt file for `prompt_arg`,
 /// or `None` when the (trimmed) prompt is blank — mirroring the old in-command
 /// quoting semantics so small prompts behave identically: the leading-dash
@@ -917,6 +958,12 @@ async fn paste_via_tmux_buffer(workspace_id: Uuid, target: &str, text: &str) -> 
 
     if let Some(mut stdin) = child.stdin.take() {
         if stdin.write_all(text.as_bytes()).await.is_err() {
+            // Reap the load-buffer child before bailing: dropping the Child does
+            // not wait() it, so a failed stdin write would otherwise leave a
+            // lingering/zombie tmux process. Drop stdin first (EOF), then kill
+            // (which also awaits the exit).
+            drop(stdin);
+            let _ = child.kill().await;
             return false;
         }
         // Drop stdin (EOF) so load-buffer completes.
@@ -1704,6 +1751,48 @@ mod tests {
         assert!(cli_prompt_fits_inline(&CliPromptArg::StdinPipe, 5_000_000));
         // Unsupported never bakes in.
         assert!(!cli_prompt_fits_inline(&CliPromptArg::Unsupported, 1));
+    }
+
+    #[test]
+    fn route_initial_prompt_bakes_defers_or_drops() {
+        // No prompt carried -> nothing to deliver, nothing to clear.
+        assert_eq!(
+            route_initial_prompt(None, &CliPromptArg::Positional),
+            CliPromptRouting::None
+        );
+        // Blank-after-trim -> None (the empty-TUI case must clear nothing).
+        assert_eq!(
+            route_initial_prompt(Some("   \n\t".to_string()), &CliPromptArg::Positional),
+            CliPromptRouting::None
+        );
+
+        // Small prompt that fits inline -> Baked, carrying the ORIGINAL
+        // (untrimmed) text; the bootstrap re-trims + dash-guards downstream.
+        assert_eq!(
+            route_initial_prompt(Some("  hi there  ".to_string()), &CliPromptArg::Positional),
+            CliPromptRouting::Baked("  hi there  ".to_string())
+        );
+
+        // Oversized Positional prompt -> Deferred (paste path), carrying the
+        // trimmed text that will actually be pasted.
+        let big = "x".repeat(MAX_INLINE_PROMPT_BYTES + 1);
+        assert_eq!(
+            route_initial_prompt(Some(format!("  {big}  ")), &CliPromptArg::Positional),
+            CliPromptRouting::Deferred(big.clone())
+        );
+
+        // StdinPipe has no argv ceiling, so even a huge prompt bakes in.
+        assert_eq!(
+            route_initial_prompt(Some(big.clone()), &CliPromptArg::StdinPipe),
+            CliPromptRouting::Baked(big)
+        );
+
+        // Unsupported agents have no launch-time transport -> always Deferred
+        // (delivered post-launch by paste), never dropped or baked.
+        assert_eq!(
+            route_initial_prompt(Some("hello".to_string()), &CliPromptArg::Unsupported),
+            CliPromptRouting::Deferred("hello".to_string())
+        );
     }
 
     #[test]

@@ -21,8 +21,9 @@ use executors::{
     profile::{ExecutorConfig, ExecutorConfigs},
 };
 use local_deployment::pty::{
-    CLI_PROMPT_PARKED_NOTICE, PtyCommand, cli_prompt_fits_inline, cli_tmux_available,
-    cli_tmux_session_exists, cli_tmux_session_name, remove_cli_prompt_file, send_cli_keys,
+    CLI_PROMPT_PARKED_NOTICE, CliPromptRouting, PtyCommand, cli_tmux_available,
+    cli_tmux_session_exists, cli_tmux_session_name, remove_cli_prompt_file, route_initial_prompt,
+    send_cli_keys,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -313,19 +314,13 @@ async fn terminal_ws(
             // after the pane is confirmed up (see handle_terminal_ws), so they're
             // never truncated and never silently lost. Either way the parked
             // prompt is cleared only after delivery is confirmed.
-            let baked_prompt = match initial_prompt {
-                Some(prompt) => {
-                    let trimmed = prompt.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else if cli_prompt_fits_inline(&spec.prompt_arg, trimmed.len()) {
-                        Some(prompt)
-                    } else {
-                        deferred_prompt = Some(trimmed.to_string());
-                        None
-                    }
+            let baked_prompt = match route_initial_prompt(initial_prompt, &spec.prompt_arg) {
+                CliPromptRouting::None => None,
+                CliPromptRouting::Baked(prompt) => Some(prompt),
+                CliPromptRouting::Deferred(prompt) => {
+                    deferred_prompt = Some(prompt);
+                    None
                 }
-                None => None,
             };
             // Remember which session's prompt to clear once delivery is
             // confirmed (only when we actually carried a prompt).
@@ -455,6 +450,11 @@ async fn handle_terminal_ws(
                 workspace_id
             );
             let _ = send_error(&mut socket, CLI_PROMPT_PARKED_NOTICE).await;
+            // Tear down the PtyService entry for the (already-dead) tmux client
+            // before bailing; otherwise this early return leaks the session map
+            // entry — one per failed attach — that the normal exit path below
+            // would have reaped via close_session.
+            let _ = deployment.pty().close_session(session_id).await;
             return;
         }
     }
