@@ -398,10 +398,15 @@ async fn terminal_ws(
                         });
                     }
                     CliPromptRouting::Deferred(prompt) => {
-                        // Only a FRESH launch needs the bare-TUI bootstrap;
-                        // for an existing session (or resume) the bootstrap
-                        // is ignored / resume wins.
-                        deferred_prompt_pending = fresh_launch;
+                        // Request the bare-TUI bootstrap whenever a resume won't
+                        // apply — not just when the session is currently absent.
+                        // A live session can exit between this check and
+                        // `new-session -A`; if it does, the freshly created pane
+                        // must NOT run `continue_launch`'s doomed `--continue`
+                        // leg (the deferred paste could land on it and be lost).
+                        // When the session survives, the bootstrap is ignored by
+                        // `-A`, so requesting it is harmless.
+                        deferred_prompt_pending = !resume_will_apply;
                         prompt_delivery = Some(PromptDelivery {
                             workspace_id: query.workspace_id,
                             clear_session_id,

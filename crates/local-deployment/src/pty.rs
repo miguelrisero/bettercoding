@@ -1187,6 +1187,9 @@ pub async fn send_cli_keys(workspace_id: Uuid, text: &str) -> bool {
     let delivered = if needs_paste_transport(text) {
         paste_via_tmux_buffer(workspace_id, &target, text).await
     } else {
+        // `--` ends option parsing so text starting with `-` (e.g. a prompt
+        // like "-rf ...") is treated as a literal key rather than an unknown
+        // send-keys flag (verified: `send-keys -l "-x"` fails "unknown flag").
         tmux_ok(&[
             "-L",
             CLI_TMUX_SOCKET,
@@ -1194,6 +1197,7 @@ pub async fn send_cli_keys(workspace_id: Uuid, text: &str) -> bool {
             "-t",
             &target,
             "-l",
+            "--",
             text,
         ])
         .await
