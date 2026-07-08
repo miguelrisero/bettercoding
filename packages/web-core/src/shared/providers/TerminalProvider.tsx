@@ -30,6 +30,17 @@ interface ConnectionGeneration {
    * when a remounted component re-registers while this generation is live.
    */
   getEndpoint: () => string | null;
+  /**
+   * Bumped whenever `getEndpoint` is refreshed (remount / session switch /
+   * resize tick re-registration). An in-flight open snapshots this before
+   * awaiting: an unchanged epoch means the endpoint source is untouched and
+   * the socket is safe to register even if the pane went hidden mid-open; a
+   * changed epoch requires re-validating against the CURRENT endpoint (see
+   * `connectWebSocket`), so a session switch that races the open can never
+   * bind the pane to the previous conversation — including when the pane is
+   * hidden at resolve time and the endpoint itself is unmeasurable.
+   */
+  endpointEpoch: number;
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
   /** Cancelled (tab closed / superseded by a newer generation). */
@@ -356,6 +367,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
         connectionCallbacksRef.current.set(tabId, { onData, onExit, getSize });
         if (liveGeneration && !liveGeneration.closed) {
           liveGeneration.getEndpoint = getEndpoint;
+          liveGeneration.endpointEpoch += 1;
         }
         return makeFacade(tabId);
       }
@@ -385,6 +397,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
 
       const generation: ConnectionGeneration = {
         getEndpoint,
+        endpointEpoch: 0,
         retryCount: 0,
         retryTimer: null,
         closed: false,
@@ -449,6 +462,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
           scheduleAttempt(UNMEASURED_POLL_MS);
           return;
         }
+        const attemptEpoch = generation.endpointEpoch;
 
         void (async () => {
           try {
@@ -466,22 +480,30 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
             // The endpoint source may have been refreshed while the open was
             // in flight (remount / session switch): registering this socket
             // would bind the visible pane to the PREVIOUS session's tmux.
-            // Size-only drift is fine (the post-open resize corrects it) —
-            // only a material change (session/mode/workspace) discards the
-            // attempt. Not a failure: re-kick through the single-timer path
-            // without spending the retry budget. A null current endpoint
-            // (pane went hidden mid-open) keeps the socket — hidden panes
-            // keep connections by design.
-            const currentEndpoint = generation.getEndpoint();
-            if (
-              currentEndpoint !== null &&
-              !terminalEndpointsEquivalent(endpoint, currentEndpoint)
-            ) {
-              ws.close();
-              if (generation.retryTimer === null) {
-                scheduleAttempt(0);
+            // Unchanged epoch = untouched source, safe (even if the pane hid
+            // mid-open: identity can't change without a refresh, every
+            // refresh bumps the epoch). Changed epoch: size-only drift still
+            // passes (the post-open resize corrects it), a material change
+            // (session/mode/workspace) discards — and an unmeasurable
+            // current endpoint discards CONSERVATIVELY, because the refresh
+            // may have changed the session and there is no URL to prove
+            // otherwise; the poll re-opens with the right one when shown.
+            // Neither discard is a failure: re-kick through the single-timer
+            // path without spending the retry budget.
+            if (generation.endpointEpoch !== attemptEpoch) {
+              const currentEndpoint = generation.getEndpoint();
+              if (
+                currentEndpoint === null ||
+                !terminalEndpointsEquivalent(endpoint, currentEndpoint)
+              ) {
+                ws.close();
+                if (generation.retryTimer === null) {
+                  scheduleAttempt(
+                    currentEndpoint === null ? UNMEASURED_POLL_MS : 0
+                  );
+                }
+                return;
               }
-              return;
             }
 
             // End of THIS connection's life without a successor: cancel the
