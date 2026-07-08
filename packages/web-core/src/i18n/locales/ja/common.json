@@ -477,7 +477,8 @@
     "permissionPlan": "計画",
     "agent": "エージェント",
     "default": "デフォルト",
-    "model": "モデル"
+    "model": "モデル",
+    "useCustom": "\"{{query}}\" を使用"
   },
   "crashScreen": {
     "title": "問題が発生しました",

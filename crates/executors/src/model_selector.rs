@@ -118,6 +118,7 @@ impl ReasoningOption {
             "high" => Some(3),
             "xhigh" => Some(4),
             "max" => Some(5),
+            "ultracode" => Some(6),
             _ => None,
         };
 
@@ -148,6 +149,7 @@ impl ReasoningOption {
 fn reasoning_label(id: &str) -> String {
     match id {
         "xhigh" => "Extra High".to_string(),
+        "ultracode" => "Ultracode".to_string(),
         _ => id.to_case(Case::Title),
     }
 }

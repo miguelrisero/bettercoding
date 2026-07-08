@@ -192,6 +192,35 @@ pub enum ClaudeEffort {
     High,
     XHigh,
     Max,
+    // Undocumented accepted `--effort` alias on the interactive CLI (2.1.204):
+    // resolves to `xhigh` plus standing dynamic-workflow orchestration for the
+    // session. Only the interactive `claude` TUI understands the alias — the
+    // pinned headless CLI (2.1.154) hard-rejects unknown values, so the headless
+    // path maps it to its underlying `xhigh` tier (see
+    // `ClaudeEffort::headless_arg`). Plain `//` (not `///`) keeps the generated
+    // JSON schema a flat string enum for the settings agent-config editor.
+    Ultracode,
+}
+
+impl ClaudeEffort {
+    /// Effort value to pass to the pinned headless CLI (`@2.1.154`). The
+    /// `ultracode` alias does not exist there (it warns-and-ignores unknown
+    /// values), and the dynamic-workflow orchestration it enables is
+    /// interactive-only, so headless runs use the equivalent `xhigh` tier.
+    fn headless_arg(&self) -> &'static str {
+        match self {
+            ClaudeEffort::Low => "low",
+            ClaudeEffort::Medium => "medium",
+            ClaudeEffort::High => "high",
+            ClaudeEffort::XHigh => "xhigh",
+            ClaudeEffort::Max => "max",
+            // 2.1.154 hard-rejects the `ultracode` alias ("argument is invalid.
+            // It must be one of: low, medium, high, xhigh, max"), and its
+            // dynamic-workflow orchestration is interactive-only, so headless
+            // runs use the underlying xhigh tier.
+            ClaudeEffort::Ultracode => "xhigh",
+        }
+    }
 }
 
 #[derive(Derivative, Clone, Serialize, Deserialize, TS, JsonSchema)]
@@ -260,7 +289,7 @@ impl ClaudeCode {
             builder = builder.extend_params(["--model", model.as_str()]);
         }
         if let Some(effort) = &self.effort {
-            builder = builder.extend_params(["--effort", effort.as_ref()]);
+            builder = builder.extend_params(["--effort", effort.headless_arg()]);
         }
         if let Some(agent) = &self.agent {
             builder = builder.extend_params(["--agent", agent]);
@@ -346,7 +375,7 @@ impl ClaudeCode {
 /// Models whose CLI accepts a reasoning `--effort` flag (Opus / Sonnet
 /// families). Haiku has no effort control.
 pub(crate) fn model_supports_effort(id: &str) -> bool {
-    id.contains("opus") || id.contains("sonnet")
+    id.contains("opus") || id.contains("sonnet") || id.contains("fable")
 }
 
 /// Claude model ids use hyphens in the version (e.g. `claude-opus-4-8`), but a
@@ -424,6 +453,49 @@ mod cli_launch_tests {
             interactive_cli_args(Some("haiku"), Some("max")),
             v(&["--model", "haiku"])
         );
+    }
+
+    #[test]
+    fn fable_models_carry_effort() {
+        // Regression: model_supports_effort() previously excluded fable, so
+        // CLI-mode launches of claude-fable-5 silently dropped --effort.
+        assert_eq!(
+            interactive_cli_args(Some("claude-fable-5"), Some("xhigh")),
+            v(&["--model", "claude-fable-5", "--effort", "xhigh"])
+        );
+        assert_eq!(
+            interactive_cli_args(Some("fable"), Some("ultracode")),
+            v(&["--model", "fable", "--effort", "ultracode"])
+        );
+    }
+
+    #[test]
+    fn interactive_passes_ultracode_verbatim() {
+        // The interactive CLI (2.1.204) understands the `ultracode` alias, so it
+        // must be forwarded unchanged rather than mapped to xhigh.
+        assert_eq!(
+            interactive_cli_args(Some("opus"), Some("ultracode")),
+            v(&["--model", "opus", "--effort", "ultracode"])
+        );
+    }
+
+    use super::ClaudeEffort;
+
+    #[test]
+    fn ultracode_effort_round_trips() {
+        let effort: ClaudeEffort = "ultracode".parse().unwrap();
+        assert_eq!(effort, ClaudeEffort::Ultracode);
+        assert_eq!(effort.as_ref(), "ultracode");
+    }
+
+    #[test]
+    fn ultracode_maps_to_xhigh_in_headless() {
+        // The pinned headless CLI (2.1.154) does not know the `ultracode` alias,
+        // and its dynamic-workflow orchestration is interactive-only, so headless
+        // runs fall back to the underlying xhigh tier.
+        assert_eq!(ClaudeEffort::Ultracode.headless_arg(), "xhigh");
+        assert_eq!(ClaudeEffort::XHigh.headless_arg(), "xhigh");
+        assert_eq!(ClaudeEffort::Max.headless_arg(), "max");
     }
 
     #[test]
@@ -513,7 +585,7 @@ fn default_discovered_options() -> crate::executor_discovery::ExecutorDiscovered
     };
 
     let effort_options = ReasoningOption::from_names_with_default(
-        ["low", "medium", "high", "xhigh", "max"].map(String::from),
+        ["low", "medium", "high", "xhigh", "max", "ultracode"].map(String::from),
         CLI_DEFAULT_EFFORT,
     );
 
@@ -521,6 +593,7 @@ fn default_discovered_options() -> crate::executor_discovery::ExecutorDiscovered
         model_selector: ModelSelectorConfig {
             providers: vec![],
             models: [
+                ("fable", "Fable"),
                 ("opus", "Opus"),
                 ("opus[1m]", "Opus (1M context)"),
                 ("sonnet", "Sonnet"),

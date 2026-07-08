@@ -477,7 +477,8 @@
     "permissionPlan": "计划",
     "agent": "代理",
     "default": "默认",
-    "model": "模型"
+    "model": "模型",
+    "useCustom": "使用 \"{{query}}\""
   },
   "crashScreen": {
     "title": "出了点问题",

@@ -50,8 +50,6 @@ export interface ModelSelectorPopoverProps {
   resolvedTheme?: 'light' | 'dark';
 }
 
-const MODEL_LIST_PAGE_SIZE = 8;
-
 function getModelKey(model: ModelListModel): string {
   return model.provider_id ? `${model.provider_id}/${model.id}` : model.id;
 }
@@ -335,7 +333,9 @@ export function ModelSelectorPopover({
       selectedProviderId,
       selectedModelId
     );
-    showSearch = models.length > MODEL_LIST_PAGE_SIZE;
+    // Always offer the search box for the flat (no-provider) picker so a custom
+    // model id can be typed even when the built-in list is short.
+    showSearch = true;
 
     content = (
       <ModelList
@@ -351,6 +351,7 @@ export function ModelSelectorPopover({
         showDefaultOption={showDefaultOption}
         onSelectDefault={onSelectDefault}
         scrollRef={scrollRef}
+        onUseCustomModel={(id) => onModelSelect(id)}
       />
     );
   }

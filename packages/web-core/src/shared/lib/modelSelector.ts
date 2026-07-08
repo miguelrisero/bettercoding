@@ -66,6 +66,20 @@ export function parseModelId(
   };
 }
 
+/**
+ * Claude model ids whose CLI accepts a reasoning `--effort` flag (Opus / Sonnet
+ * / Fable families). Mirrors `model_supports_effort` in the Rust executor. Used
+ * to decide whether an injected/custom model should inherit effort options.
+ */
+function modelSupportsEffort(id: string): boolean {
+  const lower = id.toLowerCase();
+  return (
+    lower.includes('opus') ||
+    lower.includes('sonnet') ||
+    lower.includes('fable')
+  );
+}
+
 export function appendPresetModel(
   config: ModelSelectorConfig | null,
   presetModel: string | null | undefined
@@ -82,6 +96,18 @@ export function appendPresetModel(
   );
   if (exists) return config;
 
+  // An injected/custom model has no reasoning options of its own. If it looks
+  // like an effort-capable Claude model, inherit the effort choices from the
+  // first config model that has them so the user can still pick an effort
+  // (e.g. Miguel's preset `claude-fable-5`). Gated on `modelSupportsEffort` so
+  // executors whose models legitimately have no reasoning options (e.g. codex
+  // providers) are unaffected.
+  const reasoningOptions =
+    !providerId && modelSupportsEffort(modelId)
+      ? (config.models.find((m) => m.reasoning_options.length > 0)
+          ?.reasoning_options ?? [])
+      : [];
+
   return {
     ...config,
     models: [
@@ -89,7 +115,7 @@ export function appendPresetModel(
         id: modelId,
         name: modelId,
         provider_id: providerId,
-        reasoning_options: [],
+        reasoning_options: reasoningOptions,
       },
       ...config.models,
     ],

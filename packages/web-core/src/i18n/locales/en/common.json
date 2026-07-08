@@ -491,7 +491,8 @@
     "permissionPlan": "Plan",
     "agent": "Agent",
     "default": "Default",
-    "model": "Model"
+    "model": "Model",
+    "useCustom": "Use \"{{query}}\""
   },
   "crashScreen": {
     "title": "Something went wrong",
