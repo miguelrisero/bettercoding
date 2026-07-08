@@ -478,7 +478,8 @@
     "permissionPlan": "계획",
     "agent": "에이전트",
     "default": "기본값",
-    "model": "모델"
+    "model": "모델",
+    "useCustom": "\"{{query}}\" 사용"
   },
   "crashScreen": {
     "title": "문제가 발생했습니다",

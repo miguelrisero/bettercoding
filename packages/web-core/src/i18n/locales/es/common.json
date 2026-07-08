@@ -478,7 +478,8 @@
     "permissionPlan": "Plan",
     "agent": "Agente",
     "default": "Predeterminado",
-    "model": "Modelo"
+    "model": "Modelo",
+    "useCustom": "Usar \"{{query}}\""
   },
   "crashScreen": {
     "title": "Algo salió mal",

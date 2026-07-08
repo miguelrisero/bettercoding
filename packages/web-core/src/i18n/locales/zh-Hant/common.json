@@ -478,7 +478,8 @@
     "permissionPlan": "計畫",
     "agent": "代理",
     "default": "預設",
-    "model": "模型"
+    "model": "模型",
+    "useCustom": "使用 \"{{query}}\""
   },
   "crashScreen": {
     "title": "發生了錯誤",

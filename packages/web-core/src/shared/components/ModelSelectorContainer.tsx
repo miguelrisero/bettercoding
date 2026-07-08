@@ -9,8 +9,8 @@ import {
   SlidersHorizontalIcon,
   type Icon,
 } from '@phosphor-icons/react';
-import type { BaseCodingAgent, ExecutorConfig, ModelInfo } from 'shared/types';
-import { PermissionPolicy } from 'shared/types';
+import type { ExecutorConfig, ModelInfo } from 'shared/types';
+import { BaseCodingAgent, PermissionPolicy } from 'shared/types';
 import { toPrettyCase } from '@/shared/lib/string';
 import {
   getModelKey,
@@ -117,7 +117,22 @@ export function ModelSelectorContainer({
   }, [streamError]);
 
   const baseConfig = streamConfig;
-  const config = appendPresetModel(baseConfig, presetOptions?.model_id);
+  // Claude is the only executor whose downstream tolerates arbitrary model ids
+  // and uses `--effort`, so it alone gets free-text custom entry + the effort
+  // fallback. Always surface the profile preset (unchanged behavior). For Claude,
+  // additionally surface the current override — which may be a free-text custom
+  // id — so it shows in the picker with an effort selector; other executors never
+  // produce free-text overrides, so injecting theirs would only risk surfacing a
+  // stale id. appendPresetModel is a no-op when the id is already present.
+  const isClaude = agent === BaseCodingAgent.CLAUDE_CODE;
+  const configWithPreset = appendPresetModel(
+    baseConfig,
+    presetOptions?.model_id,
+    isClaude
+  );
+  const config = isClaude
+    ? appendPresetModel(configWithPreset, executorConfig?.model_id, isClaude)
+    : configWithPreset;
 
   const availableProviderIds = useMemo(
     () => config?.providers.map((item) => item.id) ?? [],
@@ -492,6 +507,7 @@ export function ModelSelectorContainer({
           expandedProviderId={expandedProviderId}
           onExpandedProviderIdChange={setExpandedProviderId}
           resolvedTheme={resolvedTheme}
+          allowCustomModel={isClaude}
         />
       )}
 

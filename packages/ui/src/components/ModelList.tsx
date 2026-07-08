@@ -117,6 +117,13 @@ export interface ModelListProps {
   showDefaultOption?: boolean;
   onSelectDefault?: () => void;
   scrollRef?: Ref<HTMLDivElement>;
+  /**
+   * When provided, a "Use \"<query>\"" row is offered whenever the trimmed
+   * search query matches no model, letting the user select an arbitrary
+   * (custom) model id. The downstream override chain tolerates ids not present
+   * in the config.
+   */
+  onUseCustomModel?: (id: string) => void;
 }
 
 export function ModelList({
@@ -132,9 +139,11 @@ export function ModelList({
   showDefaultOption = false,
   onSelectDefault,
   scrollRef,
+  onUseCustomModel,
 }: ModelListProps) {
   const { t } = useTranslation('common');
-  const normalizedSearch = searchQuery.trim().toLowerCase();
+  const trimmedSearch = searchQuery.trim();
+  const normalizedSearch = trimmedSearch.toLowerCase();
 
   const filteredModels = normalizedSearch
     ? models.filter((model) => {
@@ -144,7 +153,37 @@ export function ModelList({
       })
     : models;
 
-  const showEmptyState = filteredModels.length === 0 && !showDefaultOption;
+  const showCustomEntry =
+    Boolean(onUseCustomModel) &&
+    trimmedSearch.length > 0 &&
+    filteredModels.length === 0;
+  const showEmptyState =
+    filteredModels.length === 0 && !showDefaultOption && !showCustomEntry;
+
+  const customEntryRow = showCustomEntry ? (
+    <div
+      key="__custom__"
+      className={cn(
+        'group flex items-center rounded-sm mx-half',
+        'transition-colors duration-100',
+        'focus-within:bg-secondary',
+        'text-normal hover:bg-secondary/60'
+      )}
+    >
+      <button
+        type="button"
+        onClick={() => onUseCustomModel?.(trimmedSearch)}
+        className={cn(
+          'flex-1 min-w-0 py-half pl-base pr-half text-left',
+          'focus:outline-none focus-visible:ring-1 focus-visible:ring-brand'
+        )}
+      >
+        <span className="block text-sm truncate" title={trimmedSearch}>
+          {t('modelSelector.useCustom', { query: trimmedSearch })}
+        </span>
+      </button>
+    </div>
+  ) : null;
   const isDefaultSelected = selectedModelId === null;
   const normalizedSelectedId = selectedModelId?.toLowerCase() ?? null;
 
@@ -269,6 +308,7 @@ export function ModelList({
               </div>
             );
           })}
+          {customEntryRow}
           {defaultRow}
         </div>
       )}
