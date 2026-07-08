@@ -65,16 +65,23 @@ fn normalize_arrows(s: &str) -> String {
 fn canonicalize_title(raw: &str, max_chars: usize) -> String {
     let joined = normalize_arrows(&raw.split_whitespace().collect::<Vec<_>>().join(" "));
     let capped: String = joined.chars().take(max_chars).collect();
-    let trimmed = capped.trim_end_matches(['.', ',', ':', ';', ' ']);
-    // A cap cut inside " -> " leaves a dangling arrow fragment; strip it, then
-    // re-trim any punctuation it was shielding (e.g. "word. ->" -> "word").
-    let trimmed = trimmed
-        .strip_suffix(" ->")
-        .or_else(|| trimmed.strip_suffix(" -"))
-        .unwrap_or(trimmed);
-    trimmed
-        .trim_end_matches(['.', ',', ':', ';', ' '])
-        .to_string()
+    // A cap cut inside " -> " (or degenerate input like "a -> ->") leaves
+    // dangling arrow fragments, possibly shielding more trailing punctuation
+    // ("word. ->"). Trim punctuation and arrow fragments to a fixpoint — each
+    // pass strictly shortens the string, so the loop terminates.
+    let mut tail = capped.as_str();
+    loop {
+        let before = tail;
+        tail = tail.trim_end_matches(['.', ',', ':', ';', ' ']);
+        tail = tail
+            .strip_suffix(" ->")
+            .or_else(|| tail.strip_suffix(" -"))
+            .unwrap_or(tail);
+        if tail.len() == before.len() {
+            break;
+        }
+    }
+    tail.to_string()
 }
 
 /// If the user's first line already reads like a deliberate title, return it
@@ -89,23 +96,29 @@ fn canonicalize_title(raw: &str, max_chars: usize) -> String {
 pub fn first_line_title_hint(message: &str) -> Option<String> {
     let mut lines = message.trim().lines();
     let raw_first = lines.next()?.trim();
-    // Strip a Markdown ATX heading marker (a leading '#' run followed by
-    // whitespace, or a bare "#..." line); keep issue-ref-style prefixes like
-    // "#27 -> ..." intact — those '#' are content, not markup.
+    // Strip a Markdown ATX heading marker (1-6 leading '#' followed by
+    // whitespace or end of line, per CommonMark); keep issue-ref-style
+    // prefixes like "#27 -> ..." and 7+-hash runs intact — those '#' are
+    // content, not markup.
     let hashes = raw_first.len() - raw_first.trim_start_matches('#').len();
-    let first = if hashes == raw_first.len() {
-        ""
-    } else if hashes > 0 && raw_first[hashes..].starts_with(char::is_whitespace) {
-        raw_first[hashes..].trim_start()
+    let first = if (1..=6).contains(&hashes) {
+        if hashes == raw_first.len() {
+            ""
+        } else if raw_first[hashes..].starts_with(char::is_whitespace) {
+            raw_first[hashes..].trim_start()
+        } else {
+            raw_first
+        }
     } else {
         raw_first
     };
     if first.is_empty() {
         return None;
     }
-    // Normalize the unicode arrow BEFORE measuring, so acceptance bounds
-    // exactly the form that gets stored (" → " grows into " -> ").
-    let first = normalize_arrows(first);
+    // Collapse whitespace and normalize unicode arrows BEFORE measuring, so
+    // acceptance bounds exactly the form that gets stored (runs of spaces
+    // shrink; " → " grows into " -> ").
+    let first = normalize_arrows(&first.split_whitespace().collect::<Vec<_>>().join(" "));
     let char_count = first.chars().count();
     let has_arrow = first.contains(" -> ") && char_count <= HINT_ARROW_MAX_CHARS;
     let has_body = lines.any(|l| !l.trim().is_empty());
@@ -327,6 +340,24 @@ mod tests {
         );
         // A bare hash run is a heading marker with no content.
         assert!(first_line_title_hint("###\n\nbody").is_none());
+        // 7+ hashes are not an ATX heading (CommonMark) — kept as content.
+        assert_eq!(
+            first_line_title_hint("####### bp -> runflow dogfood").as_deref(),
+            Some("####### bp -> runflow dogfood")
+        );
+    }
+
+    #[test]
+    fn hint_measures_length_on_collapsed_whitespace() {
+        // Interior space runs collapse before the length check, so a line
+        // whose RAW form exceeds the arrow cap but whose stored form is short
+        // is still accepted.
+        let padded = format!("bp{}->{}dogfood", " ".repeat(50), " ".repeat(50));
+        assert!(padded.chars().count() > 100);
+        assert_eq!(
+            first_line_title_hint(&padded).as_deref(),
+            Some("bp -> dogfood")
+        );
     }
 
     #[test]
@@ -489,6 +520,15 @@ mod tests {
         let s = format!("{{\"title\":\"{keyword} -> gist\",\"branch\":\"x\"}}");
         let title = parse_workspace_names(&s).unwrap().title;
         assert_eq!(title, keyword);
+        // Chained fragments trim to a fixpoint, not just one pass.
+        let s = "{\"title\":\"a -> -> \",\"branch\":\"x\"}";
+        assert_eq!(parse_workspace_names(s).unwrap().title, "a");
+        let s = "{\"title\":\"fix -> a - -\",\"branch\":\"x\"}";
+        assert_eq!(parse_workspace_names(s).unwrap().title, "fix -> a");
+        // A 43-char keyword + \" -> -> b\" cap-cut at 48 chains two fragments.
+        let keyword = "a".repeat(43);
+        let s = format!("{{\"title\":\"{keyword} -> -> b\",\"branch\":\"x\"}}");
+        assert_eq!(parse_workspace_names(&s).unwrap().title, keyword);
     }
 
     #[test]
