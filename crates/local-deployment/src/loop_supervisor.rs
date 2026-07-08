@@ -468,6 +468,26 @@ async fn deliver_due_wakeups(db: &DBService, _now: DateTime<Utc>) -> Result<(), 
             continue;
         };
 
+        // "Parked prompt delivers first" holds on the SEND path too: if the
+        // workspace has an undelivered prompt queued (an earlier delivery went
+        // unconfirmed and left it parked), don't send the wake-up ahead of it —
+        // that would reach the agent out of order. Leave the wake-up pending;
+        // a terminal attach delivers and clears the parked prompt, then a later
+        // tick delivers the wake-up. (Transient DB error: also retry.)
+        match Session::peek_pending_cli_prompt_for_workspace(pool, wid).await {
+            Ok(Some(_)) => {
+                tracing::debug!(
+                    "loop: workspace {wid} has a parked prompt; deferring wake-up until it delivers"
+                );
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("loop: failed to check parked prompt for workspace {wid}: {e}");
+                continue;
+            }
+        }
+
         if send_cli_keys(wid, &prompt).await {
             if is_limit {
                 let _ = LoopAutomation::increment_attempts(pool, wid).await;

@@ -336,8 +336,17 @@ async fn terminal_ws(
             let mut baked_prompt = None;
             let mut deferred_prompt_pending = false;
             if let Some((peeked, claim, clear_session_id)) = carried {
-                let fresh_launch = resume_session_id.is_none()
-                    && !cli_tmux_session_exists(query.workspace_id).await;
+                // Match the bootstrap's resume predicate EXACTLY (it filters the
+                // id through is_uuid before resuming): a non-UUID resume id is
+                // NOT resumed by the launch, so it must count as a fresh launch
+                // here too. Otherwise the prompt would route as a follow-up
+                // paste into a continue_launch's doomed `--continue` leg (the
+                // same loss hazard the racing-attach path avoids).
+                let resume_will_apply = resume_session_id
+                    .as_deref()
+                    .is_some_and(|id| Uuid::parse_str(id).is_ok());
+                let fresh_launch =
+                    !resume_will_apply && !cli_tmux_session_exists(query.workspace_id).await;
                 let routed = if fresh_launch {
                     route_initial_prompt(Some(peeked.clone()), &spec.prompt_arg)
                 } else {
