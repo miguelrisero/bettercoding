@@ -58,11 +58,12 @@ pub fn first_line_title_hint(message: &str) -> Option<String> {
     if first.is_empty() {
         return None;
     }
-    let has_arrow = (first.contains(" -> ") || first.contains(" → "))
-        && first.chars().count() <= HINT_ARROW_MAX_CHARS;
+    let char_count = first.chars().count();
+    let has_arrow =
+        (first.contains(" -> ") || first.contains(" → ")) && char_count <= HINT_ARROW_MAX_CHARS;
     let has_body = lines.any(|l| !l.trim().is_empty());
     let word_count = first.split_whitespace().count();
-    let short_enough = word_count <= 8 && first.chars().count() <= 48;
+    let short_enough = word_count <= 8 && char_count <= 48;
     if !(has_arrow || (short_enough && has_body)) {
         return None;
     }
@@ -195,8 +196,8 @@ fn parse_workspace_names(stdout: &str) -> Option<WorkspaceNames> {
         .take(TITLE_MAX_CHARS)
         .collect::<String>()
         // A mid-word cut (or a model-emitted period) must never leave dangling
-        // punctuation/space at the tail.
-        .trim()
+        // punctuation/space at the tail. Leading whitespace is impossible after
+        // the split/join above, so end-trimming alone suffices.
         .trim_end_matches(['.', ',', ':', ';', ' '])
         .to_string();
     if title.is_empty() {
