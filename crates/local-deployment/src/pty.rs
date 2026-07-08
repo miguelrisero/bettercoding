@@ -1040,10 +1040,23 @@ pub(crate) fn tmux_available() -> bool {
 const TMUX_MISSING_NOTICE: &[u8] =
     b"\x1b[33m\xe2\x9a\xa0 tmux not found \xe2\x80\x94 running an ephemeral shell; this session will NOT survive disconnects.\x1b[0m\r\n";
 
+/// User-facing copy shown (in red, halting the reconnect loop) whenever a CLI
+/// attach fails in a way that leaves the parked prompt intact for the next
+/// attach. Shared so the "prompt staging failed" and "session never came up"
+/// recovery paths speak with one voice.
+pub const CLI_PROMPT_PARKED_NOTICE: &str = "Failed to start the agent session — your prompt is saved and will be delivered on the next attach";
+
 #[derive(Debug, Error)]
 pub enum PtyError {
     #[error("Failed to create PTY: {0}")]
     CreateFailed(String),
+    /// A parked initial prompt could not be staged for delivery (e.g. the
+    /// prompt file write failed on a full/read-only FS). Distinct from
+    /// `CreateFailed` so the message reaches the user verbatim — and so we
+    /// never silently drop the prompt by falling through to an empty
+    /// `continue_launch` TUI. The parked DB copy is left untouched for retry.
+    #[error("{0}")]
+    PromptStageFailed(String),
     #[error("Session not found: {0}")]
     SessionNotFound(Uuid),
     #[error("Failed to write to PTY: {0}")]
@@ -1197,21 +1210,44 @@ impl PtyService {
                 let prompt_file: Option<PathBuf> = if resume_active {
                     None
                 } else {
-                    tmux_initial_prompt
+                    match tmux_initial_prompt
                         .as_deref()
                         .and_then(|p| cli_prompt_file_content(&spec.prompt_arg, p))
-                        .and_then(|content| {
-                            let wid = workspace_id_from_cli_session_name(session_name)?;
-                            match write_cli_prompt_file(wid, &content) {
-                                Ok(path) => Some(path),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Failed to write CLI prompt file for {session_name}: {e}"
+                    {
+                        // There is a prompt to deliver: its file MUST be staged.
+                        // If the write fails we CANNOT fall through to
+                        // `continue_launch` — that yields a healthy-looking but
+                        // empty TUI, and the caller (terminal.rs) would then
+                        // clear the parked DB copy, permanently losing the user's
+                        // only copy of the prompt. Fail the spawn instead so the
+                        // parked prompt survives for the next attach and the user
+                        // sees the recovery notice (the "never destroy the
+                        // prompt" invariant).
+                        Some(content) => {
+                            let wid = workspace_id_from_cli_session_name(session_name).ok_or_else(
+                                || {
+                                    tracing::error!(
+                                        "CLI session name {session_name} has no workspace id; \
+                                         cannot stage parked prompt"
                                     );
-                                    None
-                                }
-                            }
-                        })
+                                    PtyError::PromptStageFailed(
+                                        CLI_PROMPT_PARKED_NOTICE.to_string(),
+                                    )
+                                },
+                            )?;
+                            Some(write_cli_prompt_file(wid, &content).map_err(|e| {
+                                tracing::error!(
+                                    "Failed to write CLI prompt file for {session_name}: \
+                                     {e}; leaving prompt parked"
+                                );
+                                // Drop any partial file so a torn write can't
+                                // leave a stale prompt readable on disk.
+                                remove_cli_prompt_file(wid);
+                                PtyError::PromptStageFailed(CLI_PROMPT_PARKED_NOTICE.to_string())
+                            })?)
+                        }
+                        None => None,
+                    }
                 };
                 cmd.arg(cli_bootstrap(
                     spec,
@@ -1635,6 +1671,20 @@ mod tests {
             cli_prompt_file_content(&CliPromptArg::Unsupported, "hi"),
             None
         );
+    }
+
+    #[test]
+    fn prompt_stage_failed_surfaces_recovery_notice_verbatim() {
+        // When staging a parked prompt fails (e.g. a full/read-only FS), the
+        // spawn is aborted with PromptStageFailed rather than silently dropping
+        // the prompt. The error text must reach the user verbatim (terminal.rs
+        // sends `e.to_string()` to the pane), so it carries exactly the same
+        // recovery copy as the "session never came up" branch — telling the user
+        // the prompt is saved for the next attach. Guards the user-facing half
+        // of the "never destroy the prompt" invariant.
+        let err = PtyError::PromptStageFailed(CLI_PROMPT_PARKED_NOTICE.to_string());
+        assert_eq!(err.to_string(), CLI_PROMPT_PARKED_NOTICE);
+        assert!(err.to_string().contains("your prompt is saved"));
     }
 
     #[test]

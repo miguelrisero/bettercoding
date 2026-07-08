@@ -21,8 +21,8 @@ use executors::{
     profile::{ExecutorConfig, ExecutorConfigs},
 };
 use local_deployment::pty::{
-    PtyCommand, cli_prompt_fits_inline, cli_tmux_available, cli_tmux_session_exists,
-    cli_tmux_session_name, remove_cli_prompt_file, send_cli_keys,
+    CLI_PROMPT_PARKED_NOTICE, PtyCommand, cli_prompt_fits_inline, cli_tmux_available,
+    cli_tmux_session_exists, cli_tmux_session_name, remove_cli_prompt_file, send_cli_keys,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -454,11 +454,7 @@ async fn handle_terminal_ws(
                 "CLI tmux session for workspace {} never came up; prompt left parked",
                 workspace_id
             );
-            let _ = send_error(
-                &mut socket,
-                "Failed to start the agent session — your prompt is saved and will be delivered on the next attach",
-            )
-            .await;
+            let _ = send_error(&mut socket, CLI_PROMPT_PARKED_NOTICE).await;
             return;
         }
     }
