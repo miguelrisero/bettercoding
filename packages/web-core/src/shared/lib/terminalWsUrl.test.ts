@@ -1,6 +1,10 @@
 import { describe, it, expect } from 'vitest';
 
-import { buildTerminalWsUrl, resolveTerminalEndpoint } from './terminalWsUrl';
+import {
+  buildTerminalWsUrl,
+  resolveTerminalEndpoint,
+  terminalEndpointsEquivalent,
+} from './terminalWsUrl';
 
 describe('buildTerminalWsUrl', () => {
   it('carries the provided grid size instead of the 80x24 default', () => {
@@ -112,5 +116,47 @@ describe('resolveTerminalEndpoint', () => {
     expect(first).toContain('cols=100');
     expect(second).toContain('cols=120');
     expect(second).not.toBe(first);
+  });
+});
+
+describe('terminalEndpointsEquivalent', () => {
+  const make = (over: Partial<Parameters<typeof buildTerminalWsUrl>[0]>) =>
+    buildTerminalWsUrl({
+      workspaceId: 'ws-1',
+      cols: 100,
+      rows: 30,
+      protocol: 'https:',
+      host: 'example.test',
+      mode: 'cli',
+      sessionId: 'sess-a',
+      ...over,
+    });
+
+  it('treats size-only drift as equivalent (post-open resize corrects it)', () => {
+    expect(
+      terminalEndpointsEquivalent(make({}), make({ cols: 203, rows: 51 }))
+    ).toBe(true);
+  });
+
+  it('flags a changed session as stale', () => {
+    expect(
+      terminalEndpointsEquivalent(make({}), make({ sessionId: 'sess-b' }))
+    ).toBe(false);
+    // Dropping the session entirely is also a material change.
+    expect(
+      terminalEndpointsEquivalent(make({}), make({ sessionId: undefined }))
+    ).toBe(false);
+  });
+
+  it('flags changed mode or workspace as stale', () => {
+    expect(
+      terminalEndpointsEquivalent(
+        make({}),
+        make({ mode: 'shell', sessionId: undefined })
+      )
+    ).toBe(false);
+    expect(
+      terminalEndpointsEquivalent(make({}), make({ workspaceId: 'ws-2' }))
+    ).toBe(false);
   });
 });

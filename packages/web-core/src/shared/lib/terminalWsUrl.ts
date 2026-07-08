@@ -78,3 +78,31 @@ export function resolveTerminalEndpoint(
   }
   return buildTerminalWsUrl({ ...params, cols: dims.cols, rows: dims.rows });
 }
+
+/**
+ * Compare two terminal WS endpoints ignoring the size params (`cols`/`rows`).
+ *
+ * Used to validate an in-flight connect attempt after its async open
+ * resolves: size drift between "attempt started" and "attempt resolved" is
+ * legitimate (the post-open resize corrects it), but a changed `session_id`,
+ * `mode`, or `workspace_id` — e.g. a session switch while a slow relay
+ * transport was opening — makes the attempt STALE: registering it would bind
+ * the visible pane to the previous conversation's tmux session.
+ */
+export function terminalEndpointsEquivalent(a: string, b: string): boolean {
+  try {
+    const ua = new URL(a);
+    const ub = new URL(b);
+    if (ua.origin !== ub.origin || ua.pathname !== ub.pathname) return false;
+    for (const key of ['cols', 'rows']) {
+      ua.searchParams.delete(key);
+      ub.searchParams.delete(key);
+    }
+    ua.searchParams.sort();
+    ub.searchParams.sort();
+    return ua.searchParams.toString() === ub.searchParams.toString();
+  } catch {
+    // Not parseable as URLs (unexpected) — fall back to exact equality.
+    return a === b;
+  }
+}

@@ -102,21 +102,27 @@ export function XTermInstance({
   // is shown. Called fresh on every (re)connect attempt so a reconnect
   // attaches at the pane's present size, not the creation-time one.
   //
-  // Measurability is gated on the terminal element's actual DOM box, not just
-  // proposeDimensions(): FitAddon clamps its result to >=1 cell even for a
-  // hidden-but-rendered (0-height) container, which would otherwise pass the
-  // dims check with a garbage 2x1-ish grid and resurrect the tiny-then-resize
-  // bounce this fix exists to kill. display:none and detached containers
-  // both read as 0x0 here.
+  // Measurability is gated on real DOM boxes, not just proposeDimensions():
+  // FitAddon clamps its result to >=1 cell even for a hidden-but-rendered
+  // (0-height) container, which would otherwise pass the dims check with a
+  // garbage 2x1-ish grid and resurrect the tiny-then-resize bounce this fix
+  // exists to kill. Both boxes matter: display:none / detached read as 0x0
+  // on the element, while a collapsed-but-visible container (splitter
+  // dragged shut) zeroes the PARENT — which is the box FitAddon actually
+  // measures — while the element keeps its intrinsic screen height.
   const getEndpoint = useCallback((): string | null => {
     const instance = fitInstance();
     if (!instance) return null;
     const element = instance.terminal.element;
+    const parent = element?.parentElement;
     if (
       !element ||
+      !parent ||
       !element.isConnected ||
       element.offsetWidth === 0 ||
-      element.offsetHeight === 0
+      element.offsetHeight === 0 ||
+      parent.offsetWidth === 0 ||
+      parent.offsetHeight === 0
     ) {
       return null;
     }
@@ -140,14 +146,14 @@ export function XTermInstance({
   // a live connection — hidden side panes keep theirs by design; this only ever
   // creates the INITIAL connection for a tab that has none.
   const ensureConnection = useCallback(() => {
-    // Gate on measurability up front: no connection (and none of the client
-    // generation/retry machinery) is set up for a pane that has never been
-    // visible. createTerminalConnection itself is idempotent while a live or
-    // in-flight connection owns the tab, so calling this repeatedly — mount,
-    // ResizeObserver ticks, session switches — never stacks a duplicate
-    // backend PTY/tmux attach; while occupied it only refreshes the stored
-    // callbacks to this mount's closures.
-    if (getEndpoint() === null) return;
+    // The whole connect policy lives in the provider:
+    // createTerminalConnection is idempotent while a live/in-flight
+    // connection owns the tab (it then only refreshes the stored callbacks
+    // to this mount's closures — load-bearing after a remount, whose
+    // predecessor's closures read refs that its cleanup nulled) and it
+    // defers, creating nothing, while the pane is unmeasurable. So calling
+    // this repeatedly — mount, ResizeObserver ticks, session switches — is
+    // always safe.
     createTerminalConnection(
       tabId,
       getEndpoint,

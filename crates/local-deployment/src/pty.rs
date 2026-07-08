@@ -960,11 +960,10 @@ struct PtySession {
     /// ends the ephemeral shell.
     child_killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     /// Set by the reader thread once it has reaped the child via `wait()`.
-    /// `close_session` checks this before signalling so it never targets a PID
-    /// that was already reaped (and possibly recycled) on the natural-exit path.
+    /// `Drop` checks this before signalling so it never targets a PID that
+    /// was already reaped (and possibly recycled) on the natural-exit path.
     child_reaped: Arc<AtomicBool>,
     _output_handle: thread::JoinHandle<()>,
-    closed: bool,
 }
 
 impl Drop for PtySession {
@@ -981,10 +980,12 @@ impl Drop for PtySession {
         // forever (dropping `master` doesn't close that clone), leaking a
         // thread + an unreaped child per disconnect. For CLI mode this
         // detaches the tmux CLIENT — the persistent `vk_` server session
-        // survives. Skip the signal if the reader already reaped on the
-        // natural-exit path, so we never signal a freed/recycled PID (the
-        // pid can't be recycled before `wait()`, which only the reader
-        // thread calls).
+        // survives. The `child_reaped` gate skips the signal once the reader
+        // has reaped on the natural-exit path; the residual load-then-kill
+        // window (reader completes `wait()` between our load and the kill)
+        // is a few instructions wide and was accepted in the original
+        // close_session design — signaling requires the OS to recycle the
+        // PID inside that window.
         //
         // The session is constructed inside `create_session`'s blocking task,
         // so this Drop is the single teardown point EVERY path funnels
@@ -1170,10 +1171,12 @@ impl PtyService {
             let mut reader = match pty_pair.master.try_clone_reader() {
                 Ok(reader) => reader,
                 Err(e) => {
-                    // No reaper thread yet — kill directly (the child stays a
-                    // zombie until process exit, as on any pre-thread failure,
-                    // but the tmux client / shell itself is gone).
-                    let _ = child_killer.kill();
+                    // No reaper thread yet, but the child is still owned here
+                    // and this is a blocking task: kill and reap inline so
+                    // repeated create failures can't accumulate zombies.
+                    let mut child = child;
+                    let _ = child.kill();
+                    let _ = child.wait();
                     return Err(PtyError::CreateFailed(e.to_string()));
                 }
             };
@@ -1233,7 +1236,6 @@ impl PtyService {
                 child_killer,
                 child_reaped,
                 _output_handle: output_handle,
-                closed: false,
             })
         })
         .await
@@ -1263,10 +1265,6 @@ impl PtyService {
                 .get(&session_id)
                 .ok_or(PtyError::SessionNotFound(session_id))?;
 
-            if session.closed {
-                return Err(PtyError::SessionClosed);
-            }
-
             session.writer.clone()
         };
 
@@ -1294,10 +1292,6 @@ impl PtyService {
             .get(&session_id)
             .ok_or(PtyError::SessionNotFound(session_id))?;
 
-        if session.closed {
-            return Err(PtyError::SessionClosed);
-        }
-
         session
             .master
             .resize(PtySize {
@@ -1313,13 +1307,16 @@ impl PtyService {
 
     pub async fn close_session(&self, session_id: Uuid) -> Result<(), PtyError> {
         // Dropping the removed session runs the full teardown — VEOF disarm
-        // then child kill — in `Drop for PtySession`. (A send-parked reader
-        // is additionally released when the caller drops the output receiver
-        // after this returns.)
-        self.sessions
+        // then child kill — in `Drop for PtySession`. Bound OUTSIDE the lock
+        // scope so the teardown syscalls never run under the global registry
+        // lock. (A send-parked reader is additionally released when the
+        // caller drops the output receiver after this returns.)
+        let session = self
+            .sessions
             .lock()
             .map_err(|_| PtyError::SessionClosed)?
             .remove(&session_id);
+        drop(session);
         Ok(())
     }
 }
@@ -1655,7 +1652,6 @@ mod tests {
             child_killer,
             child_reaped: child_reaped.clone(),
             _output_handle: output_handle,
-            closed: false,
         };
         drop(session);
 

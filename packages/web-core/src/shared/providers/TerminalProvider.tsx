@@ -7,6 +7,7 @@ import {
   type TerminalInstance,
 } from '@/shared/hooks/useTerminal';
 import { openLocalApiWebSocket } from '@/shared/lib/localApiTransport';
+import { terminalEndpointsEquivalent } from '@/shared/lib/terminalWsUrl';
 
 interface TerminalConnection {
   ws: WebSocket;
@@ -359,6 +360,15 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
         return makeFacade(tabId);
       }
 
+      // Measurability gate, enforced here (not at call sites) so an occupied
+      // tab above ALWAYS gets its callbacks refreshed even while hidden: a
+      // pane that has never been measurable gets no generation, no timer,
+      // and no server-side PTY/tmux churn — callers simply re-invoke on
+      // resize ticks / mount / session switches until it measures.
+      if (getEndpoint() === null) {
+        return makeFacade(tabId);
+      }
+
       // Cancel any lingering closed generation and drop its dead socket
       // entry. Marking the old generation closed (on the object) is what
       // actually cancels its in-flight opens/retries; replacing the map slot
@@ -450,6 +460,27 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
               reconnectStateRef.current.get(tabId) !== generation
             ) {
               ws.close();
+              return;
+            }
+
+            // The endpoint source may have been refreshed while the open was
+            // in flight (remount / session switch): registering this socket
+            // would bind the visible pane to the PREVIOUS session's tmux.
+            // Size-only drift is fine (the post-open resize corrects it) —
+            // only a material change (session/mode/workspace) discards the
+            // attempt. Not a failure: re-kick through the single-timer path
+            // without spending the retry budget. A null current endpoint
+            // (pane went hidden mid-open) keeps the socket — hidden panes
+            // keep connections by design.
+            const currentEndpoint = generation.getEndpoint();
+            if (
+              currentEndpoint !== null &&
+              !terminalEndpointsEquivalent(endpoint, currentEndpoint)
+            ) {
+              ws.close();
+              if (generation.retryTimer === null) {
+                scheduleAttempt(0);
+              }
               return;
             }
 
