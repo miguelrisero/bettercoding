@@ -330,13 +330,19 @@ fn write_cli_prompt_file(workspace_id: Uuid, content: &str) -> std::io::Result<P
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(&path)?;
+        // `.mode()` only applies when the file is CREATED; if a looser-perm file
+        // pre-existed at this path (stale from an older build, or same-user
+        // tampering) `create(true)` reuses it without re-chmod'ing. Force 0600
+        // so the prompt is never readable at wider perms. (The 0700 dir already
+        // blocks other users; this is defense in depth.)
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         f.write_all(content.as_bytes())?;
     }
     #[cfg(not(unix))]
@@ -925,19 +931,27 @@ pub fn cli_tmux_available() -> bool {
 }
 
 /// Whether THE EXPECTED AGENT (`program`, the spec's binary name) currently
-/// owns a workspace's CLI pane. `None` when the pane itself can't be read
-/// (session gone).
+/// runs anywhere in a workspace's CLI pane process tree. `None` when the pane
+/// itself can't be read (session gone).
 ///
 /// tmux runs our bootstrap string via `default-shell -c`, and every launch
 /// stage shares that shell's process group — so `#{pane_current_command}`
 /// reports the outer shell for the pane's whole life (verified empirically)
 /// and can't distinguish "agent running" from "fallback shell". Instead this
-/// inspects the pane's process tree: the pane root (`#{pane_pid}`) or one of
-/// its direct children must BE the expected agent. Matching the exact program
-/// name (shebang exec sets the process comm to the script basename — verified
-/// on a scratch socket) rather than "any non-shell" means a user running
-/// vim/npm inside the missing-binary fallback shell can never satisfy the
-/// paste gate and receive a prompt meant for the agent.
+/// walks the pane's process SUBTREE (from `#{pane_pid}` down) looking for a
+/// process whose comm IS the expected agent.
+///
+/// The whole subtree, not just the pane root and its direct children, because
+/// node-wrapped agents run the native binary as a GRANDCHILD: `codex` ships as
+/// a `#!/usr/bin/env node` launcher that `spawn`s the native `codex` binary, so
+/// the pane tree is `sh → node → codex`. A shebang exec sets comm to the
+/// interpreter (`node`), NOT the script basename (verified on a scratch
+/// socket), and we deliberately do NOT accept the intermediate `node` as an
+/// agent — so a direct-children-only probe would never confirm a node-wrapped
+/// agent's delivery, stranding its parked prompt for replay on the next fresh
+/// launch. Matching the EXACT program name (not "any non-shell") still keeps a
+/// user's vim/npm inside the missing-binary fallback shell from satisfying the
+/// paste gate.
 pub async fn cli_pane_agent_running(workspace_id: Uuid, program: &str) -> Option<bool> {
     if !tmux_available() {
         return None;
@@ -967,33 +981,60 @@ pub async fn cli_pane_agent_running(workspace_id: Uuid, program: &str) -> Option
         .parse::<u32>()
         .ok()?;
 
-    // Direct children of the pane shell first — the agent is a direct child
-    // in every current launch shape, so this is the probe that usually
-    // answers. (`pgrep -l -P` prints "<pid> <comm>"; a non-zero exit just
-    // means no children — the bootstrap is between stages or the fallback
-    // shell is idle.)
-    let children = tokio::process::Command::new("pgrep")
-        .args(["-l", "-P", &pane_pid.to_string()])
+    // One process snapshot, walked in-process: a single `ps` instead of an
+    // unbounded fan-out of `pgrep -P` calls, and a consistent view of the tree.
+    let snapshot = tokio::process::Command::new("ps")
+        .args(["-eo", "pid=,ppid=,comm="])
         .stderr(std::process::Stdio::null())
         .output()
         .await
         .ok()?;
-    let listing = String::from_utf8_lossy(&children.stdout);
-    if listing
-        .lines()
-        .filter_map(|line| line.split_whitespace().nth(1))
-        .any(|comm| comm_matches_program(comm, program))
-    {
-        return Some(true);
+    if !snapshot.status.success() {
+        return None;
     }
+    let listing = String::from_utf8_lossy(&snapshot.stdout);
+    Some(pane_subtree_has_program(&listing, pane_pid, program))
+}
 
-    // Fall back to the pane root: normally the bootstrap/fallback shell, but
-    // a future exec'd agent would show up here directly.
-    Some(
-        process_comm(pane_pid)
-            .await
-            .is_some_and(|comm| comm_matches_program(&comm, program)),
-    )
+/// Whether `program` runs anywhere in the process subtree rooted at `root_pid`
+/// (inclusive), given a `ps -eo pid=,ppid=,comm=` snapshot. Pure so the tree
+/// walk — the part that decides whether a node-wrapped agent grandchild counts
+/// — is unit testable without a live process tree.
+fn pane_subtree_has_program(ps_listing: &str, root_pid: u32, program: &str) -> bool {
+    let mut comm_by_pid: HashMap<u32, &str> = HashMap::new();
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for line in ps_listing.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(ppid), Some(comm)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
+            continue;
+        };
+        comm_by_pid.insert(pid, comm);
+        children.entry(ppid).or_default().push(pid);
+    }
+    // Depth-first from the pane root, inclusive. `visited` guards against a
+    // malformed snapshot: a real ppid graph is a forest and can't cycle, but a
+    // torn read must not spin.
+    let mut stack = vec![root_pid];
+    let mut visited = HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        if comm_by_pid
+            .get(&pid)
+            .is_some_and(|comm| comm_matches_program(comm, program))
+        {
+            return true;
+        }
+        if let Some(kids) = children.get(&pid) {
+            stack.extend(kids);
+        }
+    }
+    false
 }
 
 /// Whether a `ps`/`pgrep` process name is the expected agent binary. The
@@ -1007,24 +1048,8 @@ fn comm_matches_program(comm: &str, program: &str) -> bool {
         || (program.len() > 15 && program.get(..15).is_some_and(|prefix| comm == prefix))
 }
 
-/// Best-effort process name for a pid (`ps -o comm=`), raw (trimmed only —
-/// [`is_shell_command`] owns normalization).
-async fn process_comm(pid: u32) -> Option<String> {
-    let output = tokio::process::Command::new("ps")
-        .args(["-o", "comm=", "-p", &pid.to_string()])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let comm = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!comm.is_empty()).then_some(comm)
-}
-
-/// Normalize a `ps`/`pgrep` process name for comparison: login shells report
-/// as `-zsh`, and macOS `ps -o comm=` can report a full path.
+/// Normalize a `ps` process name for comparison: login shells report as
+/// `-zsh`, and macOS `ps -o comm=` can report a full path.
 fn normalize_comm(comm: &str) -> &str {
     let comm = comm.trim().trim_start_matches('-');
     comm.rsplit('/').next().unwrap_or(comm)
@@ -2150,6 +2175,40 @@ mod tests {
             "verylongagentXX",
             "verylongagentname-cli"
         ));
+    }
+
+    #[test]
+    fn pane_subtree_finds_node_wrapped_agent_grandchild() {
+        // codex ships as `#!/usr/bin/env node` which spawns the native `codex`
+        // as a GRANDCHILD, so the pane tree is `sh(pane) → node → codex`. The
+        // gate must descend past the intermediate `node` (which is NOT an
+        // agent) to confirm delivery — a direct-children-only probe would miss
+        // it and strand the prompt for replay.
+        let ps = "\
+  100     1 sh
+  200   100 node
+  300   200 codex
+  400     1 unrelated
+  500   400 vim
+";
+        assert!(
+            pane_subtree_has_program(ps, 100, "codex"),
+            "grandchild agent under a node wrapper must be found"
+        );
+        // Native agent as a direct child (claude is an ELF binary).
+        let ps_native = "  100     1 sh\n  200   100 claude\n";
+        assert!(pane_subtree_has_program(ps_native, 100, "claude"));
+
+        // A shell-only subtree (bootstrap still starting / missing-binary
+        // fallback) must NOT satisfy the gate...
+        assert!(!pane_subtree_has_program("  100     1 sh\n", 100, "codex"));
+        // ...nor may an unrelated program the user ran in the fallback shell
+        // (node from an `npm` invocation is exactly the intermediate we refuse
+        // to accept as the agent).
+        let ps_npm = "  100     1 sh\n  200   100 node\n  300   200 esbuild\n";
+        assert!(!pane_subtree_has_program(ps_npm, 100, "codex"));
+        // A sibling subtree's agent (different pane) is out of scope.
+        assert!(!pane_subtree_has_program(ps, 400, "codex"));
     }
 
     #[test]
