@@ -155,7 +155,9 @@ export function LoopAutomationControl({
           ) : (
             <ClockIcon className="size-icon-sm" weight="bold" aria-hidden />
           )}
-          <span className="sr-only md:not-sr-only">{wakeupStatusText}</span>
+          <span className="sr-only md:not-sr-only md:whitespace-nowrap">
+            {wakeupStatusText}
+          </span>
           <span className="md:hidden" aria-hidden>
             {wakeupTimeText}
           </span>
