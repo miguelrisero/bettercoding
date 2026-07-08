@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE sessions\n               SET pending_cli_prompt = $1\n               WHERE id = $2 AND pending_cli_prompt IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "dce20912fb7e4bec31853c398815b162015a01f5dea425881cb99dfcaa85ecc2"
+}

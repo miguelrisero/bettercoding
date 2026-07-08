@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id AS \"id!: Uuid\", pending_cli_prompt AS \"prompt!: String\"\n               FROM sessions\n               WHERE workspace_id = $1 AND pending_cli_prompt IS NOT NULL\n               ORDER BY created_at DESC\n               LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "prompt!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "e0697566b6b789daa74f54a31bdd3a208ea541046b11130dc851c262353f756a"
+}
