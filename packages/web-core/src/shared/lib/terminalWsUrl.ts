@@ -128,6 +128,13 @@ export function terminalEndpointsEquivalent(a: string, b: string): boolean {
  * right after the async open resolves AND again at `onopen`, because the default
  * transport resolves the open with a still-`CONNECTING` socket, so a switch can
  * land in the post-registration / pre-open gap.
+ *
+ * At `onopen` (the point of no return) the caller passes `epochChanged = true`
+ * unconditionally, forcing the endpoint inspection: the epoch is bumped only by
+ * a MOUNTED terminal child, so a session change while the child is gated off
+ * (its host stops rendering it) leaves the epoch unchanged; forcing the
+ * inspection still rejects that stale socket because a gated pane's endpoint
+ * resolves to `null`.
  */
 export function terminalAttemptIsStale(
   epochChanged: boolean,

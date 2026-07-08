@@ -490,21 +490,27 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
             // so a switch landing in the post-registration / pre-open gap would
             // otherwise let a socket carrying the PREVIOUS session_id become
             // the tab's live connection and bind the pane to the wrong
-            // conversation on a first-attach / post-reap create. Unchanged
-            // epoch = untouched source, always valid; changed epoch discards on
-            // a material (session/mode/workspace) change or a now-unmeasurable
-            // pane, and keeps size-only drift (the post-open resize corrects
-            // it) — see `terminalAttemptIsStale`. Discarding is not a failure:
-            // re-kick through the single-timer path without spending the retry
-            // budget (null endpoint = pane unmeasurable now → poll).
-            const discardIfStale = (): boolean => {
+            // conversation on a first-attach / post-reap create.
+            //
+            // `epochChanged` chooses the strictness (see `terminalAttemptIsStale`):
+            // - after the open resolves we pass the real epoch delta, so an
+            //   untouched source is accepted without churn (a pane briefly
+            //   unmeasurable WITHOUT a switch keeps its attempt);
+            // - at `onopen` — the point of no return — we force `true` so the
+            //   endpoint is ALWAYS re-inspected. That closes the gated-child
+            //   race: while `CliMainPane` suppresses `XTermInstance`
+            //   (executorRunning / !sessionsReady) no mounted effect bumps the
+            //   epoch on a session change, so the epoch delta alone would be
+            //   false and wrongly accept the stale socket — but `getEndpoint()`
+            //   is null while gated (the element is detached), so forcing the
+            //   inspection rejects it, and the poll reconnects with the CURRENT
+            //   session once the pane is shown again.
+            // Discarding is not a failure: re-kick through the single-timer path
+            // without spending the retry budget (null endpoint → poll).
+            const discardIfStale = (epochChanged: boolean): boolean => {
               const currentEndpoint = generation.getEndpoint();
               if (
-                !terminalAttemptIsStale(
-                  generation.endpointEpoch !== attemptEpoch,
-                  endpoint,
-                  currentEndpoint
-                )
+                !terminalAttemptIsStale(epochChanged, endpoint, currentEndpoint)
               ) {
                 return false;
               }
@@ -521,7 +527,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
               return true;
             };
 
-            if (discardIfStale()) {
+            if (discardIfStale(generation.endpointEpoch !== attemptEpoch)) {
               return;
             }
 
@@ -546,11 +552,12 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
             // stuck at the URL size forever; resending on every (re)connect
             // also restores the right size after a reattach.
             const syncSize = () => {
-              // A session switch can land after this socket was registered but
-              // before it opened (the transport returns a CONNECTING socket):
-              // re-validate before it becomes live, closing the DUP handshake,
-              // not a hidden live connection.
-              if (superseded || discardIfStale()) {
+              // A session switch (or a gate-off that unmounts the terminal
+              // child) can land after this socket was registered but before it
+              // opened (the transport returns a CONNECTING socket): re-validate
+              // — forcing the endpoint inspection — before it becomes live,
+              // closing the DUP handshake, not a hidden live connection.
+              if (superseded || discardIfStale(true)) {
                 return;
               }
               generation.retryCount = 0;

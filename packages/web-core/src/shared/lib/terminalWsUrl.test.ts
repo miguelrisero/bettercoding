@@ -211,4 +211,18 @@ describe('terminalAttemptIsStale', () => {
     // is no current URL to prove equivalence.
     expect(terminalAttemptIsStale(true, make({}), null)).toBe(true);
   });
+
+  it('forcing epochChanged=true inspects the endpoint (the onopen contract)', () => {
+    // The onopen site passes epochChanged=true unconditionally so a stale
+    // socket cannot become live even when no mounted child bumped the epoch
+    // (the gated-child race). Forced inspection: null / material change = stale,
+    // equivalent (size-only drift) = not stale.
+    expect(terminalAttemptIsStale(true, make({}), null)).toBe(true);
+    expect(
+      terminalAttemptIsStale(true, make({}), make({ sessionId: 'sess-b' }))
+    ).toBe(true);
+    expect(
+      terminalAttemptIsStale(true, make({}), make({ cols: 5, rows: 5 }))
+    ).toBe(false);
+  });
 });
