@@ -426,6 +426,17 @@ async fn apply_name_and_branch(
         .container()
         .git_branch_from_workspace_with_len(&workspace.id, branch_seed, 40)
         .await;
+    // An un-sluggable seed (all-CJK/emoji/punctuation hint) yields an empty
+    // slug and a degenerate "<prefix>/<uuid>-" branch — keep the heuristic
+    // branch instead, mirroring the model path's empty-branch_slug bail-out.
+    // (A non-empty slug never ends in '-': git_branch_id_with_len trims it.)
+    if new_branch.ends_with('-') {
+        tracing::debug!(
+            "Skipping generated branch rename for {}: seed yields empty slug",
+            workspace.id
+        );
+        return;
+    }
     if new_branch == current.branch {
         return;
     }

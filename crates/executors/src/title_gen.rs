@@ -43,20 +43,36 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// a title, and must not be stored verbatim as the workspace name.
 const HINT_ARROW_MAX_CHARS: usize = 100;
 
+/// Rewrite every unicode arrow (" → ") to the ASCII form (" -> ").
+/// `String::replace` alone is non-overlapping ("a → → b" would keep its second
+/// arrow because the shared space is consumed by the first match), so loop
+/// until stable; each pass strictly reduces the '→' count, so it terminates.
+fn normalize_arrows(s: &str) -> String {
+    let mut out = s.to_string();
+    while out.contains(" → ") {
+        out = out.replace(" → ", " -> ");
+    }
+    out
+}
+
 /// Normalize a candidate title into the stored form shared by the hint and
 /// model paths: collapse whitespace, normalize the unicode arrow, cap at
 /// `max_chars`, and trim trailing sentence punctuation — a mid-word cut (or a
-/// model-emitted period) must never leave dangling punctuation/space at the
-/// tail. Length *policy* stays per-path (the hint path rejects overlong arrow
-/// lines up front; the model path caps at [`TITLE_MAX_CHARS`]).
+/// model-emitted period) must never leave dangling punctuation, whitespace, or
+/// an arrow fragment at the tail. Length *policy* stays per-path (the hint
+/// path rejects overlong arrow lines up front; the model path caps at
+/// [`TITLE_MAX_CHARS`]).
 fn canonicalize_title(raw: &str, max_chars: usize) -> String {
-    raw.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace(" → ", " -> ")
-        .chars()
-        .take(max_chars)
-        .collect::<String>()
+    let joined = normalize_arrows(&raw.split_whitespace().collect::<Vec<_>>().join(" "));
+    let capped: String = joined.chars().take(max_chars).collect();
+    let trimmed = capped.trim_end_matches(['.', ',', ':', ';', ' ']);
+    // A cap cut inside " -> " leaves a dangling arrow fragment; strip it, then
+    // re-trim any punctuation it was shielding (e.g. "word. ->" -> "word").
+    let trimmed = trimmed
+        .strip_suffix(" ->")
+        .or_else(|| trimmed.strip_suffix(" -"))
+        .unwrap_or(trimmed);
+    trimmed
         .trim_end_matches(['.', ',', ':', ';', ' '])
         .to_string()
 }
@@ -68,30 +84,47 @@ fn canonicalize_title(raw: &str, max_chars: usize) -> String {
 /// length, OR is short (<= 8 words AND <= 48 chars) AND the message has a body
 /// after it (a lone short message is a task, not a title hint — still
 /// model-styled) unless it contains an arrow. A trailing clause punctuation
-/// (":", ",", "...") rejects, since it signals the first line is the start of
-/// a sentence, not a title.
+/// (":", ",", "..." or the unicode "…") rejects, since it signals the first
+/// line is the start of a sentence, not a title.
 pub fn first_line_title_hint(message: &str) -> Option<String> {
     let mut lines = message.trim().lines();
-    let first = lines.next()?.trim().trim_start_matches('#').trim();
+    let raw_first = lines.next()?.trim();
+    // Strip a Markdown ATX heading marker (a leading '#' run followed by
+    // whitespace, or a bare "#..." line); keep issue-ref-style prefixes like
+    // "#27 -> ..." intact — those '#' are content, not markup.
+    let hashes = raw_first.len() - raw_first.trim_start_matches('#').len();
+    let first = if hashes == raw_first.len() {
+        ""
+    } else if hashes > 0 && raw_first[hashes..].starts_with(char::is_whitespace) {
+        raw_first[hashes..].trim_start()
+    } else {
+        raw_first
+    };
     if first.is_empty() {
         return None;
     }
+    // Normalize the unicode arrow BEFORE measuring, so acceptance bounds
+    // exactly the form that gets stored (" → " grows into " -> ").
+    let first = normalize_arrows(first);
     let char_count = first.chars().count();
-    let has_arrow =
-        (first.contains(" -> ") || first.contains(" → ")) && char_count <= HINT_ARROW_MAX_CHARS;
+    let has_arrow = first.contains(" -> ") && char_count <= HINT_ARROW_MAX_CHARS;
     let has_body = lines.any(|l| !l.trim().is_empty());
     let word_count = first.split_whitespace().count();
     let short_enough = word_count <= 8 && char_count <= 48;
     if !(has_arrow || (short_enough && has_body)) {
         return None;
     }
-    if first.ends_with(':') || first.ends_with(',') || first.ends_with("...") {
+    if first.ends_with(':')
+        || first.ends_with(',')
+        || first.ends_with("...")
+        || first.ends_with('…')
+    {
         return None;
     }
     // Acceptance already bounds the line, so the cap here is a no-op backstop;
-    // canonicalization can strip a line down to nothing (e.g. "..."), so
+    // canonicalization can strip a line down to nothing (e.g. "."), so
     // re-check emptiness before declaring it a title.
-    let title = canonicalize_title(first, HINT_ARROW_MAX_CHARS);
+    let title = canonicalize_title(&first, HINT_ARROW_MAX_CHARS);
     (!title.is_empty()).then_some(title)
 }
 
@@ -288,6 +321,21 @@ mod tests {
             first_line_title_hint("# bp -> runflow dogfood").as_deref(),
             Some("bp -> runflow dogfood")
         );
+        assert_eq!(
+            first_line_title_hint("### bp -> runflow dogfood").as_deref(),
+            Some("bp -> runflow dogfood")
+        );
+        // A bare hash run is a heading marker with no content.
+        assert!(first_line_title_hint("###\n\nbody").is_none());
+    }
+
+    #[test]
+    fn hint_keeps_issue_ref_hash_prefix() {
+        // '#' not followed by whitespace is content (issue ref), not markup.
+        assert_eq!(
+            first_line_title_hint("#27 -> short arrow titles").as_deref(),
+            Some("#27 -> short arrow titles")
+        );
     }
 
     #[test]
@@ -305,6 +353,8 @@ mod tests {
         assert!(first_line_title_hint("Please do the following:\n\n- a\n- b").is_none());
         assert!(first_line_title_hint("add this, and that,\n\nbody").is_none());
         assert!(first_line_title_hint("Do these things...\n\nbody").is_none());
+        // Unicode ellipsis (smart-punctuation form of "...") rejects too.
+        assert!(first_line_title_hint("Do these things…\n\nbody").is_none());
     }
 
     #[test]
@@ -342,6 +392,36 @@ mod tests {
         assert_eq!(
             first_line_title_hint(&at_cap).as_deref(),
             Some(at_cap.as_str())
+        );
+        // The bound is measured AFTER unicode-arrow normalization (" → " grows
+        // into " -> "), so a 100-char unicode-arrow line that would exceed the
+        // cap once normalized is rejected, never silently truncated.
+        let unicode_at_raw_cap = format!("bp → {}", "y".repeat(95)); // 100 raw, 101 normalized
+        assert_eq!(unicode_at_raw_cap.chars().count(), 100);
+        assert!(first_line_title_hint(&unicode_at_raw_cap).is_none());
+        let unicode_fits = format!("bp → {}", "y".repeat(94)); // 100 once normalized
+        assert_eq!(
+            first_line_title_hint(&unicode_fits).as_deref(),
+            Some(format!("bp -> {}", "y".repeat(94)).as_str())
+        );
+    }
+
+    #[test]
+    fn hint_normalizes_adjacent_unicode_arrows() {
+        // String::replace is non-overlapping; the stable loop converts both.
+        assert_eq!(
+            first_line_title_hint("a → → b\n\nbody").as_deref(),
+            Some("a -> -> b")
+        );
+    }
+
+    #[test]
+    fn hint_keeps_cjk_title_verbatim() {
+        // A non-ASCII hint is a fine NAME; the un-sluggable branch seed is
+        // guarded at the rename site (empty slug -> heuristic branch kept).
+        assert_eq!(
+            first_line_title_hint("修复登录\n\n详情").as_deref(),
+            Some("修复登录")
         );
     }
 
@@ -394,6 +474,21 @@ mod tests {
         let s = format!("{{\"title\":\"{long}\",\"branch\":\"x\"}}");
         let title = parse_workspace_names(&s).unwrap().title;
         assert!(title.chars().count() <= TITLE_MAX_CHARS);
+    }
+
+    #[test]
+    fn cap_cut_never_leaves_dangling_arrow_fragment() {
+        // 45-char keyword + " -> gist" = 53 chars; the 48-char cap cuts inside
+        // the arrow, which must be stripped rather than stored as "... ->".
+        let keyword = "a".repeat(45);
+        let s = format!("{{\"title\":\"{keyword} -> gist\",\"branch\":\"x\"}}");
+        let title = parse_workspace_names(&s).unwrap().title;
+        assert_eq!(title, keyword);
+        // One char shorter cut ends in " -" — also stripped.
+        let keyword = "a".repeat(46);
+        let s = format!("{{\"title\":\"{keyword} -> gist\",\"branch\":\"x\"}}");
+        let title = parse_workspace_names(&s).unwrap().title;
+        assert_eq!(title, keyword);
     }
 
     #[test]

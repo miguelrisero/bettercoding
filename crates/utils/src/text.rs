@@ -85,4 +85,16 @@ mod tests {
             "patri-main-chief"
         );
     }
+
+    #[test]
+    fn unsluggable_input_yields_empty_slug() {
+        use super::git_branch_id_with_len;
+
+        // Pins the premise behind the generated-branch-rename guard: inputs
+        // with no ASCII alphanumerics slug to "" (never to a bare "-"), so a
+        // degenerate "<prefix>/<uuid>-" branch is detectable via ends_with('-').
+        assert_eq!(git_branch_id_with_len("修复登录", 40), "");
+        assert_eq!(git_branch_id_with_len("$ -> %", 40), "");
+        assert_eq!(git_branch_id_with_len("🔥🔥", 40), "");
+    }
 }
