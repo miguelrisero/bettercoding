@@ -204,9 +204,11 @@ pub enum ClaudeEffort {
 
 impl ClaudeEffort {
     /// Effort value to pass to the pinned headless CLI (`@2.1.154`). The
-    /// `ultracode` alias does not exist there (it warns-and-ignores unknown
-    /// values), and the dynamic-workflow orchestration it enables is
-    /// interactive-only, so headless runs use the equivalent `xhigh` tier.
+    /// `ultracode` alias does not exist there (2.1.154 hard-rejects unknown
+    /// `--effort` values), and the dynamic-workflow orchestration it enables is
+    /// interactive-only, so headless runs use the equivalent `xhigh` tier. Every
+    /// other variant maps to the same string strum's `as_ref()` produces; only
+    /// `Ultracode` is a deliberate delta (see the `headless_arg` tests).
     fn headless_arg(&self) -> &'static str {
         match self {
             ClaudeEffort::Low => "low",
@@ -372,9 +374,14 @@ impl ClaudeCode {
     }
 }
 
-/// Models whose CLI accepts a reasoning `--effort` flag (Opus / Sonnet
-/// families). Haiku has no effort control.
+/// Models whose CLI accepts a reasoning `--effort` flag (Opus / Sonnet / Fable
+/// families). Haiku has no effort control. Matched case-insensitively so a
+/// free-text / custom id like `Claude-Fable-5` is gated the same in the UI and
+/// at launch (otherwise the interactive path would silently drop `--effort`).
+/// Keep in sync with `modelSupportsEffort` in
+/// `packages/web-core/src/shared/lib/modelSelector.ts`.
 pub(crate) fn model_supports_effort(id: &str) -> bool {
+    let id = id.to_lowercase();
     id.contains("opus") || id.contains("sonnet") || id.contains("fable")
 }
 
@@ -496,6 +503,59 @@ mod cli_launch_tests {
         assert_eq!(ClaudeEffort::Ultracode.headless_arg(), "xhigh");
         assert_eq!(ClaudeEffort::XHigh.headless_arg(), "xhigh");
         assert_eq!(ClaudeEffort::Max.headless_arg(), "max");
+    }
+
+    #[test]
+    fn headless_arg_matches_as_ref_except_ultracode() {
+        // Invariant: the headless CLI receives the same value as the interactive
+        // path (strum's `as_ref()`) for every tier EXCEPT `ultracode`, which the
+        // pinned @2.1.154 headless CLI does not accept and so maps to `xhigh`.
+        // If someone customizes a variant's serialized form (e.g. a strum
+        // `serialize = "..."`), this pins that both paths keep agreeing.
+        for effort in [
+            ClaudeEffort::Low,
+            ClaudeEffort::Medium,
+            ClaudeEffort::High,
+            ClaudeEffort::XHigh,
+            ClaudeEffort::Max,
+        ] {
+            assert_eq!(
+                effort.headless_arg(),
+                effort.as_ref(),
+                "{effort:?} must map to its interactive wire value in headless mode"
+            );
+        }
+        // The one deliberate delta.
+        assert_eq!(ClaudeEffort::Ultracode.as_ref(), "ultracode");
+        assert_eq!(ClaudeEffort::Ultracode.headless_arg(), "xhigh");
+    }
+
+    #[test]
+    fn effort_wire_strings_are_stable() {
+        // ClaudeEffort is serialized into profiles.json and stored
+        // ExecutorActions history. Renaming/reordering a variant would corrupt
+        // that persisted data, so pin the exact on-the-wire string of every
+        // variant. ADD-only: new variants extend this list, never mutate it.
+        assert_eq!(ClaudeEffort::Low.as_ref(), "low");
+        assert_eq!(ClaudeEffort::Medium.as_ref(), "medium");
+        assert_eq!(ClaudeEffort::High.as_ref(), "high");
+        assert_eq!(ClaudeEffort::XHigh.as_ref(), "xhigh");
+        assert_eq!(ClaudeEffort::Max.as_ref(), "max");
+        assert_eq!(ClaudeEffort::Ultracode.as_ref(), "ultracode");
+    }
+
+    #[test]
+    fn model_supports_effort_boundary() {
+        use super::model_supports_effort;
+        // Effort-capable families (any id form, case-insensitive).
+        assert!(model_supports_effort("opus"));
+        assert!(model_supports_effort("opus[1m]"));
+        assert!(model_supports_effort("sonnet"));
+        assert!(model_supports_effort("claude-fable-5"));
+        assert!(model_supports_effort("Claude-Fable-5")); // mirrors the TS lowercasing
+        // Haiku has no effort control — keep it out.
+        assert!(!model_supports_effort("haiku"));
+        assert!(!model_supports_effort("claude-haiku-4-5-20251001"));
     }
 
     #[test]
