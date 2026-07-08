@@ -14,11 +14,19 @@ interface TerminalConnection {
   resize: (cols: number, rows: number) => void;
 }
 
+/**
+ * Poll cadence while a pane is unmeasurable (hidden/detached). A wait-state
+ * knob, NOT part of the retry backoff ladder — waiting while hidden must
+ * never spend the retry budget (see `connectWebSocket`).
+ */
+const UNMEASURED_POLL_MS = 1000;
+
 interface ConnectionGeneration {
   /**
    * Called fresh on every (re)connect attempt; null = pane unmeasurable,
    * defer. Full contract on `TerminalContextType.createTerminalConnection`
-   * and `resolveTerminalEndpoint`.
+   * and `resolveTerminalEndpoint`. Refreshed by `createTerminalConnection`
+   * when a remounted component re-registers while this generation is live.
    */
   getEndpoint: () => string | null;
   retryCount: number;
@@ -308,6 +316,21 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
     terminalInstancesRef.current.delete(tabId);
   }, []);
 
+  // Stable facade handed to callers: send/resize resolve the CURRENT
+  // connection on every call, so holders survive reconnects and generation
+  // swaps.
+  const makeFacade = useCallback(
+    (tabId: string) => ({
+      send: (data: string) => {
+        terminalConnectionsRef.current.get(tabId)?.send(data);
+      },
+      resize: (cols: number, rows: number) => {
+        terminalConnectionsRef.current.get(tabId)?.resize(cols, rows);
+      },
+    }),
+    []
+  );
+
   const createTerminalConnection = useCallback(
     (
       tabId: string,
@@ -316,20 +339,35 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       onExit?: () => void,
       getSize?: () => { cols: number; rows: number } | null
     ) => {
-      // Close any previous connection and cancel its generation. Marking the
-      // old generation closed (on the object) is what actually cancels its
-      // in-flight opens/retries; replacing the map slot alone would not.
-      const previousGeneration = reconnectStateRef.current.get(tabId);
-      if (previousGeneration) {
-        previousGeneration.closed = true;
-        if (previousGeneration.retryTimer) {
-          clearTimeout(previousGeneration.retryTimer);
+      // Idempotent while a live connection or in-flight open owns the tab —
+      // enforced HERE, where the generation state lives, so no caller can
+      // stack a duplicate backend PTY/tmux attach inside the async open
+      // window (the socket registers only after the open resolves, which on
+      // relay transports takes real time). The callbacks are still refreshed:
+      // a remounted component hands in fresh closures, and the previous
+      // mount's were built on refs that its cleanup nulled. The generation's
+      // endpoint source is refreshed for the same reason.
+      const liveGeneration = reconnectStateRef.current.get(tabId);
+      const occupied =
+        terminalConnectionsRef.current.has(tabId) ||
+        (liveGeneration !== undefined && !liveGeneration.closed);
+      if (occupied) {
+        connectionCallbacksRef.current.set(tabId, { onData, onExit, getSize });
+        if (liveGeneration && !liveGeneration.closed) {
+          liveGeneration.getEndpoint = getEndpoint;
         }
+        return makeFacade(tabId);
       }
-      const existing = terminalConnectionsRef.current.get(tabId);
-      if (existing) {
-        existing.ws.close();
-        terminalConnectionsRef.current.delete(tabId);
+
+      // Cancel any lingering closed generation and drop its dead socket
+      // entry. Marking the old generation closed (on the object) is what
+      // actually cancels its in-flight opens/retries; replacing the map slot
+      // alone would not.
+      if (liveGeneration) {
+        liveGeneration.closed = true;
+        if (liveGeneration.retryTimer) {
+          clearTimeout(liveGeneration.retryTimer);
+        }
       }
 
       // Store callbacks in ref so they can be updated without recreating connection
@@ -398,7 +436,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
         // user ever shows it again.
         const endpoint = generation.getEndpoint();
         if (endpoint === null) {
-          scheduleAttempt(1000);
+          scheduleAttempt(UNMEASURED_POLL_MS);
           return;
         }
 
@@ -415,14 +453,28 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
               return;
             }
 
-            ws.onopen = () => {
-              // Reset retry count on successful connection
+            // End of THIS connection's life without a successor: cancel the
+            // generation and drop the tab's entries (only if they still
+            // belong to this ws/generation) so a later mount or session
+            // switch can start fresh. Without this, the dead socket would
+            // keep the tab "occupied" and block healing forever.
+            const release = () => {
+              generation.closed = true;
+              if (reconnectStateRef.current.get(tabId) === generation) {
+                reconnectStateRef.current.delete(tabId);
+              }
+              if (terminalConnectionsRef.current.get(tabId)?.ws === ws) {
+                terminalConnectionsRef.current.delete(tabId);
+              }
+            };
+
+            // Send the current terminal size once the socket is open. The
+            // initial ResizeObserver fit usually fires before the socket is
+            // ready and is dropped, which would otherwise leave the PTY/tmux
+            // stuck at the URL size forever; resending on every (re)connect
+            // also restores the right size after a reattach.
+            const syncSize = () => {
               generation.retryCount = 0;
-              // Send the current terminal size now that the socket is open. The
-              // initial ResizeObserver fit usually fires before the socket is
-              // ready and is dropped, which would otherwise leave the PTY/tmux
-              // stuck at the 80x24 default; resending on every (re)connect also
-              // restores the right size after a reattach.
               const size = connectionCallbacksRef.current
                 .get(tabId)
                 ?.getSize?.();
@@ -436,6 +488,12 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
                 );
               }
             };
+            ws.onopen = syncSize;
+            // A pluggable transport may hand back an already-open socket
+            // whose `open` event has fired; onopen would then never run.
+            if (ws.readyState === WebSocket.OPEN) {
+              syncSize();
+            }
 
             ws.onmessage = (event) => {
               try {
@@ -448,8 +506,10 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
                 } else if (msg.type === 'error' && callbacks) {
                   // Hard backend error (e.g. PTY creation failed). Surface it
                   // in the terminal and stop the reconnect loop — retrying a
-                  // failed create_session forever just blinks silently.
-                  generation.closed = true;
+                  // failed create_session forever just blinks silently. The
+                  // release frees the slot so the NEXT user-initiated mount
+                  // or session switch tries once afresh.
+                  release();
                   callbacks.onData(
                     `\r\n\x1b[31m${msg.message ?? 'terminal error'}\x1b[0m\r\n`
                   );
@@ -468,8 +528,10 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
                 return;
               }
 
-              // Don't reconnect on clean close (code 1000) or if shell exited
+              // Clean close (code 1000, e.g. shell exited): don't reconnect,
+              // but free the slot so a later mount can start a fresh session.
               if (event.code === 1000 && event.wasClean) {
+                release();
                 return;
               }
 
@@ -500,20 +562,9 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
 
       connectWebSocket();
 
-      // Return functions that use the current connection
-      const send = (data: string) => {
-        const conn = terminalConnectionsRef.current.get(tabId);
-        conn?.send(data);
-      };
-
-      const resize = (cols: number, rows: number) => {
-        const conn = terminalConnectionsRef.current.get(tabId);
-        conn?.resize(cols, rows);
-      };
-
-      return { send, resize };
+      return makeFacade(tabId);
     },
-    []
+    [makeFacade]
   );
 
   const getTerminalConnection = useCallback(
@@ -522,17 +573,6 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
     },
     []
   );
-
-  const hasTerminalConnection = useCallback((tabId: string): boolean => {
-    if (terminalConnectionsRef.current.has(tabId)) return true;
-    // A live generation with no registered socket yet is an in-flight open or
-    // a scheduled retry — callers must treat it as occupied so they never
-    // stack a second connect (and a duplicate backend PTY/tmux attach) on top
-    // of it. Cancelled generations are flagged closed / pruned and don't
-    // count.
-    const generation = reconnectStateRef.current.get(tabId);
-    return !!generation && !generation.closed;
-  }, []);
 
   const value = useMemo(
     () => ({
@@ -548,7 +588,6 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       unregisterTerminalInstance,
       createTerminalConnection,
       getTerminalConnection,
-      hasTerminalConnection,
     }),
     [
       getTabsForWorkspace,
@@ -563,7 +602,6 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       unregisterTerminalInstance,
       createTerminalConnection,
       getTerminalConnection,
-      hasTerminalConnection,
     ]
   );
 

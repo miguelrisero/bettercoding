@@ -62,6 +62,19 @@ export function resolveTerminalEndpoint(
   params: Omit<TerminalWsUrlParams, 'cols' | 'rows'>,
   dims: { cols: number; rows: number } | undefined | null
 ): string | null {
-  if (!dims || dims.cols <= 0 || dims.rows <= 0) return null;
+  // Number.isFinite also rejects NaN: FitAddon.proposeDimensions() derives
+  // its numbers from parseInt(getComputedStyle(...)) and can yield NaN for a
+  // detached or oddly-styled container — that must defer like any other
+  // unmeasured pane, not bake "cols=NaN" into the URL (the server would
+  // reject it and the reconnect ladder would burn its budget to giveUp).
+  if (
+    !dims ||
+    !Number.isFinite(dims.cols) ||
+    !Number.isFinite(dims.rows) ||
+    dims.cols <= 0 ||
+    dims.rows <= 0
+  ) {
+    return null;
+  }
   return buildTerminalWsUrl({ ...params, cols: dims.cols, rows: dims.rows });
 }

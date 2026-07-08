@@ -66,7 +66,6 @@ export function XTermInstance({
     getTerminalInstance,
     createTerminalConnection,
     getTerminalConnection,
-    hasTerminalConnection,
   } = useTerminal();
 
   // Latest sessionId / onClose for the connection callbacks. The provider
@@ -97,15 +96,30 @@ export function XTermInstance({
   }, [tabId, getTerminalInstance]);
 
   // Re-fit and resolve the WS endpoint at the terminal's CURRENT grid. Returns
-  // null when the pane is unmeasurable (hidden / 0-height): FitAddon.fit() then
-  // silently no-ops and proposeDimensions() is undefined, so connecting would
-  // bake xterm's 80x24 constructor default into the URL and make claude reflow
-  // (stacking blank lines that read as a stray Enter) on the follow-up resize
-  // once the pane is shown. Called fresh on every (re)connect attempt so a
-  // reconnect attaches at the pane's present size, not the creation-time one.
+  // null when the pane is unmeasurable — never connect then: the URL would
+  // carry a placeholder/garbage size and claude would reflow (stacking blank
+  // lines that read as a stray Enter) on the follow-up resize once the pane
+  // is shown. Called fresh on every (re)connect attempt so a reconnect
+  // attaches at the pane's present size, not the creation-time one.
+  //
+  // Measurability is gated on the terminal element's actual DOM box, not just
+  // proposeDimensions(): FitAddon clamps its result to >=1 cell even for a
+  // hidden-but-rendered (0-height) container, which would otherwise pass the
+  // dims check with a garbage 2x1-ish grid and resurrect the tiny-then-resize
+  // bounce this fix exists to kill. display:none and detached containers
+  // both read as 0x0 here.
   const getEndpoint = useCallback((): string | null => {
     const instance = fitInstance();
     if (!instance) return null;
+    const element = instance.terminal.element;
+    if (
+      !element ||
+      !element.isConnected ||
+      element.offsetWidth === 0 ||
+      element.offsetHeight === 0
+    ) {
+      return null;
+    }
     return resolveTerminalEndpoint(
       {
         workspaceId,
@@ -126,14 +140,13 @@ export function XTermInstance({
   // a live connection — hidden side panes keep theirs by design; this only ever
   // creates the INITIAL connection for a tab that has none.
   const ensureConnection = useCallback(() => {
-    // A live connection OR an in-flight/pending one counts as "already
-    // connected": the provider registers the socket only after its async open
-    // resolves, and stacking a second generation into that window would churn
-    // a duplicate backend PTY/tmux attach (slow relay transports make the
-    // window real).
-    if (hasTerminalConnection(tabId)) return;
-    // Gate on measurability up front so no connection object (and no server-side
-    // PTY/tmux churn) is created for an invisible pane.
+    // Gate on measurability up front: no connection (and none of the client
+    // generation/retry machinery) is set up for a pane that has never been
+    // visible. createTerminalConnection itself is idempotent while a live or
+    // in-flight connection owns the tab, so calling this repeatedly — mount,
+    // ResizeObserver ticks, session switches — never stacks a duplicate
+    // backend PTY/tmux attach; while occupied it only refreshes the stored
+    // callbacks to this mount's closures.
     if (getEndpoint() === null) return;
     createTerminalConnection(
       tabId,
@@ -156,23 +169,21 @@ export function XTermInstance({
     getEndpoint,
     fitInstance,
     getTerminalInstance,
-    hasTerminalConnection,
     createTerminalConnection,
   ]);
 
   const fitTerminal = useCallback(() => {
-    fitAddonRef.current?.fit();
-    const terminal = terminalRef.current;
-    if (!terminal) return;
+    const instance = fitInstance();
+    if (!instance) return;
     const conn = getTerminalConnection(tabId);
     if (conn) {
-      conn.resize(terminal.cols, terminal.rows);
+      conn.resize(instance.terminal.cols, instance.terminal.rows);
     } else {
       // The initial connect was deferred because the pane was unmeasured at
       // mount; now that the ResizeObserver reports a real size, open it.
       ensureConnection();
     }
-  }, [tabId, getTerminalConnection, ensureConnection]);
+  }, [tabId, fitInstance, getTerminalConnection, ensureConnection]);
 
   // Terminal + connection lifecycle. Every run of this effect MUST register
   // the same cleanup: an early return without one leaves `terminalRef`
@@ -368,6 +379,15 @@ export function XTermInstance({
     registerTerminalInstance,
     getTerminalConnection,
   ]);
+
+  // A session switch must also heal a dead/given-up connection: without this,
+  // a pane whose connection died would only recover on a remount or a resize
+  // tick. ensureConnection is idempotent — with a live connection it merely
+  // refreshes the stored callbacks (which also re-syncs them after the
+  // switch).
+  useEffect(() => {
+    ensureConnection();
+  }, [ensureConnection, sessionId]);
 
   useEffect(() => {
     if (!resizeRef.current) return;

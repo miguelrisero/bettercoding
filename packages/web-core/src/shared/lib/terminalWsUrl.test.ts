@@ -75,6 +75,18 @@ describe('resolveTerminalEndpoint', () => {
     expect(resolveTerminalEndpoint(base, { cols: 120, rows: 0 })).toBeNull();
   });
 
+  it('returns null for NaN/non-finite dims (detached or unstyled container)', () => {
+    // proposeDimensions() computes from parseInt(getComputedStyle(...)) and
+    // can yield NaN when the container has no usable computed style —
+    // "cols=NaN" must never reach the URL.
+    expect(resolveTerminalEndpoint(base, { cols: NaN, rows: 24 })).toBeNull();
+    expect(resolveTerminalEndpoint(base, { cols: 80, rows: NaN })).toBeNull();
+    expect(resolveTerminalEndpoint(base, { cols: NaN, rows: NaN })).toBeNull();
+    expect(
+      resolveTerminalEndpoint(base, { cols: Infinity, rows: 24 })
+    ).toBeNull();
+  });
+
   it('builds a URL carrying the real measured grid when measurable', () => {
     const url = resolveTerminalEndpoint(base, { cols: 203, rows: 51 });
     expect(url).not.toBeNull();

@@ -46,10 +46,14 @@ enum TerminalMode {
 #[derive(Debug, Deserialize)]
 struct TerminalQuery {
     pub workspace_id: Uuid,
-    #[serde(default = "default_cols")]
-    pub cols: u16,
-    #[serde(default = "default_rows")]
-    pub rows: u16,
+    /// `None` (fell back to 80x24) is distinguishable from an explicit value
+    /// so the stray-newline regression tripwire below can warn on true
+    /// absence without false-positiving on a pane that genuinely measures
+    /// 80x24.
+    #[serde(default)]
+    pub cols: Option<u16>,
+    #[serde(default)]
+    pub rows: Option<u16>,
     #[serde(default)]
     mode: TerminalMode,
     /// VibeKanban session whose claude conversation CLI mode should resume,
@@ -58,13 +62,8 @@ struct TerminalQuery {
     session_id: Option<Uuid>,
 }
 
-fn default_cols() -> u16 {
-    80
-}
-
-fn default_rows() -> u16 {
-    24
-}
+const DEFAULT_COLS: u16 = 80;
+const DEFAULT_ROWS: u16 = 24;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -191,17 +190,18 @@ async fn terminal_ws(
     let (working_dir, command) = match query.mode {
         TerminalMode::Cli => {
             // Regression tripwire for the stray-newline bug: a CLI attach must
-            // always carry the pane's real fitted grid. An absent-or-default
-            // 80x24 means the frontend connected while the terminal was
-            // unmeasured (hidden / 0-height), which makes claude reflow and
-            // stack blank lines on the follow-up resize. After the frontend fix
-            // (never connect at an unmeasured size) this must never fire.
-            if query.cols == default_cols() && query.rows == default_rows() {
+            // always carry the pane's real fitted grid. Absent cols/rows mean
+            // the frontend connected without measuring, which makes claude
+            // reflow and stack blank lines on the follow-up resize. After the
+            // frontend fix (never connect at an unmeasured size, URL always
+            // carries the fitted grid) this must never fire. An EXPLICIT
+            // 80x24 is legitimate (a pane can really measure that); a
+            // literal-default regression stays observable via the per-attach
+            // cols x rows log in pty.rs.
+            if query.cols.is_none() || query.rows.is_none() {
                 tracing::warn!(
-                    "CLI terminal attaching at default {}x{} for workspace {} — \
-                     pane likely connected while unmeasured (stray-newline regression)",
-                    query.cols,
-                    query.rows,
+                    "CLI terminal attaching without cols/rows for workspace {} — \
+                     frontend connected unmeasured (stray-newline regression)",
                     query.workspace_id
                 );
             }
@@ -365,8 +365,8 @@ async fn terminal_ws(
             socket,
             deployment,
             working_dir,
-            query.cols,
-            query.rows,
+            query.cols.unwrap_or(DEFAULT_COLS),
+            query.rows.unwrap_or(DEFAULT_ROWS),
             command,
             prompt_session_to_clear,
         )
@@ -571,7 +571,48 @@ pub(super) fn router() -> Router<DeploymentImpl> {
 
 #[cfg(test)]
 mod tripwire_tests {
-    use super::hex_dump;
+    use uuid::Uuid;
+
+    use super::{AttachInputTripwire, hex_dump};
+
+    fn tripwire() -> AttachInputTripwire {
+        AttachInputTripwire::new("vk_test".to_string(), Uuid::new_v4())
+    }
+
+    /// The byte budget: chunks are truncated to the remaining budget, and a
+    /// spent budget stops all logging state changes.
+    #[test]
+    fn observe_caps_logged_bytes_at_budget() {
+        let mut tw = tripwire();
+        tw.observe(&[0x0a; 100]);
+        assert_eq!(tw.bytes_logged, 100);
+        // 100 + 100 crosses the 128 cap: only the remainder is taken.
+        tw.observe(&[0x0a; 100]);
+        assert_eq!(tw.bytes_logged, AttachInputTripwire::MAX_BYTES);
+        // Spent: further input changes nothing.
+        tw.observe(&[0x0a; 4]);
+        assert_eq!(tw.bytes_logged, AttachInputTripwire::MAX_BYTES);
+        // Empty chunks never count.
+        let mut fresh = tripwire();
+        fresh.observe(&[]);
+        assert_eq!(fresh.bytes_logged, 0);
+    }
+
+    /// The time window: the first out-of-window observation latches the
+    /// budget as spent (behavior-identical to checking the clock forever,
+    /// but cheaper), and nothing is logged after expiry.
+    #[test]
+    fn observe_latches_after_window_expires() {
+        let mut tw = tripwire();
+        // Simulate an expired window without sleeping.
+        tw.started = std::time::Instant::now() - (AttachInputTripwire::WINDOW * 2);
+        tw.observe(&[0x0a]);
+        assert_eq!(
+            tw.bytes_logged,
+            AttachInputTripwire::MAX_BYTES,
+            "expiry must latch the budget as spent without logging"
+        );
+    }
 
     #[test]
     fn hex_dump_shows_control_bytes_and_masks_printables() {
