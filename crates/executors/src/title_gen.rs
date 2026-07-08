@@ -37,21 +37,29 @@ const PROMPT_MAX_CHARS: usize = 2000;
 // stuck call still falls back to heuristic naming.
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Arrow first lines get extra slack over the 48-char short-line bound
+/// (matching the frontend's 100-char first-line name cap), but an arbitrarily
+/// long arrow line — e.g. a pasted log line containing " -> " — is a task, not
+/// a title, and must not be stored verbatim as the workspace name.
+const HINT_ARROW_MAX_CHARS: usize = 100;
+
 /// If the user's first line already reads like a deliberate title, return it
 /// (lightly trimmed) so we keep it verbatim instead of asking the model.
 ///
-/// Signals: contains " -> " (Miguel's explicit format), OR is short
-/// (<= 8 words AND <= 48 chars) AND the message has a body after it (a lone
-/// short message is a task, not a title hint — still model-styled) unless it
-/// contains an arrow. A trailing clause punctuation (":", ",", "...") rejects,
-/// since it signals the first line is the start of a sentence, not a title.
+/// Signals: contains " -> " (Miguel's explicit format) at a plausible title
+/// length, OR is short (<= 8 words AND <= 48 chars) AND the message has a body
+/// after it (a lone short message is a task, not a title hint — still
+/// model-styled) unless it contains an arrow. A trailing clause punctuation
+/// (":", ",", "...") rejects, since it signals the first line is the start of
+/// a sentence, not a title.
 pub fn first_line_title_hint(message: &str) -> Option<String> {
     let mut lines = message.trim().lines();
     let first = lines.next()?.trim().trim_start_matches('#').trim();
     if first.is_empty() {
         return None;
     }
-    let has_arrow = first.contains(" -> ") || first.contains(" → ");
+    let has_arrow = (first.contains(" -> ") || first.contains(" → "))
+        && first.chars().count() <= HINT_ARROW_MAX_CHARS;
     let has_body = lines.any(|l| !l.trim().is_empty());
     let word_count = first.split_whitespace().count();
     let short_enough = word_count <= 8 && first.chars().count() <= 48;
@@ -298,6 +306,22 @@ mod tests {
     fn hint_rejects_empty() {
         assert!(first_line_title_hint("").is_none());
         assert!(first_line_title_hint("\n\n").is_none());
+    }
+
+    #[test]
+    fn hint_rejects_overlong_arrow_line() {
+        // A pasted log line containing " -> " is a task, not a title — it must
+        // fall through to the model path instead of being stored verbatim.
+        let long_arrow = format!("request -> response {}", "x".repeat(120));
+        assert!(first_line_title_hint(&long_arrow).is_none());
+        assert!(first_line_title_hint(&format!("{long_arrow}\n\nbody")).is_none());
+        // At the boundary (100 chars) the arrow line is still accepted.
+        let at_cap = format!("bp -> {}", "y".repeat(94)); // 6 + 94 = 100 chars
+        assert_eq!(at_cap.chars().count(), 100);
+        assert_eq!(
+            first_line_title_hint(&at_cap).as_deref(),
+            Some(at_cap.as_str())
+        );
     }
 
     #[test]
