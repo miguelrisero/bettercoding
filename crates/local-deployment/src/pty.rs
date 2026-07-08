@@ -130,15 +130,22 @@ fn cli_bootstrap(
                 format!(r#"vk_p="$(cat {qfile})"; rm -f -- {qfile}; {base} "$vk_p""#)
             }
             // Prompt as a flag value (e.g. gemini/copilot `-i "<prompt>"`); a
-            // leading '-' is harmless after the flag.
+            // leading '-' is harmless after the flag. The flag is one of our
+            // own spec constants, but quote it anyway (like the program and
+            // base args) so it can never be more than a single command word.
             CliPromptArg::Flag(flag) => {
-                format!(r#"vk_p="$(cat {qfile})"; rm -f -- {qfile}; {base} {flag} "$vk_p""#)
+                let qflag = shell_single_quote(flag);
+                format!(r#"vk_p="$(cat {qfile})"; rm -f -- {qfile}; {base} {qflag} "$vk_p""#)
             }
             // Prompt piped on stdin (e.g. amp); the TUI stays interactive
             // because the tmux pane keeps stdout a TTY. No argv-length ceiling
-            // at all. The file already carries the trailing newline printf added.
+            // at all. The file already carries the trailing newline printf
+            // added. The `rm` runs inside the pipeline's producer — right after
+            // `cat` streams the file — so consumption is acknowledged (file
+            // gone) as soon as the prompt is handed off, not when the agent
+            // eventually exits.
             CliPromptArg::StdinPipe => {
-                format!("cat {qfile} | {base}; rm -f -- {qfile}")
+                format!("{{ cat {qfile}; rm -f -- {qfile}; }} | {base}")
             }
             // No CLI way to seed the prompt — start the TUI and rely on a
             // post-launch keystroke delivery (loop automation / send-keys).
@@ -270,6 +277,18 @@ fn cli_prompt_file_path(workspace_id: Uuid) -> PathBuf {
 fn write_cli_prompt_file(workspace_id: Uuid, content: &str) -> std::io::Result<PathBuf> {
     let path = cli_prompt_file_path(workspace_id);
     if let Some(dir) = path.parent() {
+        // Owner-only dir: the files inside are already 0600, but a 0700 dir
+        // also keeps prompt-file names (workspace ids + staging times) from
+        // being enumerable by other local users.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
+        }
+        #[cfg(not(unix))]
         std::fs::create_dir_all(dir)?;
     }
     #[cfg(unix)]
@@ -296,6 +315,56 @@ fn write_cli_prompt_file(workspace_id: Uuid, content: &str) -> std::io::Result<P
 /// needed.
 pub fn remove_cli_prompt_file(workspace_id: Uuid) {
     let _ = std::fs::remove_file(cli_prompt_file_path(workspace_id));
+}
+
+/// Whether a workspace's staged CLI prompt file is still on disk. The bootstrap
+/// `rm`s the file the moment it consumes it, so "file gone" is the delivery
+/// acknowledgement the terminal route polls before clearing the parked DB copy.
+/// A launch that never consumed the prompt (agent binary missing → the
+/// `command -v` guard skips the whole launch arm) leaves the file — and
+/// therefore the DB copy — in place for the next fresh session.
+pub fn cli_prompt_file_exists(workspace_id: Uuid) -> bool {
+    cli_prompt_file_path(workspace_id).exists()
+}
+
+/// Workspaces with a CLI prompt delivery currently in flight. See
+/// [`CliPromptDelivery`].
+static CLI_PROMPT_DELIVERIES: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+
+/// In-process claim that exactly ONE terminal attach delivers a workspace's
+/// parked CLI prompt at a time. Two racing first-attaches can both pass the
+/// "no tmux session yet" gate before either spawns; without the claim both
+/// would stage the same prompt file (the loser's `truncate` can tear the
+/// winner's in-flight `cat`) or, for an oversized prompt, both would paste it
+/// (double delivery). The loser simply attaches without carrying the prompt —
+/// `new-session -A` ignores its bootstrap anyway. Dropping the claim releases
+/// it; delivery holders keep it until the parked prompt is cleared or
+/// explicitly left parked.
+#[derive(Debug)]
+pub struct CliPromptDelivery(Uuid);
+
+impl CliPromptDelivery {
+    /// Claim the workspace's prompt delivery, or `None` if another attach in
+    /// this process already holds it.
+    pub fn try_claim(workspace_id: Uuid) -> Option<Self> {
+        let set = CLI_PROMPT_DELIVERIES.get_or_init(Default::default);
+        // Release the registry guard BEFORE constructing the claim: an eagerly
+        // built `Self` on the not-inserted path (`then_some`) would be dropped
+        // while the guard is still alive, and `Drop` re-locks the same
+        // (non-reentrant) mutex — a self-deadlock.
+        let inserted = set.lock().ok()?.insert(workspace_id);
+        inserted.then(|| Self(workspace_id))
+    }
+}
+
+impl Drop for CliPromptDelivery {
+    fn drop(&mut self) {
+        if let Some(set) = CLI_PROMPT_DELIVERIES.get()
+            && let Ok(mut set) = set.lock()
+        {
+            set.remove(&self.0);
+        }
+    }
 }
 
 /// How to install each interactive-CLI agent, shown in the pane when its binary
@@ -804,6 +873,117 @@ pub fn cli_tmux_available() -> bool {
     tmux_available()
 }
 
+/// Whether the AGENT (a non-shell process) currently owns a workspace's CLI
+/// pane. `None` when the pane itself can't be read (session gone).
+///
+/// tmux runs our bootstrap string via `default-shell -c`, and every launch
+/// stage shares that shell's process group — so `#{pane_current_command}`
+/// reports the outer shell for the pane's whole life (verified empirically)
+/// and can't distinguish "agent running" from "fallback shell". Instead this
+/// inspects the pane's process tree: the pane root (`#{pane_pid}`) or one of
+/// its direct children being a non-shell process means the agent is up. The
+/// bootstrap keeps the agent a direct child of the pane shell (it is not
+/// `exec`ed), and the missing-binary fallback `exec`s an interactive shell
+/// with no children — both shapes verified on a scratch socket.
+pub async fn cli_pane_agent_running(workspace_id: Uuid) -> Option<bool> {
+    if !tmux_available() {
+        return None;
+    }
+    let target = cli_tmux_session_name(workspace_id);
+    let output = tokio::process::Command::new("tmux")
+        .args([
+            "-L",
+            CLI_TMUX_SOCKET,
+            "list-panes",
+            "-t",
+            &target,
+            "-F",
+            "#{pane_pid}",
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let pane_pid = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+
+    // Pane root: normally the bootstrap/fallback shell, but a future exec'd
+    // agent would show up here directly.
+    if let Some(comm) = process_comm(pane_pid).await
+        && !is_shell_command(&comm)
+    {
+        return Some(true);
+    }
+
+    // Direct children of the pane shell (`pgrep -l -P` prints "<pid> <comm>";
+    // a non-zero exit just means no children — the bootstrap is between
+    // stages or the fallback shell is idle).
+    let children = tokio::process::Command::new("pgrep")
+        .args(["-l", "-P", &pane_pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    let listing = String::from_utf8_lossy(&children.stdout);
+    Some(
+        listing
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .any(|comm| !is_shell_command(comm)),
+    )
+}
+
+/// Best-effort process name for a pid (`ps -o comm=`), normalized.
+async fn process_comm(pid: u32) -> Option<String> {
+    let output = tokio::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let comm = normalize_comm(String::from_utf8_lossy(&output.stdout).trim()).to_string();
+    (!comm.is_empty()).then_some(comm)
+}
+
+/// Normalize a `ps`/`pgrep` process name for shell detection: login shells
+/// report as `-zsh`, and macOS `ps -o comm=` can report a full path.
+fn normalize_comm(comm: &str) -> &str {
+    let comm = comm.trim().trim_start_matches('-');
+    comm.rsplit('/').next().unwrap_or(comm)
+}
+
+/// Whether a process name is a shell — i.e. NOT the agent. Used to gate the
+/// deferred paste: pasting into a shell would execute/mangle the prompt as
+/// shell input (the bootstrap still starting up, or the missing-binary
+/// fallback shell), so delivery waits for a non-shell process in the pane.
+pub fn is_shell_command(cmd: &str) -> bool {
+    matches!(
+        normalize_comm(cmd),
+        "sh" | "bash"
+            | "zsh"
+            | "dash"
+            | "ash"
+            | "ksh"
+            | "mksh"
+            | "csh"
+            | "tcsh"
+            | "fish"
+            | "nu"
+            | "busybox"
+            | "login"
+    )
+}
+
 /// Inverse of [`cli_tmux_session_name`]: recover the workspace id from one of
 /// our tmux session names. Returns `None` for anything outside the `vk_`
 /// namespace (e.g. a user-created session on the same socket).
@@ -943,7 +1123,13 @@ pub async fn send_cli_keys(workspace_id: Uuid, text: &str) -> bool {
 async fn paste_via_tmux_buffer(workspace_id: Uuid, target: &str, text: &str) -> bool {
     use tokio::io::AsyncWriteExt;
 
-    let buffer = format!("vk_prompt_{}", workspace_id.simple());
+    // Per-send sequence number on top of the workspace namespace: two
+    // concurrent sends to the SAME workspace (e.g. a loop wake-up racing a
+    // deferred initial-prompt delivery) must not overwrite each other's buffer
+    // between load and paste.
+    static SEND_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEND_SEQ.fetch_add(1, Ordering::Relaxed);
+    let buffer = format!("vk_prompt_{}_{seq}", workspace_id.simple());
 
     let mut child = match tokio::process::Command::new("tmux")
         .args(["-L", CLI_TMUX_SOCKET, "load-buffer", "-b", &buffer, "-"])
@@ -976,7 +1162,7 @@ async fn paste_via_tmux_buffer(workspace_id: Uuid, target: &str, text: &str) -> 
         return false;
     }
 
-    tmux_ok(&[
+    let pasted = tmux_ok(&[
         "-L",
         CLI_TMUX_SOCKET,
         "paste-buffer",
@@ -987,7 +1173,13 @@ async fn paste_via_tmux_buffer(workspace_id: Uuid, target: &str, text: &str) -> 
         "-t",
         target,
     ])
-    .await
+    .await;
+    if !pasted {
+        // `-d` only fires on a successful paste; don't leave the staged prompt
+        // readable in the server-global buffer list after a failed one.
+        tmux_ok(&["-L", CLI_TMUX_SOCKET, "delete-buffer", "-b", &buffer]).await;
+    }
+    pasted
 }
 
 /// Seconds since the Unix epoch (best-effort; 0 if the system clock is before
@@ -1656,16 +1848,20 @@ mod tests {
     fn cli_bootstrap_flag_and_stdin_prompt_forms_read_from_file() {
         let file = Path::new("/tmp/vk/p.txt");
 
-        // Flag agents expand the file into the flag's value, double-quoted.
+        // Flag agents expand the file into the flag's value, double-quoted;
+        // the flag itself is quoted like every other word we emit.
         let flag_spec = CliLaunchSpec::new("gemini", vec![])
             .with_prompt_arg(CliPromptArg::Flag("-i".to_string()));
         let b = cli_bootstrap(&flag_spec, None, Some(file));
-        assert!(b.contains("rm -f -- '/tmp/vk/p.txt'; 'gemini' -i \"$vk_p\""));
+        assert!(b.contains("rm -f -- '/tmp/vk/p.txt'; 'gemini' '-i' \"$vk_p\""));
 
         // StdinPipe agents pipe the file into the program — no argv ceiling.
+        // The `rm` runs inside the producer group, right after `cat` streams
+        // the file, so consumption is acknowledged (file gone) immediately —
+        // not when the agent eventually exits.
         let pipe_spec = CliLaunchSpec::new("amp", vec![]).with_prompt_arg(CliPromptArg::StdinPipe);
         let b = cli_bootstrap(&pipe_spec, None, Some(file));
-        assert!(b.contains("cat '/tmp/vk/p.txt' | 'amp'; rm -f -- '/tmp/vk/p.txt'"));
+        assert!(b.contains("{ cat '/tmp/vk/p.txt'; rm -f -- '/tmp/vk/p.txt'; } | 'amp'"));
     }
 
     #[test]
@@ -1793,6 +1989,46 @@ mod tests {
             route_initial_prompt(Some("hello".to_string()), &CliPromptArg::Unsupported),
             CliPromptRouting::Deferred("hello".to_string())
         );
+    }
+
+    #[test]
+    fn cli_prompt_delivery_claim_is_exclusive_until_dropped() {
+        // Fresh workspace id so parallel tests can't collide in the global set.
+        let wid = Uuid::new_v4();
+        let claim = CliPromptDelivery::try_claim(wid).expect("first claim succeeds");
+        // A racing second attach must NOT also carry the prompt.
+        assert!(
+            CliPromptDelivery::try_claim(wid).is_none(),
+            "second claim while held must fail"
+        );
+        // Another workspace's delivery is independent.
+        let other = Uuid::new_v4();
+        assert!(CliPromptDelivery::try_claim(other).is_some());
+        // Releasing (drop) lets the next attach retry delivery.
+        drop(claim);
+        assert!(
+            CliPromptDelivery::try_claim(wid).is_some(),
+            "claim must be reusable after drop"
+        );
+    }
+
+    #[test]
+    fn shell_commands_are_recognized_for_paste_gating() {
+        // The deferred paste must never target a pane whose process tree is
+        // all shells (bootstrap still starting, or the missing-binary
+        // fallback shell).
+        for shell in ["sh", "bash", "zsh", "dash", "fish"] {
+            assert!(is_shell_command(shell), "{shell} must gate the paste");
+        }
+        // Login-shell (`-zsh`) and full-path (`/bin/zsh`, macOS ps) spellings
+        // normalize to the same shell names.
+        assert!(is_shell_command("-zsh"));
+        assert!(is_shell_command("/bin/bash"));
+        assert!(is_shell_command(" -/usr/bin/fish".trim()));
+        // Agent TUIs (binary or interpreter names) unblock the paste.
+        for agent in ["claude", "codex", "node", "amp", "gemini"] {
+            assert!(!is_shell_command(agent), "{agent} must allow the paste");
+        }
     }
 
     #[test]
