@@ -117,20 +117,17 @@ export function ModelSelectorContainer({
   }, [streamError]);
 
   const baseConfig = streamConfig;
-  // Inject both the profile preset and the current override model (which may be
-  // a free-text custom id typed by the user) so each shows up in the picker with
-  // an effort selector. Effort inheritance is enabled only for Claude, the sole
-  // executor that uses `--effort`. appendPresetModel is a no-op when the id is
-  // already present, so built-in / provider selections are untouched.
-  const enableEffortFallback = agent === BaseCodingAgent.CLAUDE_CODE;
+  // Claude is the only executor whose downstream tolerates arbitrary model ids
+  // and uses `--effort`, so it alone gets free-text custom entry + the effort
+  // fallback. Inject both the profile preset and the current override model
+  // (which may be a free-text custom id) so each shows up in the picker with an
+  // effort selector. appendPresetModel is a no-op when the id is already present,
+  // so built-in / provider selections are untouched.
+  const isClaude = agent === BaseCodingAgent.CLAUDE_CODE;
   const config = appendPresetModel(
-    appendPresetModel(
-      baseConfig,
-      presetOptions?.model_id,
-      enableEffortFallback
-    ),
+    appendPresetModel(baseConfig, presetOptions?.model_id, isClaude),
     executorConfig?.model_id,
-    enableEffortFallback
+    isClaude
   );
 
   const availableProviderIds = useMemo(
@@ -506,6 +503,7 @@ export function ModelSelectorContainer({
           expandedProviderId={expandedProviderId}
           onExpandedProviderIdChange={setExpandedProviderId}
           resolvedTheme={resolvedTheme}
+          allowCustomModel={isClaude}
         />
       )}
 

@@ -48,7 +48,17 @@ export interface ModelSelectorPopoverProps {
   expandedProviderId?: string;
   onExpandedProviderIdChange?: (id: string) => void;
   resolvedTheme?: 'light' | 'dark';
+  /**
+   * Enables the free-text "Use \"<query>\"" custom-model row (and forces the
+   * search box on) for the flat picker. Off by default: only executors whose
+   * downstream tolerates arbitrary model ids (Claude) opt in; other flat
+   * executors keep their fixed model lists.
+   */
+  allowCustomModel?: boolean;
 }
+
+// Above this many models the flat picker shows a search box to filter the list.
+const MODEL_LIST_PAGE_SIZE = 8;
 
 function getModelKey(model: ModelListModel): string {
   return model.provider_id ? `${model.provider_id}/${model.id}` : model.id;
@@ -295,6 +305,7 @@ export function ModelSelectorPopover({
   expandedProviderId = '',
   onExpandedProviderIdChange,
   resolvedTheme = 'light',
+  allowCustomModel = false,
 }: ModelSelectorPopoverProps) {
   const { t } = useTranslation('common');
   const models = config.models;
@@ -305,6 +316,10 @@ export function ModelSelectorPopover({
   const popoverWidth = getPopoverWidth(hasProviders, hasReasoning);
   const popoverHeightClass = hasProviders ? 'h-[280px]' : '';
 
+  // Provider (accordion) pickers always show the search box. The flat picker
+  // shows it once the list is long enough to warrant filtering, or whenever
+  // custom-model entry is allowed (which needs the box to type an id into).
+  let showSearch = true;
   let content: ReactElement;
 
   if (hasProviders) {
@@ -332,6 +347,7 @@ export function ModelSelectorPopover({
       selectedProviderId,
       selectedModelId
     );
+    showSearch = allowCustomModel || models.length > MODEL_LIST_PAGE_SIZE;
     content = (
       <ModelList
         models={sortedModels}
@@ -346,11 +362,13 @@ export function ModelSelectorPopover({
         showDefaultOption={showDefaultOption}
         onSelectDefault={onSelectDefault}
         scrollRef={scrollRef}
-        // Free-text custom-model entry is intentionally offered only in the flat
-        // (no-provider) picker: a bare typed id has no provider to attach to, and
-        // Claude — the executor that needs custom ids — is a flat picker. The
-        // provider accordion deliberately omits it.
-        onUseCustomModel={(id) => onModelSelect(id)}
+        // Free-text custom-model entry is gated on `allowCustomModel` so it only
+        // appears for executors that opt in (Claude) — a bare typed id has no
+        // provider, so exposing it to other flat/provider pickers would produce
+        // malformed provider-less overrides.
+        onUseCustomModel={
+          allowCustomModel ? (id) => onModelSelect(id) : undefined
+        }
       />
     );
   }
@@ -383,16 +401,15 @@ export function ModelSelectorPopover({
           <DropdownMenuLabel>{t('modelSelector.model')}</DropdownMenuLabel>
           <div className="flex flex-col flex-1 min-h-0 min-w-0">
             {content}
-            {/* The search box is always shown: it filters the list and, for the
-                flat (no-provider) picker, lets a custom model id be typed even
-                when the built-in list is short. */}
-            <div className="border-t border-border">
-              <DropdownMenuSearchInput
-                placeholder="Filter by name or ID..."
-                value={searchQuery}
-                onValueChange={onSearchChange}
-              />
-            </div>
+            {showSearch && (
+              <div className="border-t border-border">
+                <DropdownMenuSearchInput
+                  placeholder="Filter by name or ID..."
+                  value={searchQuery}
+                  onValueChange={onSearchChange}
+                />
+              </div>
+            )}
           </div>
         </div>
       </DropdownMenuContent>
