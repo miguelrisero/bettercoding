@@ -129,15 +129,18 @@ export function LoopAutomationControl({
   const attemptsUsed = policy ? Number(policy.attempts_used) : 0;
   const showAttempts = enabled && maxAttemptsCount > 0;
 
-  // Mobile shows only the bare time next to the moon/clock icon; the full
-  // localized status stays in the accessibility tree via an sr-only twin.
+  // Mobile (<768px) shows only the bare time next to the moon/clock icon; the
+  // full localized status stays in the accessibility tree via sr-only. md:
+  // (>=768px) is the exact complement of useIsMobile's 767px max-width — keep
+  // in sync with MOBILE_BREAKPOINT in useIsMobile.ts.
+  const isUsageLimitWake = nextWakeup?.kind === 'usage_limit_wake';
   const wakeupTimeText = nextWakeup
-    ? nextWakeup.kind === 'usage_limit_wake'
+    ? isUsageLimitWake
       ? formatUtcTime(nextWakeup.fire_at)
       : formatLocalTime(nextWakeup.fire_at)
     : null;
   const wakeupStatusText = nextWakeup
-    ? nextWakeup.kind === 'usage_limit_wake'
+    ? isUsageLimitWake
       ? t('loopAutomation.wakingAt', { time: wakeupTimeText })
       : t('loopAutomation.retryingAt', { time: wakeupTimeText })
     : null;
@@ -146,16 +149,15 @@ export function LoopAutomationControl({
     <div className="flex items-center gap-1.5 md:gap-2 min-w-0">
       {enabled && nextWakeup && (
         <span className="flex items-center gap-1 text-xs text-low whitespace-nowrap shrink-0">
-          {nextWakeup.kind === 'usage_limit_wake' ? (
+          {isUsageLimitWake ? (
             <MoonIcon className="size-icon-sm" weight="bold" aria-hidden />
           ) : (
             <ClockIcon className="size-icon-sm" weight="bold" aria-hidden />
           )}
-          <span className="hidden md:inline">{wakeupStatusText}</span>
+          <span className="sr-only md:not-sr-only">{wakeupStatusText}</span>
           <span className="md:hidden" aria-hidden>
             {wakeupTimeText}
           </span>
-          <span className="sr-only md:hidden">{wakeupStatusText}</span>
           {showAttempts && (
             <span className="hidden md:inline">
               {'· '}
