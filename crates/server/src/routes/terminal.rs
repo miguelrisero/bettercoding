@@ -21,7 +21,8 @@ use executors::{
     profile::{ExecutorConfig, ExecutorConfigs},
 };
 use local_deployment::pty::{
-    PtyCommand, cli_tmux_available, cli_tmux_session_exists, cli_tmux_session_name,
+    PtyCommand, cli_prompt_fits_inline, cli_tmux_available, cli_tmux_session_exists,
+    cli_tmux_session_name, remove_cli_prompt_file, send_cli_keys,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -187,6 +188,10 @@ async fn terminal_ws(
     // is confirmed created (CLI-first first attach only). Set inside the Cli
     // arm; cleared post-spawn in handle_terminal_ws.
     let mut prompt_session_to_clear: Option<Uuid> = None;
+    // A large (or otherwise non-inlineable) initial prompt that must be
+    // delivered by paste AFTER the pane is up, rather than baked into the launch
+    // command. Set inside the Cli arm; delivered in handle_terminal_ws.
+    let mut deferred_prompt: Option<String> = None;
 
     let (working_dir, command) = match query.mode {
         TerminalMode::Cli => {
@@ -297,23 +302,43 @@ async fn terminal_ws(
                 }
                 _ => None,
             };
-            // Remember which session's prompt to clear once the PTY/tmux
-            // session is up (only when we actually carried a prompt).
-            if initial_prompt.is_some() {
-                prompt_session_to_clear = session.as_ref().map(|s| s.id);
-            }
-
             // Honor the workspace's selected agent + model/effort at launch
             // (defaults to claude at Opus/max when nothing was selected).
             let (model_id, reasoning_id) = resolve_cli_model_effort(pool, session.as_ref()).await;
             let spec = resolve_cli_launch_spec(session.as_ref(), model_id, reasoning_id, &dir);
+
+            // Small prompts ride the bootstrap's temp-file transport (baked into
+            // the launch). Prompts too large to pass as one argv entry — or
+            // agents with no launch-time prompt arg — are delivered by paste
+            // after the pane is confirmed up (see handle_terminal_ws), so they're
+            // never truncated and never silently lost. Either way the parked
+            // prompt is cleared only after delivery is confirmed.
+            let baked_prompt = match initial_prompt {
+                Some(prompt) => {
+                    let trimmed = prompt.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else if cli_prompt_fits_inline(&spec.prompt_arg, trimmed.len()) {
+                        Some(prompt)
+                    } else {
+                        deferred_prompt = Some(trimmed.to_string());
+                        None
+                    }
+                }
+                None => None,
+            };
+            // Remember which session's prompt to clear once delivery is
+            // confirmed (only when we actually carried a prompt).
+            if baked_prompt.is_some() || deferred_prompt.is_some() {
+                prompt_session_to_clear = session.as_ref().map(|s| s.id);
+            }
 
             (
                 dir,
                 PtyCommand::TmuxCli {
                     session_name: cli_tmux_session_name(query.workspace_id),
                     resume_session_id,
-                    initial_prompt,
+                    initial_prompt: baked_prompt,
                     spec,
                 },
             )
@@ -352,11 +377,14 @@ async fn terminal_ws(
             query.cols,
             query.rows,
             command,
+            query.workspace_id,
             prompt_session_to_clear,
+            deferred_prompt,
         )
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_terminal_ws(
     mut socket: MaybeSignedWebSocket,
     deployment: DeploymentImpl,
@@ -364,7 +392,9 @@ async fn handle_terminal_ws(
     cols: u16,
     rows: u16,
     command: PtyCommand,
+    workspace_id: Uuid,
     prompt_session_to_clear: Option<Uuid>,
+    deferred_prompt: Option<String>,
 ) {
     let (session_id, mut output_rx) = match deployment
         .pty()
@@ -379,19 +409,58 @@ async fn handle_terminal_ws(
         }
     };
 
-    // The tmux session is now created and its bootstrap (carrying the parked
-    // CLI prompt) is running; only now is it safe to clear the prompt, so a
-    // failure before this point leaves it parked for the next attach. If the
-    // clear itself fails the prompt stays parked and a later attach (after a
-    // tmux death) could replay it — narrow, but log so it's observable.
-    if let Some(session_id) = prompt_session_to_clear
-        && let Err(e) = Session::clear_pending_cli_prompt(&deployment.db().pool, session_id).await
-    {
-        tracing::warn!(
-            "Failed to clear delivered CLI prompt for session {}: {}",
-            session_id,
-            e
-        );
+    // create_session returning Ok only means the tmux *client* process spawned;
+    // the tmux server can still reject the command moments later (historically:
+    // an over-long prompt baked into `new-session`). So confirm the session
+    // actually exists before clearing the parked prompt — and, for a deferred
+    // large prompt, before pasting it in. A session that never comes up leaves
+    // the prompt saved for the next attach and tells the user so, instead of
+    // silently destroying it.
+    if let Some(clear_session_id) = prompt_session_to_clear {
+        if wait_for_cli_session(workspace_id).await {
+            let delivered = match &deferred_prompt {
+                Some(text) => {
+                    // Give the freshly-launched TUI a moment to be ready to
+                    // accept a paste, then deliver the oversized prompt via the
+                    // buffer path (no argv-length ceiling).
+                    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                    send_cli_keys(workspace_id, text).await
+                }
+                None => true,
+            };
+            if delivered {
+                if let Err(e) =
+                    Session::clear_pending_cli_prompt(&deployment.db().pool, clear_session_id).await
+                {
+                    tracing::warn!(
+                        "Failed to clear delivered CLI prompt for session {}: {}",
+                        clear_session_id,
+                        e
+                    );
+                }
+            } else {
+                // Leave the prompt parked; the next attach retries delivery.
+                tracing::warn!(
+                    "Failed to deliver large CLI prompt to workspace {}; left parked",
+                    workspace_id
+                );
+            }
+        } else {
+            // The session never appeared — remove the transient prompt file (the
+            // DB copy stays parked) and surface the failure. The frontend renders
+            // this in red and halts its reconnect loop.
+            remove_cli_prompt_file(workspace_id);
+            tracing::error!(
+                "CLI tmux session for workspace {} never came up; prompt left parked",
+                workspace_id
+            );
+            let _ = send_error(
+                &mut socket,
+                "Failed to start the agent session — your prompt is saved and will be delivered on the next attach",
+            )
+            .await;
+            return;
+        }
     }
 
     let pty_service = deployment.pty().clone();
@@ -445,6 +514,23 @@ async fn handle_terminal_ws(
     }
 
     let _ = deployment.pty().close_session(session_id).await;
+}
+
+/// Poll for the workspace's CLI tmux session to appear after a spawn. The
+/// session existing proves tmux accepted `new-session` and the bootstrap (which
+/// owns the prompt file) is running; only then is it safe to clear the parked
+/// prompt. Short backoff (~5 × 200ms) — the session shows up immediately when
+/// tmux accepts the command, so this only spins when it's failing.
+async fn wait_for_cli_session(workspace_id: Uuid) -> bool {
+    for attempt in 0..5 {
+        if cli_tmux_session_exists(workspace_id).await {
+            return true;
+        }
+        if attempt < 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+    false
 }
 
 async fn send_error(socket: &mut MaybeSignedWebSocket, message: &str) -> anyhow::Result<()> {

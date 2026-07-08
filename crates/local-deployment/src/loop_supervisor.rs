@@ -453,7 +453,13 @@ async fn deliver_due_wakeups(db: &DBService, _now: DateTime<Utc>) -> Result<(), 
                 wakeup.kind.as_str()
             );
         } else {
-            tracing::warn!("loop: failed to deliver wake-up to workspace {wid}");
+            // Delivery failed (e.g. tmux rejected an over-long send). Re-park the
+            // prompt so the next terminal attach delivers it rather than dropping
+            // the wake-up — mirrors the session-gone branch above.
+            tracing::warn!("loop: failed to deliver wake-up to workspace {wid}; re-parking");
+            if let Ok(Some(session)) = Session::find_latest_by_workspace_id(pool, wid).await {
+                let _ = Session::set_pending_cli_prompt(pool, session.id, &prompt).await;
+            }
         }
         ScheduledWakeup::mark_fired(pool, wakeup.id).await?;
     }

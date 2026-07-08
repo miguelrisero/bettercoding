@@ -73,7 +73,7 @@ pub enum PtyCommand {
 fn cli_bootstrap(
     spec: &CliLaunchSpec,
     resume_session_id: Option<&str>,
-    initial_prompt: Option<&str>,
+    prompt_file: Option<&Path>,
 ) -> String {
     // The program is a bare binary name from our own code; quote it anyway so
     // it can never be anything but a single command word.
@@ -112,27 +112,33 @@ fn cli_bootstrap(
             CliResume::Subcommand(sub) => format!("{prog} {sub} {id}"),
             CliResume::Unsupported => continue_launch(),
         }
-    } else if let Some(prompt) = initial_prompt.map(str::trim).filter(|p| !p.is_empty()) {
-        // CLI-first creation: the workspace prompt is delivered to the agent.
+    } else if let Some(file) = prompt_file {
+        // CLI-first creation: the workspace prompt lives in a private file
+        // ([`write_cli_prompt_file`]) and is read into the launch at pane-shell
+        // time. This keeps the tmux `new-session` command O(1) in prompt size
+        // (tmux rejects commands past ~16KB) and means the prompt never re-enters
+        // shell quoting — the file PATH is single-quoted, and the content only
+        // ever expands inside double quotes, so it can't be word-split or parsed
+        // as shell. The file self-deletes (`rm`) once consumed.
+        let qfile = shell_single_quote(&file.to_string_lossy());
         match &spec.prompt_arg {
-            // Trailing positional arg (single-quote escaped — arbitrary user
-            // text). A leading space neutralizes prompts starting with '-' so
-            // they can never parse as flags.
+            // Trailing positional arg. The leading-dash guard and any trailing
+            // whitespace handling are baked into the file's contents
+            // ([`cli_prompt_file_content`]); command substitution strips a
+            // trailing newline, which is harmless.
             CliPromptArg::Positional => {
-                let guarded = if prompt.starts_with('-') {
-                    format!(" {prompt}")
-                } else {
-                    prompt.to_string()
-                };
-                format!("{base} {}", shell_single_quote(&guarded))
+                format!(r#"vk_p="$(cat {qfile})"; rm -f -- {qfile}; {base} "$vk_p""#)
             }
-            // Prompt as a flag value (e.g. gemini/copilot `-i '<prompt>'`); a
+            // Prompt as a flag value (e.g. gemini/copilot `-i "<prompt>"`); a
             // leading '-' is harmless after the flag.
-            CliPromptArg::Flag(flag) => format!("{base} {flag} {}", shell_single_quote(prompt)),
+            CliPromptArg::Flag(flag) => {
+                format!(r#"vk_p="$(cat {qfile})"; rm -f -- {qfile}; {base} {flag} "$vk_p""#)
+            }
             // Prompt piped on stdin (e.g. amp); the TUI stays interactive
-            // because the tmux pane keeps stdout a TTY.
+            // because the tmux pane keeps stdout a TTY. No argv-length ceiling
+            // at all. The file already carries the trailing newline printf added.
             CliPromptArg::StdinPipe => {
-                format!("printf '%s\\n' {} | {base}", shell_single_quote(prompt))
+                format!("cat {qfile} | {base}; rm -f -- {qfile}")
             }
             // No CLI way to seed the prompt — start the TUI and rely on a
             // post-launch keystroke delivery (loop automation / send-keys).
@@ -157,6 +163,98 @@ fn cli_bootstrap(
     format!(
         r#"if command -v {prog} >/dev/null 2>&1; then {launch}; else {missing}; fi; exec "${{SHELL:-/bin/sh}}""#
     )
+}
+
+/// Largest prompt (bytes) baked into the launch command via the temp-file
+/// `$(cat)` transport for argv-passing agents. Positional/Flag agents hand the
+/// prompt to the pane shell as a single argv entry, bounded by Linux
+/// `MAX_ARG_STRLEN` (~131072 bytes); a conservative cap keeps clear of `E2BIG`
+/// (and of macOS's smaller shared `ARG_MAX`). Larger prompts are delivered
+/// post-launch by paste instead (see [`cli_prompt_fits_inline`]).
+const MAX_INLINE_PROMPT_BYTES: usize = 100_000;
+
+/// Whether an initial prompt of `byte_len` bytes can be baked into the launch
+/// command for an agent with this `prompt_arg`, or must be delivered after the
+/// TUI is up (via [`send_cli_keys`]). `StdinPipe` has no argv ceiling;
+/// `Positional`/`Flag` pass the prompt as one argv entry and are capped;
+/// `Unsupported` has no launch-time transport at all.
+pub fn cli_prompt_fits_inline(prompt_arg: &CliPromptArg, byte_len: usize) -> bool {
+    match prompt_arg {
+        CliPromptArg::Positional | CliPromptArg::Flag(_) => byte_len <= MAX_INLINE_PROMPT_BYTES,
+        CliPromptArg::StdinPipe => true,
+        CliPromptArg::Unsupported => false,
+    }
+}
+
+/// The exact bytes to write to a workspace's CLI prompt file for `prompt_arg`,
+/// or `None` when the (trimmed) prompt is blank — mirroring the old in-command
+/// quoting semantics so small prompts behave identically: the leading-dash
+/// guard for `Positional` (so a prompt like `-rf` can't parse as a flag) is a
+/// literal leading space in the file; `StdinPipe` keeps the trailing newline the
+/// old `printf '%s\n'` added. The content is stored verbatim (never
+/// shell-escaped) — the bootstrap reads it back inside double quotes.
+fn cli_prompt_file_content(prompt_arg: &CliPromptArg, prompt: &str) -> Option<String> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return None;
+    }
+    Some(match prompt_arg {
+        CliPromptArg::Positional => {
+            if prompt.starts_with('-') {
+                format!(" {prompt}")
+            } else {
+                prompt.to_string()
+            }
+        }
+        CliPromptArg::Flag(_) => prompt.to_string(),
+        CliPromptArg::StdinPipe => format!("{prompt}\n"),
+        CliPromptArg::Unsupported => return None,
+    })
+}
+
+/// Path of a workspace's transient CLI initial-prompt file. Kept next to the
+/// other backend assets (same trust domain as the SQLite DB) under a dedicated
+/// `cli-prompts/` subdir; named by the workspace id so racing first-attaches
+/// write the same path idempotently.
+fn cli_prompt_file_path(workspace_id: Uuid) -> PathBuf {
+    utils::assets::asset_dir()
+        .join("cli-prompts")
+        .join(format!("{}.txt", workspace_id.simple()))
+}
+
+/// Write a workspace's CLI initial prompt to its private (0600) file for the
+/// bootstrap to read. Returns the path on success. The file self-deletes once
+/// the bootstrap consumes it; [`remove_cli_prompt_file`] and
+/// [`kill_cli_tmux_session`] clean up the never-consumed case.
+fn write_cli_prompt_file(workspace_id: Uuid, content: &str) -> std::io::Result<PathBuf> {
+    let path = cli_prompt_file_path(workspace_id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        f.write_all(content.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, content.as_bytes())?;
+    }
+    Ok(path)
+}
+
+/// Best-effort delete of a workspace's transient CLI prompt file. Called when a
+/// session that never consumed it is torn down (spawn failure recovery, kill,
+/// reaper) so a prompt is never left readable on disk after it's no longer
+/// needed.
+pub fn remove_cli_prompt_file(workspace_id: Uuid) {
+    let _ = std::fs::remove_file(cli_prompt_file_path(workspace_id));
 }
 
 /// How to install each interactive-CLI agent, shown in the pane when its binary
@@ -680,6 +778,9 @@ pub(crate) fn workspace_id_from_cli_session_name(name: &str) -> Option<Uuid> {
 /// cleanup so sessions don't outlive their worktree). `=` forces exact-name
 /// matching — tmux `-t` is otherwise a prefix match.
 pub async fn kill_cli_tmux_session(workspace_id: Uuid) {
+    // Drop any transient prompt file alongside the session (covers the
+    // never-attached case where the bootstrap never ran to self-delete it).
+    remove_cli_prompt_file(workspace_id);
     if !tmux_available() {
         return;
     }
@@ -736,22 +837,43 @@ pub async fn capture_cli_pane(workspace_id: Uuid) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Texts at/above this size go through tmux buffers (load-buffer + paste-buffer)
+/// instead of `send-keys -l`, which — like every tmux client command — is
+/// rejected once its argv exceeds ~16KB. The small-text `send-keys` path is the
+/// already-live-verified one, so keep it for the common case.
+const SEND_KEYS_PASTE_THRESHOLD: usize = 4096;
+
+/// Run a fire-and-forget tmux command on our socket, reporting only success.
+async fn tmux_ok(args: &[&str]) -> bool {
+    tokio::process::Command::new("tmux")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Type `text` into a workspace's CLI tmux pane and submit it (Enter), as if the
 /// user typed it. This is the only way to re-prompt a LIVE, detached agent: the
 /// parked `pending_cli_prompt` path only fires when a fresh tmux session is
-/// created, so an already-running pane needs keystroke injection. `-l` sends the
-/// text literally so it can never be interpreted as tmux key names; Enter is a
+/// created, so an already-running pane needs keystroke injection. Small texts go
+/// via `send-keys -l` (literal, so never interpreted as tmux key names); larger
+/// texts are staged through a namespaced tmux buffer and bracketed-pasted (no
+/// argv-length ceiling; embedded newlines don't submit early). Enter is a
 /// separate call so it submits rather than being typed verbatim. Best-effort.
 pub async fn send_cli_keys(workspace_id: Uuid, text: &str) -> bool {
     if !tmux_available() {
         return false;
     }
-    // Bare name (not `=exact`): send-keys takes a pane target, for which the
-    // `=` session-target syntax is rejected. Unambiguous given full-hex names.
+    // Bare name (not `=exact`): send-keys/paste-buffer take a pane target, for
+    // which the `=` session-target syntax is rejected. Unambiguous given
+    // full-hex names.
     let target = cli_tmux_session_name(workspace_id);
 
-    let typed = tokio::process::Command::new("tmux")
-        .args([
+    let delivered = if text.len() < SEND_KEYS_PASTE_THRESHOLD {
+        tmux_ok(&[
             "-L",
             CLI_TMUX_SOCKET,
             "send-keys",
@@ -760,24 +882,65 @@ pub async fn send_cli_keys(workspace_id: Uuid, text: &str) -> bool {
             "-l",
             text,
         ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
         .await
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !typed {
+    } else {
+        paste_via_tmux_buffer(workspace_id, &target, text).await
+    };
+    if !delivered {
         return false;
     }
 
-    tokio::process::Command::new("tmux")
-        .args(["-L", CLI_TMUX_SOCKET, "send-keys", "-t", &target, "Enter"])
+    tmux_ok(&["-L", CLI_TMUX_SOCKET, "send-keys", "-t", &target, "Enter"]).await
+}
+
+/// Stage `text` into a per-workspace tmux buffer via `load-buffer -` (text on
+/// stdin, so no argv-length limit) and bracketed-paste it into the pane. The
+/// buffer is namespaced (`vk_prompt_<wsid>`) and deleted on paste (`-d`) because
+/// tmux buffers are server-global — otherwise concurrent workspaces could
+/// cross-deliver. `-p` (bracketed paste) makes the TUI treat multi-line text as
+/// one paste so embedded newlines don't submit early.
+async fn paste_via_tmux_buffer(workspace_id: Uuid, target: &str, text: &str) -> bool {
+    use tokio::io::AsyncWriteExt;
+
+    let buffer = format!("vk_prompt_{}", workspace_id.simple());
+
+    let mut child = match tokio::process::Command::new("tmux")
+        .args(["-L", CLI_TMUX_SOCKET, "load-buffer", "-b", &buffer, "-"])
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(text.as_bytes()).await.is_err() {
+            return false;
+        }
+        // Drop stdin (EOF) so load-buffer completes.
+        let _ = stdin.shutdown().await;
+        drop(stdin);
+    }
+
+    let loaded = child.wait().await.map(|s| s.success()).unwrap_or(false);
+    if !loaded {
+        return false;
+    }
+
+    tmux_ok(&[
+        "-L",
+        CLI_TMUX_SOCKET,
+        "paste-buffer",
+        "-d",
+        "-p",
+        "-b",
+        &buffer,
+        "-t",
+        target,
+    ])
+    .await
 }
 
 /// Seconds since the Unix epoch (best-effort; 0 if the system clock is before
@@ -982,86 +1145,112 @@ impl PtyService {
                 }
             }
 
-            let (mut cmd, shell_name) =
-                if let (Some(session_name), Some(spec)) = (&tmux_session, &tmux_spec) {
-                    // Bring an already-running server in line with our config
-                    // (options are server-wide; `-f` below only affects a fresh
-                    // server start).
-                    ensure_cli_tmux_server_options();
+            let (mut cmd, shell_name) = if let (Some(session_name), Some(spec)) =
+                (&tmux_session, &tmux_spec)
+            {
+                // Bring an already-running server in line with our config
+                // (options are server-wide; `-f` below only affects a fresh
+                // server start).
+                ensure_cli_tmux_server_options();
 
-                    // Pre-accept the agent's per-directory folder-trust / first-run
-                    // dialog for this app-created worktree so the launch never
-                    // blocks on it.
-                    maybe_seed_cli_trust(&spec.program, &working_dir);
+                // Pre-accept the agent's per-directory folder-trust / first-run
+                // dialog for this app-created worktree so the launch never
+                // blocks on it.
+                maybe_seed_cli_trust(&spec.program, &working_dir);
 
-                    let mut cmd = CommandBuilder::new("tmux");
-                    // Our own config instead of the user's ~/.tmux.conf — the
-                    // embedded terminal needs deterministic mouse/clipboard
-                    // behavior (see CLI_TMUX_CONF); the user's personal tmux on
-                    // the default socket is unaffected.
-                    if let Some(conf) = cli_tmux_conf_path() {
-                        cmd.arg("-f");
-                        cmd.arg(conf);
-                    }
-                    // Dedicated socket isolates our sessions from the user's tmux.
-                    cmd.arg("-L");
-                    cmd.arg(CLI_TMUX_SOCKET);
-                    cmd.arg("new-session");
-                    // -A: attach if the session exists, else create.
-                    //
-                    // We deliberately do NOT pass -D (detach other clients): a new
-                    // attach would detach the prior client, whose tmux process then
-                    // exits → its PTY hits EOF → the WebSocket closes → the frontend
-                    // reconnects → the new attach detaches it again, a self-
-                    // sustaining reconnect loop that also resets the session to the
-                    // attaching client's 80x24 default on every cycle. Without -D,
-                    // reconnects simply attach; the prior client is cleaned up by
-                    // close_session killing its PTY child. Two simultaneous browser
-                    // windows would mirror (tmux sizes to the smaller) — a rare,
-                    // benign trade vs. the loop.
-                    cmd.arg("-A");
-                    cmd.arg("-s");
-                    cmd.arg(session_name);
-                    cmd.arg("-c");
-                    cmd.arg(&working_dir);
-                    cmd.arg(cli_bootstrap(
-                        spec,
-                        tmux_resume_id.as_deref(),
-                        tmux_initial_prompt.as_deref(),
-                    ));
-                    cmd.cwd(&working_dir);
-                    // No shell-specific prompt configuration for the tmux client.
-                    (cmd, String::new())
+                let mut cmd = CommandBuilder::new("tmux");
+                // Our own config instead of the user's ~/.tmux.conf — the
+                // embedded terminal needs deterministic mouse/clipboard
+                // behavior (see CLI_TMUX_CONF); the user's personal tmux on
+                // the default socket is unaffected.
+                if let Some(conf) = cli_tmux_conf_path() {
+                    cmd.arg("-f");
+                    cmd.arg(conf);
+                }
+                // Dedicated socket isolates our sessions from the user's tmux.
+                cmd.arg("-L");
+                cmd.arg(CLI_TMUX_SOCKET);
+                cmd.arg("new-session");
+                // -A: attach if the session exists, else create.
+                //
+                // We deliberately do NOT pass -D (detach other clients): a new
+                // attach would detach the prior client, whose tmux process then
+                // exits → its PTY hits EOF → the WebSocket closes → the frontend
+                // reconnects → the new attach detaches it again, a self-
+                // sustaining reconnect loop that also resets the session to the
+                // attaching client's 80x24 default on every cycle. Without -D,
+                // reconnects simply attach; the prior client is cleaned up by
+                // close_session killing its PTY child. Two simultaneous browser
+                // windows would mirror (tmux sizes to the smaller) — a rare,
+                // benign trade vs. the loop.
+                cmd.arg("-A");
+                cmd.arg("-s");
+                cmd.arg(session_name);
+                cmd.arg("-c");
+                cmd.arg(&working_dir);
+                // Materialize the initial prompt to a private file so the
+                // bootstrap reads it back rather than carrying it inline
+                // (tmux rejects `new-session` commands past ~16KB). Only when
+                // an existing conversation won't take precedence and the
+                // prompt isn't blank; the file self-deletes once consumed.
+                let resume_active = tmux_resume_id.as_deref().is_some_and(is_uuid);
+                let prompt_file: Option<PathBuf> = if resume_active {
+                    None
                 } else {
-                    let mut cmd = CommandBuilder::new(&shell);
-                    cmd.cwd(&working_dir);
-
-                    // Configure shell-specific options
-                    let shell_name = shell
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string();
-
-                    if shell_name == "powershell.exe" || shell_name == "pwsh.exe" {
-                        // PowerShell: use -NoLogo for cleaner startup
-                        cmd.arg("-NoLogo");
-                    } else if shell_name == "cmd.exe" {
-                        // cmd.exe: no special args needed
-                    } else {
-                        // Unix shells
-                        cmd.env("VIBE_KANBAN_TERMINAL", "1");
-
-                        if shell_name == "bash" {
-                            cmd.env("PROMPT_COMMAND", r#"PS1='$ '; unset PROMPT_COMMAND"#);
-                        } else if shell_name == "zsh" {
-                            // PROMPT is set after spawning
-                        } else {
-                            cmd.env("PS1", "$ ");
-                        }
-                    }
-                    (cmd, shell_name)
+                    tmux_initial_prompt
+                        .as_deref()
+                        .and_then(|p| cli_prompt_file_content(&spec.prompt_arg, p))
+                        .and_then(|content| {
+                            let wid = workspace_id_from_cli_session_name(session_name)?;
+                            match write_cli_prompt_file(wid, &content) {
+                                Ok(path) => Some(path),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to write CLI prompt file for {session_name}: {e}"
+                                    );
+                                    None
+                                }
+                            }
+                        })
                 };
+                cmd.arg(cli_bootstrap(
+                    spec,
+                    tmux_resume_id.as_deref(),
+                    prompt_file.as_deref(),
+                ));
+                cmd.cwd(&working_dir);
+                // No shell-specific prompt configuration for the tmux client.
+                (cmd, String::new())
+            } else {
+                let mut cmd = CommandBuilder::new(&shell);
+                cmd.cwd(&working_dir);
+
+                // Configure shell-specific options
+                let shell_name = shell
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                if shell_name == "powershell.exe" || shell_name == "pwsh.exe" {
+                    // PowerShell: use -NoLogo for cleaner startup
+                    cmd.arg("-NoLogo");
+                } else if shell_name == "cmd.exe" {
+                    // cmd.exe: no special args needed
+                } else {
+                    // Unix shells
+                    cmd.env("VIBE_KANBAN_TERMINAL", "1");
+
+                    if shell_name == "bash" {
+                        cmd.env("PROMPT_COMMAND", r#"PS1='$ '; unset PROMPT_COMMAND"#);
+                    } else if shell_name == "zsh" {
+                        // PROMPT is set after spawning
+                    } else {
+                        cmd.env("PS1", "$ ");
+                    }
+                }
+                (cmd, shell_name)
+            };
 
             cmd.env("TERM", "xterm-256color");
             cmd.env("COLORTERM", "truecolor");
@@ -1306,9 +1495,15 @@ mod tests {
         // A valid session UUID -> --resume <id>, even if a prompt is also
         // present (an existing conversation always wins).
         let id = "28b98f08-5f5f-4b1e-8c4e-41ae87c0c706";
-        let b = cli_bootstrap(&claude_spec(&[]), Some(id), Some("do things"));
+        let b = cli_bootstrap(
+            &claude_spec(&[]),
+            Some(id),
+            Some(Path::new("/tmp/vk/prompt.txt")),
+        );
         assert!(b.contains(&format!("--resume {id}")));
-        assert!(!b.contains("do things"));
+        // The prompt file is ignored entirely when resuming.
+        assert!(!b.contains("prompt.txt"));
+        assert!(!b.contains("vk_p="));
         // Non-UUID (injection attempt) is rejected and never interpolated.
         let evil = "x; rm -rf ~";
         let b = cli_bootstrap(&claude_spec(&[]), Some(evil), None);
@@ -1334,27 +1529,131 @@ mod tests {
     }
 
     #[test]
-    fn cli_bootstrap_passes_initial_prompt_injection_safe() {
+    fn cli_bootstrap_reads_prompt_from_file_length_is_constant() {
+        // The prompt is delivered via a temp file, so the generated command is
+        // O(1) in prompt size — the whole point of the fix (tmux rejects
+        // commands past ~16KB). The file PATH is single-quoted; the content is
+        // only ever expanded inside double quotes, so it can never be
+        // word-split or parsed as shell (injection-safe by construction).
         let spec = claude_spec(&["--dangerously-skip-permissions"]);
-        let b = cli_bootstrap(&spec, None, Some("Fix the login bug"));
-        assert!(b.contains("'--dangerously-skip-permissions' 'Fix the login bug'"));
+        let file = Path::new("/tmp/vk/cli-prompts/abc.txt");
+        let b = cli_bootstrap(&spec, None, Some(file));
+        assert!(
+            b.len() < 2048,
+            "bootstrap must stay small regardless of prompt size: {} bytes",
+            b.len()
+        );
+        // Path single-quoted, expansion double-quoted, file self-deletes.
+        assert!(b.contains("vk_p=\"$(cat '/tmp/vk/cli-prompts/abc.txt')\""));
+        assert!(b.contains("rm -f -- '/tmp/vk/cli-prompts/abc.txt'"));
+        assert!(
+            b.contains("'--dangerously-skip-permissions' \"$vk_p\""),
+            "positional prompt expands double-quoted after the flags: {b}"
+        );
 
-        // Quotes and shell metacharacters stay inert inside the quoting.
-        let evil = "'; rm -rf ~; echo '";
+        // A prompt file whose path contains a quote can't break out of the
+        // single-quoting (defense in depth; real paths are workspace hex): the
+        // embedded quote is POSIX-escaped as `'\''`, so the dangerous run stays
+        // inert data inside the quoting rather than terminating it.
+        let evil = Path::new("/tmp/'; rm -rf ~; echo '.txt");
         let b = cli_bootstrap(&spec, None, Some(evil));
-        // The single quotes in the prompt are escaped as '\'' — the raw
-        // sequence `'; rm` can therefore never terminate the quoting.
-        assert!(b.contains(r"'"), "quotes must be escaped: {b}");
-        assert!(!b.contains("&& rm"), "injection must not escape: {b}");
+        assert!(
+            b.contains(r"'\''; rm -rf ~; echo '\''"),
+            "path quote must be escaped, not terminated: {b}"
+        );
+        // The raw, unescaped break-out (a bare `'` closing the cat quote right
+        // before the command) must never appear.
+        assert!(
+            !b.contains("cat '/tmp/'; rm"),
+            "quoting must not break out: {b}"
+        );
+    }
 
-        // A prompt starting with '-' is space-guarded so the agent can't parse
-        // it as a flag.
-        let dashy = cli_bootstrap(&spec, None, Some("-rf is a flag-looking prompt"));
-        assert!(dashy.contains("' -rf is a flag-looking prompt'"));
+    #[test]
+    fn cli_bootstrap_flag_and_stdin_prompt_forms_read_from_file() {
+        let file = Path::new("/tmp/vk/p.txt");
 
-        // Blank prompts fall through to the no-prompt path.
-        let blank = cli_bootstrap(&spec, None, Some("   "));
-        assert!(blank.contains("--continue || 'claude'"));
+        // Flag agents expand the file into the flag's value, double-quoted.
+        let flag_spec = CliLaunchSpec::new("gemini", vec![])
+            .with_prompt_arg(CliPromptArg::Flag("-i".to_string()));
+        let b = cli_bootstrap(&flag_spec, None, Some(file));
+        assert!(b.contains("rm -f -- '/tmp/vk/p.txt'; 'gemini' -i \"$vk_p\""));
+
+        // StdinPipe agents pipe the file into the program — no argv ceiling.
+        let pipe_spec = CliLaunchSpec::new("amp", vec![]).with_prompt_arg(CliPromptArg::StdinPipe);
+        let b = cli_bootstrap(&pipe_spec, None, Some(file));
+        assert!(b.contains("cat '/tmp/vk/p.txt' | 'amp'; rm -f -- '/tmp/vk/p.txt'"));
+    }
+
+    #[test]
+    fn cli_bootstrap_no_prompt_file_falls_through_to_continue() {
+        // No prompt file (blank prompt filtered out by the caller) -> the
+        // no-prompt continue/fresh path, exactly as before.
+        let spec = claude_spec(&["--dangerously-skip-permissions"]);
+        let b = cli_bootstrap(&spec, None, None);
+        assert!(b.contains("--continue || 'claude'"));
+        assert!(!b.contains("vk_p="));
+    }
+
+    #[test]
+    fn cli_prompt_file_content_matches_old_quoting_semantics() {
+        // Blank (after trim) -> no file is written (falls through to continue).
+        assert_eq!(
+            cli_prompt_file_content(&CliPromptArg::Positional, "   "),
+            None
+        );
+
+        // Positional: stored verbatim, byte-exact — quotes/metacharacters are
+        // NOT escaped (the bootstrap reads it back inside double quotes).
+        let evil = "'; rm -rf ~; echo '";
+        assert_eq!(
+            cli_prompt_file_content(&CliPromptArg::Positional, evil).as_deref(),
+            Some(evil)
+        );
+
+        // Positional leading-dash guard becomes a literal leading space in the
+        // file so the agent can't parse the prompt as a flag.
+        assert_eq!(
+            cli_prompt_file_content(&CliPromptArg::Positional, "-rf is a prompt").as_deref(),
+            Some(" -rf is a prompt")
+        );
+
+        // Flag: no dash guard needed (the value follows a flag).
+        assert_eq!(
+            cli_prompt_file_content(&CliPromptArg::Flag("-i".to_string()), "-x").as_deref(),
+            Some("-x")
+        );
+
+        // StdinPipe keeps the trailing newline the old `printf '%s\n'` added.
+        assert_eq!(
+            cli_prompt_file_content(&CliPromptArg::StdinPipe, "hello").as_deref(),
+            Some("hello\n")
+        );
+
+        // Unsupported agents have no launch-time transport.
+        assert_eq!(
+            cli_prompt_file_content(&CliPromptArg::Unsupported, "hi"),
+            None
+        );
+    }
+
+    #[test]
+    fn cli_prompt_fits_inline_caps_argv_agents_only() {
+        // Positional/Flag are capped (single argv entry, Linux MAX_ARG_STRLEN).
+        assert!(cli_prompt_fits_inline(&CliPromptArg::Positional, 100_000));
+        assert!(!cli_prompt_fits_inline(&CliPromptArg::Positional, 100_001));
+        assert!(cli_prompt_fits_inline(
+            &CliPromptArg::Flag("-i".to_string()),
+            100_000
+        ));
+        assert!(!cli_prompt_fits_inline(
+            &CliPromptArg::Flag("-i".to_string()),
+            200_000
+        ));
+        // StdinPipe has no argv ceiling.
+        assert!(cli_prompt_fits_inline(&CliPromptArg::StdinPipe, 5_000_000));
+        // Unsupported never bakes in.
+        assert!(!cli_prompt_fits_inline(&CliPromptArg::Unsupported, 1));
     }
 
     #[test]

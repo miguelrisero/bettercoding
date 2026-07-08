@@ -211,11 +211,13 @@ impl Session {
     }
 
     /// Read the parked CLI prompt WITHOUT clearing it. The clear is deferred
-    /// to [`clear_pending_cli_prompt`] after the tmux session is confirmed
-    /// created, so a failure between attach and spawn can't destroy the
-    /// user's only copy of their prompt, and two racing first-attaches that
-    /// both peek the same prompt are harmless — whichever wins `new-session`
-    /// carries it (the loser's `-A` reattach ignores its bootstrap).
+    /// to [`clear_pending_cli_prompt`] until the tmux session is confirmed to
+    /// *exist* (and, for a large paste-delivered prompt, until the paste
+    /// succeeds), so neither a failure between attach and spawn nor tmux
+    /// rejecting the launch command after spawn can destroy the user's only
+    /// copy of their prompt. Two racing first-attaches that both peek the same
+    /// prompt are harmless — whichever wins `new-session` carries it (the
+    /// loser's `-A` reattach ignores its bootstrap).
     pub async fn peek_pending_cli_prompt(
         pool: &SqlitePool,
         id: Uuid,
