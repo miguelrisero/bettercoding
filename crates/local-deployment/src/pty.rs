@@ -891,9 +891,51 @@ pub enum PtyError {
     SessionClosed,
 }
 
+/// Disarm the pty master's `VEOF` (Ctrl-D / end-of-transmission) control char so
+/// that dropping `portable-pty`'s writer does NOT inject a keystroke into the
+/// terminal.
+///
+/// `portable-pty` 0.8.1's `UnixMasterWriter::drop` reads the master's termios
+/// and, if `c_cc[VEOF]` is non-zero, writes `[b'\n', VEOF]` — LF + Ctrl-D — into
+/// the pty. That is the crate's documented "dropping the writer sends EOF to the
+/// slave" behavior (registry source `unix.rs:351-363`), and nothing in this
+/// crate's own source reveals it — hence this comment. It bites us because our
+/// pty master drives a *tmux client's* tty: on teardown the tmux server reads
+/// those 2 bytes as client keyboard input and forwards them to the active pane.
+/// In the Claude TUI composer the LF inserts a stray newline (never submits) and
+/// the Ctrl-D is a no-op; in a bare shell the Enter+Ctrl-D EXITS the shell and
+/// kills the (persistent, `vk_`-named) session. Reproduced live 4-6/6 teardowns.
+///
+/// This is a TEARDOWN-ONLY fix: a live shell-mode terminal legitimately needs
+/// Ctrl-D/VEOF, so we clear it only right before the writer drops. The writer
+/// holds a `dup(2)` of the master fd (`take_writer` → `self.fd.try_clone()`) and
+/// termios is a property of the pty device shared across dup'd fds, so clearing
+/// `VEOF` here — on the master fd — is seen by the writer's own `tcgetattr`,
+/// making its `if eot != 0` guard skip the write.
+#[cfg(unix)]
+fn disarm_master_eof(master: &dyn portable_pty::MasterPty) {
+    let Some(fd) = master.as_raw_fd() else {
+        return;
+    };
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut termios) == 0 {
+            termios.c_cc[libc::VEOF] = 0;
+            let _ = libc::tcsetattr(fd, libc::TCSANOW, &termios);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn disarm_master_eof(_master: &dyn portable_pty::MasterPty) {}
+
 struct PtySession {
     /// Per-session writer behind its own lock so a blocking PTY write never
     /// holds up the global session registry (see `write`).
+    ///
+    /// Field order matters: `writer` is declared before `master` so that on
+    /// drop it is dropped first — and `Drop for PtySession` runs before either,
+    /// disarming the master's VEOF so this writer's own Drop injects nothing.
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     /// Kills the PTY child (tmux client / shell) on teardown. Required because
@@ -909,6 +951,21 @@ struct PtySession {
     child_reaped: Arc<AtomicBool>,
     _output_handle: thread::JoinHandle<()>,
     closed: bool,
+}
+
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        // Disarm the master's VEOF BEFORE any field is dropped. A custom
+        // `Drop::drop` runs ahead of field drops, and the fields then drop in
+        // declaration order (`writer` first), so this guarantees
+        // `portable-pty`'s writer-Drop sees `VEOF == 0` and skips its `\n` +
+        // Ctrl-D injection. This is the single teardown point that every path
+        // funnels through — `close_session` (map `remove` + drop), process/
+        // service shutdown (the sessions `HashMap` dropping), and any future
+        // cleanup path — so the disarm can never be forgotten. See
+        // `disarm_master_eof` for why the injection happens at all.
+        disarm_master_eof(self.master.as_ref());
+    }
 }
 
 #[derive(Clone)]
@@ -1231,6 +1288,9 @@ impl PtyService {
             if !session.child_reaped.load(Ordering::Acquire) {
                 let _ = session.child_killer.kill();
             }
+            // `session` drops at the end of this scope: `Drop for PtySession`
+            // disarms the master's VEOF first, so the writer's own Drop does not
+            // inject `\n` + Ctrl-D into the (now detaching) tmux client's tty.
         }
         Ok(())
     }
@@ -1466,5 +1526,47 @@ mod tests {
         assert!(parse_cli_session_line(id, 1000).is_none());
         // Non-vk session names are ignored entirely.
         assert!(parse_cli_session_line("misc\t0\t900", 1000).is_none());
+    }
+
+    /// Read the master fd's `VEOF` control char, or `None` if it has no fd /
+    /// `tcgetattr` fails. Test-only mirror of the read side of
+    /// `disarm_master_eof`.
+    #[cfg(unix)]
+    fn master_veof(master: &dyn portable_pty::MasterPty) -> Option<libc::cc_t> {
+        let fd = master.as_raw_fd()?;
+        unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut termios) == 0 {
+                Some(termios.c_cc[libc::VEOF])
+            } else {
+                None
+            }
+        }
+    }
+
+    /// The core of the stray-newline/EOT fix: after `disarm_master_eof`,
+    /// `portable-pty`'s writer-Drop reads `VEOF == 0` and skips its `\n` +
+    /// Ctrl-D injection. Uses the same `openpty` path as `create_session`.
+    #[cfg(unix)]
+    #[test]
+    fn disarm_master_eof_zeroes_veof() {
+        let pair = NativePtySystem::default()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+
+        // Guard against the helper silently no-oping: a fresh pty must have
+        // VEOF armed (Ctrl-D == 4 by default) for the disarm to be meaningful.
+        let before = master_veof(pair.master.as_ref()).expect("tcgetattr before");
+        assert_ne!(before, 0, "a fresh pty master should have VEOF armed");
+
+        disarm_master_eof(pair.master.as_ref());
+
+        let after = master_veof(pair.master.as_ref()).expect("tcgetattr after");
+        assert_eq!(after, 0, "VEOF must be disarmed after disarm_master_eof");
     }
 }

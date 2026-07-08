@@ -38,6 +38,9 @@ futures = "0.3"
 tokio = { workspace = true }
 globwalk = "0.9"
 portable-pty = "0.8"
+# Used directly on Unix to disarm the pty master's VEOF before portable-pty's
+# writer Drop fires (see pty.rs `disarm_master_eof`).
+libc = "0.2"
 dirs = "5.0"
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }

@@ -382,6 +382,14 @@ async fn handle_terminal_ws(
     command: PtyCommand,
     prompt_session_to_clear: Option<Uuid>,
 ) {
+    // FIX 4 tripwire label: the pty session name, captured before `command` is
+    // moved into `create_session`. For CLI mode this is the tmux `vk_<uuid>`
+    // name, so the logged bytes line up with tmux server logs.
+    let tripwire_session = match &command {
+        PtyCommand::TmuxCli { session_name, .. } => session_name.clone(),
+        PtyCommand::Shell => "shell".to_string(),
+    };
+
     let (session_id, mut output_rx) = match deployment
         .pty()
         .create_session(working_dir, cols, rows, command)
@@ -394,6 +402,21 @@ async fn handle_terminal_ws(
             return;
         }
     };
+
+    // FIX 4 input tripwire: for a strictly bounded window right after attach,
+    // hex-dump every client→pty input chunk. This is the production canary for
+    // the stray-newline / EOT injection bug (portable-pty's writer-Drop wrote
+    // `\n` + Ctrl-D into the tmux client's tty on teardown, killing the pane)
+    // and for any FUTURE client-side injector: it makes the exact bytes the
+    // browser sent — with an ms-since-attach stamp and the per-attach id —
+    // visible in server logs, so we can tell a client-origin injection from a
+    // server-side one. Bounded to the first `TRIPWIRE_WINDOW` OR
+    // `TRIPWIRE_MAX_BYTES` (whichever first); it allocates nothing once the
+    // window closes, so it is permanently safe to leave enabled.
+    const TRIPWIRE_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+    const TRIPWIRE_MAX_BYTES: usize = 128;
+    let attach_started = std::time::Instant::now();
+    let mut tripwire_bytes_logged: usize = 0;
 
     // The tmux session is now created and its bootstrap (carrying the parked
     // CLI prompt) is running; only now is it safe to clear the prompt, so a
@@ -439,6 +462,23 @@ async fn handle_terminal_ws(
                             match cmd {
                                 TerminalCommand::Input { data } => {
                                     if let Ok(bytes) = BASE64.decode(&data) {
+                                        // FIX 4 tripwire (bounded — see above).
+                                        let elapsed = attach_started.elapsed();
+                                        if !bytes.is_empty()
+                                            && tripwire_bytes_logged < TRIPWIRE_MAX_BYTES
+                                            && elapsed < TRIPWIRE_WINDOW
+                                        {
+                                            let take = (TRIPWIRE_MAX_BYTES - tripwire_bytes_logged)
+                                                .min(bytes.len());
+                                            tracing::info!(
+                                                session = %tripwire_session,
+                                                attach = %session_id_for_input,
+                                                ms_since_attach = elapsed.as_millis() as u64,
+                                                bytes = %hex_dump(&bytes[..take]),
+                                                "terminal input (attach-window tripwire)"
+                                            );
+                                            tripwire_bytes_logged += take;
+                                        }
                                         let _ = pty_service.write(session_id_for_input, &bytes).await;
                                     }
                                 }
@@ -461,6 +501,19 @@ async fn handle_terminal_ws(
     }
 
     let _ = deployment.pty().close_session(session_id).await;
+}
+
+/// Space-separated lowercase hex of a byte slice (e.g. `0a 04`) for the
+/// attach-window input tripwire. The caller bounds the slice length, so this
+/// never allocates more than a fixed maximum.
+fn hex_dump(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 3);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x} ");
+    }
+    out.pop(); // trailing space
+    out
 }
 
 async fn send_error(socket: &mut MaybeSignedWebSocket, message: &str) -> anyhow::Result<()> {
