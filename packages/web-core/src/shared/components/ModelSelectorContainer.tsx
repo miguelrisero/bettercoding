@@ -119,16 +119,20 @@ export function ModelSelectorContainer({
   const baseConfig = streamConfig;
   // Claude is the only executor whose downstream tolerates arbitrary model ids
   // and uses `--effort`, so it alone gets free-text custom entry + the effort
-  // fallback. Inject both the profile preset and the current override model
-  // (which may be a free-text custom id) so each shows up in the picker with an
-  // effort selector. appendPresetModel is a no-op when the id is already present,
-  // so built-in / provider selections are untouched.
+  // fallback. Always surface the profile preset (unchanged behavior). For Claude,
+  // additionally surface the current override — which may be a free-text custom
+  // id — so it shows in the picker with an effort selector; other executors never
+  // produce free-text overrides, so injecting theirs would only risk surfacing a
+  // stale id. appendPresetModel is a no-op when the id is already present.
   const isClaude = agent === BaseCodingAgent.CLAUDE_CODE;
-  const config = appendPresetModel(
-    appendPresetModel(baseConfig, presetOptions?.model_id, isClaude),
-    executorConfig?.model_id,
+  const configWithPreset = appendPresetModel(
+    baseConfig,
+    presetOptions?.model_id,
     isClaude
   );
+  const config = isClaude
+    ? appendPresetModel(configWithPreset, executorConfig?.model_id, isClaude)
+    : configWithPreset;
 
   const availableProviderIds = useMemo(
     () => config?.providers.map((item) => item.id) ?? [],
