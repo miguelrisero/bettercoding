@@ -48,9 +48,21 @@ export interface TerminalContextType {
   ) => void;
   getTerminalInstance: (tabId: string) => TerminalInstance | null;
   unregisterTerminalInstance: (tabId: string) => void;
+  /**
+   * Ensure-style and idempotent: while the tab has a live connection OR an
+   * in-flight open (generation created, socket not registered yet), calling
+   * again never opens a second socket — it only refreshes the stored
+   * callbacks and endpoint source with the caller's fresh closures, so a
+   * remounted component re-binds without touching the socket. Safe to call
+   * from mount effects, resize ticks, and session switches.
+   */
   createTerminalConnection: (
     tabId: string,
-    endpoint: string,
+    // Called fresh on every (re)connect attempt so the socket always attaches
+    // at the pane's CURRENT fitted grid. Returns null when the pane is not
+    // measurable yet (hidden/0-height); the provider polls without spending
+    // the retry budget instead of attaching at a wrong/placeholder size.
+    getEndpoint: () => string | null,
     onData: (data: string) => void,
     onExit?: () => void,
     getSize?: () => { cols: number; rows: number } | null
