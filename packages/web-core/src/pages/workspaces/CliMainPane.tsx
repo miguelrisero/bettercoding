@@ -78,7 +78,7 @@ export function CliMainPane({
           <button
             type="button"
             onClick={onBackToChat}
-            className="flex items-center gap-1 text-low hover:text-normal transition-colors shrink-0"
+            className="flex items-center gap-1 text-low hover:text-normal transition-colors shrink-0 p-1.5 -m-1.5 md:p-0 md:m-0"
             title={t('cliMode.backToChat')}
             aria-label={t('cliMode.backToChat')}
           >

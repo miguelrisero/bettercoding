@@ -129,6 +129,19 @@ export function LoopAutomationControl({
   const attemptsUsed = policy ? Number(policy.attempts_used) : 0;
   const showAttempts = enabled && maxAttemptsCount > 0;
 
+  // Mobile shows only the bare time next to the moon/clock icon; the full
+  // localized status stays in the accessibility tree via an sr-only twin.
+  const wakeupTimeText = nextWakeup
+    ? nextWakeup.kind === 'usage_limit_wake'
+      ? formatUtcTime(nextWakeup.fire_at)
+      : formatLocalTime(nextWakeup.fire_at)
+    : null;
+  const wakeupStatusText = nextWakeup
+    ? nextWakeup.kind === 'usage_limit_wake'
+      ? t('loopAutomation.wakingAt', { time: wakeupTimeText })
+      : t('loopAutomation.retryingAt', { time: wakeupTimeText })
+    : null;
+
   return (
     <div className="flex items-center gap-1.5 md:gap-2 min-w-0">
       {enabled && nextWakeup && (
@@ -138,20 +151,11 @@ export function LoopAutomationControl({
           ) : (
             <ClockIcon className="size-icon-sm" weight="bold" aria-hidden />
           )}
-          <span className="hidden md:inline">
-            {nextWakeup.kind === 'usage_limit_wake'
-              ? t('loopAutomation.wakingAt', {
-                  time: formatUtcTime(nextWakeup.fire_at),
-                })
-              : t('loopAutomation.retryingAt', {
-                  time: formatLocalTime(nextWakeup.fire_at),
-                })}
+          <span className="hidden md:inline">{wakeupStatusText}</span>
+          <span className="md:hidden" aria-hidden>
+            {wakeupTimeText}
           </span>
-          <span className="md:hidden">
-            {nextWakeup.kind === 'usage_limit_wake'
-              ? formatUtcTime(nextWakeup.fire_at)
-              : formatLocalTime(nextWakeup.fire_at)}
-          </span>
+          <span className="sr-only md:hidden">{wakeupStatusText}</span>
           {showAttempts && (
             <span className="hidden md:inline">
               {'· '}
