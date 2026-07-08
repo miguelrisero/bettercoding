@@ -1004,15 +1004,22 @@ fn pane_subtree_has_program(ps_listing: &str, root_pid: u32, program: &str) -> b
     let mut comm_by_pid: HashMap<u32, &str> = HashMap::new();
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for line in ps_listing.lines() {
-        let mut fields = line.split_whitespace();
-        let (Some(pid), Some(ppid), Some(comm)) = (fields.next(), fields.next(), fields.next())
-        else {
+        // `ps` right-justifies pid/ppid; split off exactly those two fields and
+        // keep the WHOLE remainder as comm — a comm can contain spaces (macOS
+        // `comm=` reports a full path, e.g. `/Applications/My App/codex`), and
+        // splitting it at the first space would strand a space-containing agent
+        // path (normalize_comm reduces it to the basename for the match).
+        let rest = line.trim_start();
+        let Some((pid, rest)) = rest.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Some((ppid, comm)) = rest.trim_start().split_once(char::is_whitespace) else {
             continue;
         };
         let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
             continue;
         };
-        comm_by_pid.insert(pid, comm);
+        comm_by_pid.insert(pid, comm.trim());
         children.entry(ppid).or_default().push(pid);
     }
     // Depth-first from the pane root, inclusive. `visited` guards against a
@@ -2198,6 +2205,12 @@ mod tests {
         // Native agent as a direct child (claude is an ELF binary).
         let ps_native = "  100     1 sh\n  200   100 claude\n";
         assert!(pane_subtree_has_program(ps_native, 100, "claude"));
+
+        // macOS `ps -o comm=` reports a full path that can contain spaces; the
+        // whole remainder is the comm and normalize_comm reduces it to the
+        // basename, so a space in the path must not truncate the match.
+        let ps_macos = "  100     1 sh\n  200   100 /Applications/My App/codex\n";
+        assert!(pane_subtree_has_program(ps_macos, 100, "codex"));
 
         // A shell-only subtree (bootstrap still starting / missing-binary
         // fallback) must NOT satisfy the gate...
