@@ -305,7 +305,6 @@ export function ModelSelectorPopover({
   const popoverWidth = getPopoverWidth(hasProviders, hasReasoning);
   const popoverHeightClass = hasProviders ? 'h-[280px]' : '';
 
-  let showSearch = true;
   let content: ReactElement;
 
   if (hasProviders) {
@@ -333,10 +332,6 @@ export function ModelSelectorPopover({
       selectedProviderId,
       selectedModelId
     );
-    // Always offer the search box for the flat (no-provider) picker so a custom
-    // model id can be typed even when the built-in list is short.
-    showSearch = true;
-
     content = (
       <ModelList
         models={sortedModels}
@@ -351,6 +346,10 @@ export function ModelSelectorPopover({
         showDefaultOption={showDefaultOption}
         onSelectDefault={onSelectDefault}
         scrollRef={scrollRef}
+        // Free-text custom-model entry is intentionally offered only in the flat
+        // (no-provider) picker: a bare typed id has no provider to attach to, and
+        // Claude — the executor that needs custom ids — is a flat picker. The
+        // provider accordion deliberately omits it.
         onUseCustomModel={(id) => onModelSelect(id)}
       />
     );
@@ -384,15 +383,16 @@ export function ModelSelectorPopover({
           <DropdownMenuLabel>{t('modelSelector.model')}</DropdownMenuLabel>
           <div className="flex flex-col flex-1 min-h-0 min-w-0">
             {content}
-            {showSearch && (
-              <div className="border-t border-border">
-                <DropdownMenuSearchInput
-                  placeholder="Filter by name or ID..."
-                  value={searchQuery}
-                  onValueChange={onSearchChange}
-                />
-              </div>
-            )}
+            {/* The search box is always shown: it filters the list and, for the
+                flat (no-provider) picker, lets a custom model id be typed even
+                when the built-in list is short. */}
+            <div className="border-t border-border">
+              <DropdownMenuSearchInput
+                placeholder="Filter by name or ID..."
+                value={searchQuery}
+                onValueChange={onSearchChange}
+              />
+            </div>
           </div>
         </div>
       </DropdownMenuContent>

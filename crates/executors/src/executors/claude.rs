@@ -181,9 +181,20 @@ fn normalize_claude_stderr_logs(
 }
 
 use derivative::Derivative;
-use strum_macros::{AsRefStr, EnumString};
+use strum_macros::{AsRefStr, EnumString, VariantNames};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS, JsonSchema, AsRefStr, EnumString)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    TS,
+    JsonSchema,
+    AsRefStr,
+    EnumString,
+    VariantNames,
+)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum ClaudeEffort {
@@ -542,6 +553,15 @@ mod cli_launch_tests {
         assert_eq!(ClaudeEffort::XHigh.as_ref(), "xhigh");
         assert_eq!(ClaudeEffort::Max.as_ref(), "max");
         assert_eq!(ClaudeEffort::Ultracode.as_ref(), "ultracode");
+
+        // The picker's effort list is derived from these VARIANTS (strum
+        // VariantNames honoring serialize_all="lowercase"); pin the exact set so
+        // a rename or a strum casing change can't silently corrupt the wire ids.
+        use strum::VariantNames;
+        assert_eq!(
+            ClaudeEffort::VARIANTS,
+            ["low", "medium", "high", "xhigh", "max", "ultracode"]
+        );
     }
 
     #[test]
@@ -639,13 +659,18 @@ mod cli_launch_tests {
 }
 
 fn default_discovered_options() -> crate::executor_discovery::ExecutorDiscoveredOptions {
+    // Derived from the ClaudeEffort enum (strum `VariantNames`, lowercased) so a
+    // future effort tier automatically appears in the picker instead of silently
+    // missing from this list. `from_names_with_default` sorts by rank, so the
+    // declaration order here is irrelevant.
+    use strum::VariantNames;
+
     use crate::{
         executor_discovery::ExecutorDiscoveredOptions,
         model_selector::{ModelInfo, ModelSelectorConfig, ReasoningOption},
     };
-
     let effort_options = ReasoningOption::from_names_with_default(
-        ["low", "medium", "high", "xhigh", "max", "ultracode"].map(String::from),
+        ClaudeEffort::VARIANTS.iter().copied(),
         CLI_DEFAULT_EFFORT,
     );
 
