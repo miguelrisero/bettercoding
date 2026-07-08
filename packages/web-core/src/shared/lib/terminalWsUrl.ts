@@ -106,3 +106,37 @@ export function terminalEndpointsEquivalent(a: string, b: string): boolean {
     return a === b;
   }
 }
+
+/**
+ * Decide whether an in-flight terminal WS attempt must be discarded because the
+ * tab's endpoint source was refreshed (session switch / remount) while the
+ * socket was opening.
+ *
+ * `epochChanged` is the caller's snapshot comparison (`endpointEpoch !==
+ * attemptEpoch`): when `false` the source is untouched and the attempt is always
+ * valid — no endpoint inspection needed. When `true`:
+ * - size-only drift is NOT stale (`terminalEndpointsEquivalent` ignores
+ *   cols/rows; the post-open resize corrects it);
+ * - a changed `session_id` / `mode` / `workspace_id` IS stale — letting the
+ *   socket become live would bind the pane to the PREVIOUS conversation's tmux
+ *   on a first-attach / post-reap create;
+ * - a now-unmeasurable pane (`currentEndpoint === null`) is discarded
+ *   CONSERVATIVELY: the refresh may have changed the session and there is no URL
+ *   to prove otherwise, so re-open with the right one once the pane is shown.
+ *
+ * The caller must re-run this at EVERY point an attempt could become live — both
+ * right after the async open resolves AND again at `onopen`, because the default
+ * transport resolves the open with a still-`CONNECTING` socket, so a switch can
+ * land in the post-registration / pre-open gap.
+ */
+export function terminalAttemptIsStale(
+  epochChanged: boolean,
+  attemptEndpoint: string,
+  currentEndpoint: string | null
+): boolean {
+  if (!epochChanged) return false;
+  return (
+    currentEndpoint === null ||
+    !terminalEndpointsEquivalent(attemptEndpoint, currentEndpoint)
+  );
+}

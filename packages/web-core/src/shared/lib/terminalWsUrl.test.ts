@@ -4,6 +4,7 @@ import {
   buildTerminalWsUrl,
   resolveTerminalEndpoint,
   terminalEndpointsEquivalent,
+  terminalAttemptIsStale,
 } from './terminalWsUrl';
 
 describe('buildTerminalWsUrl', () => {
@@ -158,5 +159,56 @@ describe('terminalEndpointsEquivalent', () => {
     expect(
       terminalEndpointsEquivalent(make({}), make({ workspaceId: 'ws-2' }))
     ).toBe(false);
+  });
+});
+
+describe('terminalAttemptIsStale', () => {
+  const make = (over: Partial<Parameters<typeof buildTerminalWsUrl>[0]>) =>
+    buildTerminalWsUrl({
+      workspaceId: 'ws-1',
+      cols: 100,
+      rows: 30,
+      protocol: 'https:',
+      host: 'example.test',
+      mode: 'cli',
+      sessionId: 'sess-a',
+      ...over,
+    });
+
+  it('is never stale when the epoch did not change', () => {
+    // Unchanged epoch = untouched endpoint source: valid without inspecting
+    // endpoints, even against a materially different current endpoint (the
+    // caller never recomputes in this branch).
+    expect(terminalAttemptIsStale(false, make({}), make({}))).toBe(false);
+    expect(
+      terminalAttemptIsStale(false, make({}), make({ sessionId: 'sess-b' }))
+    ).toBe(false);
+    expect(terminalAttemptIsStale(false, make({}), null)).toBe(false);
+  });
+
+  it('epoch changed but size-only drift is not stale', () => {
+    // The post-open resize corrects size; a refresh that only re-fit the grid
+    // must not discard the attempt.
+    expect(
+      terminalAttemptIsStale(true, make({}), make({ cols: 203, rows: 51 }))
+    ).toBe(false);
+  });
+
+  it('epoch changed with a material change (session) is stale', () => {
+    expect(
+      terminalAttemptIsStale(true, make({}), make({ sessionId: 'sess-b' }))
+    ).toBe(true);
+    expect(
+      terminalAttemptIsStale(true, make({}), make({ sessionId: undefined }))
+    ).toBe(true);
+    expect(
+      terminalAttemptIsStale(true, make({}), make({ workspaceId: 'ws-2' }))
+    ).toBe(true);
+  });
+
+  it('epoch changed and the pane is now unmeasurable (null) is stale', () => {
+    // Conservative discard: the refresh may have changed the session and there
+    // is no current URL to prove equivalence.
+    expect(terminalAttemptIsStale(true, make({}), null)).toBe(true);
   });
 });

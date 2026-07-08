@@ -7,7 +7,7 @@ import {
   type TerminalInstance,
 } from '@/shared/hooks/useTerminal';
 import { openLocalApiWebSocket } from '@/shared/lib/localApiTransport';
-import { terminalEndpointsEquivalent } from '@/shared/lib/terminalWsUrl';
+import { terminalAttemptIsStale } from '@/shared/lib/terminalWsUrl';
 
 interface TerminalConnection {
   ws: WebSocket;
@@ -477,33 +477,52 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
               return;
             }
 
-            // The endpoint source may have been refreshed while the open was
-            // in flight (remount / session switch): registering this socket
-            // would bind the visible pane to the PREVIOUS session's tmux.
-            // Unchanged epoch = untouched source, safe (even if the pane hid
-            // mid-open: identity can't change without a refresh, every
-            // refresh bumps the epoch). Changed epoch: size-only drift still
-            // passes (the post-open resize corrects it), a material change
-            // (session/mode/workspace) discards — and an unmeasurable
-            // current endpoint discards CONSERVATIVELY, because the refresh
-            // may have changed the session and there is no URL to prove
-            // otherwise; the poll re-opens with the right one when shown.
-            // Neither discard is a failure: re-kick through the single-timer
-            // path without spending the retry budget.
-            if (generation.endpointEpoch !== attemptEpoch) {
+            // Latches once a re-validation discards this attempt, so the
+            // socket's own message/close handlers below become no-ops (the
+            // re-kick is already scheduled).
+            let superseded = false;
+
+            // Reject an attempt whose endpoint the tab has since refreshed
+            // (session switch / remount while opening). It MUST run at every
+            // point the socket could become live: right here after the open
+            // resolves AND again at `onopen`. The default transport resolves
+            // the open with a still-CONNECTING socket (see localApiTransport),
+            // so a switch landing in the post-registration / pre-open gap would
+            // otherwise let a socket carrying the PREVIOUS session_id become
+            // the tab's live connection and bind the pane to the wrong
+            // conversation on a first-attach / post-reap create. Unchanged
+            // epoch = untouched source, always valid; changed epoch discards on
+            // a material (session/mode/workspace) change or a now-unmeasurable
+            // pane, and keeps size-only drift (the post-open resize corrects
+            // it) — see `terminalAttemptIsStale`. Discarding is not a failure:
+            // re-kick through the single-timer path without spending the retry
+            // budget (null endpoint = pane unmeasurable now → poll).
+            const discardIfStale = (): boolean => {
               const currentEndpoint = generation.getEndpoint();
               if (
-                currentEndpoint === null ||
-                !terminalEndpointsEquivalent(endpoint, currentEndpoint)
+                !terminalAttemptIsStale(
+                  generation.endpointEpoch !== attemptEpoch,
+                  endpoint,
+                  currentEndpoint
+                )
               ) {
-                ws.close();
-                if (generation.retryTimer === null) {
-                  scheduleAttempt(
-                    currentEndpoint === null ? UNMEASURED_POLL_MS : 0
-                  );
-                }
-                return;
+                return false;
               }
+              superseded = true;
+              if (terminalConnectionsRef.current.get(tabId)?.ws === ws) {
+                terminalConnectionsRef.current.delete(tabId);
+              }
+              ws.close();
+              if (generation.retryTimer === null) {
+                scheduleAttempt(
+                  currentEndpoint === null ? UNMEASURED_POLL_MS : 0
+                );
+              }
+              return true;
+            };
+
+            if (discardIfStale()) {
+              return;
             }
 
             // End of THIS connection's life without a successor: cancel the
@@ -527,6 +546,13 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
             // stuck at the URL size forever; resending on every (re)connect
             // also restores the right size after a reattach.
             const syncSize = () => {
+              // A session switch can land after this socket was registered but
+              // before it opened (the transport returns a CONNECTING socket):
+              // re-validate before it becomes live, closing the DUP handshake,
+              // not a hidden live connection.
+              if (superseded || discardIfStale()) {
+                return;
+              }
               generation.retryCount = 0;
               const size = connectionCallbacksRef.current
                 .get(tabId)
@@ -546,9 +572,19 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
             // whose `open` event has fired; onopen would then never run.
             if (ws.readyState === WebSocket.OPEN) {
               syncSize();
+              // Already-open + stale: syncSize discarded it synchronously —
+              // don't register a socket we just closed.
+              if (superseded) {
+                return;
+              }
             }
 
             ws.onmessage = (event) => {
+              // Discarded stale handshake: a late-arriving frame must not reach
+              // the (now different-session) pane's callbacks.
+              if (superseded) {
+                return;
+              }
               try {
                 const msg = JSON.parse(event.data);
                 const callbacks = connectionCallbacksRef.current.get(tabId);
@@ -577,7 +613,9 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
             };
 
             ws.onclose = (event) => {
-              if (generation.closed) {
+              // `superseded`: WE closed this stale handshake and already
+              // scheduled the successor — do not reconnect on top of it.
+              if (superseded || generation.closed) {
                 return;
               }
 
