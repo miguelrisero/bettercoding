@@ -129,26 +129,40 @@ export function LoopAutomationControl({
   const attemptsUsed = policy ? Number(policy.attempts_used) : 0;
   const showAttempts = enabled && maxAttemptsCount > 0;
 
+  // Mobile (<768px) shows only the bare time next to the moon/clock icon; the
+  // full "Waking/Retrying at …" string stays in the accessibility tree via
+  // sr-only (the attempts counter is hidden on mobile for AT and sighted
+  // users alike). md: pairs with useIsMobile's 767px max-width — keep in
+  // sync with MOBILE_BREAKPOINT in useIsMobile.ts.
+  const isUsageLimitWake = nextWakeup?.kind === 'usage_limit_wake';
+  const wakeupTimeText = nextWakeup
+    ? isUsageLimitWake
+      ? formatUtcTime(nextWakeup.fire_at)
+      : formatLocalTime(nextWakeup.fire_at)
+    : null;
+  const wakeupStatusText = nextWakeup
+    ? isUsageLimitWake
+      ? t('loopAutomation.wakingAt', { time: wakeupTimeText })
+      : t('loopAutomation.retryingAt', { time: wakeupTimeText })
+    : null;
+
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex items-center gap-1.5 md:gap-2 min-w-0">
       {enabled && nextWakeup && (
-        <span className="flex items-center gap-1 text-xs text-low">
-          {nextWakeup.kind === 'usage_limit_wake' ? (
+        <span className="flex items-center gap-1 text-xs text-low whitespace-nowrap shrink-0">
+          {isUsageLimitWake ? (
             <MoonIcon className="size-icon-sm" weight="bold" aria-hidden />
           ) : (
             <ClockIcon className="size-icon-sm" weight="bold" aria-hidden />
           )}
-          <span>
-            {nextWakeup.kind === 'usage_limit_wake'
-              ? t('loopAutomation.wakingAt', {
-                  time: formatUtcTime(nextWakeup.fire_at),
-                })
-              : t('loopAutomation.retryingAt', {
-                  time: formatLocalTime(nextWakeup.fire_at),
-                })}
+          <span className="sr-only md:not-sr-only md:whitespace-nowrap">
+            {wakeupStatusText}
+          </span>
+          <span className="md:hidden" aria-hidden>
+            {wakeupTimeText}
           </span>
           {showAttempts && (
-            <span>
+            <span className="hidden md:inline">
               {'· '}
               {t('loopAutomation.attempts', {
                 used: attemptsUsed,
@@ -167,7 +181,7 @@ export function LoopAutomationControl({
       )}
 
       {showAttempts && !nextWakeup && (
-        <span className="text-xs text-low">
+        <span className="text-xs text-low hidden md:inline">
           {t('loopAutomation.attempts', {
             used: attemptsUsed,
             max: maxAttemptsCount,
@@ -176,13 +190,13 @@ export function LoopAutomationControl({
       )}
 
       <Tooltip content={t('loopAutomation.tooltip')} side="bottom">
-        <span className="flex items-center gap-1.5">
+        <span className="flex items-center gap-1.5 shrink-0">
           <ArrowsClockwiseIcon
             className="size-icon-sm text-low"
             weight="bold"
             aria-hidden
           />
-          <span className="text-xs text-normal select-none">
+          <span className="text-xs text-normal select-none hidden md:inline">
             {t('loopAutomation.label')}
           </span>
           <Switch
@@ -201,7 +215,7 @@ export function LoopAutomationControl({
               type="button"
               aria-label={t('loopAutomation.settingsLabel')}
               title={t('loopAutomation.settingsLabel')}
-              className="flex items-center justify-center p-half rounded-sm text-low hover:text-normal hover:bg-secondary/50 transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-brand"
+              className="flex items-center justify-center p-half rounded-sm text-low hover:text-normal hover:bg-secondary/50 transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-brand shrink-0"
             >
               <GearSixIcon className="size-icon-sm" weight="bold" aria-hidden />
             </button>

@@ -1,6 +1,7 @@
 {
   "cliMode": {
     "title": "CLI Claude",
+    "titleShort": "CLI",
     "persistentHint": "session tmux persistante",
     "backToChat": "Retour au chat",
     "agentRunningTitle": "Claude travaille sur votre prompt",
