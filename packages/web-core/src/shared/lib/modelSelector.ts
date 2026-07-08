@@ -82,7 +82,12 @@ function modelSupportsEffort(id: string): boolean {
 
 export function appendPresetModel(
   config: ModelSelectorConfig | null,
-  presetModel: string | null | undefined
+  presetModel: string | null | undefined,
+  // Only the Claude executor uses the `--effort` reasoning flag, so the caller
+  // opts in explicitly. Keeps this shared helper executor-agnostic: without it,
+  // any provider-less executor whose id happened to contain "opus"/"sonnet"/
+  // "fable" would inherit effort options it does not support.
+  enableEffortFallback = false
 ): ModelSelectorConfig | null {
   if (!config || !presetModel) return config;
   const hasProviders = config.providers.length > 0;
@@ -96,14 +101,12 @@ export function appendPresetModel(
   );
   if (exists) return config;
 
-  // An injected/custom model has no reasoning options of its own. If it looks
-  // like an effort-capable Claude model, inherit the effort choices from the
-  // first config model that has them so the user can still pick an effort
-  // (e.g. Miguel's preset `claude-fable-5`). Gated on `modelSupportsEffort` so
-  // executors whose models legitimately have no reasoning options (e.g. codex
-  // providers) are unaffected.
+  // An injected/custom model has no reasoning options of its own. If effort is
+  // enabled and it looks like an effort-capable Claude model, inherit the effort
+  // choices from the first config model that has them so the user can still pick
+  // an effort (e.g. Miguel's preset `claude-fable-5`, or a free-text custom id).
   const reasoningOptions =
-    !providerId && modelSupportsEffort(modelId)
+    enableEffortFallback && !providerId && modelSupportsEffort(modelId)
       ? (config.models.find((m) => m.reasoning_options.length > 0)
           ?.reasoning_options ?? [])
       : [];

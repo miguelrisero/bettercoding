@@ -9,8 +9,8 @@ import {
   SlidersHorizontalIcon,
   type Icon,
 } from '@phosphor-icons/react';
-import type { BaseCodingAgent, ExecutorConfig, ModelInfo } from 'shared/types';
-import { PermissionPolicy } from 'shared/types';
+import type { ExecutorConfig, ModelInfo } from 'shared/types';
+import { BaseCodingAgent, PermissionPolicy } from 'shared/types';
 import { toPrettyCase } from '@/shared/lib/string';
 import {
   getModelKey,
@@ -117,7 +117,21 @@ export function ModelSelectorContainer({
   }, [streamError]);
 
   const baseConfig = streamConfig;
-  const config = appendPresetModel(baseConfig, presetOptions?.model_id);
+  // Inject both the profile preset and the current override model (which may be
+  // a free-text custom id typed by the user) so each shows up in the picker with
+  // an effort selector. Effort inheritance is enabled only for Claude, the sole
+  // executor that uses `--effort`. appendPresetModel is a no-op when the id is
+  // already present, so built-in / provider selections are untouched.
+  const enableEffortFallback = agent === BaseCodingAgent.CLAUDE_CODE;
+  const config = appendPresetModel(
+    appendPresetModel(
+      baseConfig,
+      presetOptions?.model_id,
+      enableEffortFallback
+    ),
+    executorConfig?.model_id,
+    enableEffortFallback
+  );
 
   const availableProviderIds = useMemo(
     () => config?.providers.map((item) => item.id) ?? [],
