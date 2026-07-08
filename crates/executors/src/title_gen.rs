@@ -29,13 +29,45 @@ struct RawNames {
     branch: String,
 }
 
-const TITLE_MAX_CHARS: usize = 72;
+const TITLE_MAX_CHARS: usize = 48;
 const BRANCH_MAX_CHARS: usize = 40;
 const PROMPT_MAX_CHARS: usize = 2000;
 // claude's startup (loading the user's possibly-large ~/.claude.json) can take
 // 10-15s+, so allow generous headroom — measured calls were 5-14s. A genuinely
 // stuck call still falls back to heuristic naming.
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// If the user's first line already reads like a deliberate title, return it
+/// (lightly trimmed) so we keep it verbatim instead of asking the model.
+///
+/// Signals: contains " -> " (Miguel's explicit format), OR is short
+/// (<= 8 words AND <= 48 chars) AND the message has a body after it (a lone
+/// short message is a task, not a title hint — still model-styled) unless it
+/// contains an arrow. A trailing clause punctuation (":", ",", "...") rejects,
+/// since it signals the first line is the start of a sentence, not a title.
+pub fn first_line_title_hint(message: &str) -> Option<String> {
+    let mut lines = message.trim().lines();
+    let first = lines.next()?.trim().trim_start_matches('#').trim();
+    if first.is_empty() {
+        return None;
+    }
+    let has_arrow = first.contains(" -> ") || first.contains(" → ");
+    let has_body = lines.any(|l| !l.trim().is_empty());
+    let word_count = first.split_whitespace().count();
+    let short_enough = word_count <= 8 && first.chars().count() <= 48;
+    if !(has_arrow || (short_enough && has_body)) {
+        return None;
+    }
+    if first.ends_with(':') || first.ends_with(',') || first.ends_with("...") {
+        return None;
+    }
+    Some(
+        first
+            .trim_end_matches('.')
+            .replace(" → ", " -> ")
+            .to_string(),
+    )
+}
 
 /// Ask Claude Haiku for a concise title + branch slug describing `first_message`.
 /// Returns `None` on any failure (spawn error, non-zero exit, timeout, or
@@ -47,11 +79,36 @@ pub async fn generate_workspace_names(first_message: &str) -> Option<WorkspaceNa
     }
     let task: String = task.chars().take(PROMPT_MAX_CHARS).collect();
     let prompt = format!(
-        "Summarize the following task as a PR title and a git branch slug. \
-         Reply with ONLY a minified JSON object, no prose and no code fence: \
-         {{\"title\":\"imperative summary, at most 6 words, no trailing period\",\
-         \"branch\":\"lowercase kebab-case, at most 30 chars, hyphen-separated, no slashes\"}}.\
-         \n\nTask:\n{task}"
+        "You name coding-agent workspaces. Reply with ONLY a minified JSON object, \
+         no prose and no code fence: {{\"title\":\"...\",\"branch\":\"...\"}}.\n\
+         \n\
+         Title rules:\n\
+         - Format: '<keyword> -> <gist>' where keyword is the product, repo, service, \
+         or person the task is about (infer it from the task text: repo names, \
+         project codenames, people, tools), and gist is 2-5 words.\n\
+         - Hard cap: 40 characters total.\n\
+         - Lowercase everything except proper nouns and code identifiers.\n\
+         - Terse noun fragments, never sentences. No trailing period. \
+         Never start with 'Fix bug where', 'Implement', 'Update the', or similar prose.\n\
+         - If the task's FIRST LINE already looks like a title (8 words or fewer, \
+         not a full sentence, no trailing verb clause), reuse that line as the title \
+         verbatim (only trim trailing punctuation) instead of inventing one.\n\
+         \n\
+         Good titles:\n\
+         - bp -> runflow dogfood\n\
+         - sentinel -> throughput fixes\n\
+         - bp -> customer.io migration\n\
+         - patri -> main chief\n\
+         \n\
+         Bad titles (never do this):\n\
+         - Fix bug where b2b companies cannot start an order\n\
+         - Implement CSV export for the reports page\n\
+         \n\
+         Branch rules: lowercase kebab-case, at most 30 chars, hyphens only, \
+         no slashes, no arrows — a descriptive slug of the task \
+         (e.g. 'bp-customerio-migration', 'sentinel-throughput-fixes').\n\
+         \n\
+         Task:\n{task}"
     );
 
     // Reuse the executor's pinned claude CLI (`npx -y @anthropic-ai/claude-code@X`),
@@ -125,10 +182,14 @@ fn parse_workspace_names(stdout: &str) -> Option<WorkspaceNames> {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+        .replace(" → ", " -> ")
         .chars()
         .take(TITLE_MAX_CHARS)
         .collect::<String>()
+        // A mid-word cut (or a model-emitted period) must never leave dangling
+        // punctuation/space at the tail.
         .trim()
+        .trim_end_matches(['.', ',', ':', ';', ' '])
         .to_string();
     if title.is_empty() {
         return None;
@@ -170,7 +231,7 @@ fn slugify(input: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_workspace_names, slugify};
+    use super::{TITLE_MAX_CHARS, first_line_title_hint, parse_workspace_names, slugify};
 
     #[test]
     fn parses_fenced_json() {
@@ -178,6 +239,65 @@ mod tests {
         let n = parse_workspace_names(s).unwrap();
         assert_eq!(n.title, "Add CSV export to reports");
         assert_eq!(n.branch_slug, "add-csv-export-reports");
+    }
+
+    #[test]
+    fn hint_arrow_wins_even_without_body() {
+        assert_eq!(
+            first_line_title_hint("patri -> main chief").as_deref(),
+            Some("patri -> main chief")
+        );
+        assert_eq!(
+            first_line_title_hint("bp -> runflow dogfood\n\ndetails here").as_deref(),
+            Some("bp -> runflow dogfood")
+        );
+    }
+
+    #[test]
+    fn hint_normalizes_unicode_arrow_and_trims_period() {
+        assert_eq!(
+            first_line_title_hint("bp → customer.io migration.").as_deref(),
+            Some("bp -> customer.io migration")
+        );
+    }
+
+    #[test]
+    fn hint_short_first_line_with_body_wins() {
+        assert_eq!(
+            first_line_title_hint("Fix mobile scroll\n\nthe terminal jumps").as_deref(),
+            Some("Fix mobile scroll")
+        );
+    }
+
+    #[test]
+    fn hint_strips_leading_markdown_heading() {
+        assert_eq!(
+            first_line_title_hint("# bp -> runflow dogfood").as_deref(),
+            Some("bp -> runflow dogfood")
+        );
+    }
+
+    #[test]
+    fn hint_rejects_long_sentence_and_lone_short_line() {
+        // 9 words, no body, no arrow -> not a title hint.
+        assert!(
+            first_line_title_hint("Fix bug where b2b companies cannot start an order").is_none()
+        );
+        // Short but no body and no arrow -> a task, not a title.
+        assert!(first_line_title_hint("Fix mobile scroll").is_none());
+    }
+
+    #[test]
+    fn hint_rejects_trailing_clause_punctuation() {
+        assert!(first_line_title_hint("Please do the following:\n\n- a\n- b").is_none());
+        assert!(first_line_title_hint("add this, and that,\n\nbody").is_none());
+        assert!(first_line_title_hint("Do these things...\n\nbody").is_none());
+    }
+
+    #[test]
+    fn hint_rejects_empty() {
+        assert!(first_line_title_hint("").is_none());
+        assert!(first_line_title_hint("\n\n").is_none());
     }
 
     #[test]
@@ -205,6 +325,42 @@ mod tests {
     }
 
     #[test]
+    fn keeps_arrow_in_title_and_slugifies_branch() {
+        let s =
+            "{\"title\":\"bp -> customer.io migration\",\"branch\":\"bp-customerio-migration\"}";
+        let n = parse_workspace_names(s).unwrap();
+        assert_eq!(n.title, "bp -> customer.io migration");
+        assert!(!n.branch_slug.contains('>'));
+        assert!(!n.branch_slug.contains(' '));
+    }
+
+    #[test]
+    fn normalizes_unicode_arrow_in_title() {
+        let s = "{\"title\":\"bp → runflow dogfood\",\"branch\":\"bp-runflow-dogfood\"}";
+        assert_eq!(
+            parse_workspace_names(s).unwrap().title,
+            "bp -> runflow dogfood"
+        );
+    }
+
+    #[test]
+    fn caps_title_at_max_and_trims_trailing_punctuation() {
+        let long = "a".repeat(60);
+        let s = format!("{{\"title\":\"{long}\",\"branch\":\"x\"}}");
+        let title = parse_workspace_names(&s).unwrap().title;
+        assert!(title.chars().count() <= TITLE_MAX_CHARS);
+    }
+
+    #[test]
+    fn strips_trailing_period_from_title() {
+        let s = "{\"title\":\"sentinel -> throughput fixes.\",\"branch\":\"x\"}";
+        assert_eq!(
+            parse_workspace_names(s).unwrap().title,
+            "sentinel -> throughput fixes"
+        );
+    }
+
+    #[test]
     fn rejects_non_json_and_empty_title() {
         assert!(parse_workspace_names("sorry, I can't help with that").is_none());
         assert!(parse_workspace_names("{\"title\":\"   \",\"branch\":\"x\"}").is_none());
@@ -216,5 +372,11 @@ mod tests {
         assert_eq!(slugify("feature/Foo Bar", 40), "feature-foo-bar");
         assert_eq!(slugify("a".repeat(50).as_str(), 8), "aaaaaaaa");
         assert_eq!(slugify("---", 40), "");
+        // An arrow title degrades to a clean branch slug (no '>', no spaces).
+        assert_eq!(
+            slugify("bp -> customer.io migration", 40),
+            "bp-customer-io-migration"
+        );
+        assert_eq!(slugify("bp -> runflow dogfood", 40), "bp-runflow-dogfood");
     }
 }

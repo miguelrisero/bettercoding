@@ -65,4 +65,24 @@ mod tests {
         assert_eq!(truncate_to_char_boundary(input, 5), "🔥");
         assert_eq!(truncate_to_char_boundary(input, 3), "");
     }
+
+    #[test]
+    fn arrow_titles_slugify_to_git_safe_branch() {
+        use super::git_branch_id_with_len;
+
+        // A " -> " title (space, dash, greater-than are all invalid in git refs)
+        // must degrade to a clean hyphenated slug.
+        assert_eq!(
+            git_branch_id_with_len("bp -> runflow dogfood", 40),
+            "bp-runflow-dogfood"
+        );
+        assert_eq!(
+            git_branch_id_with_len("bp -> customer.io migration", 40),
+            "bp-customer-io-migration"
+        );
+        assert_eq!(
+            git_branch_id_with_len("patri → main chief", 40),
+            "patri-main-chief"
+        );
+    }
 }

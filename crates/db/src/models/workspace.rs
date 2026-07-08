@@ -380,6 +380,31 @@ impl Workspace {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Compare-and-set name update: only sets `name` if it still equals
+    /// `expected_old` (NULL-safe via SQLite `IS`). Returns `true` if a row was
+    /// updated (the name was unchanged since the caller snapshotted it), `false`
+    /// if it changed concurrently. Lets the async generated-title write avoid
+    /// clobbering a manual rename (or an MCP-provided name) that landed in the
+    /// meantime. `expected_old` must be the pre-spawn workspace-row snapshot
+    /// name, NOT a value re-derived from the prompt (they can differ).
+    pub async fn update_name_if_unchanged(
+        pool: &SqlitePool,
+        workspace_id: Uuid,
+        new_name: &str,
+        expected_old: Option<&str>,
+    ) -> Result<bool, WorkspaceError> {
+        let result = sqlx::query!(
+            "UPDATE workspaces SET name = $1, updated_at = datetime('now', 'subsec') WHERE id = $2 AND name IS $3",
+            new_name,
+            workspace_id,
+            expected_old,
+        )
+        .execute(pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Find workspace by path using container-ref path containment.
     /// Used by clients that may open a repo subfolder rather than the workspace root.
     pub async fn resolve_container_ref_by_prefix(
