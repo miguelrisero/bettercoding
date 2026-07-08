@@ -16,10 +16,9 @@ interface TerminalConnection {
 
 interface ConnectionGeneration {
   /**
-   * Rebuilt on every (re)connect attempt so retries/reconnects attach at the
-   * pane's CURRENT fitted grid, not the size frozen when the tab was created.
-   * Returns null when the pane is not measurable yet (hidden/0-height) — the
-   * attempt is then rescheduled instead of attaching at a placeholder size.
+   * Called fresh on every (re)connect attempt; null = pane unmeasurable,
+   * defer. Full contract on `TerminalContextType.createTerminalConnection`
+   * and `resolveTerminalEndpoint`.
    */
   getEndpoint: () => string | null;
   retryCount: number;
@@ -360,6 +359,16 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
         terminalConnectionsRef.current.delete(tabId);
       };
 
+      const scheduleAttempt = (delay: number) => {
+        if (generation.closed) {
+          return;
+        }
+        generation.retryTimer = setTimeout(() => {
+          generation.retryTimer = null;
+          connectWebSocket();
+        }, delay);
+      };
+
       const scheduleReconnect = () => {
         if (generation.closed) {
           return;
@@ -373,10 +382,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
 
         const delay = Math.min(8000, 500 * Math.pow(2, generation.retryCount));
         generation.retryCount += 1;
-        generation.retryTimer = setTimeout(() => {
-          generation.retryTimer = null;
-          connectWebSocket();
-        }, delay);
+        scheduleAttempt(delay);
       };
 
       const connectWebSocket = () => {
@@ -384,14 +390,15 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
           return;
         }
 
-        // Rebuild the endpoint at the CURRENT fitted grid on every attempt. A
-        // null means the pane isn't measurable yet (e.g. a hidden tab across an
-        // iOS background socket kill); reschedule rather than attach at a
-        // placeholder 80x24 that would make claude reflow on the follow-up
-        // resize.
+        // null = pane unmeasurable right now (e.g. hidden tab across an iOS
+        // background socket kill) — see `resolveTerminalEndpoint`. Being
+        // hidden is a wait state, not a connect failure: poll without
+        // spending the retry budget, so a pane hidden longer than the
+        // backoff ladder doesn't burn its retries and give up before the
+        // user ever shows it again.
         const endpoint = generation.getEndpoint();
         if (endpoint === null) {
-          scheduleReconnect();
+          scheduleAttempt(1000);
           return;
         }
 

@@ -912,11 +912,11 @@ pub enum PtyError {
 /// termios is a property of the pty device shared across dup'd fds, so clearing
 /// `VEOF` here — on the master fd — is seen by the writer's own `tcgetattr`,
 /// making its `if eot != 0` guard skip the write.
+/// The termios write shared by `disarm_master_eof` and `VeofDisarmOnDrop`.
+/// termios is pty-DEVICE state shared across every dup'd fd, so a disarm
+/// through any fd of the pty is seen by the writer's own `tcgetattr`.
 #[cfg(unix)]
-fn disarm_master_eof(master: &dyn portable_pty::MasterPty) {
-    let Some(fd) = master.as_raw_fd() else {
-        return;
-    };
+fn disarm_eof_on_fd(fd: std::os::unix::io::RawFd) {
     unsafe {
         let mut termios: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(fd, &mut termios) == 0 {
@@ -935,27 +935,72 @@ fn disarm_master_eof(master: &dyn portable_pty::MasterPty) {
     }
 }
 
+#[cfg(unix)]
+fn disarm_master_eof(master: &dyn portable_pty::MasterPty) {
+    let Some(fd) = master.as_raw_fd() else {
+        return;
+    };
+    disarm_eof_on_fd(fd);
+}
+
 #[cfg(not(unix))]
 fn disarm_master_eof(_master: &dyn portable_pty::MasterPty) {}
 
-/// Disarms the master's VEOF on drop unless defused. Covers the window in
+/// Disarms the pty's VEOF on drop unless defused. Covers the whole window in
 /// `create_session` between `take_writer()` succeeding and the `PtySession`
-/// being constructed (whose own `Drop` takes over the disarm duty): an early
-/// return (e.g. `try_clone_reader` failing) or a panic-unwind inside that
-/// window drops the writer with no `PtySession` in existence, and its Drop
-/// would inject `\n` + Ctrl-D into the just-spawned child. Declared AFTER the
-/// writer local so it drops FIRST (locals drop in reverse declaration order).
-struct VeofDisarmOnDrop<'a> {
-    master: &'a dyn portable_pty::MasterPty,
-    /// Set to true once the writer's ownership is safely inside a
+/// being inserted into the registry (whose own `Drop` takes over the disarm
+/// duty from there): an early return (`try_clone_reader` failing), a
+/// panic-unwind, or the request future being cancelled at the
+/// `spawn_blocking` `.await` (the detached blocking task still completes and
+/// the runtime then drops its returned tuple) would each drop the writer
+/// with no `PtySession` in existence, and the writer's Drop would inject
+/// `\n` + Ctrl-D into the just-spawned child.
+///
+/// Owns a `dup(2)` of the master fd instead of borrowing the master so it
+/// can travel across the `spawn_blocking` boundary inside the returned tuple
+/// — declared FIRST there, because tuple fields drop in declaration order
+/// and the disarm must precede the writer's Drop on a cancellation drop.
+struct VeofDisarmOnDrop {
+    #[cfg(unix)]
+    fd: Option<std::os::fd::OwnedFd>,
+    /// Set once the writer's ownership is safely inside a registered
     /// `PtySession`; the guard then does nothing.
     defused: bool,
 }
 
-impl Drop for VeofDisarmOnDrop<'_> {
+impl VeofDisarmOnDrop {
+    fn new(master: &dyn portable_pty::MasterPty) -> Self {
+        #[cfg(unix)]
+        {
+            let fd = master.as_raw_fd().and_then(|raw| {
+                // SAFETY: `raw` is a live fd owned by `master`, which outlives
+                // this immediate clone-to-owned.
+                let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
+                borrowed.try_clone_to_owned().ok()
+            });
+            Self { fd, defused: false }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = master;
+            Self { defused: false }
+        }
+    }
+
+    fn defuse(&mut self) {
+        self.defused = true;
+    }
+}
+
+impl Drop for VeofDisarmOnDrop {
     fn drop(&mut self) {
-        if !self.defused {
-            disarm_master_eof(self.master);
+        if self.defused {
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(fd) = &self.fd {
+            use std::os::fd::AsRawFd;
+            disarm_eof_on_fd(fd.as_raw_fd());
         }
     }
 }
@@ -964,12 +1009,8 @@ struct PtySession {
     /// Per-session writer behind its own lock so a blocking PTY write never
     /// holds up the global session registry (see `write`).
     ///
-    /// Drop safety: `Drop for PtySession` disarms the master's VEOF before any
-    /// field drops. That disarm is a tcsetattr on the pty DEVICE — persistent
-    /// state shared by every dup'd fd — so this writer's own Drop reads
-    /// `VEOF == 0` and injects nothing regardless of when it runs (even from
-    /// an `Arc` clone in `write` that outlives the session, or after `master`
-    /// closes). The `writer`-before-`master` declaration order is only
+    /// Drop safety lives on `Drop for PtySession` below; the
+    /// `writer`-before-`master` declaration order here is only
     /// defense-in-depth, not the load-bearing guarantee.
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn portable_pty::MasterPty + Send>,
@@ -1176,14 +1217,11 @@ impl PtyService {
                 .take_writer()
                 .map_err(|e| PtyError::CreateFailed(e.to_string()))?;
 
-            // From here until the `PtySession` exists there is a writer whose
-            // Drop injects `\n` + Ctrl-D but no session Drop to disarm it; the
-            // guard covers every early return and unwind in that window.
-            // Declared after `writer` so it drops first.
-            let mut veof_guard = VeofDisarmOnDrop {
-                master: pty_pair.master.as_ref(),
-                defused: false,
-            };
+            // From here until the `PtySession` is registered there is a writer
+            // whose Drop injects `\n` + Ctrl-D but no session Drop to disarm
+            // it; the guard rides the returned tuple to cover every early
+            // return, unwind, and cancellation in that window (see its doc).
+            let veof_guard = VeofDisarmOnDrop::new(pty_pair.master.as_ref());
 
             if shell_name == "zsh" {
                 let _ = writer.write_all(b" PROMPT='$ '; RPROMPT=''\n");
@@ -1222,13 +1260,11 @@ impl PtyService {
                 child_reaped_reader.store(true, Ordering::Release);
             });
 
-            // The writer will be owned by a `PtySession`, whose own Drop takes
-            // over the disarm duty from here. Dropped explicitly to release
-            // the guard's borrow before `pty_pair.master` moves out.
-            veof_guard.defused = true;
-            drop(veof_guard);
-
+            // Guard first: tuple fields drop in declaration order, so if this
+            // tuple is dropped un-consumed (request future cancelled at the
+            // `.await` below), the guard disarms before the writer drops.
             Ok::<_, PtyError>((
+                veof_guard,
                 pty_pair.master,
                 writer,
                 child_killer,
@@ -1239,7 +1275,7 @@ impl PtyService {
         .await
         .map_err(|e| PtyError::CreateFailed(e.to_string()))??;
 
-        let (master, writer, child_killer, child_reaped, output_handle) = result;
+        let (mut veof_guard, master, writer, child_killer, child_reaped, output_handle) = result;
 
         let session = PtySession {
             writer: Arc::new(Mutex::new(writer)),
@@ -1254,6 +1290,12 @@ impl PtyService {
             .lock()
             .map_err(|e| PtyError::CreateFailed(e.to_string()))?
             .insert(session_id, session);
+
+        // The writer is now owned by a registered `PtySession`, whose own Drop
+        // holds the disarm duty from here. (If the insert above failed, both
+        // the constructed session's Drop and the still-armed guard disarm —
+        // idempotent.)
+        veof_guard.defuse();
 
         Ok((session_id, output_rx))
     }
@@ -1596,20 +1638,26 @@ mod tests {
         }
     }
 
-    /// The core of the stray-newline/EOT fix: after `disarm_master_eof`,
-    /// `portable-pty`'s writer-Drop reads `VEOF == 0` and skips its `\n` +
-    /// Ctrl-D injection. Uses the same `openpty` path as `create_session`.
+    /// Same `openpty` path as `create_session`.
     #[cfg(unix)]
-    #[test]
-    fn disarm_master_eof_zeroes_veof() {
-        let pair = NativePtySystem::default()
+    fn open_test_pty() -> portable_pty::PtyPair {
+        NativePtySystem::default()
             .openpty(PtySize {
                 rows: 24,
                 cols: 80,
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .expect("openpty");
+            .expect("openpty")
+    }
+
+    /// The core of the stray-newline/EOT fix: after `disarm_master_eof`,
+    /// `portable-pty`'s writer-Drop reads `VEOF == 0` and skips its `\n` +
+    /// Ctrl-D injection.
+    #[cfg(unix)]
+    #[test]
+    fn disarm_master_eof_zeroes_veof() {
+        let pair = open_test_pty();
 
         // Guard against the helper silently no-oping: a fresh pty must have
         // VEOF armed (Ctrl-D == 4 by default) for the disarm to be meaningful.
@@ -1622,37 +1670,26 @@ mod tests {
         assert_eq!(after, 0, "VEOF must be disarmed after disarm_master_eof");
     }
 
-    /// The `create_session` failure-window guard: dropped undefused (early
-    /// return / unwind before `PtySession` exists) it must disarm VEOF;
-    /// dropped defused (ownership handed to `PtySession`) it must leave the
-    /// live session's VEOF armed.
+    /// The `create_session` creation-window guard: dropped undefused (early
+    /// return / unwind / cancelled `.await` before the `PtySession` is
+    /// registered) it must disarm VEOF — via its own dup'd fd, independent of
+    /// the master; dropped defused (ownership handed to `PtySession`) it must
+    /// leave the live session's VEOF armed.
     #[cfg(unix)]
     #[test]
     fn veof_guard_disarms_only_when_not_defused() {
-        let pair = NativePtySystem::default()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
+        let pair = open_test_pty();
 
         // Defused guard (success path): VEOF stays armed for the live session.
-        let guard = VeofDisarmOnDrop {
-            master: pair.master.as_ref(),
-            defused: true,
-        };
+        let mut guard = VeofDisarmOnDrop::new(pair.master.as_ref());
+        guard.defuse();
         drop(guard);
         let veof = master_veof(pair.master.as_ref()).expect("tcgetattr");
         assert_ne!(veof, 0, "a defused guard must not touch VEOF");
 
-        // Undefused guard (failure path): VEOF is disarmed before the writer
-        // local would drop.
-        let guard = VeofDisarmOnDrop {
-            master: pair.master.as_ref(),
-            defused: false,
-        };
+        // Undefused guard (failure/cancellation path): VEOF is disarmed before
+        // the writer would drop, even with the master untouched.
+        let guard = VeofDisarmOnDrop::new(pair.master.as_ref());
         drop(guard);
         let veof = master_veof(pair.master.as_ref()).expect("tcgetattr");
         assert_eq!(veof, 0, "an undefused guard must disarm VEOF");

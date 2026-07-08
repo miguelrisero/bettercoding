@@ -403,20 +403,8 @@ async fn handle_terminal_ws(
         }
     };
 
-    // FIX 4 input tripwire: for a strictly bounded window right after attach,
-    // hex-dump every client→pty input chunk. This is the production canary for
-    // the stray-newline / EOT injection bug (portable-pty's writer-Drop wrote
-    // `\n` + Ctrl-D into the tmux client's tty on teardown, killing the pane)
-    // and for any FUTURE client-side injector: it makes the exact bytes the
-    // browser sent — with an ms-since-attach stamp and the per-attach id —
-    // visible in server logs, so we can tell a client-origin injection from a
-    // server-side one. Bounded to the first `TRIPWIRE_WINDOW` OR
-    // `TRIPWIRE_MAX_BYTES` (whichever first); it allocates nothing once the
-    // window closes, so it is permanently safe to leave enabled.
-    const TRIPWIRE_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
-    const TRIPWIRE_MAX_BYTES: usize = 128;
-    let attach_started = std::time::Instant::now();
-    let mut tripwire_bytes_logged: usize = 0;
+    // FIX 4 input tripwire — bounds and rationale live on `AttachInputTripwire`.
+    let mut tripwire = AttachInputTripwire::new(tripwire_session, session_id);
 
     // The tmux session is now created and its bootstrap (carrying the parked
     // CLI prompt) is running; only now is it safe to clear the prompt, so a
@@ -462,23 +450,7 @@ async fn handle_terminal_ws(
                             match cmd {
                                 TerminalCommand::Input { data } => {
                                     if let Ok(bytes) = BASE64.decode(&data) {
-                                        // FIX 4 tripwire (bounded — see above).
-                                        let elapsed = attach_started.elapsed();
-                                        if !bytes.is_empty()
-                                            && tripwire_bytes_logged < TRIPWIRE_MAX_BYTES
-                                            && elapsed < TRIPWIRE_WINDOW
-                                        {
-                                            let take = (TRIPWIRE_MAX_BYTES - tripwire_bytes_logged)
-                                                .min(bytes.len());
-                                            tracing::info!(
-                                                session = %tripwire_session,
-                                                attach = %session_id_for_input,
-                                                ms_since_attach = elapsed.as_millis() as u64,
-                                                bytes = %hex_dump(&bytes[..take]),
-                                                "terminal input (attach-window tripwire)"
-                                            );
-                                            tripwire_bytes_logged += take;
-                                        }
+                                        tripwire.observe(&bytes);
                                         let _ = pty_service.write(session_id_for_input, &bytes).await;
                                     }
                                 }
@@ -501,6 +473,65 @@ async fn handle_terminal_ws(
     }
 
     let _ = deployment.pty().close_session(session_id).await;
+}
+
+/// FIX 4 input tripwire: for a strictly bounded window right after each
+/// attach, hex-dump every client→pty input chunk. This is the production
+/// canary for the stray-newline / EOT injection bug (portable-pty's
+/// writer-Drop wrote `\n` + Ctrl-D into the tmux client's tty on teardown,
+/// killing the pane) and for any FUTURE client-side injector: it makes the
+/// exact bytes the browser sent — with an ms-since-attach stamp and the
+/// per-attach id — visible in server logs, so a client-origin injection can
+/// be told from a server-side one. Bounded to the first `Self::WINDOW` OR
+/// `Self::MAX_BYTES` (whichever first); once spent, `observe` is a single
+/// integer compare with no allocation, so it is permanently safe to leave
+/// enabled.
+struct AttachInputTripwire {
+    /// The pty session name (tmux `vk_<uuid>` for CLI mode) so the logged
+    /// bytes line up with tmux server logs.
+    session: String,
+    /// The per-attach PTY session id.
+    attach_id: Uuid,
+    started: std::time::Instant,
+    bytes_logged: usize,
+}
+
+impl AttachInputTripwire {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+    const MAX_BYTES: usize = 128;
+
+    fn new(session: String, attach_id: Uuid) -> Self {
+        Self {
+            session,
+            attach_id,
+            started: std::time::Instant::now(),
+            bytes_logged: 0,
+        }
+    }
+
+    /// Log (redacted — see `hex_dump`) input bytes while the attach window is
+    /// open. Expiry latches: the monotonic clock never goes backwards, so
+    /// marking the byte budget spent on the first out-of-window observation
+    /// is behavior-identical and skips even the clock read afterwards.
+    fn observe(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() || self.bytes_logged >= Self::MAX_BYTES {
+            return;
+        }
+        let elapsed = self.started.elapsed();
+        if elapsed >= Self::WINDOW {
+            self.bytes_logged = Self::MAX_BYTES;
+            return;
+        }
+        let take = (Self::MAX_BYTES - self.bytes_logged).min(bytes.len());
+        tracing::info!(
+            session = %self.session,
+            attach = %self.attach_id,
+            ms_since_attach = elapsed.as_millis() as u64,
+            bytes = %hex_dump(&bytes[..take]),
+            "terminal input (attach-window tripwire)"
+        );
+        self.bytes_logged += take;
+    }
 }
 
 /// Space-separated redacted hex of a byte slice for the attach-window input
