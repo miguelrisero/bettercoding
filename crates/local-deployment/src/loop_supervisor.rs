@@ -416,17 +416,19 @@ async fn deliver_due_wakeups(db: &DBService, _now: DateTime<Utc>) -> Result<(), 
         // The tmux session may have been reaped before a long usage-window wake
         // came due — re-park the prompt so the next attach delivers it.
         if !cli_tmux_session_exists(wid).await {
-            if repark_prompt(pool, wid, &prompt).await == ReparkOutcome::Failed {
-                // Transient DB error: leave the wake-up pending so the next
-                // tick retries rather than dropping it (marking it fired here
-                // would neither deliver nor park the prompt).
+            let outcome = repark_prompt(pool, wid, &prompt).await;
+            if wakeup_stays_pending(&outcome, is_limit) {
+                // Not re-parked and not deliverable now (transient DB error, or
+                // a manual wake-up blocked behind an already-parked prompt):
+                // leave it pending so a later tick delivers it, rather than
+                // marking it fired and dropping the user's prompt.
                 tracing::warn!(
-                    "loop: workspace {wid} session gone; re-park failed transiently, \
-                     leaving wake-up pending"
+                    "loop: workspace {wid} session gone; wake-up not re-parked ({outcome:?}), \
+                     leaving pending"
                 );
                 continue;
             }
-            tracing::info!("loop: workspace {wid} session gone; re-parked wake-up prompt");
+            tracing::info!("loop: workspace {wid} session gone; re-park outcome {outcome:?}");
             ScheduledWakeup::mark_fired(pool, wakeup.id).await?;
             continue;
         }
@@ -479,12 +481,13 @@ async fn deliver_due_wakeups(db: &DBService, _now: DateTime<Utc>) -> Result<(), 
             // prompt so the next terminal attach delivers it rather than dropping
             // the wake-up — mirrors the session-gone branch above.
             tracing::warn!("loop: failed to deliver wake-up to workspace {wid}; re-parking");
-            if repark_prompt(pool, wid, &prompt).await == ReparkOutcome::Failed {
-                // Transient DB error: leave the wake-up pending for the next
-                // tick instead of marking it fired and dropping it.
+            let outcome = repark_prompt(pool, wid, &prompt).await;
+            if wakeup_stays_pending(&outcome, is_limit) {
+                // Transient DB error, or a manual wake-up blocked behind an
+                // already-parked prompt: leave it pending for a later tick
+                // instead of marking it fired and dropping it.
                 tracing::warn!(
-                    "loop: re-park failed transiently for workspace {wid}; \
-                     leaving wake-up pending"
+                    "loop: wake-up for workspace {wid} not re-parked ({outcome:?}); leaving pending"
                 );
                 continue;
             }
@@ -494,14 +497,18 @@ async fn deliver_due_wakeups(db: &DBService, _now: DateTime<Utc>) -> Result<(), 
     Ok(())
 }
 
-/// Outcome of a [`repark_prompt`] attempt. Only `Failed` (a transient DB error)
-/// warrants leaving the wake-up pending for a retry; every other outcome is
-/// final and the caller may mark the wake-up fired.
+/// Outcome of a [`repark_prompt`] attempt, so callers can decide whether to
+/// mark the wake-up fired or leave it pending for a retry.
 #[derive(Debug, PartialEq, Eq)]
 enum ReparkOutcome {
-    /// The prompt is parked (or a prompt is already parked for the workspace,
-    /// which delivers first) — handled, mark the wake-up fired.
-    Handled,
+    /// This wake-up's prompt is now parked for the next attach to deliver.
+    Parked,
+    /// The workspace already had an undelivered prompt parked, so this wake-up's
+    /// prompt was NOT parked (the parked one delivers first). Fine to drop a
+    /// limit-kind continuation (the loop re-detects its banner afterwards), but
+    /// a MANUAL wake-up is the user's explicit prompt and must not be dropped —
+    /// the caller leaves it pending until the slot frees.
+    AlreadyParked,
     /// No session row exists to park on — nothing more the loop can do.
     NoSession,
     /// A transient DB error — leave the wake-up pending so the next tick retries
@@ -530,7 +537,7 @@ async fn repark_prompt(pool: &sqlx::SqlitePool, wid: Uuid, prompt: &str) -> Repa
             tracing::info!(
                 "loop: workspace {wid} already has a parked prompt; wake-up not re-parked"
             );
-            return ReparkOutcome::Handled;
+            return ReparkOutcome::AlreadyParked;
         }
         Ok(None) => {}
         Err(e) => {
@@ -541,9 +548,10 @@ async fn repark_prompt(pool: &sqlx::SqlitePool, wid: Uuid, prompt: &str) -> Repa
     match Session::find_latest_by_workspace_id(pool, wid).await {
         Ok(Some(session)) => {
             match Session::set_pending_cli_prompt_if_empty(pool, session.id, prompt).await {
-                // `false` = a prompt was parked between our check and here
-                // (raced an attach/another wake-up); either way one is queued.
-                Ok(_) => ReparkOutcome::Handled,
+                Ok(true) => ReparkOutcome::Parked,
+                // A prompt was parked between our check and here (raced an
+                // attach/another wake-up); treat it like the already-parked case.
+                Ok(false) => ReparkOutcome::AlreadyParked,
                 Err(e) => {
                     tracing::warn!(
                         "loop: failed to re-park wake-up prompt for workspace {wid}: {e}"
@@ -560,6 +568,20 @@ async fn repark_prompt(pool: &sqlx::SqlitePool, wid: Uuid, prompt: &str) -> Repa
             tracing::warn!("loop: failed to re-park wake-up prompt for workspace {wid}: {e}");
             ReparkOutcome::Failed
         }
+    }
+}
+
+/// Whether a wake-up whose re-park had this `outcome` must be left PENDING (not
+/// marked fired). A transient DB error always retries. `AlreadyParked` drops a
+/// limit-kind continuation (self-heals — the loop re-detects its banner) but
+/// keeps a MANUAL wake-up pending, since a manual wake-up is the user's explicit
+/// prompt and there is no second parking slot to hold it while the existing
+/// prompt delivers.
+fn wakeup_stays_pending(outcome: &ReparkOutcome, is_limit: bool) -> bool {
+    match outcome {
+        ReparkOutcome::Failed => true,
+        ReparkOutcome::AlreadyParked => !is_limit,
+        ReparkOutcome::Parked | ReparkOutcome::NoSession => false,
     }
 }
 
@@ -628,6 +650,22 @@ mod tests {
     /// `parse_reset_at` with a deterministic (UTC) default zone.
     fn reset_at(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         parse_reset_at(text, now, utc())
+    }
+
+    #[test]
+    fn wakeup_pending_policy_keeps_manual_but_drops_limit_when_already_parked() {
+        // Transient DB error: always retry, regardless of kind.
+        assert!(wakeup_stays_pending(&ReparkOutcome::Failed, true));
+        assert!(wakeup_stays_pending(&ReparkOutcome::Failed, false));
+        // Already-parked: a limit continuation self-heals (re-detected), so
+        // drop it; a manual wake-up is the user's prompt, so keep it pending.
+        assert!(!wakeup_stays_pending(&ReparkOutcome::AlreadyParked, true));
+        assert!(wakeup_stays_pending(&ReparkOutcome::AlreadyParked, false));
+        // Parked / no-session are final for both kinds.
+        assert!(!wakeup_stays_pending(&ReparkOutcome::Parked, true));
+        assert!(!wakeup_stays_pending(&ReparkOutcome::Parked, false));
+        assert!(!wakeup_stays_pending(&ReparkOutcome::NoSession, true));
+        assert!(!wakeup_stays_pending(&ReparkOutcome::NoSession, false));
     }
 
     #[test]
