@@ -1,6 +1,7 @@
 {
   "cliMode": {
     "title": "CLI Claude",
+    "titleShort": "CLI",
     "persistentHint": "session tmux persistante",
     "backToChat": "Retour au chat",
     "agentRunningTitle": "Claude travaille sur votre prompt",
@@ -477,7 +478,8 @@
     "permissionPlan": "Plan",
     "agent": "Agent",
     "default": "Par défaut",
-    "model": "Modèle"
+    "model": "Modèle",
+    "useCustom": "Utiliser \"{{query}}\""
   },
   "crashScreen": {
     "title": "Une erreur est survenue",

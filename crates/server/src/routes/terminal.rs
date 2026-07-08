@@ -23,7 +23,8 @@ use executors::{
 use local_deployment::pty::{
     CLI_PROMPT_PARKED_NOTICE, CliPromptDelivery, CliPromptRouting, PtyCommand,
     cli_pane_agent_running, cli_prompt_file_exists, cli_tmux_available, cli_tmux_session_exists,
-    remove_cli_prompt_file, route_followup_prompt, route_initial_prompt, send_cli_keys,
+    cli_tmux_session_name, remove_cli_prompt_file, route_followup_prompt, route_initial_prompt,
+    send_cli_keys,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -48,10 +49,14 @@ enum TerminalMode {
 #[derive(Debug, Deserialize)]
 struct TerminalQuery {
     pub workspace_id: Uuid,
-    #[serde(default = "default_cols")]
-    pub cols: u16,
-    #[serde(default = "default_rows")]
-    pub rows: u16,
+    /// `None` (fell back to 80x24) is distinguishable from an explicit value
+    /// so the stray-newline regression tripwire below can warn on true
+    /// absence without false-positiving on a pane that genuinely measures
+    /// 80x24.
+    #[serde(default)]
+    pub cols: Option<u16>,
+    #[serde(default)]
+    pub rows: Option<u16>,
     #[serde(default)]
     mode: TerminalMode,
     /// VibeKanban session whose claude conversation CLI mode should resume,
@@ -60,13 +65,8 @@ struct TerminalQuery {
     session_id: Option<Uuid>,
 }
 
-fn default_cols() -> u16 {
-    80
-}
-
-fn default_rows() -> u16 {
-    24
-}
+const DEFAULT_COLS: u16 = 80;
+const DEFAULT_ROWS: u16 = 24;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -191,6 +191,23 @@ async fn terminal_ws(
 
     let (working_dir, command) = match query.mode {
         TerminalMode::Cli => {
+            // Regression tripwire for the stray-newline bug: a CLI attach must
+            // always carry the pane's real fitted grid. Absent cols/rows mean
+            // the frontend connected without measuring, which makes claude
+            // reflow and stack blank lines on the follow-up resize. After the
+            // frontend fix (never connect at an unmeasured size, URL always
+            // carries the fitted grid) this must never fire. An EXPLICIT
+            // 80x24 is legitimate (a pane can really measure that); a
+            // literal-default regression stays observable via the per-attach
+            // cols x rows log in pty.rs.
+            if query.cols.is_none() || query.rows.is_none() {
+                tracing::warn!(
+                    "CLI terminal attaching without cols/rows for workspace {} — \
+                     frontend connected unmeasured (stray-newline regression)",
+                    query.workspace_id
+                );
+            }
+
             let pool = &deployment.db().pool;
 
             // Resolve the uix session driving the handover. A mid-switch
@@ -439,8 +456,8 @@ async fn terminal_ws(
             socket,
             deployment,
             working_dir,
-            query.cols,
-            query.rows,
+            query.cols.unwrap_or(DEFAULT_COLS),
+            query.rows.unwrap_or(DEFAULT_ROWS),
             command,
             prompt_delivery,
         )
@@ -481,6 +498,16 @@ async fn handle_terminal_ws(
     command: PtyCommand,
     prompt_delivery: Option<PromptDelivery>,
 ) {
+    // FIX 4 tripwire label: the pty session name, captured before `command` is
+    // moved into `create_session`. For CLI mode this is the tmux `vk_<uuid>`
+    // name, so the logged bytes line up with tmux server logs.
+    let tripwire_session = match &command {
+        // #30 carries the workspace id on TmuxCli (the tmux session name is
+        // derived from it); recover the `vk_<uuid>` name for the tripwire label.
+        PtyCommand::TmuxCli { workspace_id, .. } => cli_tmux_session_name(*workspace_id),
+        PtyCommand::Shell => "shell".to_string(),
+    };
+
     let (session_id, mut output_rx) = match deployment
         .pty()
         .create_session(working_dir, cols, rows, command)
@@ -499,6 +526,9 @@ async fn handle_terminal_ws(
             return;
         }
     };
+
+    // FIX 4 input tripwire — bounds and rationale live on `AttachInputTripwire`.
+    let mut tripwire = AttachInputTripwire::new(tripwire_session, session_id);
 
     // create_session returning Ok only means the tmux *client* process spawned;
     // the tmux server can still reject the command moments later (historically:
@@ -609,6 +639,7 @@ async fn handle_terminal_ws(
                             match cmd {
                                 TerminalCommand::Input { data } => {
                                     if let Ok(bytes) = BASE64.decode(&data) {
+                                        tripwire.observe(&bytes);
                                         let _ = pty_service.write(session_id_for_input, &bytes).await;
                                     }
                                 }
@@ -729,6 +760,86 @@ async fn deliver_deferred_prompt(workspace_id: Uuid, text: &str, program: &str) 
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     false
+}
+
+/// FIX 4 input tripwire: for a strictly bounded window right after each
+/// attach, hex-dump every client→pty input chunk. This is the production
+/// canary for the stray-newline / EOT injection bug (portable-pty's
+/// writer-Drop wrote `\n` + Ctrl-D into the tmux client's tty on teardown,
+/// killing the pane) and for any FUTURE client-side injector: it makes the
+/// exact bytes the browser sent — with an ms-since-attach stamp and the
+/// per-attach id — visible in server logs, so a client-origin injection can
+/// be told from a server-side one. Bounded to the first `Self::WINDOW` OR
+/// `Self::MAX_BYTES` (whichever first); once spent, `observe` is a single
+/// integer compare with no allocation, so it is permanently safe to leave
+/// enabled.
+struct AttachInputTripwire {
+    /// The pty session name (tmux `vk_<uuid>` for CLI mode) so the logged
+    /// bytes line up with tmux server logs.
+    session: String,
+    /// The per-attach PTY session id.
+    attach_id: Uuid,
+    started: std::time::Instant,
+    bytes_logged: usize,
+}
+
+impl AttachInputTripwire {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+    const MAX_BYTES: usize = 128;
+
+    fn new(session: String, attach_id: Uuid) -> Self {
+        Self {
+            session,
+            attach_id,
+            started: std::time::Instant::now(),
+            bytes_logged: 0,
+        }
+    }
+
+    /// Log (redacted — see `hex_dump`) input bytes while the attach window is
+    /// open. Expiry latches: the monotonic clock never goes backwards, so
+    /// marking the byte budget spent on the first out-of-window observation
+    /// is behavior-identical and skips even the clock read afterwards.
+    fn observe(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() || self.bytes_logged >= Self::MAX_BYTES {
+            return;
+        }
+        let elapsed = self.started.elapsed();
+        if elapsed >= Self::WINDOW {
+            self.bytes_logged = Self::MAX_BYTES;
+            return;
+        }
+        let take = (Self::MAX_BYTES - self.bytes_logged).min(bytes.len());
+        tracing::info!(
+            session = %self.session,
+            attach = %self.attach_id,
+            ms_since_attach = elapsed.as_millis() as u64,
+            bytes = %hex_dump(&bytes[..take]),
+            "terminal input (attach-window tripwire)"
+        );
+        self.bytes_logged += take;
+    }
+}
+
+/// Space-separated redacted hex of a byte slice for the attach-window input
+/// tripwire: control bytes (< 0x20, or 0x7f) are shown verbatim (e.g. `0a 04`,
+/// `1b`) because they are the injection/escape-sequence signature; every other
+/// byte is masked as `..` so real keystrokes (passwords, pasted secrets) never
+/// reach the logs — only their count and timing do.
+/// The caller bounds the slice length, so this
+/// never allocates more than a fixed maximum.
+fn hex_dump(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 3);
+    for byte in bytes {
+        if *byte < 0x20 || *byte == 0x7f {
+            let _ = write!(out, "{byte:02x} ");
+        } else {
+            out.push_str(".. ");
+        }
+    }
+    out.pop(); // trailing space
+    out
 }
 
 async fn send_error(socket: &mut MaybeSignedWebSocket, message: &str) -> anyhow::Result<()> {
@@ -899,5 +1010,79 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod tripwire_tests {
+    use uuid::Uuid;
+
+    use super::{AttachInputTripwire, hex_dump};
+
+    fn tripwire() -> AttachInputTripwire {
+        AttachInputTripwire::new("vk_test".to_string(), Uuid::new_v4())
+    }
+
+    /// The byte budget: chunks are truncated to the remaining budget, and a
+    /// spent budget stops all logging state changes.
+    #[test]
+    fn observe_caps_logged_bytes_at_budget() {
+        let mut tw = tripwire();
+        tw.observe(&[0x0a; 100]);
+        assert_eq!(tw.bytes_logged, 100);
+        // 100 + 100 crosses the 128 cap: only the remainder is taken.
+        tw.observe(&[0x0a; 100]);
+        assert_eq!(tw.bytes_logged, AttachInputTripwire::MAX_BYTES);
+        // Spent: further input changes nothing.
+        tw.observe(&[0x0a; 4]);
+        assert_eq!(tw.bytes_logged, AttachInputTripwire::MAX_BYTES);
+        // Empty chunks never count.
+        let mut fresh = tripwire();
+        fresh.observe(&[]);
+        assert_eq!(fresh.bytes_logged, 0);
+    }
+
+    /// The time window: the first out-of-window observation latches the
+    /// budget as spent (behavior-identical to checking the clock forever,
+    /// but cheaper), and nothing is logged after expiry.
+    #[test]
+    fn observe_latches_after_window_expires() {
+        let mut tw = tripwire();
+        // Simulate an expired window without sleeping.
+        tw.started = std::time::Instant::now() - (AttachInputTripwire::WINDOW * 2);
+        tw.observe(&[0x0a]);
+        assert_eq!(
+            tw.bytes_logged,
+            AttachInputTripwire::MAX_BYTES,
+            "expiry must latch the budget as spent without logging"
+        );
+    }
+
+    #[test]
+    fn hex_dump_shows_control_bytes_and_masks_printables() {
+        // The \n+EOT injection signature must stay fully visible…
+        assert_eq!(hex_dump(&[0x0a, 0x04]), "0a 04");
+        // …while printable payload (keystrokes, secrets) is masked to `..`,
+        // keeping only count and position.
+        assert_eq!(hex_dump(b"hi"), ".. ..");
+        assert_eq!(hex_dump(&[0x1b, b'[', b'A']), "1b .. ..");
+        assert_eq!(hex_dump(&[0x7f]), "7f");
+        assert_eq!(hex_dump(&[]), "");
+    }
+
+    /// Locks the redaction invariant over the whole byte range: ONLY the C0
+    /// controls (0x00-0x1f) and DEL (0x7f) may appear verbatim; every
+    /// printable AND high/UTF-8 byte (0x20-0x7e, 0x80-0xff) must be masked so
+    /// no keystroke content can ever reach the logs.
+    #[test]
+    fn hex_dump_masks_every_non_control_byte() {
+        for byte in 0x00u8..=0xff {
+            let dumped = hex_dump(&[byte]);
+            if byte < 0x20 || byte == 0x7f {
+                assert_eq!(dumped, format!("{byte:02x}"), "control byte {byte:#04x}");
+            } else {
+                assert_eq!(dumped, "..", "byte {byte:#04x} must be masked");
+            }
+        }
     }
 }

@@ -118,6 +118,7 @@ impl ReasoningOption {
             "high" => Some(3),
             "xhigh" => Some(4),
             "max" => Some(5),
+            "ultracode" => Some(6),
             _ => None,
         };
 
@@ -147,6 +148,9 @@ impl ReasoningOption {
 
 fn reasoning_label(id: &str) -> String {
     match id {
+        // Only override tiers the Title-case fallback would render wrong.
+        // "xhigh" -> "Xhigh" is wrong; "ultracode" -> "Ultracode" is already
+        // correct via the fallback, like low/medium/high/max.
         "xhigh" => "Extra High".to_string(),
         _ => id.to_case(Case::Title),
     }

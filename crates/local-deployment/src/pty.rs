@@ -1418,9 +1418,65 @@ pub enum PtyError {
     SessionClosed,
 }
 
+/// Disarm the pty master's `VEOF` (Ctrl-D / end-of-transmission) control char so
+/// that dropping `portable-pty`'s writer does NOT inject a keystroke into the
+/// terminal.
+///
+/// `portable-pty` 0.8.1's `UnixMasterWriter::drop` reads the master's termios
+/// and, if `c_cc[VEOF]` is non-zero, writes `[b'\n', VEOF]` — LF + Ctrl-D — into
+/// the pty. That is the crate's documented "dropping the writer sends EOF to the
+/// slave" behavior (registry source `unix.rs:351-363`), and nothing in this
+/// crate's own source reveals it — hence this comment. It bites us because our
+/// pty master drives a *tmux client's* tty: on teardown the tmux server reads
+/// those 2 bytes as client keyboard input and forwards them to the active pane.
+/// In the Claude TUI composer the LF inserts a stray newline (never submits) and
+/// the Ctrl-D is a no-op; in a bare shell the Enter+Ctrl-D EXITS the shell and
+/// kills the (persistent, `vk_`-named) session. Reproduced live 4-6/6 teardowns.
+///
+/// This is a TEARDOWN-ONLY fix: a live shell-mode terminal legitimately needs
+/// Ctrl-D/VEOF, so we clear it only right before the writer drops. The writer
+/// holds a `dup(2)` of the master fd (`take_writer` → `self.fd.try_clone()`) and
+/// termios is a property of the pty device shared across dup'd fds, so clearing
+/// `VEOF` here — on the master fd — is seen by the writer's own `tcgetattr`,
+/// making its `if eot != 0` guard skip the write.
+#[cfg(unix)]
+fn disarm_master_eof(master: &dyn portable_pty::MasterPty) {
+    let Some(fd) = master.as_raw_fd() else {
+        // Runs inside Drop, so never panic — but with no fd there is no
+        // disarm, and the writer's Drop may inject; leave a trace so the
+        // attach-window tripwire (server side) can be correlated.
+        tracing::debug!("pty master has no raw fd; VEOF disarm skipped");
+        return;
+    };
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut termios) == 0 {
+            termios.c_cc[libc::VEOF] = 0;
+            if libc::tcsetattr(fd, libc::TCSANOW, &termios) != 0 {
+                tracing::debug!(
+                    "tcsetattr failed disarming pty VEOF; writer teardown may \
+                     inject \\n+EOT"
+                );
+            }
+        } else {
+            tracing::debug!(
+                "tcgetattr failed disarming pty VEOF; writer teardown may \
+                 inject \\n+EOT"
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn disarm_master_eof(_master: &dyn portable_pty::MasterPty) {}
+
 struct PtySession {
     /// Per-session writer behind its own lock so a blocking PTY write never
     /// holds up the global session registry (see `write`).
+    ///
+    /// Drop safety lives on `Drop for PtySession` below; the
+    /// `writer`-before-`master` declaration order here is only
+    /// defense-in-depth, not the load-bearing guarantee.
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     /// Kills the PTY child (tmux client / shell) on teardown. Required because
@@ -1431,11 +1487,43 @@ struct PtySession {
     /// ends the ephemeral shell.
     child_killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     /// Set by the reader thread once it has reaped the child via `wait()`.
-    /// `close_session` checks this before signalling so it never targets a PID
-    /// that was already reaped (and possibly recycled) on the natural-exit path.
+    /// `Drop` checks this before signalling so it never targets a PID that
+    /// was already reaped (and possibly recycled) on the natural-exit path.
     child_reaped: Arc<AtomicBool>,
     _output_handle: thread::JoinHandle<()>,
-    closed: bool,
+}
+
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        // Disarm the master's VEOF BEFORE any field is dropped: a custom
+        // `Drop::drop` runs ahead of field drops, and the disarm writes
+        // persistent pty-device state, so every later writer Drop — the field
+        // drop here or an outliving `Arc` clone — reads `VEOF == 0` and skips
+        // its `\n` + Ctrl-D injection. See `disarm_master_eof` for why the
+        // injection happens at all.
+        disarm_master_eof(self.master.as_ref());
+        // Kill the PTY child so a read-parked reader thread sees EOF, exits,
+        // and reaps it. Without this the reader blocks on its cloned reader
+        // forever (dropping `master` doesn't close that clone), leaking a
+        // thread + an unreaped child per disconnect. For CLI mode this
+        // detaches the tmux CLIENT — the persistent `vk_` server session
+        // survives. The `child_reaped` gate skips the signal once the reader
+        // has reaped on the natural-exit path; the residual load-then-kill
+        // window (reader completes `wait()` between our load and the kill)
+        // is a few instructions wide and was accepted in the original
+        // close_session design — signaling requires the OS to recycle the
+        // PID inside that window.
+        //
+        // The session is constructed inside `create_session`'s blocking task,
+        // so this Drop is the single teardown point EVERY path funnels
+        // through: `close_session` (map remove), service shutdown (the
+        // sessions `HashMap` dropping), creation failures after spawn, and
+        // the caller's future being cancelled at the `.await` (the runtime
+        // drops the returned session).
+        if !self.child_reaped.load(Ordering::Acquire) {
+            let _ = self.child_killer.kill();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1503,7 +1591,7 @@ impl PtyService {
             if matches!(&command, PtyCommand::TmuxCli { .. }) {
                 match tmux_workspace {
                     Some(workspace_id) => tracing::info!(
-                        "CLI terminal attaching tmux session {} in {}",
+                        "CLI terminal attaching tmux session {} at {cols}x{rows} in {}",
                         cli_tmux_session_name(workspace_id),
                         working_dir.display()
                     ),
@@ -1641,27 +1729,26 @@ impl PtyService {
                 .spawn_command(cmd)
                 .map_err(|e| PtyError::CreateFailed(e.to_string()))?;
 
-            // Independent kill handle so close_session can unblock the reader.
-            let child_killer = child.clone_killer();
+            // Independent kill handle so teardown can unblock the reader.
+            let mut child_killer = child.clone_killer();
             let child_reaped = Arc::new(AtomicBool::new(false));
             let child_reaped_reader = child_reaped.clone();
 
-            let mut writer = pty_pair
-                .master
-                .take_writer()
-                .map_err(|e| PtyError::CreateFailed(e.to_string()))?;
-
-            if shell_name == "zsh" {
-                let _ = writer.write_all(b" PROMPT='$ '; RPROMPT=''\n");
-                let _ = writer.flush();
-                let _ = writer.write_all(b"\x0c");
-                let _ = writer.flush();
-            }
-
-            let mut reader = pty_pair
-                .master
-                .try_clone_reader()
-                .map_err(|e| PtyError::CreateFailed(e.to_string()))?;
+            // Reader + reaper thread BEFORE the writer exists: from here on,
+            // every failure path can kill the child and rely on this thread to
+            // reap it, and no failure can strand a VEOF-armed writer.
+            let mut reader = match pty_pair.master.try_clone_reader() {
+                Ok(reader) => reader,
+                Err(e) => {
+                    // No reaper thread yet, but the child is still owned here
+                    // and this is a blocking task: kill and reap inline so
+                    // repeated create failures can't accumulate zombies.
+                    let mut child = child;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(PtyError::CreateFailed(e.to_string()));
+                }
+            };
 
             let output_handle = thread::spawn(move || {
                 let mut child = child;
@@ -1684,36 +1771,49 @@ impl PtyService {
                 // unreaped PTY child leaves one zombie per disconnect until
                 // the server exits (observed live as a defunct tmux client).
                 let _ = child.wait();
-                // Mark reaped so close_session won't signal a freed/recycled PID.
+                // Mark reaped so teardown won't signal a freed/recycled PID.
                 child_reaped_reader.store(true, Ordering::Release);
             });
 
-            Ok::<_, PtyError>((
-                pty_pair.master,
-                writer,
+            let mut writer = match pty_pair.master.take_writer() {
+                Ok(writer) => writer,
+                Err(e) => {
+                    // The reaper thread owns the child; kill so it unblocks
+                    // and reaps. No writer exists, so nothing can inject.
+                    let _ = child_killer.kill();
+                    return Err(PtyError::CreateFailed(e.to_string()));
+                }
+            };
+
+            if shell_name == "zsh" {
+                let _ = writer.write_all(b" PROMPT='$ '; RPROMPT=''\n");
+                let _ = writer.flush();
+                let _ = writer.write_all(b"\x0c");
+                let _ = writer.flush();
+            }
+
+            // Construct the session INSIDE the blocking task, with no fallible
+            // step between `take_writer` above and this point: the writer is
+            // never alive outside a `PtySession`, so every teardown — early
+            // return, panic-unwind, cancellation of the caller at the `.await`
+            // (the runtime then drops this returned session), or normal
+            // close — funnels through `Drop for PtySession`, which disarms
+            // VEOF and kills the child.
+            Ok::<_, PtyError>(PtySession {
+                writer: Arc::new(Mutex::new(writer)),
+                master: pty_pair.master,
                 child_killer,
                 child_reaped,
-                output_handle,
-            ))
+                _output_handle: output_handle,
+            })
         })
         .await
         .map_err(|e| PtyError::CreateFailed(e.to_string()))??;
 
-        let (master, writer, child_killer, child_reaped, output_handle) = result;
-
-        let session = PtySession {
-            writer: Arc::new(Mutex::new(writer)),
-            master,
-            child_killer,
-            child_reaped,
-            _output_handle: output_handle,
-            closed: false,
-        };
-
         self.sessions
             .lock()
             .map_err(|e| PtyError::CreateFailed(e.to_string()))?
-            .insert(session_id, session);
+            .insert(session_id, result);
 
         Ok((session_id, output_rx))
     }
@@ -1733,10 +1833,6 @@ impl PtyService {
             let session = sessions
                 .get(&session_id)
                 .ok_or(PtyError::SessionNotFound(session_id))?;
-
-            if session.closed {
-                return Err(PtyError::SessionClosed);
-            }
 
             session.writer.clone()
         };
@@ -1765,10 +1861,6 @@ impl PtyService {
             .get(&session_id)
             .ok_or(PtyError::SessionNotFound(session_id))?;
 
-        if session.closed {
-            return Err(PtyError::SessionClosed);
-        }
-
         session
             .master
             .resize(PtySize {
@@ -1783,24 +1875,17 @@ impl PtyService {
     }
 
     pub async fn close_session(&self, session_id: Uuid) -> Result<(), PtyError> {
-        if let Some(mut session) = self
+        // Dropping the removed session runs the full teardown — VEOF disarm
+        // then child kill — in `Drop for PtySession`. Bound OUTSIDE the lock
+        // scope so the teardown syscalls never run under the global registry
+        // lock. (A send-parked reader is additionally released when the
+        // caller drops the output receiver after this returns.)
+        let session = self
             .sessions
             .lock()
             .map_err(|_| PtyError::SessionClosed)?
-            .remove(&session_id)
-        {
-            // Kill the PTY child so a read-parked reader sees EOF, exits, and
-            // reaps it. Without this the reader blocks on its cloned reader
-            // forever (dropping the master here doesn't close that clone),
-            // leaking a thread + an unreaped child per disconnect. (A
-            // send-parked reader is instead released when the caller drops the
-            // output receiver after this returns.) Skip the signal if the
-            // reader already reaped on the natural-exit path, so we never
-            // SIGHUP a freed/recycled PID.
-            if !session.child_reaped.load(Ordering::Acquire) {
-                let _ = session.child_killer.kill();
-            }
-        }
+            .remove(&session_id);
+        drop(session);
         Ok(())
     }
 }
@@ -2336,5 +2421,133 @@ mod tests {
         assert!(parse_cli_session_line(id, 1000).is_none());
         // Non-vk session names are ignored entirely.
         assert!(parse_cli_session_line("misc\t0\t900", 1000).is_none());
+    }
+
+    /// Read the master fd's `VEOF` control char, or `None` if it has no fd /
+    /// `tcgetattr` fails. Test-only mirror of the read side of
+    /// `disarm_master_eof`.
+    #[cfg(unix)]
+    fn master_veof(master: &dyn portable_pty::MasterPty) -> Option<libc::cc_t> {
+        let fd = master.as_raw_fd()?;
+        unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut termios) == 0 {
+                Some(termios.c_cc[libc::VEOF])
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Same `openpty` path as `create_session`.
+    #[cfg(unix)]
+    fn open_test_pty() -> portable_pty::PtyPair {
+        NativePtySystem::default()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty")
+    }
+
+    /// The core of the stray-newline/EOT fix: after `disarm_master_eof`,
+    /// `portable-pty`'s writer-Drop reads `VEOF == 0` and skips its `\n` +
+    /// Ctrl-D injection.
+    #[cfg(unix)]
+    #[test]
+    fn disarm_master_eof_zeroes_veof() {
+        let pair = open_test_pty();
+
+        // Guard against the helper silently no-oping: a fresh pty must have
+        // VEOF armed (Ctrl-D == 4 by default) for the disarm to be meaningful.
+        let before = master_veof(pair.master.as_ref()).expect("tcgetattr before");
+        assert_ne!(before, 0, "a fresh pty master should have VEOF armed");
+
+        disarm_master_eof(pair.master.as_ref());
+
+        let after = master_veof(pair.master.as_ref()).expect("tcgetattr after");
+        assert_eq!(after, 0, "VEOF must be disarmed after disarm_master_eof");
+    }
+
+    /// `Drop for PtySession` is the single teardown point every path funnels
+    /// through (close_session, shutdown, creation failure, cancelled create):
+    /// dropping a session must disarm VEOF on the pty device (so the writer's
+    /// own Drop injects nothing) AND kill the child so the reader thread
+    /// reaps it.
+    #[cfg(unix)]
+    #[test]
+    fn pty_session_drop_disarms_veof_and_reaps_child() {
+        use std::os::fd::{AsRawFd as _, BorrowedFd};
+
+        let portable_pty::PtyPair { master, slave } = open_test_pty();
+
+        // Independent dup of the master so the pty device (and its termios)
+        // stays observable after the session — and its master fd — drops.
+        let probe = {
+            let raw = master.as_raw_fd().expect("master raw fd");
+            let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
+            borrowed.try_clone_to_owned().expect("dup master fd")
+        };
+
+        let mut cmd = CommandBuilder::new("sleep");
+        cmd.arg("30");
+        let child = slave.spawn_command(cmd).expect("spawn child");
+        // Mirror create_session: the slave fd is not held beyond spawn, so
+        // the child's exit closes the last slave and EOFs the reader.
+        drop(slave);
+
+        let child_killer = child.clone_killer();
+        let child_reaped = Arc::new(AtomicBool::new(false));
+        let child_reaped_reader = child_reaped.clone();
+        let mut reader = master.try_clone_reader().expect("clone reader");
+        let output_handle = thread::spawn(move || {
+            let mut child = child;
+            let mut buf = [0u8; 256];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let _ = child.wait();
+            child_reaped_reader.store(true, Ordering::Release);
+        });
+        let writer = master.take_writer().expect("take writer");
+
+        let session = PtySession {
+            writer: Arc::new(Mutex::new(writer)),
+            master,
+            child_killer,
+            child_reaped: child_reaped.clone(),
+            _output_handle: output_handle,
+        };
+        drop(session);
+
+        // VEOF disarmed on the device (visible through the probe dup).
+        let veof = unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            assert_eq!(
+                libc::tcgetattr(probe.as_raw_fd(), &mut termios),
+                0,
+                "probe tcgetattr"
+            );
+            termios.c_cc[libc::VEOF]
+        };
+        assert_eq!(veof, 0, "session drop must disarm VEOF");
+
+        // Child killed -> reader EOFs -> thread reaps. Bounded wait; the
+        // `sleep 30` bounds a kill failure to a test failure, not a hang.
+        for _ in 0..200 {
+            if child_reaped.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            child_reaped.load(Ordering::Acquire),
+            "session drop must kill the child so the reader thread reaps it"
+        );
     }
 }

@@ -65,23 +65,29 @@ export function CliMainPane({
 
   return (
     <div className="h-full bg-secondary flex flex-col">
-      <div className="px-4 py-1 flex items-center justify-between shrink-0 h-8">
-        <span className="text-sm font-medium text-normal">
-          {t('cliMode.title')}
-          <span className="ml-2 text-xs text-low">
+      {/* md: (>=768px) pairs with useIsMobile's 767px max-width — keep in
+          sync with MOBILE_BREAKPOINT in useIsMobile.ts. */}
+      <div className="px-4 py-1 flex items-center justify-between gap-2 shrink-0 h-8 min-w-0">
+        <span className="text-sm font-medium text-normal min-w-0 truncate">
+          <span className="hidden md:inline">{t('cliMode.title')}</span>
+          <span className="md:hidden">{t('cliMode.titleShort')}</span>
+          <span className="ml-2 text-xs text-low hidden md:inline">
             {t('cliMode.persistentHint')}
           </span>
         </span>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2 md:gap-3 shrink-0">
           <LoopAutomationControl workspaceId={workspaceId} />
           <button
             type="button"
             onClick={onBackToChat}
-            className="flex items-center gap-1 text-low hover:text-normal transition-colors"
+            className="flex items-center gap-1 text-low hover:text-normal transition-colors shrink-0 p-1.5 -m-1.5 md:p-0 md:m-0"
             title={t('cliMode.backToChat')}
+            aria-label={t('cliMode.backToChat')}
           >
             <ChatsTeardropIcon className="size-icon-sm" weight="bold" />
-            <span className="text-xs">{t('cliMode.backToChat')}</span>
+            <span className="text-xs hidden md:inline">
+              {t('cliMode.backToChat')}
+            </span>
           </button>
         </div>
       </div>

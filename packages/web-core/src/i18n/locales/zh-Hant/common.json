@@ -1,6 +1,7 @@
 {
   "cliMode": {
     "title": "Claude CLI",
+    "titleShort": "CLI",
     "persistentHint": "持久 tmux 工作階段",
     "backToChat": "返回聊天",
     "agentRunningTitle": "Claude 正在處理你的提示",
@@ -477,7 +478,8 @@
     "permissionPlan": "計畫",
     "agent": "代理",
     "default": "預設",
-    "model": "模型"
+    "model": "模型",
+    "useCustom": "使用 \"{{query}}\""
   },
   "crashScreen": {
     "title": "發生了錯誤",

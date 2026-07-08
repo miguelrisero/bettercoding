@@ -1,6 +1,7 @@
 {
   "cliMode": {
     "title": "Claude CLI",
+    "titleShort": "CLI",
     "persistentHint": "永続的な tmux セッション",
     "backToChat": "チャットに戻る",
     "agentRunningTitle": "Claude がプロンプトを処理しています",
@@ -477,7 +478,8 @@
     "permissionPlan": "計画",
     "agent": "エージェント",
     "default": "デフォルト",
-    "model": "モデル"
+    "model": "モデル",
+    "useCustom": "\"{{query}}\" を使用"
   },
   "crashScreen": {
     "title": "問題が発生しました",

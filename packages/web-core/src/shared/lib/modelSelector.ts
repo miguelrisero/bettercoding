@@ -66,9 +66,28 @@ export function parseModelId(
   };
 }
 
+/**
+ * Claude model ids whose CLI accepts a reasoning `--effort` flag (Opus / Sonnet
+ * / Fable families). Mirrors `model_supports_effort` in the Rust executor. Used
+ * to decide whether an injected/custom model should inherit effort options.
+ */
+function modelSupportsEffort(id: string): boolean {
+  const lower = id.toLowerCase();
+  return (
+    lower.includes('opus') ||
+    lower.includes('sonnet') ||
+    lower.includes('fable')
+  );
+}
+
 export function appendPresetModel(
   config: ModelSelectorConfig | null,
-  presetModel: string | null | undefined
+  presetModel: string | null | undefined,
+  // Only the Claude executor uses the `--effort` reasoning flag, so the caller
+  // opts in explicitly. Keeps this shared helper executor-agnostic: without it,
+  // any provider-less executor whose id happened to contain "opus"/"sonnet"/
+  // "fable" would inherit effort options it does not support.
+  enableEffortFallback = false
 ): ModelSelectorConfig | null {
   if (!config || !presetModel) return config;
   const hasProviders = config.providers.length > 0;
@@ -82,6 +101,16 @@ export function appendPresetModel(
   );
   if (exists) return config;
 
+  // An injected/custom model has no reasoning options of its own. If effort is
+  // enabled and it looks like an effort-capable Claude model, inherit the effort
+  // choices from the first config model that has them so the user can still pick
+  // an effort (e.g. Miguel's preset `claude-fable-5`, or a free-text custom id).
+  const reasoningOptions =
+    enableEffortFallback && !providerId && modelSupportsEffort(modelId)
+      ? (config.models.find((m) => m.reasoning_options.length > 0)
+          ?.reasoning_options ?? [])
+      : [];
+
   return {
     ...config,
     models: [
@@ -89,7 +118,7 @@ export function appendPresetModel(
         id: modelId,
         name: modelId,
         provider_id: providerId,
-        reasoning_options: [],
+        reasoning_options: reasoningOptions,
       },
       ...config.models,
     ],

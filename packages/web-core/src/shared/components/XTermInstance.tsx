@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
@@ -8,7 +14,7 @@ import {
   TERMINAL_BACKGROUND,
   getTerminalTheme,
 } from '@/shared/lib/terminalTheme';
-import { buildTerminalWsUrl } from '@/shared/lib/terminalWsUrl';
+import { resolveTerminalEndpoint } from '@/shared/lib/terminalWsUrl';
 import { cancelActiveTerminalGesture } from '@/shared/lib/terminalTouchGestures';
 import { installTerminalTouchLayers } from '@/shared/lib/terminalTouchLayers';
 import { applyStickyCtrl } from '@/shared/lib/terminalKeySequences';
@@ -68,31 +74,132 @@ export function XTermInstance({
     getTerminalConnection,
   } = useTerminal();
 
-  // Built with the terminal's CURRENT grid size (see buildTerminalWsUrl): a
-  // fresh attach must open the PTY at the real size, not the 80x24 default, or
-  // claude reflows on the follow-up onopen resize and stacks blank lines every
-  // time the CLI pane is reopened.
-  const buildEndpoint = useCallback(
-    (cols: number, rows: number) =>
-      buildTerminalWsUrl({
+  // Latest sessionId / onClose for the connection callbacks. The provider
+  // stores those callbacks for the connection's whole lifetime, which spans
+  // session switches and component remounts (a live connection is never torn
+  // down on either). Reading the props through refs keeps every later
+  // reconnect on the session the UI currently shows — a sessionId captured at
+  // connect time could resume the wrong conversation if the tmux session was
+  // meanwhile reaped and the reconnect had to recreate it — and keeps the
+  // unstable onClose prop identity out of the callback deps (it would
+  // otherwise churn the ResizeObserver effect on every parent render).
+  const sessionIdRef = useRef(sessionId);
+  const onCloseRef = useRef(onClose);
+  // Layout effect, not passive: it must run synchronously inside the commit,
+  // BEFORE any pending websocket-open promise continuation can execute —
+  // otherwise an open resolving in the commit→passive-effect gap would read
+  // the previous session's value (see the heal effect below, same reason).
+  useLayoutEffect(() => {
+    sessionIdRef.current = sessionId;
+    onCloseRef.current = onClose;
+  });
+
+  // Registry lookup + re-fit shared by every stored connection callback. The
+  // callbacks live as long as the connection, which survives XTermInstance
+  // remounts (CliMainPane gate flips, hidden side tabs) — so they resolve the
+  // terminal through the provider REGISTRY (same lifetime), never through this
+  // component's refs, which are nulled on unmount.
+  const fitInstance = useCallback(() => {
+    const instance = getTerminalInstance(tabId);
+    instance?.fitAddon.fit();
+    return instance;
+  }, [tabId, getTerminalInstance]);
+
+  // Re-fit and resolve the WS endpoint at the terminal's CURRENT grid. Returns
+  // null when the pane is unmeasurable — never connect then: the URL would
+  // carry a placeholder/garbage size and claude would reflow (stacking blank
+  // lines that read as a stray Enter) on the follow-up resize once the pane
+  // is shown. Called fresh on every (re)connect attempt so a reconnect
+  // attaches at the pane's present size, not the creation-time one.
+  //
+  // Measurability is gated on real DOM boxes, not just proposeDimensions():
+  // FitAddon clamps its result to >=1 cell even for a hidden-but-rendered
+  // (0-height) container, which would otherwise pass the dims check with a
+  // garbage 2x1-ish grid and resurrect the tiny-then-resize bounce this fix
+  // exists to kill. Both boxes matter: display:none / detached read as 0x0
+  // on the element, while a collapsed-but-visible container (splitter
+  // dragged shut) zeroes the PARENT — which is the box FitAddon actually
+  // measures — while the element keeps its intrinsic screen height.
+  const getEndpoint = useCallback((): string | null => {
+    const instance = fitInstance();
+    if (!instance) return null;
+    const element = instance.terminal.element;
+    const parent = element?.parentElement;
+    if (
+      !element ||
+      !parent ||
+      !element.isConnected ||
+      element.offsetWidth === 0 ||
+      element.offsetHeight === 0 ||
+      parent.offsetWidth === 0 ||
+      parent.offsetHeight === 0
+    ) {
+      return null;
+    }
+    return resolveTerminalEndpoint(
+      {
         workspaceId,
-        cols,
-        rows,
         protocol: window.location.protocol,
         host: window.location.host,
         mode,
-        sessionId,
-      }),
-    [workspaceId, mode, sessionId]
-  );
+        sessionId: sessionIdRef.current,
+      },
+      instance.fitAddon.proposeDimensions()
+    );
+  }, [fitInstance, workspaceId, mode]);
+
+  // Open the backend connection for this tab — but only once the pane is
+  // actually measurable. A CLI pane can mount inside a hidden (display:none)
+  // mobile tab where fit() no-ops; connecting then bakes cols=80&rows=24 into
+  // the URL. When unmeasured we DEFER: fitTerminal() re-runs this on the first
+  // non-zero ResizeObserver tick (i.e. when the tab is shown). NEVER tears down
+  // a live connection — hidden side panes keep theirs by design; this only ever
+  // creates the INITIAL connection for a tab that has none.
+  const ensureConnection = useCallback(() => {
+    // The whole connect policy lives in the provider:
+    // createTerminalConnection is idempotent while a live/in-flight
+    // connection owns the tab (it then only refreshes the stored callbacks
+    // to this mount's closures — load-bearing after a remount, whose
+    // predecessor's closures read refs that its cleanup nulled) and it
+    // defers, creating nothing, while the pane is unmeasurable. So calling
+    // this repeatedly — mount, ResizeObserver ticks, session switches — is
+    // always safe.
+    createTerminalConnection(
+      tabId,
+      getEndpoint,
+      // Registry-resolved for the same remount-survival reason as fitInstance:
+      // a closure over this component's refs would silently drop all output
+      // after a reattach.
+      (data) => getTerminalInstance(tabId)?.terminal.write(data),
+      () => onCloseRef.current?.(),
+      () => {
+        // Re-fit and report the current grid so the PTY/tmux is sized to the
+        // pane on every (re)connect (see TerminalProvider ws.onopen).
+        const instance = fitInstance();
+        if (!instance) return null;
+        return { cols: instance.terminal.cols, rows: instance.terminal.rows };
+      }
+    );
+  }, [
+    tabId,
+    getEndpoint,
+    fitInstance,
+    getTerminalInstance,
+    createTerminalConnection,
+  ]);
 
   const fitTerminal = useCallback(() => {
-    fitAddonRef.current?.fit();
-    if (terminalRef.current) {
-      const conn = getTerminalConnection(tabId);
-      conn?.resize(terminalRef.current.cols, terminalRef.current.rows);
+    const instance = fitInstance();
+    if (!instance) return;
+    const conn = getTerminalConnection(tabId);
+    if (conn) {
+      conn.resize(instance.terminal.cols, instance.terminal.rows);
+    } else {
+      // The initial connect was deferred because the pane was unmeasured at
+      // mount; now that the ResizeObserver reports a real size, open it.
+      ensureConnection();
     }
-  }, [tabId, getTerminalConnection]);
+  }, [tabId, fitInstance, getTerminalConnection, ensureConnection]);
 
   // Terminal + connection lifecycle. Every run of this effect MUST register
   // the same cleanup: an early return without one leaves `terminalRef`
@@ -256,24 +363,10 @@ export function XTermInstance({
 
     // Ensure a backend connection exists for this tab — also on the reattach
     // path, so a tab whose connection died (e.g. reconnect gave up, server
-    // restarted) heals on the next mount instead of staying dead.
-    if (!getTerminalConnection(tabId)) {
-      // Connect at the fitted size (set by fit() above) so the backend opens
-      // the PTY at the real dimensions — no 80x24-then-resize reflow.
-      createTerminalConnection(
-        tabId,
-        buildEndpoint(terminal.cols, terminal.rows),
-        (data) => terminal.write(data),
-        onClose,
-        () => {
-          // Re-fit and report the current grid so the PTY/tmux is sized to the
-          // pane on every (re)connect (see TerminalProvider ws.onopen).
-          fitAddonRef.current?.fit();
-          const t = terminalRef.current;
-          return t ? { cols: t.cols, rows: t.rows } : null;
-        }
-      );
-    }
+    // restarted) heals on the next mount instead of staying dead. Connects at
+    // the fitted size, or defers if the pane isn't measurable yet (hidden tab);
+    // fitTerminal() opens it on the first non-zero resize once shown.
+    ensureConnection();
 
     return () => {
       // A D-pad gesture running right now would never see its touchend once
@@ -297,13 +390,26 @@ export function XTermInstance({
     };
   }, [
     tabId,
-    buildEndpoint,
-    onClose,
+    ensureConnection,
     getTerminalInstance,
     registerTerminalInstance,
-    createTerminalConnection,
     getTerminalConnection,
   ]);
+
+  // A session switch must also heal a dead/given-up connection: without this,
+  // a pane whose connection died would only recover on a remount or a resize
+  // tick. ensureConnection is idempotent — with a live connection it merely
+  // refreshes the stored callbacks (which also re-syncs them after the
+  // switch). Layout effect on purpose: the refresh bumps the generation's
+  // endpointEpoch, and that must happen synchronously in the SAME commit as
+  // the sessionId change — a websocket open resolving in the gap before a
+  // passive effect would see an unbumped epoch and register the previous
+  // session's socket. (At first mount this runs before the terminal exists
+  // in the registry and defers harmlessly; the lifecycle effect below opens
+  // the connection.)
+  useLayoutEffect(() => {
+    ensureConnection();
+  }, [ensureConnection, sessionId]);
 
   useEffect(() => {
     if (!resizeRef.current) return;

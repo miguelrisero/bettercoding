@@ -181,9 +181,20 @@ fn normalize_claude_stderr_logs(
 }
 
 use derivative::Derivative;
-use strum_macros::{AsRefStr, EnumString};
+use strum_macros::{AsRefStr, EnumString, VariantNames};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS, JsonSchema, AsRefStr, EnumString)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    TS,
+    JsonSchema,
+    AsRefStr,
+    EnumString,
+    VariantNames,
+)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum ClaudeEffort {
@@ -192,6 +203,37 @@ pub enum ClaudeEffort {
     High,
     XHigh,
     Max,
+    // Undocumented accepted `--effort` alias on the interactive CLI (2.1.204):
+    // resolves to `xhigh` plus standing dynamic-workflow orchestration for the
+    // session. Only the interactive `claude` TUI understands the alias — the
+    // pinned headless CLI (2.1.154) hard-rejects unknown values, so the headless
+    // path maps it to its underlying `xhigh` tier (see
+    // `ClaudeEffort::headless_arg`). Plain `//` (not `///`) keeps the generated
+    // JSON schema a flat string enum for the settings agent-config editor.
+    Ultracode,
+}
+
+impl ClaudeEffort {
+    /// Effort value to pass to the pinned headless CLI (`@2.1.154`). The
+    /// `ultracode` alias does not exist there (2.1.154 hard-rejects unknown
+    /// `--effort` values), and the dynamic-workflow orchestration it enables is
+    /// interactive-only, so headless runs use the equivalent `xhigh` tier. Every
+    /// other variant maps to the same string strum's `as_ref()` produces; only
+    /// `Ultracode` is a deliberate delta (see the `headless_arg` tests).
+    fn headless_arg(&self) -> &'static str {
+        match self {
+            ClaudeEffort::Low => "low",
+            ClaudeEffort::Medium => "medium",
+            ClaudeEffort::High => "high",
+            ClaudeEffort::XHigh => "xhigh",
+            ClaudeEffort::Max => "max",
+            // 2.1.154 hard-rejects the `ultracode` alias ("argument is invalid.
+            // It must be one of: low, medium, high, xhigh, max"), and its
+            // dynamic-workflow orchestration is interactive-only, so headless
+            // runs use the underlying xhigh tier.
+            ClaudeEffort::Ultracode => "xhigh",
+        }
+    }
 }
 
 #[derive(Derivative, Clone, Serialize, Deserialize, TS, JsonSchema)]
@@ -260,7 +302,7 @@ impl ClaudeCode {
             builder = builder.extend_params(["--model", model.as_str()]);
         }
         if let Some(effort) = &self.effort {
-            builder = builder.extend_params(["--effort", effort.as_ref()]);
+            builder = builder.extend_params(["--effort", effort.headless_arg()]);
         }
         if let Some(agent) = &self.agent {
             builder = builder.extend_params(["--agent", agent]);
@@ -343,10 +385,15 @@ impl ClaudeCode {
     }
 }
 
-/// Models whose CLI accepts a reasoning `--effort` flag (Opus / Sonnet
-/// families). Haiku has no effort control.
+/// Models whose CLI accepts a reasoning `--effort` flag (Opus / Sonnet / Fable
+/// families). Haiku has no effort control. Matched case-insensitively so a
+/// free-text / custom id like `Claude-Fable-5` is gated the same in the UI and
+/// at launch (otherwise the interactive path would silently drop `--effort`).
+/// Keep in sync with `modelSupportsEffort` in
+/// `packages/web-core/src/shared/lib/modelSelector.ts`.
 pub(crate) fn model_supports_effort(id: &str) -> bool {
-    id.contains("opus") || id.contains("sonnet")
+    let id = id.to_lowercase();
+    id.contains("opus") || id.contains("sonnet") || id.contains("fable")
 }
 
 /// Claude model ids use hyphens in the version (e.g. `claude-opus-4-8`), but a
@@ -424,6 +471,111 @@ mod cli_launch_tests {
             interactive_cli_args(Some("haiku"), Some("max")),
             v(&["--model", "haiku"])
         );
+    }
+
+    #[test]
+    fn fable_models_carry_effort() {
+        // Regression: model_supports_effort() previously excluded fable, so
+        // CLI-mode launches of claude-fable-5 silently dropped --effort.
+        assert_eq!(
+            interactive_cli_args(Some("claude-fable-5"), Some("xhigh")),
+            v(&["--model", "claude-fable-5", "--effort", "xhigh"])
+        );
+        assert_eq!(
+            interactive_cli_args(Some("fable"), Some("ultracode")),
+            v(&["--model", "fable", "--effort", "ultracode"])
+        );
+    }
+
+    #[test]
+    fn interactive_passes_ultracode_verbatim() {
+        // The interactive CLI (2.1.204) understands the `ultracode` alias, so it
+        // must be forwarded unchanged rather than mapped to xhigh.
+        assert_eq!(
+            interactive_cli_args(Some("opus"), Some("ultracode")),
+            v(&["--model", "opus", "--effort", "ultracode"])
+        );
+    }
+
+    use super::ClaudeEffort;
+
+    #[test]
+    fn ultracode_effort_round_trips() {
+        let effort: ClaudeEffort = "ultracode".parse().unwrap();
+        assert_eq!(effort, ClaudeEffort::Ultracode);
+        assert_eq!(effort.as_ref(), "ultracode");
+    }
+
+    #[test]
+    fn ultracode_maps_to_xhigh_in_headless() {
+        // The pinned headless CLI (2.1.154) does not know the `ultracode` alias,
+        // and its dynamic-workflow orchestration is interactive-only, so headless
+        // runs fall back to the underlying xhigh tier.
+        assert_eq!(ClaudeEffort::Ultracode.headless_arg(), "xhigh");
+        assert_eq!(ClaudeEffort::XHigh.headless_arg(), "xhigh");
+        assert_eq!(ClaudeEffort::Max.headless_arg(), "max");
+    }
+
+    #[test]
+    fn headless_arg_matches_as_ref_except_ultracode() {
+        // Invariant: the headless CLI receives the same value as the interactive
+        // path (strum's `as_ref()`) for every tier EXCEPT `ultracode`, which the
+        // pinned @2.1.154 headless CLI does not accept and so maps to `xhigh`.
+        // If someone customizes a variant's serialized form (e.g. a strum
+        // `serialize = "..."`), this pins that both paths keep agreeing.
+        for effort in [
+            ClaudeEffort::Low,
+            ClaudeEffort::Medium,
+            ClaudeEffort::High,
+            ClaudeEffort::XHigh,
+            ClaudeEffort::Max,
+        ] {
+            assert_eq!(
+                effort.headless_arg(),
+                effort.as_ref(),
+                "{effort:?} must map to its interactive wire value in headless mode"
+            );
+        }
+        // The one deliberate delta.
+        assert_eq!(ClaudeEffort::Ultracode.as_ref(), "ultracode");
+        assert_eq!(ClaudeEffort::Ultracode.headless_arg(), "xhigh");
+    }
+
+    #[test]
+    fn effort_wire_strings_are_stable() {
+        // ClaudeEffort is serialized into profiles.json and stored
+        // ExecutorActions history. Renaming/reordering a variant would corrupt
+        // that persisted data, so pin the exact on-the-wire string of every
+        // variant. ADD-only: new variants extend this list, never mutate it.
+        assert_eq!(ClaudeEffort::Low.as_ref(), "low");
+        assert_eq!(ClaudeEffort::Medium.as_ref(), "medium");
+        assert_eq!(ClaudeEffort::High.as_ref(), "high");
+        assert_eq!(ClaudeEffort::XHigh.as_ref(), "xhigh");
+        assert_eq!(ClaudeEffort::Max.as_ref(), "max");
+        assert_eq!(ClaudeEffort::Ultracode.as_ref(), "ultracode");
+
+        // The picker's effort list is derived from these VARIANTS (strum
+        // VariantNames honoring serialize_all="lowercase"); pin the exact set so
+        // a rename or a strum casing change can't silently corrupt the wire ids.
+        use strum::VariantNames;
+        assert_eq!(
+            ClaudeEffort::VARIANTS,
+            ["low", "medium", "high", "xhigh", "max", "ultracode"]
+        );
+    }
+
+    #[test]
+    fn model_supports_effort_boundary() {
+        use super::model_supports_effort;
+        // Effort-capable families (any id form, case-insensitive).
+        assert!(model_supports_effort("opus"));
+        assert!(model_supports_effort("opus[1m]"));
+        assert!(model_supports_effort("sonnet"));
+        assert!(model_supports_effort("claude-fable-5"));
+        assert!(model_supports_effort("Claude-Fable-5")); // mirrors the TS lowercasing
+        // Haiku has no effort control — keep it out.
+        assert!(!model_supports_effort("haiku"));
+        assert!(!model_supports_effort("claude-haiku-4-5-20251001"));
     }
 
     #[test]
@@ -507,13 +659,18 @@ mod cli_launch_tests {
 }
 
 fn default_discovered_options() -> crate::executor_discovery::ExecutorDiscoveredOptions {
+    // Derived from the ClaudeEffort enum (strum `VariantNames`, lowercased) so a
+    // future effort tier automatically appears in the picker instead of silently
+    // missing from this list. `from_names_with_default` sorts by rank, so the
+    // declaration order here is irrelevant.
+    use strum::VariantNames;
+
     use crate::{
         executor_discovery::ExecutorDiscoveredOptions,
         model_selector::{ModelInfo, ModelSelectorConfig, ReasoningOption},
     };
-
     let effort_options = ReasoningOption::from_names_with_default(
-        ["low", "medium", "high", "xhigh", "max"].map(String::from),
+        ClaudeEffort::VARIANTS.iter().copied(),
         CLI_DEFAULT_EFFORT,
     );
 
@@ -521,6 +678,7 @@ fn default_discovered_options() -> crate::executor_discovery::ExecutorDiscovered
         model_selector: ModelSelectorConfig {
             providers: vec![],
             models: [
+                ("fable", "Fable"),
                 ("opus", "Opus"),
                 ("opus[1m]", "Opus (1M context)"),
                 ("sonnet", "Sonnet"),

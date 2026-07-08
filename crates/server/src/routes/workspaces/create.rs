@@ -338,33 +338,69 @@ pub async fn create_and_start_workspace(
     )))
 }
 
-/// Background best-effort: ask Haiku for a concise title + branch slug from the
-/// first message, apply the title, and rename the branch IF it is still the
-/// original heuristic one (compare-and-set, so a manual rename always wins).
-/// Any failure leaves the heuristic name/branch and is logged. Spawned only
-/// after the worktree exists, so the git rename can't race worktree creation.
+/// Background best-effort naming. Two paths:
+///
+/// 1. If the first line already reads like a deliberate title (Miguel's
+///    `keyword -> gist` format, or a short first line with a body), we KEEP it
+///    verbatim and derive the branch deterministically from it — no model call,
+///    so hinted creations are instant.
+/// 2. Otherwise we ask Haiku for a concise `keyword -> gist` title + branch slug.
+///
+/// Either way the name write is compare-and-set on the pre-spawn snapshot name
+/// and the branch rename is compare-and-set on the heuristic branch, so a manual
+/// rename (or an MCP-provided name) that landed in the window always wins. Any
+/// failure leaves the heuristic name/branch and is logged. Spawned only after
+/// the worktree exists, so the git rename can't race worktree creation.
 async fn apply_generated_workspace_names(
     deployment: &DeploymentImpl,
     workspace: &Workspace,
     first_message: &str,
 ) {
+    // Path 1: a deliberate first-line title hint wins — keep it verbatim, no
+    // model call, branch derived deterministically from the hint.
+    if let Some(hint) = executors::title_gen::first_line_title_hint(first_message) {
+        apply_name_and_branch(deployment, workspace, &hint, &hint).await;
+        return;
+    }
+
+    // Path 2: ask Haiku for a `keyword -> gist` title + branch slug.
     let Some(names) = executors::title_gen::generate_workspace_names(first_message).await else {
         return;
     };
+    apply_name_and_branch(deployment, workspace, &names.title, &names.branch_slug).await;
+}
+
+/// Compare-and-set the workspace `name` to `title` (only if it still equals the
+/// pre-spawn snapshot) and rename the branch from `branch_seed` (only if the
+/// branch is still the heuristic one). Shared by the hint and Haiku paths.
+async fn apply_name_and_branch(
+    deployment: &DeploymentImpl,
+    workspace: &Workspace,
+    title: &str,
+    branch_seed: &str,
+) {
     let pool = &deployment.db().pool;
 
-    if let Err(e) =
-        Workspace::update(pool, workspace.id, None, None, Some(names.title.as_str())).await
+    // Compare-and-set on the name: only overwrite if it is still the value the
+    // workspace was created with (the snapshot). A manual rename or an
+    // MCP-provided name that landed in the window is NULL-safe-preserved.
+    match Workspace::update_name_if_unchanged(pool, workspace.id, title, workspace.name.as_deref())
+        .await
     {
-        tracing::warn!(
+        Ok(false) => tracing::debug!(
+            "Skipping generated title for {}: name already changed",
+            workspace.id
+        ),
+        Ok(true) => {}
+        Err(e) => tracing::warn!(
             "Failed to apply generated title to workspace {}: {e}",
             workspace.id
-        );
+        ),
     }
 
     // Compare-and-set: only rename if the branch is still the heuristic one the
     // workspace was created with. The user may have manually renamed it in the
-    // 5-14s Haiku window, and we must not clobber that.
+    // naming window, and we must not clobber that.
     let current = match Workspace::find_by_id(pool, workspace.id).await {
         Ok(Some(ws)) => ws,
         Ok(None) => return, // workspace deleted meanwhile
@@ -384,10 +420,23 @@ async fn apply_generated_workspace_names(
         return;
     }
 
+    // `git_branch_from_workspace_with_len` re-slugifies the seed, so passing a
+    // raw title containing " -> " is safe (it degrades to a hyphenated slug).
     let new_branch = deployment
         .container()
-        .git_branch_from_workspace_with_len(&workspace.id, &names.branch_slug, 40)
+        .git_branch_from_workspace_with_len(&workspace.id, branch_seed, 40)
         .await;
+    // An un-sluggable seed (all-CJK/emoji/punctuation hint) yields an empty
+    // slug and a degenerate "<prefix>/<uuid>-" branch — keep the heuristic
+    // branch instead, mirroring the model path's empty-branch_slug bail-out.
+    // (A non-empty slug never ends in '-': git_branch_id_with_len trims it.)
+    if new_branch.ends_with('-') {
+        tracing::debug!(
+            "Skipping generated branch rename for {}: seed yields empty slug",
+            workspace.id
+        );
+        return;
+    }
     if new_branch == current.branch {
         return;
     }
