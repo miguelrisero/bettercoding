@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
@@ -79,7 +85,11 @@ export function XTermInstance({
   // otherwise churn the ResizeObserver effect on every parent render).
   const sessionIdRef = useRef(sessionId);
   const onCloseRef = useRef(onClose);
-  useEffect(() => {
+  // Layout effect, not passive: it must run synchronously inside the commit,
+  // BEFORE any pending websocket-open promise continuation can execute —
+  // otherwise an open resolving in the commit→passive-effect gap would read
+  // the previous session's value (see the heal effect below, same reason).
+  useLayoutEffect(() => {
     sessionIdRef.current = sessionId;
     onCloseRef.current = onClose;
   });
@@ -390,8 +400,14 @@ export function XTermInstance({
   // a pane whose connection died would only recover on a remount or a resize
   // tick. ensureConnection is idempotent — with a live connection it merely
   // refreshes the stored callbacks (which also re-syncs them after the
-  // switch).
-  useEffect(() => {
+  // switch). Layout effect on purpose: the refresh bumps the generation's
+  // endpointEpoch, and that must happen synchronously in the SAME commit as
+  // the sessionId change — a websocket open resolving in the gap before a
+  // passive effect would see an unbumped epoch and register the previous
+  // session's socket. (At first mount this runs before the terminal exists
+  // in the registry and defers harmlessly; the lifecycle effect below opens
+  // the connection.)
+  useLayoutEffect(() => {
     ensureConnection();
   }, [ensureConnection, sessionId]);
 
