@@ -516,6 +516,17 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
     []
   );
 
+  const hasTerminalConnection = useCallback((tabId: string): boolean => {
+    if (terminalConnectionsRef.current.has(tabId)) return true;
+    // A live generation with no registered socket yet is an in-flight open or
+    // a scheduled retry — callers must treat it as occupied so they never
+    // stack a second connect (and a duplicate backend PTY/tmux attach) on top
+    // of it. Cancelled generations are flagged closed / pruned and don't
+    // count.
+    const generation = reconnectStateRef.current.get(tabId);
+    return !!generation && !generation.closed;
+  }, []);
+
   const value = useMemo(
     () => ({
       getTabsForWorkspace,
@@ -530,6 +541,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       unregisterTerminalInstance,
       createTerminalConnection,
       getTerminalConnection,
+      hasTerminalConnection,
     }),
     [
       getTabsForWorkspace,
@@ -544,6 +556,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       unregisterTerminalInstance,
       createTerminalConnection,
       getTerminalConnection,
+      hasTerminalConnection,
     ]
   );
 

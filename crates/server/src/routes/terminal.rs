@@ -553,4 +553,20 @@ mod tripwire_tests {
         assert_eq!(hex_dump(&[0x7f]), "7f");
         assert_eq!(hex_dump(&[]), "");
     }
+
+    /// Locks the redaction invariant over the whole byte range: ONLY the C0
+    /// controls (0x00-0x1f) and DEL (0x7f) may appear verbatim; every
+    /// printable AND high/UTF-8 byte (0x20-0x7e, 0x80-0xff) must be masked so
+    /// no keystroke content can ever reach the logs.
+    #[test]
+    fn hex_dump_masks_every_non_control_byte() {
+        for byte in 0x00u8..=0xff {
+            let dumped = hex_dump(&[byte]);
+            if byte < 0x20 || byte == 0x7f {
+                assert_eq!(dumped, format!("{byte:02x}"), "control byte {byte:#04x}");
+            } else {
+                assert_eq!(dumped, "..", "byte {byte:#04x} must be masked");
+            }
+        }
+    }
 }

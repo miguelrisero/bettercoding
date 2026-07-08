@@ -63,6 +63,14 @@ export interface TerminalContextType {
     resize: (cols: number, rows: number) => void;
   };
   getTerminalConnection: (tabId: string) => TerminalConnection | null;
+  /**
+   * True when the tab has an established connection OR a live in-flight one
+   * (generation created, socket not registered yet — the async open hasn't
+   * resolved). Connect-or-defer callers must gate on this, not on
+   * getTerminalConnection, or two quick calls stack duplicate backend
+   * PTY/tmux attaches inside the open window.
+   */
+  hasTerminalConnection: (tabId: string) => boolean;
 }
 
 export const TerminalContext = createHmrContext<TerminalContextType | null>(

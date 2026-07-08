@@ -66,7 +66,20 @@ export function XTermInstance({
     getTerminalInstance,
     createTerminalConnection,
     getTerminalConnection,
+    hasTerminalConnection,
   } = useTerminal();
+
+  // Latest sessionId for getEndpoint. The provider stores getEndpoint on the
+  // connection generation for the connection's whole lifetime, and that
+  // lifetime spans session switches (a live connection is never torn down on
+  // a sessionId change). Reading the prop through a ref keeps every later
+  // reconnect on the session the UI currently shows — a value captured at
+  // connect time could resume the wrong conversation if the tmux session was
+  // meanwhile reaped and the reconnect had to recreate it.
+  const sessionIdRef = useRef(sessionId);
+  useEffect(() => {
+    sessionIdRef.current = sessionId;
+  });
 
   // Re-fit and resolve the WS endpoint at the terminal's CURRENT grid. Returns
   // null when the pane is unmeasurable (hidden / 0-height): FitAddon.fit() then
@@ -75,22 +88,26 @@ export function XTermInstance({
   // (stacking blank lines that read as a stray Enter) on the follow-up resize
   // once the pane is shown. Called fresh on every (re)connect attempt so a
   // reconnect attaches at the pane's present size, not the creation-time one.
+  //
+  // Resolves the terminal through the provider REGISTRY, not this component's
+  // refs: the stored callback lives as long as the connection, which survives
+  // XTermInstance remounts (CliMainPane gate flips, hidden side tabs), while
+  // this component's refs are nulled on unmount.
   const getEndpoint = useCallback((): string | null => {
-    const fitAddon = fitAddonRef.current;
-    const terminal = terminalRef.current;
-    if (!fitAddon || !terminal) return null;
-    fitAddon.fit();
+    const instance = getTerminalInstance(tabId);
+    if (!instance) return null;
+    instance.fitAddon.fit();
     return resolveTerminalEndpoint(
       {
         workspaceId,
         protocol: window.location.protocol,
         host: window.location.host,
         mode,
-        sessionId,
+        sessionId: sessionIdRef.current,
       },
-      fitAddon.proposeDimensions()
+      instance.fitAddon.proposeDimensions()
     );
-  }, [workspaceId, mode, sessionId]);
+  }, [tabId, workspaceId, mode, getTerminalInstance]);
 
   // Open the backend connection for this tab — but only once the pane is
   // actually measurable. A CLI pane can mount inside a hidden (display:none)
@@ -100,29 +117,39 @@ export function XTermInstance({
   // a live connection — hidden side panes keep theirs by design; this only ever
   // creates the INITIAL connection for a tab that has none.
   const ensureConnection = useCallback(() => {
-    if (!terminalRef.current || !fitAddonRef.current) return;
-    if (getTerminalConnection(tabId)) return;
+    // A live connection OR an in-flight/pending one counts as "already
+    // connected": the provider registers the socket only after its async open
+    // resolves, and stacking a second generation into that window would churn
+    // a duplicate backend PTY/tmux attach (slow relay transports make the
+    // window real).
+    if (hasTerminalConnection(tabId)) return;
     // Gate on measurability up front so no connection object (and no server-side
     // PTY/tmux churn) is created for an invisible pane.
     if (getEndpoint() === null) return;
     createTerminalConnection(
       tabId,
       getEndpoint,
-      (data) => terminalRef.current?.write(data),
+      // Both callbacks resolve through the registry on every call: they live
+      // as long as the connection, which survives XTermInstance remounts,
+      // while this component's refs are nulled on unmount — a closure over
+      // them would silently drop all output after a reattach.
+      (data) => getTerminalInstance(tabId)?.terminal.write(data),
       onClose,
       () => {
         // Re-fit and report the current grid so the PTY/tmux is sized to the
         // pane on every (re)connect (see TerminalProvider ws.onopen).
-        fitAddonRef.current?.fit();
-        const t = terminalRef.current;
-        return t ? { cols: t.cols, rows: t.rows } : null;
+        const instance = getTerminalInstance(tabId);
+        if (!instance) return null;
+        instance.fitAddon.fit();
+        return { cols: instance.terminal.cols, rows: instance.terminal.rows };
       }
     );
   }, [
     tabId,
     getEndpoint,
     onClose,
-    getTerminalConnection,
+    getTerminalInstance,
+    hasTerminalConnection,
     createTerminalConnection,
   ]);
 
