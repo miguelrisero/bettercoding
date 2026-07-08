@@ -130,9 +130,10 @@ export function LoopAutomationControl({
   const showAttempts = enabled && maxAttemptsCount > 0;
 
   // Mobile (<768px) shows only the bare time next to the moon/clock icon; the
-  // full localized status stays in the accessibility tree via sr-only. md:
-  // (>=768px) is the exact complement of useIsMobile's 767px max-width — keep
-  // in sync with MOBILE_BREAKPOINT in useIsMobile.ts.
+  // full "Waking/Retrying at …" string stays in the accessibility tree via
+  // sr-only (the attempts counter is hidden on mobile for AT and sighted
+  // users alike). md: pairs with useIsMobile's 767px max-width — keep in
+  // sync with MOBILE_BREAKPOINT in useIsMobile.ts.
   const isUsageLimitWake = nextWakeup?.kind === 'usage_limit_wake';
   const wakeupTimeText = nextWakeup
     ? isUsageLimitWake

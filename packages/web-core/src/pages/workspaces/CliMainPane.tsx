@@ -65,8 +65,8 @@ export function CliMainPane({
 
   return (
     <div className="h-full bg-secondary flex flex-col">
-      {/* md: (>=768px) is the exact complement of useIsMobile's 767px
-          max-width — keep in sync with MOBILE_BREAKPOINT in useIsMobile.ts. */}
+      {/* md: (>=768px) pairs with useIsMobile's 767px max-width — keep in
+          sync with MOBILE_BREAKPOINT in useIsMobile.ts. */}
       <div className="px-4 py-1 flex items-center justify-between gap-2 shrink-0 h-8 min-w-0">
         <span className="text-sm font-medium text-normal min-w-0 truncate">
           <span className="hidden md:inline">{t('cliMode.title')}</span>
