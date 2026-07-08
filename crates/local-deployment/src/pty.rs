@@ -30,7 +30,10 @@ pub enum PtyCommand {
     /// session (and whatever runs inside it) survives WebSocket disconnects
     /// and server restarts; reconnects reattach instead of respawning.
     TmuxCli {
-        session_name: String,
+        /// The workspace this pane belongs to; the tmux session name and the
+        /// staged prompt-file path are both derived from it
+        /// ([`cli_tmux_session_name`], [`write_cli_prompt_file`]).
+        workspace_id: Uuid,
         /// claude's own session UUID to resume (the workspace's selected uix
         /// chat). When set, the bootstrap runs `claude --resume <id>` so CLI
         /// mode joins the *exact* conversation the chat UI is showing, and
@@ -100,10 +103,7 @@ fn cli_bootstrap(
         CliContinue::Fresh => base.clone(),
     };
 
-    // Only a strict UUID may be interpolated into the shell string. Agent
-    // session ids are UUIDs, so this both validates intent and forecloses
-    // shell injection via the id.
-    let launch = if let Some(id) = resume_session_id.filter(|id| is_uuid(id)) {
+    let launch = if let Some(id) = active_resume_id(resume_session_id) {
         match &spec.resume {
             // `<base> --resume <id>` — flags still apply (claude).
             CliResume::Flag(flag) => format!("{base} {flag} {id}"),
@@ -121,13 +121,17 @@ fn cli_bootstrap(
         // ever expands inside double quotes, so it can't be word-split or parsed
         // as shell. The file self-deletes (`rm`) once consumed.
         let qfile = shell_single_quote(&file.to_string_lossy());
+        // Shared read-and-delete stage for the argv-passing arms: consume the
+        // file into `vk_p`, then delete it (the delete doubles as the delivery
+        // acknowledgement — see [`cli_prompt_file_exists`]).
+        let read_rm = format!(r#"vk_p="$(cat {qfile})"; rm -f -- {qfile};"#);
         match &spec.prompt_arg {
             // Trailing positional arg. The leading-dash guard and any trailing
             // whitespace handling are baked into the file's contents
             // ([`cli_prompt_file_content`]); command substitution strips a
             // trailing newline, which is harmless.
             CliPromptArg::Positional => {
-                format!(r#"vk_p="$(cat {qfile})"; rm -f -- {qfile}; {base} "$vk_p""#)
+                format!(r#"{read_rm} {base} "$vk_p""#)
             }
             // Prompt as a flag value (e.g. gemini/copilot `-i "<prompt>"`); a
             // leading '-' is harmless after the flag. The flag is one of our
@@ -135,7 +139,7 @@ fn cli_bootstrap(
             // base args) so it can never be more than a single command word.
             CliPromptArg::Flag(flag) => {
                 let qflag = shell_single_quote(flag);
-                format!(r#"vk_p="$(cat {qfile})"; rm -f -- {qfile}; {base} {qflag} "$vk_p""#)
+                format!(r#"{read_rm} {base} {qflag} "$vk_p""#)
             }
             // Prompt piped on stdin (e.g. amp); the TUI stays interactive
             // because the tmux pane keeps stdout a TTY. No argv-length ceiling
@@ -180,12 +184,21 @@ fn cli_bootstrap(
 /// post-launch by paste instead (see [`cli_prompt_fits_inline`]).
 const MAX_INLINE_PROMPT_BYTES: usize = 100_000;
 
+/// The resume id that will actually drive a resume launch: only a strict UUID
+/// may ever be interpolated into the bootstrap shell string (agent session ids
+/// are UUIDs, so this both validates intent and forecloses shell injection via
+/// the id). The prompt-staging gate uses the SAME predicate, so a file is
+/// staged exactly when the bootstrap will consume it — the two can't drift.
+fn active_resume_id(resume_session_id: Option<&str>) -> Option<&str> {
+    resume_session_id.filter(|id| is_uuid(id))
+}
+
 /// Whether an initial prompt of `byte_len` bytes can be baked into the launch
 /// command for an agent with this `prompt_arg`, or must be delivered after the
 /// TUI is up (via [`send_cli_keys`]). `StdinPipe` has no argv ceiling;
 /// `Positional`/`Flag` pass the prompt as one argv entry and are capped;
 /// `Unsupported` has no launch-time transport at all.
-pub fn cli_prompt_fits_inline(prompt_arg: &CliPromptArg, byte_len: usize) -> bool {
+fn cli_prompt_fits_inline(prompt_arg: &CliPromptArg, byte_len: usize) -> bool {
     match prompt_arg {
         CliPromptArg::Positional | CliPromptArg::Flag(_) => byte_len <= MAX_INLINE_PROMPT_BYTES,
         CliPromptArg::StdinPipe => true,
@@ -201,14 +214,10 @@ pub enum CliPromptRouting {
     /// Nothing to deliver: no prompt was carried, or it was blank after trim.
     None,
     /// Small enough to bake into the launch command's temp-file transport.
-    /// Carries the ORIGINAL (untrimmed) text — the bootstrap's
-    /// [`cli_prompt_file_content`] step re-trims and applies the leading-dash
-    /// guard, so downstream behavior is byte-identical to passing it straight
-    /// through.
     Baked(String),
     /// Too large to pass as one argv entry, or an agent with no launch-time
     /// prompt arg: deliver by paste ([`send_cli_keys`]) after the pane is
-    /// confirmed up. Carries the trimmed text (what actually gets pasted).
+    /// confirmed up.
     Deferred(String),
 }
 
@@ -216,7 +225,8 @@ pub enum CliPromptRouting {
 /// baked-vs-deferred routing that gates the deferred-clear recovery path is unit
 /// testable without a live tmux/socket. Blank prompts route to `None` (the
 /// caller carries no prompt and clears nothing); anything that fits inline is
-/// `Baked`, everything else `Deferred`.
+/// `Baked`, everything else `Deferred`. Both variants carry the trimmed text
+/// (the downstream [`cli_prompt_file_content`] trim is then a no-op).
 pub fn route_initial_prompt(
     initial_prompt: Option<String>,
     prompt_arg: &CliPromptArg,
@@ -228,7 +238,7 @@ pub fn route_initial_prompt(
     if trimmed.is_empty() {
         CliPromptRouting::None
     } else if cli_prompt_fits_inline(prompt_arg, trimmed.len()) {
-        CliPromptRouting::Baked(prompt)
+        CliPromptRouting::Baked(trimmed.to_string())
     } else {
         CliPromptRouting::Deferred(trimmed.to_string())
     }
@@ -847,20 +857,14 @@ pub async fn cli_tmux_session_exists(workspace_id: Uuid) -> bool {
         return false;
     }
     let session_name = cli_tmux_session_name(workspace_id);
-    tokio::process::Command::new("tmux")
-        .args([
-            "-L",
-            CLI_TMUX_SOCKET,
-            "has-session",
-            "-t",
-            &format!("={session_name}"),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+    tmux_ok(&[
+        "-L",
+        CLI_TMUX_SOCKET,
+        "has-session",
+        "-t",
+        &format!("={session_name}"),
+    ])
+    .await
 }
 
 /// Whether CLI mode can actually run claude in a tmux session (vs. degrading
@@ -914,17 +918,11 @@ pub async fn cli_pane_agent_running(workspace_id: Uuid) -> Option<bool> {
         .parse::<u32>()
         .ok()?;
 
-    // Pane root: normally the bootstrap/fallback shell, but a future exec'd
-    // agent would show up here directly.
-    if let Some(comm) = process_comm(pane_pid).await
-        && !is_shell_command(&comm)
-    {
-        return Some(true);
-    }
-
-    // Direct children of the pane shell (`pgrep -l -P` prints "<pid> <comm>";
-    // a non-zero exit just means no children — the bootstrap is between
-    // stages or the fallback shell is idle).
+    // Direct children of the pane shell first — the agent is a direct child
+    // in every current launch shape, so this is the probe that usually
+    // answers. (`pgrep -l -P` prints "<pid> <comm>"; a non-zero exit just
+    // means no children — the bootstrap is between stages or the fallback
+    // shell is idle.)
     let children = tokio::process::Command::new("pgrep")
         .args(["-l", "-P", &pane_pid.to_string()])
         .stderr(std::process::Stdio::null())
@@ -932,15 +930,25 @@ pub async fn cli_pane_agent_running(workspace_id: Uuid) -> Option<bool> {
         .await
         .ok()?;
     let listing = String::from_utf8_lossy(&children.stdout);
+    if listing
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .any(|comm| !is_shell_command(comm))
+    {
+        return Some(true);
+    }
+
+    // Fall back to the pane root: normally the bootstrap/fallback shell, but
+    // a future exec'd agent would show up here directly.
     Some(
-        listing
-            .lines()
-            .filter_map(|line| line.split_whitespace().nth(1))
-            .any(|comm| !is_shell_command(comm)),
+        process_comm(pane_pid)
+            .await
+            .is_some_and(|comm| !is_shell_command(&comm)),
     )
 }
 
-/// Best-effort process name for a pid (`ps -o comm=`), normalized.
+/// Best-effort process name for a pid (`ps -o comm=`), raw (trimmed only —
+/// [`is_shell_command`] owns normalization).
 async fn process_comm(pid: u32) -> Option<String> {
     let output = tokio::process::Command::new("ps")
         .args(["-o", "comm=", "-p", &pid.to_string()])
@@ -951,7 +959,7 @@ async fn process_comm(pid: u32) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let comm = normalize_comm(String::from_utf8_lossy(&output.stdout).trim()).to_string();
+    let comm = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!comm.is_empty()).then_some(comm)
 }
 
@@ -966,7 +974,7 @@ fn normalize_comm(comm: &str) -> &str {
 /// deferred paste: pasting into a shell would execute/mangle the prompt as
 /// shell input (the bootstrap still starting up, or the missing-binary
 /// fallback shell), so delivery waits for a non-shell process in the pane.
-pub fn is_shell_command(cmd: &str) -> bool {
+fn is_shell_command(cmd: &str) -> bool {
     matches!(
         normalize_comm(cmd),
         "sh" | "bash"
@@ -1142,20 +1150,25 @@ async fn paste_via_tmux_buffer(workspace_id: Uuid, target: &str, text: &str) -> 
         Err(_) => return false,
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
-        if stdin.write_all(text.as_bytes()).await.is_err() {
-            // Reap the load-buffer child before bailing: dropping the Child does
-            // not wait() it, so a failed stdin write would otherwise leave a
-            // lingering/zombie tmux process. Drop stdin first (EOF), then kill
-            // (which also awaits the exit).
-            drop(stdin);
-            let _ = child.kill().await;
-            return false;
-        }
-        // Drop stdin (EOF) so load-buffer completes.
-        let _ = stdin.shutdown().await;
+    let Some(mut stdin) = child.stdin.take() else {
+        // Piped stdin should always be there; a missing handle means the
+        // buffer can't be loaded, so reap the child and report failure rather
+        // than pasting an empty buffer.
+        let _ = child.kill().await;
+        return false;
+    };
+    if stdin.write_all(text.as_bytes()).await.is_err() {
+        // Reap the load-buffer child before bailing: dropping the Child does
+        // not wait() it, so a failed stdin write would otherwise leave a
+        // lingering/zombie tmux process. Drop stdin first (EOF), then kill
+        // (which also awaits the exit).
         drop(stdin);
+        let _ = child.kill().await;
+        return false;
     }
+    // Drop stdin (EOF) so load-buffer completes.
+    let _ = stdin.shutdown().await;
+    drop(stdin);
 
     let loaded = child.wait().await.map(|s| s.success()).unwrap_or(false);
     if !loaded {
@@ -1294,8 +1307,10 @@ pub enum PtyError {
     /// `CreateFailed` so the message reaches the user verbatim — and so we
     /// never silently drop the prompt by falling through to an empty
     /// `continue_launch` TUI. The parked DB copy is left untouched for retry.
-    #[error("{0}")]
-    PromptStageFailed(String),
+    /// A unit variant whose display IS the shared recovery notice, so every
+    /// construction site speaks the same user-facing copy by construction.
+    #[error("{}", CLI_PROMPT_PARKED_NOTICE)]
+    PromptStageFailed,
     #[error("Session not found: {0}")]
     SessionNotFound(Uuid),
     #[error("Failed to write to PTY: {0}")]
@@ -1363,19 +1378,19 @@ impl PtyService {
 
             // CLI mode rides tmux when present; otherwise (and for the
             // default side terminal) spawn the user's shell directly.
-            let (tmux_session, tmux_resume_id, tmux_initial_prompt, tmux_spec): (
-                Option<String>,
+            let (tmux_workspace, tmux_resume_id, tmux_initial_prompt, tmux_spec): (
+                Option<Uuid>,
                 Option<String>,
                 Option<String>,
                 Option<CliLaunchSpec>,
             ) = match &command {
                 PtyCommand::TmuxCli {
-                    session_name,
+                    workspace_id,
                     resume_session_id,
                     initial_prompt,
                     spec,
                 } if tmux_available() => (
-                    Some(session_name.clone()),
+                    Some(*workspace_id),
                     resume_session_id.clone(),
                     initial_prompt.clone(),
                     Some(spec.clone()),
@@ -1386,9 +1401,10 @@ impl PtyService {
             // Never silently break the persistence promise: if CLI mode was
             // requested but tmux is absent, say so in the pane itself.
             if matches!(&command, PtyCommand::TmuxCli { .. }) {
-                match &tmux_session {
-                    Some(session_name) => tracing::info!(
-                        "CLI terminal attaching tmux session {session_name} in {}",
+                match tmux_workspace {
+                    Some(workspace_id) => tracing::info!(
+                        "CLI terminal attaching tmux session {} in {}",
+                        cli_tmux_session_name(workspace_id),
                         working_dir.display()
                     ),
                     None => {
@@ -1397,9 +1413,10 @@ impl PtyService {
                 }
             }
 
-            let (mut cmd, shell_name) = if let (Some(session_name), Some(spec)) =
-                (&tmux_session, &tmux_spec)
+            let (mut cmd, shell_name) = if let (Some(workspace_id), Some(spec)) =
+                (tmux_workspace, &tmux_spec)
             {
+                let session_name = cli_tmux_session_name(workspace_id);
                 // Bring an already-running server in line with our config
                 // (options are server-wide; `-f` below only affects a fresh
                 // server start).
@@ -1437,15 +1454,16 @@ impl PtyService {
                 // benign trade vs. the loop.
                 cmd.arg("-A");
                 cmd.arg("-s");
-                cmd.arg(session_name);
+                cmd.arg(&session_name);
                 cmd.arg("-c");
                 cmd.arg(&working_dir);
                 // Materialize the initial prompt to a private file so the
                 // bootstrap reads it back rather than carrying it inline
                 // (tmux rejects `new-session` commands past ~16KB). Only when
-                // an existing conversation won't take precedence and the
-                // prompt isn't blank; the file self-deletes once consumed.
-                let resume_active = tmux_resume_id.as_deref().is_some_and(is_uuid);
+                // an existing conversation won't take precedence (the same
+                // predicate the bootstrap applies) and the prompt isn't blank;
+                // the file self-deletes once consumed.
+                let resume_active = active_resume_id(tmux_resume_id.as_deref()).is_some();
                 let prompt_file: Option<PathBuf> = if resume_active {
                     None
                 } else {
@@ -1456,33 +1474,20 @@ impl PtyService {
                         // There is a prompt to deliver: its file MUST be staged.
                         // If the write fails we CANNOT fall through to
                         // `continue_launch` — that yields a healthy-looking but
-                        // empty TUI, and the caller (terminal.rs) would then
-                        // clear the parked DB copy, permanently losing the user's
-                        // only copy of the prompt. Fail the spawn instead so the
-                        // parked prompt survives for the next attach and the user
-                        // sees the recovery notice (the "never destroy the
-                        // prompt" invariant).
+                        // empty TUI that could then be mistaken for delivery.
+                        // Fail the spawn instead so the parked prompt survives
+                        // for the next attach and the user sees the recovery
+                        // notice (the "never destroy the prompt" invariant).
                         Some(content) => {
-                            let wid = workspace_id_from_cli_session_name(session_name).ok_or_else(
-                                || {
-                                    tracing::error!(
-                                        "CLI session name {session_name} has no workspace id; \
-                                         cannot stage parked prompt"
-                                    );
-                                    PtyError::PromptStageFailed(
-                                        CLI_PROMPT_PARKED_NOTICE.to_string(),
-                                    )
-                                },
-                            )?;
-                            Some(write_cli_prompt_file(wid, &content).map_err(|e| {
+                            Some(write_cli_prompt_file(workspace_id, &content).map_err(|e| {
                                 tracing::error!(
                                     "Failed to write CLI prompt file for {session_name}: \
                                      {e}; leaving prompt parked"
                                 );
                                 // Drop any partial file so a torn write can't
                                 // leave a stale prompt readable on disk.
-                                remove_cli_prompt_file(wid);
-                                PtyError::PromptStageFailed(CLI_PROMPT_PARKED_NOTICE.to_string())
+                                remove_cli_prompt_file(workspace_id);
+                                PtyError::PromptStageFailed
                             })?)
                         }
                         None => None,
@@ -1921,11 +1926,11 @@ mod tests {
         // When staging a parked prompt fails (e.g. a full/read-only FS), the
         // spawn is aborted with PromptStageFailed rather than silently dropping
         // the prompt. The error text must reach the user verbatim (terminal.rs
-        // sends `e.to_string()` to the pane), so it carries exactly the same
-        // recovery copy as the "session never came up" branch — telling the user
-        // the prompt is saved for the next attach. Guards the user-facing half
-        // of the "never destroy the prompt" invariant.
-        let err = PtyError::PromptStageFailed(CLI_PROMPT_PARKED_NOTICE.to_string());
+        // sends `e.to_string()` to the pane), and the unit variant makes it
+        // structurally impossible to construct with different copy than the
+        // "session never came up" branch — both speak the shared recovery
+        // notice telling the user the prompt is saved for the next attach.
+        let err = PtyError::PromptStageFailed;
         assert_eq!(err.to_string(), CLI_PROMPT_PARKED_NOTICE);
         assert!(err.to_string().contains("your prompt is saved"));
     }
@@ -1962,11 +1967,11 @@ mod tests {
             CliPromptRouting::None
         );
 
-        // Small prompt that fits inline -> Baked, carrying the ORIGINAL
-        // (untrimmed) text; the bootstrap re-trims + dash-guards downstream.
+        // Small prompt that fits inline -> Baked, trimmed (the downstream
+        // file-content trim is then a no-op; the dash guard still applies).
         assert_eq!(
             route_initial_prompt(Some("  hi there  ".to_string()), &CliPromptArg::Positional),
-            CliPromptRouting::Baked("  hi there  ".to_string())
+            CliPromptRouting::Baked("hi there".to_string())
         );
 
         // Oversized Positional prompt -> Deferred (paste path), carrying the

@@ -23,8 +23,7 @@ use executors::{
 use local_deployment::pty::{
     CLI_PROMPT_PARKED_NOTICE, CliPromptDelivery, CliPromptRouting, PtyCommand,
     cli_pane_agent_running, cli_prompt_file_exists, cli_tmux_available, cli_tmux_session_exists,
-    cli_tmux_session_name, kill_cli_tmux_session, remove_cli_prompt_file, route_initial_prompt,
-    send_cli_keys,
+    kill_cli_tmux_session, remove_cli_prompt_file, route_initial_prompt, send_cli_keys,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -186,19 +185,9 @@ async fn terminal_ws(
         ));
     }
 
-    // Session whose parked CLI prompt should be cleared once the tmux session
-    // is confirmed created (CLI-first first attach only). Set inside the Cli
-    // arm; cleared post-spawn in handle_terminal_ws.
-    let mut prompt_session_to_clear: Option<Uuid> = None;
-    // A large (or otherwise non-inlineable) initial prompt that must be
-    // delivered by paste AFTER the pane is up, rather than baked into the launch
-    // command. Set inside the Cli arm; delivered in handle_terminal_ws.
-    let mut deferred_prompt: Option<String> = None;
-    // Exclusive in-process claim on this workspace's prompt delivery — held
-    // whenever this attach carries the prompt, released once the parked copy is
-    // cleared or deliberately left parked. Racing first-attaches that lose the
-    // claim attach without the prompt instead of double-staging/double-pasting.
-    let mut delivery_claim: Option<CliPromptDelivery> = None;
+    // Set inside the Cli arm when this attach carries the workspace's parked
+    // prompt; consumed by handle_terminal_ws to confirm delivery and clear it.
+    let mut prompt_delivery: Option<PromptDelivery> = None;
 
     let (working_dir, command) = match query.mode {
         TerminalMode::Cli => {
@@ -268,17 +257,12 @@ async fn terminal_ws(
                 None => None,
             };
 
-            // CLI-first creation parks the workspace's initial prompt on the
-            // session; the tmux bootstrap runs claude with it directly. We
-            // only PEEK it here (read, don't clear) and only on the genuine
-            // FIRST attach (no tmux session yet) — reattaches and post-death
-            // reconnects must not replay it. The clear is deferred until the
-            // tmux session is confirmed created (see `prompt_session_to_clear`
-            // below), so a failure between WS upgrade and PTY spawn can't
-            // destroy the prompt, and two racing first-attaches that both peek
-            // the same prompt are safe (whichever wins `new-session` carries
-            // it; the loser's `-A` reattach ignores its bootstrap). An
-            // existing resumable conversation always wins over a parked prompt.
+            // A parked prompt (CLI-first creation, or a re-parked loop wake-up)
+            // is only ever PEEKED here (read, don't clear); the clear happens
+            // after delivery is CONFIRMED (see handle_terminal_ws), so no
+            // failure between WS upgrade and agent hand-off can destroy the
+            // user's only copy. Racing attaches are serialized by the
+            // CliPromptDelivery claim — the loser attaches without the prompt.
             //
             // Gate on tmux availability: with tmux down, CLI mode degrades to
             // an ephemeral shell that can't run claude, so the bootstrap would
@@ -286,40 +270,26 @@ async fn terminal_ws(
             // Since availability is process-cached, `true` here means
             // `create_session` also takes the tmux branch, so a successful
             // spawn really did carry the prompt into a tmux session.
-            let initial_prompt = match &session {
-                Some(s)
-                    if resume_session_id.is_none()
-                        && cli_tmux_available()
-                        && !cli_tmux_session_exists(query.workspace_id).await =>
-                {
-                    // Two attaches can both pass the no-session-yet gate before
-                    // either spawns; only the claim holder carries the prompt
-                    // (the loser's `-A` attach ignores its bootstrap anyway),
-                    // so the prompt file can't be re-truncated mid-`cat` and an
-                    // oversized prompt can't be pasted twice.
+            let carried: Option<(String, CliPromptDelivery, Uuid)> = match &session {
+                Some(s) if cli_tmux_available() => {
                     match CliPromptDelivery::try_claim(query.workspace_id) {
-                        Some(claim) => {
-                            match Session::peek_pending_cli_prompt(pool, s.id).await {
-                                Ok(Some(prompt)) => {
-                                    delivery_claim = Some(claim);
-                                    Some(prompt)
-                                }
-                                // Nothing parked: release the claim (drop).
-                                Ok(None) => None,
-                                Err(e) => {
-                                    // The prompt is not lost — it stays parked
-                                    // and the next attach re-peeks — but a
-                                    // transient DB error here delays delivery,
-                                    // so make it observable.
-                                    tracing::warn!(
-                                        "Failed to read pending CLI prompt for session {}: {}",
-                                        s.id,
-                                        e
-                                    );
-                                    None
-                                }
+                        Some(claim) => match Session::peek_pending_cli_prompt(pool, s.id).await {
+                            Ok(Some(prompt)) => Some((prompt, claim, s.id)),
+                            // Nothing parked: release the claim (drop).
+                            Ok(None) => None,
+                            Err(e) => {
+                                // The prompt is not lost — it stays parked and
+                                // the next attach re-peeks — but a transient DB
+                                // error here delays delivery, so make it
+                                // observable.
+                                tracing::warn!(
+                                    "Failed to read pending CLI prompt for session {}: {}",
+                                    s.id,
+                                    e
+                                );
+                                None
                             }
-                        }
+                        },
                         None => {
                             tracing::debug!(
                                 "CLI prompt delivery for workspace {} already in flight; \
@@ -337,34 +307,63 @@ async fn terminal_ws(
             let (model_id, reasoning_id) = resolve_cli_model_effort(pool, session.as_ref()).await;
             let spec = resolve_cli_launch_spec(session.as_ref(), model_id, reasoning_id, &dir);
 
-            // Small prompts ride the bootstrap's temp-file transport (baked into
-            // the launch). Prompts too large to pass as one argv entry — or
-            // agents with no launch-time prompt arg — are delivered by paste
-            // after the pane is confirmed up (see handle_terminal_ws), so they're
-            // never truncated and never silently lost. Either way the parked
-            // prompt is cleared only after delivery is confirmed.
-            let baked_prompt = match route_initial_prompt(initial_prompt, &spec.prompt_arg) {
-                CliPromptRouting::None => None,
-                CliPromptRouting::Baked(prompt) => Some(prompt),
-                CliPromptRouting::Deferred(prompt) => {
-                    deferred_prompt = Some(prompt);
-                    None
+            // How the parked prompt travels:
+            // - Genuine first attach (no tmux session yet, nothing to resume):
+            //   small prompts ride the bootstrap's temp-file transport (baked
+            //   into the launch); prompts too large for one argv entry are
+            //   pasted after the agent owns the pane.
+            // - Otherwise (the session already exists — e.g. an earlier
+            //   delivery went unconfirmed, or a loop wake-up was re-parked —
+            //   or an existing conversation is being resumed, which always
+            //   wins the launch itself): deliver by paste into the running
+            //   agent, as a follow-up. Without this branch a parked prompt
+            //   behind a live session or a resume would be stranded forever.
+            // Either way the parked prompt is cleared only after delivery is
+            // confirmed.
+            let mut baked_prompt = None;
+            if let Some((peeked, claim, clear_session_id)) = carried {
+                let fresh_launch = resume_session_id.is_none()
+                    && !cli_tmux_session_exists(query.workspace_id).await;
+                let routed = if fresh_launch {
+                    route_initial_prompt(Some(peeked.clone()), &spec.prompt_arg)
+                } else {
+                    let trimmed = peeked.trim();
+                    if trimmed.is_empty() {
+                        CliPromptRouting::None
+                    } else {
+                        CliPromptRouting::Deferred(trimmed.to_string())
+                    }
+                };
+                match routed {
+                    // Blank-after-trim: nothing will be delivered; the claim
+                    // drops here rather than being held across the attach.
+                    CliPromptRouting::None => {}
+                    CliPromptRouting::Baked(prompt) => {
+                        baked_prompt = Some(prompt);
+                        prompt_delivery = Some(PromptDelivery {
+                            workspace_id: query.workspace_id,
+                            clear_session_id,
+                            peeked,
+                            deferred: None,
+                            claim,
+                        });
+                    }
+                    CliPromptRouting::Deferred(prompt) => {
+                        prompt_delivery = Some(PromptDelivery {
+                            workspace_id: query.workspace_id,
+                            clear_session_id,
+                            peeked,
+                            deferred: Some(prompt),
+                            claim,
+                        });
+                    }
                 }
-            };
-            // Remember which session's prompt to clear once delivery is
-            // confirmed (only when we actually carried a prompt).
-            if baked_prompt.is_some() || deferred_prompt.is_some() {
-                prompt_session_to_clear = session.as_ref().map(|s| s.id);
-            } else {
-                // Blank-after-trim prompt: nothing will be delivered, so don't
-                // hold the delivery claim across the attach.
-                delivery_claim = None;
             }
 
             (
                 dir,
                 PtyCommand::TmuxCli {
-                    session_name: cli_tmux_session_name(query.workspace_id),
+                    workspace_id: query.workspace_id,
                     resume_session_id,
                     initial_prompt: baked_prompt,
                     spec,
@@ -405,15 +404,32 @@ async fn terminal_ws(
             query.cols,
             query.rows,
             command,
-            query.workspace_id,
-            prompt_session_to_clear,
-            deferred_prompt,
-            delivery_claim,
+            prompt_delivery,
         )
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Everything a prompt-carrying CLI attach needs to confirm delivery and clear
+/// the parked prompt. Built only when this attach actually carries the prompt
+/// (it holds the claim), so "claim without prompt" or "deferred text without a
+/// session to clear" are unrepresentable.
+struct PromptDelivery {
+    workspace_id: Uuid,
+    /// Session whose parked prompt to clear once delivery is confirmed.
+    clear_session_id: Uuid,
+    /// The exact parked value that was peeked — the clear is a compare-and-swap
+    /// against it, so a NEWER prompt parked mid-confirmation (e.g. a loop
+    /// wake-up re-parked while this delivery was in flight) is never destroyed
+    /// by this delivery's clear.
+    peeked: String,
+    /// Prompt to paste once the agent owns the pane (`None` = baked into the
+    /// launch's temp-file transport instead).
+    deferred: Option<String>,
+    /// Exclusive in-process claim; held until the parked copy is cleared or
+    /// deliberately left parked, releasing on drop.
+    claim: CliPromptDelivery,
+}
+
 async fn handle_terminal_ws(
     mut socket: MaybeSignedWebSocket,
     deployment: DeploymentImpl,
@@ -421,10 +437,7 @@ async fn handle_terminal_ws(
     cols: u16,
     rows: u16,
     command: PtyCommand,
-    workspace_id: Uuid,
-    prompt_session_to_clear: Option<Uuid>,
-    deferred_prompt: Option<String>,
-    delivery_claim: Option<CliPromptDelivery>,
+    prompt_delivery: Option<PromptDelivery>,
 ) {
     let (session_id, mut output_rx) = match deployment
         .pty()
@@ -437,8 +450,8 @@ async fn handle_terminal_ws(
             // A prompt file staged before the spawn failure must not outlive
             // it (the DB copy stays parked for the next attach; the claim is
             // released on return).
-            if prompt_session_to_clear.is_some() {
-                remove_cli_prompt_file(workspace_id);
+            if let Some(delivery) = &prompt_delivery {
+                remove_cli_prompt_file(delivery.workspace_id);
             }
             let _ = send_error(&mut socket, &e.to_string()).await;
             return;
@@ -451,7 +464,8 @@ async fn handle_terminal_ws(
     // actually exists before doing anything with the parked prompt. A session
     // that never comes up leaves the prompt saved for the next attach and tells
     // the user so, instead of silently destroying it.
-    if let Some(clear_session_id) = prompt_session_to_clear {
+    if let Some(delivery) = prompt_delivery {
+        let workspace_id = delivery.workspace_id;
         if wait_for_cli_session(workspace_id).await {
             // Confirm delivery and clear the parked prompt in the background so
             // the pane's output starts streaming immediately — the confirmation
@@ -460,23 +474,38 @@ async fn handle_terminal_ws(
             tokio::spawn(async move {
                 // Hold the exclusive delivery claim for the whole
                 // confirm-then-clear window.
-                let _claim = delivery_claim;
-                let delivered = match deferred_prompt {
-                    Some(text) => deliver_deferred_prompt(workspace_id, &text).await,
+                let _claim = delivery.claim;
+                let delivered = match &delivery.deferred {
+                    Some(text) => deliver_deferred_prompt(workspace_id, text).await,
                     None => confirm_baked_prompt_consumed(workspace_id).await,
                 };
                 if delivered {
-                    if let Err(e) = Session::clear_pending_cli_prompt(&pool, clear_session_id).await
+                    match Session::clear_pending_cli_prompt(
+                        &pool,
+                        delivery.clear_session_id,
+                        &delivery.peeked,
+                    )
+                    .await
                     {
-                        tracing::warn!(
+                        // Superseded: a newer prompt was parked while this one
+                        // was being confirmed; it stays parked for its own
+                        // delivery on the next attach.
+                        Ok(false) => tracing::info!(
+                            "Parked CLI prompt for session {} changed during delivery; \
+                             left for the next attach",
+                            delivery.clear_session_id
+                        ),
+                        Ok(true) => {}
+                        Err(e) => tracing::warn!(
                             "Failed to clear delivered CLI prompt for session {}: {}",
-                            clear_session_id,
+                            delivery.clear_session_id,
                             e
-                        );
+                        ),
                     }
                 } else {
-                    // Leave the prompt parked; a later fresh session delivers
-                    // it (delivery is only ever confirmed, never assumed).
+                    // Leave the prompt parked; the next attach retries (paste
+                    // into the live pane, or a fresh launch after the session
+                    // dies) — delivery is only ever confirmed, never assumed.
                     tracing::warn!(
                         "CLI prompt delivery for workspace {} unconfirmed; left parked",
                         workspace_id
@@ -578,16 +607,18 @@ async fn wait_for_cli_session(workspace_id: Uuid) -> bool {
     false
 }
 
-/// Confirm the pane's bootstrap actually consumed the staged (baked) prompt
-/// file. The bootstrap `rm`s the file the moment it hands the prompt to the
-/// agent, so "file gone" is a real delivery acknowledgement — while a launch
-/// that never consumed it (agent binary missing → the bootstrap's `command -v`
-/// guard skips the launch arm and drops to the fallback shell) leaves the file
-/// behind, and the parked DB prompt must then survive for a later fresh
-/// session instead of being cleared into the void.
+/// Confirm a baked prompt was actually handed to the agent: the staged file is
+/// gone (the bootstrap `rm`s it at hand-off — see [`cli_prompt_file_exists`])
+/// AND a non-shell process owns the pane. The second condition catches the
+/// consumed-but-never-executed window (`command -v` passed but the agent's
+/// exec failed: bad shebang, loader error, permissions) where file-gone alone
+/// would clear a prompt no agent ever received. An unconfirmed launch leaves
+/// the parked DB prompt for the next attach's paste/fresh-launch retry.
 async fn confirm_baked_prompt_consumed(workspace_id: Uuid) -> bool {
     for _ in 0..20 {
-        if !cli_prompt_file_exists(workspace_id) {
+        if !cli_prompt_file_exists(workspace_id)
+            && cli_pane_agent_running(workspace_id).await == Some(true)
+        {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;

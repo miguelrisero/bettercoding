@@ -211,13 +211,14 @@ impl Session {
     }
 
     /// Read the parked CLI prompt WITHOUT clearing it. The clear is deferred
-    /// to [`clear_pending_cli_prompt`] until the tmux session is confirmed to
-    /// *exist* (and, for a large paste-delivered prompt, until the paste
-    /// succeeds), so neither a failure between attach and spawn nor tmux
-    /// rejecting the launch command after spawn can destroy the user's only
-    /// copy of their prompt. Two racing first-attaches that both peek the same
-    /// prompt are harmless — whichever wins `new-session` carries it (the
-    /// loser's `-A` reattach ignores its bootstrap).
+    /// to [`clear_pending_cli_prompt`] until delivery is CONFIRMED — the
+    /// launch bootstrap consumed the staged prompt file with the agent up, or
+    /// the paste into the agent's pane succeeded — so neither a failure
+    /// between attach and spawn nor tmux rejecting the launch command after
+    /// spawn can destroy the user's only copy of the prompt. Racing
+    /// first-attaches are serialized by an in-process delivery claim
+    /// (`CliPromptDelivery` in local-deployment); the losing attach simply
+    /// doesn't carry the prompt.
     pub async fn peek_pending_cli_prompt(
         pool: &SqlitePool,
         id: Uuid,
@@ -231,19 +232,30 @@ impl Session {
         .flatten())
     }
 
-    /// Clear the parked CLI prompt once it has been delivered to a freshly
-    /// created tmux session. Idempotent and atomic (a single guarded UPDATE),
-    /// so a double-call from racing attaches is a no-op.
-    pub async fn clear_pending_cli_prompt(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query!(
+    /// Clear the parked CLI prompt once THIS delivery's copy of it has been
+    /// confirmed delivered. Compare-and-swap on the exact delivered value —
+    /// a prompt parked mid-confirmation (e.g. a loop wake-up re-parked while
+    /// an initial prompt's delivery was still being confirmed) is newer,
+    /// undelivered, and must not be destroyed by the older delivery's clear.
+    /// Returns whether the clear happened (`false` = superseded; the newer
+    /// prompt stays parked for its own delivery). Idempotent and atomic (a
+    /// single guarded UPDATE), so a double-call from racing attaches is a
+    /// no-op.
+    pub async fn clear_pending_cli_prompt(
+        pool: &SqlitePool,
+        id: Uuid,
+        delivered: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query!(
             r#"UPDATE sessions
                SET pending_cli_prompt = NULL
-               WHERE id = $1 AND pending_cli_prompt IS NOT NULL"#,
-            id
+               WHERE id = $1 AND pending_cli_prompt = $2"#,
+            id,
+            delivered
         )
         .execute(pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// Persist the model + reasoning effort chosen at CLI-first creation so the
