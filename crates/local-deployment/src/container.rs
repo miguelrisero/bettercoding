@@ -1480,7 +1480,11 @@ impl ContainerService for LocalContainerService {
         );
 
         // Always inject workspace/session context
-        env.insert("VK_WORKSPACE_ID", workspace.id.to_string());
+        let workspace_id = workspace.id.to_string();
+        env.insert("BC_WORKSPACE_ID", &workspace_id);
+        env.insert("BC_WORKSPACE_BRANCH", &workspace.branch);
+        // TODO(bc-legacy-cleanup): remove legacy VK_ workspace context variables.
+        env.insert("VK_WORKSPACE_ID", &workspace_id);
         env.insert("VK_WORKSPACE_BRANCH", &workspace.branch);
 
         // Create the child and stream, add to execution tracker with timeout

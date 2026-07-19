@@ -1,4 +1,4 @@
-use std::{env, sync::OnceLock};
+use std::sync::OnceLock;
 
 use directories::ProjectDirs;
 
@@ -7,6 +7,7 @@ pub mod assets;
 pub mod browser;
 pub mod command_ext;
 pub mod diff;
+pub mod env;
 pub mod execution_logs;
 pub mod http_headers;
 pub mod jwt;
