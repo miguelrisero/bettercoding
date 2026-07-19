@@ -104,6 +104,19 @@ fn should_ignore_client_size(input_idle_secs: u64, presence: Option<SizingPresen
     }
 }
 
+/// `None` gives a never-before-seen client one sweep to acquire its web
+/// presence record; a new manual client cannot be stale during that grace.
+fn desired_ignore_client_size(
+    input_idle_secs: u64,
+    presence: Option<SizingPresence>,
+    seen_in_previous_sweep: bool,
+) -> Option<bool> {
+    if presence.is_none() && !seen_in_previous_sweep {
+        return None;
+    }
+    Some(should_ignore_client_size(input_idle_secs, presence))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct TmuxClientRow {
     client_pid: u32,
@@ -242,6 +255,7 @@ impl CliActivityMonitor {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut size_sweep_ticks = 0;
             let mut size_refresh_failures: HashMap<(u32, String), u8> = HashMap::new();
+            let mut seen_client_pids = HashSet::new();
 
             loop {
                 interval.tick().await;
@@ -249,7 +263,12 @@ impl CliActivityMonitor {
                 size_sweep_ticks += 1;
                 if size_sweep_ticks == SIZE_SWEEP_TICKS {
                     size_sweep_ticks = 0;
-                    sweep_client_size_flags(&pty, &mut size_refresh_failures).await;
+                    sweep_client_size_flags(
+                        &pty,
+                        &mut size_refresh_failures,
+                        &mut seen_client_pids,
+                    )
+                    .await;
                 }
 
                 // A missing tmux server (no sessions yet, or it died) reads
@@ -324,6 +343,7 @@ impl CliActivityMonitor {
 async fn sweep_client_size_flags(
     pty: &PtyService,
     refresh_failures: &mut HashMap<(u32, String), u8>,
+    seen_client_pids: &mut HashSet<u32>,
 ) {
     if !tmux_client_flags_supported() {
         return;
@@ -371,6 +391,10 @@ async fn sweep_client_size_flags(
         .lines()
         .filter_map(parse_cli_client_line)
         .collect();
+    let previous_client_pids = std::mem::replace(
+        seen_client_pids,
+        clients.iter().map(|client| client.client_pid).collect(),
+    );
     let live_clients: HashSet<_> = clients
         .iter()
         .map(|client| (client.client_pid, client.client_name.clone()))
@@ -383,7 +407,13 @@ async fn sweep_client_size_flags(
         let sizing_presence = presence
             .get(&client.client_pid)
             .map(|presence| sizing_presence(*presence, now_instant));
-        let desired_ignore = should_ignore_client_size(input_idle_secs, sizing_presence);
+        let Some(desired_ignore) = desired_ignore_client_size(
+            input_idle_secs,
+            sizing_presence,
+            previous_client_pids.contains(&client.client_pid),
+        ) else {
+            continue;
+        };
         if desired_ignore == client.ignore_size {
             refresh_failures.remove(&failure_key);
             continue;
@@ -661,6 +691,20 @@ mod tests {
     fn manual_client_is_flagged_only_after_twenty_minutes_idle() {
         assert!(!should_ignore_client_size(MANUAL_CLIENT_IDLE_SECS, None));
         assert!(should_ignore_client_size(MANUAL_CLIENT_IDLE_SECS + 1, None));
+    }
+
+    #[test]
+    fn never_seen_unknown_client_gets_one_sweep_of_grace() {
+        let idle = MANUAL_CLIENT_IDLE_SECS + 1;
+        assert_eq!(desired_ignore_client_size(idle, None, false), None);
+        assert_eq!(desired_ignore_client_size(idle, None, true), Some(true));
+
+        let hidden = Some(SizingPresence {
+            visible: false,
+            last_visible_ago_secs: 0,
+            changed_ago_secs: 0,
+        });
+        assert_eq!(desired_ignore_client_size(idle, hidden, false), Some(true));
     }
 
     #[test]
