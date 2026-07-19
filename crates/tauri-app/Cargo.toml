@@ -1,4 +1,5 @@
 [package]
+# TODO(bc-legacy-cleanup): vibe-kanban-tauri is a packaged binary identity; rename requires migration.
 name = "vibe-kanban-tauri"
 version = "0.1.44"
 edition = "2024"

@@ -1,4 +1,5 @@
 name: Create GitHub Pre-Release
+# TODO(bc-legacy-cleanup): vibe-kanban artifact/zip names are release identity; zip filenames are coupled to artifact ids.
 
 on:
   workflow_dispatch:

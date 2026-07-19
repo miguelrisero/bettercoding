@@ -109,6 +109,7 @@ pub fn normalize_macos_private_alias<P: AsRef<Path>>(p: P) -> PathBuf {
     p.to_path_buf()
 }
 
+// TODO(bc-legacy-cleanup): function and temp-dir names are persisted identities; rename needs migration.
 pub fn get_vibe_kanban_temp_dir() -> std::path::PathBuf {
     let dir_name = if cfg!(debug_assertions) {
         "vibe-kanban-dev"

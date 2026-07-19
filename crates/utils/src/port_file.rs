@@ -14,6 +14,7 @@ pub async fn write_port_file_with_proxy(
     main_port: u16,
     preview_proxy_port: Option<u16>,
 ) -> std::io::Result<PathBuf> {
+    // TODO(bc-legacy-cleanup): temp dir and vibe-kanban.port are discovery identities; keep stable.
     let dir = env::temp_dir().join("vibe-kanban");
     let path = dir.join("vibe-kanban.port");
     let port_info = PortInfo {

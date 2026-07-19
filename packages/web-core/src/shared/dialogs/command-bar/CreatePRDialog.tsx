@@ -48,6 +48,7 @@ export type CreatePRDialogResult = {
   error?: string;
 };
 
+// TODO(bc-legacy-cleanup): PR title suffix is externally visible persisted identity; keep stable.
 const PR_TITLE_SUFFIX = ' (vibe-kanban)';
 
 const appendPrTitleSuffix = (title: string): string => {

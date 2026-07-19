@@ -22,6 +22,7 @@ pub fn asset_dir() -> std::path::PathBuf {
 }
 
 pub fn prod_asset_dir_path() -> std::path::PathBuf {
+    // TODO(bc-legacy-cleanup): ProjectDirs identity is persisted on disk; rename requires migration.
     ProjectDirs::from("ai", "bloop", "vibe-kanban")
         .expect("OS didn't give us a home directory")
         .data_dir()
