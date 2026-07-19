@@ -221,7 +221,7 @@
       },
       "privacy": {
         "title": "Confidentialité",
-        "description": "Aidez à améliorer Vibe-Kanban en partageant des données d'utilisation anonymes.",
+        "description": "Aidez à améliorer BetterCoding en partageant des données d'utilisation anonymes.",
         "telemetry": {
           "label": "Activer la télémétrie",
           "helper": "Active le suivi anonyme des événements d'utilisation pour aider à améliorer l'application. Aucun prompt ou information de projet n'est collecté."
