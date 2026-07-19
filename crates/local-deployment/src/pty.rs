@@ -1724,7 +1724,9 @@ impl PtyService {
                 _ => (None, None, None, false, false, None),
             };
             // Client flags are the release valve that makes smallest sizing
-            // safe. F9 gates the entire feature on this cached capability.
+            // safe. The cached client-flags capability gates the entire
+            // feature; without it smallest sizing would clamp with no release
+            // valve.
             let tmux_connect_hidden = tmux_connect_hidden && tmux_client_flags_supported();
 
             // Never silently break the persistence promise: if CLI mode was
@@ -2086,6 +2088,8 @@ impl PtyService {
             client_pid
         };
 
+        // Two rapid transitions can finish out of order; the periodic sweep
+        // repairs any resulting divergence within one sweep period.
         tokio::spawn(async move {
             let client_name = match cli_tmux_client_name(client_pid).await {
                 Ok(Some(client_name)) => client_name,
