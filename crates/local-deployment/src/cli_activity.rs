@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::pty::{
     CLI_TMUX_SOCKET, CliClientPresence, PtyService, refresh_cli_tmux_client_ignore_size,
-    tmux_available, workspace_id_from_cli_session_name,
+    tmux_available, tmux_client_flags_supported, workspace_id_from_cli_session_name,
 };
 
 /// Poll cadence. Two seconds keeps bucket transitions snappy while the cost
@@ -320,6 +320,10 @@ impl CliActivityMonitor {
 /// every field needed for every workspace; refresh only actual transitions so
 /// steady state stays at a single tmux fork per sweep.
 async fn sweep_client_size_flags(pty: &PtyService) {
+    if !tmux_client_flags_supported() {
+        return;
+    }
+
     let output = match tokio::process::Command::new("tmux")
         .args([
             "-L",

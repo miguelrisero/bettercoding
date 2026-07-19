@@ -808,14 +808,16 @@ fn seed_codex_update_dismissal() -> std::io::Result<()> {
 ///   no keystroke.
 /// - right-click is unbound from tmux's context menu so the web terminal can
 ///   use it for paste.
-/// - `window-size smallest`: when several browser clients share a workspace,
-///   the pane grid fits every client that participates in sizing.
+/// - `window-size smallest` (tmux >= 3.2 only): when several browser clients
+///   share a workspace, the pane grid fits every client that participates in
+///   sizing. Older tmux versions lack the client flags needed to exclude a
+///   hidden/stale client, so they keep tmux's default sizing behavior.
 /// - `default-shell /bin/sh`: window command strings (our launch bootstrap)
 ///   are run via `default-shell -c`, and the bootstrap is POSIX sh
 ///   (`vk_p="$(cat …)"`, `{ …; } | …`) — a fish/csh login shell would fail on
 ///   it outright. The pane still ends in the USER'S shell: the bootstrap's
 ///   final `exec "${SHELL:-/bin/sh}"` honors `$SHELL`.
-const CLI_TMUX_CONF: &str = "\
+const CLI_TMUX_CONF_WITH_CLIENT_FLAGS: &str = "\
 # BetterCoding embedded terminal tmux server (socket: vibe-kanban).
 # Written by the backend before each CLI terminal attach - edits are overwritten.
 set -g mouse on
@@ -826,14 +828,33 @@ set -g default-shell /bin/sh
 unbind-key -n MouseDown3Pane
 ";
 
+const CLI_TMUX_CONF_WITHOUT_CLIENT_FLAGS: &str = "\
+# BetterCoding embedded terminal tmux server (socket: vibe-kanban).
+# Written by the backend before each CLI terminal attach - edits are overwritten.
+set -g mouse on
+set -s set-clipboard on
+set -as terminal-features ',xterm*:clipboard'
+set -g default-shell /bin/sh
+unbind-key -n MouseDown3Pane
+";
+
+fn cli_tmux_conf(client_flags_supported: bool) -> &'static str {
+    if client_flags_supported {
+        CLI_TMUX_CONF_WITH_CLIENT_FLAGS
+    } else {
+        CLI_TMUX_CONF_WITHOUT_CLIENT_FLAGS
+    }
+}
+
 /// Write the embedded server config (idempotent) and return its path.
 fn cli_tmux_conf_path() -> Option<PathBuf> {
     let dir = utils::assets::asset_dir();
     let path = dir.join("cli-tmux.conf");
+    let desired = cli_tmux_conf(tmux_client_flags_supported());
     let current = std::fs::read_to_string(&path).ok();
-    if current.as_deref() != Some(CLI_TMUX_CONF) {
+    if current.as_deref() != Some(desired) {
         std::fs::create_dir_all(&dir).ok()?;
-        std::fs::write(&path, CLI_TMUX_CONF).ok()?;
+        std::fs::write(&path, desired).ok()?;
     }
     Some(path)
 }
@@ -843,10 +864,10 @@ fn cli_tmux_conf_path() -> Option<PathBuf> {
 /// first so the append-style options aren't re-applied on every attach.
 /// Best-effort: no server running is the common case and simply a no-op.
 fn ensure_cli_tmux_server_options() {
-    ensure_cli_tmux_server_options_on(CLI_TMUX_SOCKET);
+    ensure_cli_tmux_server_options_on(CLI_TMUX_SOCKET, tmux_client_flags_supported());
 }
 
-fn ensure_cli_tmux_server_options_on(socket: &str) {
+fn ensure_cli_tmux_server_options_on(socket: &str, client_flags_supported: bool) {
     let tmux = |args: &[&str]| {
         std::process::Command::new("tmux")
             .args(["-L", socket])
@@ -862,10 +883,13 @@ fn ensure_cli_tmux_server_options_on(socket: &str) {
     // the conf don't hand the bootstrap to a fish/csh login shell.
     let _ = tmux(&["set-option", "-g", "default-shell", "/bin/sh"]);
 
-    // This migration MUST stay above the clipboard probe: a production server
-    // commonly already has `set-clipboard on`, which makes the probe return
-    // early, but may have started before window-size joined the config.
-    let _ = tmux(&["set-option", "-g", "window-size", "smallest"]);
+    if client_flags_supported {
+        // This migration MUST stay above the clipboard probe: a production
+        // server commonly already has `set-clipboard on`, which makes the
+        // probe return early, but may have started before window-size joined
+        // the config.
+        let _ = tmux(&["set-option", "-g", "window-size", "smallest"]);
+    }
 
     let Ok(probe) = tmux(&["show-options", "-s", "set-clipboard"]) else {
         return;
@@ -1380,25 +1404,85 @@ pub async fn cli_tmux_session_liveness(workspace_id: Uuid) -> Option<(bool, i64)
         .map(|(_, attached, idle)| (attached, idle))
 }
 
-/// Whether tmux is on PATH. Checked once per process; when unavailable
-/// (e.g. Windows, minimal containers) CLI mode degrades to a bare shell.
-pub(crate) fn tmux_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        let available = std::process::Command::new("tmux")
+#[derive(Debug, Clone, Copy)]
+struct TmuxCapabilities {
+    available: bool,
+    client_flags: bool,
+}
+
+/// Parse tmux's stable `tmux -V` output and recognize the first release with
+/// per-client flags. A version gate is preferable to probing `refresh-client`
+/// because the latter needs a live client and would perturb it; tmux 3.2 added
+/// the `-f` client-flag option used by the sizing feature.
+fn tmux_version_supports_client_flags(output: &str) -> bool {
+    let Some(version) = output.trim().strip_prefix("tmux ") else {
+        return false;
+    };
+    let version = version.strip_prefix("next-").unwrap_or(version);
+    let Some((major, minor_and_suffix)) = version.split_once('.') else {
+        return false;
+    };
+    let minor: String = minor_and_suffix
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else {
+        return false;
+    };
+    (major, minor) >= (3, 2)
+}
+
+fn tmux_capabilities() -> &'static TmuxCapabilities {
+    static CAPABILITIES: OnceLock<TmuxCapabilities> = OnceLock::new();
+    CAPABILITIES.get_or_init(|| {
+        let output = std::process::Command::new("tmux")
             .arg("-V")
-            .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if !available {
+            .output();
+        let Ok(output) = output else {
             tracing::warn!(
                 "tmux not found on PATH; CLI mode terminals will degrade to ephemeral shells"
             );
+            return TmuxCapabilities {
+                available: false,
+                client_flags: false,
+            };
+        };
+        if !output.status.success() {
+            tracing::warn!(
+                "tmux not found on PATH; CLI mode terminals will degrade to ephemeral shells"
+            );
+            return TmuxCapabilities {
+                available: false,
+                client_flags: false,
+            };
         }
-        available
+
+        let version = String::from_utf8_lossy(&output.stdout);
+        let client_flags = tmux_version_supports_client_flags(&version);
+        if !client_flags {
+            tracing::warn!(
+                version = version.trim(),
+                "tmux client flags require tmux >= 3.2; shared CLI terminal sizing disabled"
+            );
+        }
+        TmuxCapabilities {
+            available: true,
+            client_flags,
+        }
     })
+}
+
+/// Whether tmux is on PATH. Checked once per process; when unavailable
+/// (e.g. Windows, minimal containers) CLI mode degrades to a bare shell.
+pub(crate) fn tmux_available() -> bool {
+    tmux_capabilities().available
+}
+
+/// Whether tmux can exclude individual clients from `window-size smallest`.
+/// Shares the cached `tmux -V` probe with [`tmux_available`].
+pub(crate) fn tmux_client_flags_supported() -> bool {
+    tmux_capabilities().client_flags
 }
 
 /// Visible notice written into a CLI pane when tmux is unavailable, so the
@@ -1653,7 +1737,7 @@ impl PtyService {
                 let mut cmd = CommandBuilder::new("tmux");
                 // Our own config instead of the user's ~/.tmux.conf — the
                 // embedded terminal needs deterministic mouse/clipboard
-                // behavior (see CLI_TMUX_CONF); the user's personal tmux on
+                // behavior (see `cli_tmux_conf`); the user's personal tmux on
                 // the default socket is unaffected.
                 if let Some(conf) = cli_tmux_conf_path() {
                     cmd.arg("-f");
@@ -1932,6 +2016,10 @@ impl PtyService {
     /// silent no-op; tmux lookup/refresh races are best-effort because the slow
     /// activity sweep repairs the desired flag later.
     pub async fn set_cli_presence(&self, session_id: Uuid, visible: bool) {
+        if !tmux_client_flags_supported() {
+            return;
+        }
+
         let client_pid = {
             let mut sessions = match self.sessions.lock() {
                 Ok(sessions) => sessions,
@@ -2045,6 +2133,10 @@ pub(crate) async fn refresh_cli_tmux_client_ignore_size(
     client_name: &str,
     ignore_size: bool,
 ) -> Result<(), String> {
+    if !tmux_client_flags_supported() {
+        return Ok(());
+    }
+
     let flag = if ignore_size {
         "ignore-size"
     } else {
@@ -2569,14 +2661,28 @@ mod tests {
     fn cli_tmux_conf_keeps_mouse_scroll_and_osc52_copy() {
         // The reconciliation contract: wheel scrolling stays (mouse on) AND
         // selections land in the system clipboard via OSC 52.
-        assert!(CLI_TMUX_CONF.contains("set -g mouse on"));
-        assert!(CLI_TMUX_CONF.contains("set -s set-clipboard on"));
-        assert!(CLI_TMUX_CONF.contains("clipboard"));
-        assert!(CLI_TMUX_CONF.contains("unbind-key -n MouseDown3Pane"));
-        // Window command strings (the POSIX-sh launch bootstrap) are parsed by
-        // default-shell; a fish/csh login shell would reject them outright.
-        assert!(CLI_TMUX_CONF.contains("set -g default-shell /bin/sh"));
-        assert!(CLI_TMUX_CONF.contains("set -g window-size smallest"));
+        for conf in [cli_tmux_conf(false), cli_tmux_conf(true)] {
+            assert!(conf.contains("set -g mouse on"));
+            assert!(conf.contains("set -s set-clipboard on"));
+            assert!(conf.contains("clipboard"));
+            assert!(conf.contains("unbind-key -n MouseDown3Pane"));
+            // Window command strings (the POSIX-sh launch bootstrap) are
+            // parsed by default-shell; fish/csh would reject them outright.
+            assert!(conf.contains("set -g default-shell /bin/sh"));
+        }
+        assert!(cli_tmux_conf(true).contains("set -g window-size smallest"));
+        assert!(!cli_tmux_conf(false).contains("window-size smallest"));
+    }
+
+    #[test]
+    fn tmux_client_flag_version_gate_handles_release_formats() {
+        assert!(tmux_version_supports_client_flags("tmux 3.2a\n"));
+        assert!(tmux_version_supports_client_flags("tmux 3.4"));
+        assert!(tmux_version_supports_client_flags("tmux next-3.6"));
+        assert!(tmux_version_supports_client_flags("tmux 4.0"));
+        assert!(!tmux_version_supports_client_flags("tmux 3.1c"));
+        assert!(!tmux_version_supports_client_flags("tmux 2.9"));
+        assert!(!tmux_version_supports_client_flags("tmux master"));
     }
 
     struct ScratchTmuxServer {
@@ -2595,7 +2701,7 @@ mod tests {
 
     #[test]
     fn ensure_sets_smallest_before_current_clipboard_probe_returns() {
-        if !tmux_available() {
+        if !tmux_client_flags_supported() {
             return;
         }
 
@@ -2623,7 +2729,7 @@ mod tests {
             String::from_utf8_lossy(&started.stderr)
         );
 
-        ensure_cli_tmux_server_options_on(&socket);
+        ensure_cli_tmux_server_options_on(&socket, true);
 
         let shown = std::process::Command::new("tmux")
             .args(["-L", &socket, "show-options", "-gv", "window-size"])
