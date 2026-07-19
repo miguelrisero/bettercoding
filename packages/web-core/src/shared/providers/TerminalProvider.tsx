@@ -20,6 +20,8 @@ interface TerminalConnection {
   ws: WebSocket;
   send: (data: string) => void;
   resize: (cols: number, rows: number) => void;
+  /** Last effective presence sent on this socket; null until open sync. */
+  lastSentPresence: boolean | null;
   generation: ConnectionGeneration;
 }
 
@@ -233,14 +235,16 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
     new Map()
   );
 
-  // One document-level broadcaster serves every terminal. The generation
+  // One document-level broadcaster serves every terminal. Presence is
+  // connection-specific: a visible document can still have a gated/detached
+  // pane whose stale grid must not participate in tmux sizing. The generation
   // check prevents a socket discarded during a session switch from receiving
-  // a late visibility heartbeat before its close event settles.
+  // a late heartbeat before its close event settles.
   const broadcastPresence = useCallback(
-    (visible: boolean, resendSize: boolean) => {
-      const presence = JSON.stringify({ type: 'presence', visible });
+    (force: boolean, resendVisibleSize: boolean, targetTabId?: string) => {
       terminalConnectionsRef.current.forEach((connection, tabId) => {
         if (
+          (targetTabId !== undefined && tabId !== targetTabId) ||
           connection.generation.closed ||
           reconnectStateRef.current.get(tabId) !== connection.generation ||
           connection.ws.readyState !== WebSocket.OPEN
@@ -248,13 +252,21 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
           return;
         }
 
-        connection.ws.send(presence);
-        if (resendSize) {
-          const size = connectionCallbacksRef.current.get(tabId)?.getSize?.();
-          if (size) {
-            connection.resize(size.cols, size.rows);
-          }
+        const size =
+          connectionCallbacksRef.current.get(tabId)?.getSize?.() ?? null;
+        const visible = document.visibilityState === 'visible' && size !== null;
+        if (!force && connection.lastSentPresence === visible) {
+          return;
         }
+
+        // Re-admitting a previously hidden client at its stale grid would
+        // reflow tmux once here and again on resize. Refresh its grid first,
+        // then clear ignore-size with the presence frame.
+        if (visible && resendVisibleSize) {
+          connection.resize(size.cols, size.rows);
+        }
+        connection.ws.send(JSON.stringify({ type: 'presence', visible }));
+        connection.lastSentPresence = visible;
       });
     },
     []
@@ -262,15 +274,14 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
 
   useEffect(() => {
     const handleVisibilityChange = () => {
-      const visible = document.visibilityState === 'visible';
-      broadcastPresence(visible, visible);
+      broadcastPresence(false, true);
     };
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
     const heartbeat = window.setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        broadcastPresence(true, false);
-      }
+      // Backend staleness is heartbeat-based. Send each connection's current
+      // effective state even when unchanged; same-state updates are in-memory.
+      broadcastPresence(true, false);
     }, 60_000);
 
     return () => {
@@ -391,10 +402,14 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
         terminalConnectionsRef.current.get(tabId)?.send(data);
       },
       resize: (cols: number, rows: number) => {
-        terminalConnectionsRef.current.get(tabId)?.resize(cols, rows);
+        const connection = terminalConnectionsRef.current.get(tabId);
+        connection?.resize(cols, rows);
+        // A resize callback comes from a measurable mounted pane. If it was
+        // gated off, rejoin sizing immediately after sending the fresh grid.
+        broadcastPresence(false, false, tabId);
       },
     }),
-    []
+    [broadcastPresence]
   );
 
   const createTerminalConnection = useCallback(
@@ -600,6 +615,28 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
               }
             };
 
+            const send = (data: string) => {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(
+                  JSON.stringify({ type: 'input', data: encodeBase64(data) })
+                );
+              }
+            };
+
+            const resize = (cols: number, rows: number) => {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+              }
+            };
+
+            const connection: TerminalConnection = {
+              ws,
+              send,
+              resize,
+              lastSentPresence: null,
+              generation,
+            };
+
             // Send the current terminal size once the socket is open. The
             // initial ResizeObserver fit usually fires before the socket is
             // ready and is dropped, which would otherwise leave the PTY/tmux
@@ -619,17 +656,21 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
                 return;
               }
 
-              // Reconnects can complete while the document is hidden. Correct
-              // the backend's visible-by-default presence before syncing size.
+              const size =
+                connectionCallbacksRef.current.get(tabId)?.getSize?.() ?? null;
+              const visible =
+                document.visibilityState === 'visible' && size !== null;
+              // Reconnects can complete while the document or pane is hidden.
+              // Correct connect-time presence before syncing size. This open
+              // path keeps its existing ordering; visibility transitions use
+              // resize-before-presence in `broadcastPresence` above.
               ws.send(
                 JSON.stringify({
                   type: 'presence',
-                  visible: document.visibilityState === 'visible',
+                  visible,
                 })
               );
-              const size = connectionCallbacksRef.current
-                .get(tabId)
-                ?.getSize?.();
+              connection.lastSentPresence = visible;
               if (size) {
                 ws.send(
                   JSON.stringify({
@@ -702,26 +743,6 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
               scheduleReconnect();
             };
 
-            const send = (data: string) => {
-              if (ws.readyState === WebSocket.OPEN) {
-                ws.send(
-                  JSON.stringify({ type: 'input', data: encodeBase64(data) })
-                );
-              }
-            };
-
-            const resize = (cols: number, rows: number) => {
-              if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'resize', cols, rows }));
-              }
-            };
-
-            const connection: TerminalConnection = {
-              ws,
-              send,
-              resize,
-              generation,
-            };
             terminalConnectionsRef.current.set(tabId, connection);
           } catch {
             scheduleReconnect();
