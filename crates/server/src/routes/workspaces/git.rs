@@ -968,3 +968,169 @@ pub async fn continue_workspace_rebase(
 
     Ok(ResponseJson(ApiResponse::success(())))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use db::{
+        models::{
+            repo::Repo,
+            workspace::{CreateWorkspace, Workspace},
+            workspace_repo::{CreateWorkspaceRepo, WorkspaceRepo},
+        },
+        run_migrations_for_tests,
+    };
+    use git::GitServiceError;
+    use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+    use uuid::Uuid;
+
+    use super::rebase_workspace_core;
+
+    const OLD_TARGET: &str = "main";
+    const NEW_TARGET: &str = "release";
+
+    struct RebaseFixture {
+        pool: SqlitePool,
+        workspace_id: Uuid,
+        repo_id: Uuid,
+    }
+
+    async fn rebase_fixture() -> RebaseFixture {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations_for_tests(&pool).await.unwrap();
+
+        let repo = Repo::find_or_create(
+            &pool,
+            Path::new("/virtual/rebase-persist-order-test"),
+            "Rebase persist order test",
+        )
+        .await
+        .unwrap();
+        let workspace_id = Uuid::new_v4();
+        Workspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "feature/test".to_string(),
+                name: Some("Rebase persist order test".to_string()),
+            },
+            workspace_id,
+        )
+        .await
+        .unwrap();
+        WorkspaceRepo::create_many(
+            &pool,
+            workspace_id,
+            &[CreateWorkspaceRepo {
+                repo_id: repo.id,
+                target_branch: OLD_TARGET.to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        RebaseFixture {
+            pool,
+            workspace_id,
+            repo_id: repo.id,
+        }
+    }
+
+    async fn persisted_target_state(fixture: &RebaseFixture) -> (Vec<u8>, Vec<u8>) {
+        sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
+            r#"SELECT CAST(target_branch AS BLOB), CAST(updated_at AS BLOB)
+               FROM workspace_repos
+               WHERE workspace_id = $1 AND repo_id = $2"#,
+        )
+        .bind(fixture.workspace_id)
+        .bind(fixture.repo_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn assert_failed_rebase_preserves_target(error: GitServiceError) -> GitServiceError {
+        let fixture = rebase_fixture().await;
+        let before = persisted_target_state(&fixture).await;
+
+        let error = rebase_workspace_core(
+            &fixture.pool,
+            fixture.workspace_id,
+            fixture.repo_id,
+            OLD_TARGET,
+            NEW_TARGET,
+            move |new_base_branch, old_base_branch| {
+                assert_eq!(new_base_branch, NEW_TARGET);
+                assert_eq!(old_base_branch, OLD_TARGET);
+                Err::<(), _>(error)
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        let after = persisted_target_state(&fixture).await;
+        assert_eq!(
+            after, before,
+            "a failed rebase must not change target_branch or updated_at"
+        );
+
+        error
+    }
+
+    #[tokio::test]
+    async fn merge_conflicts_leave_rebase_target_unchanged() {
+        let error = assert_failed_rebase_preserves_target(GitServiceError::MergeConflicts {
+            message: "simulated conflict".to_string(),
+            conflicted_files: vec!["src/lib.rs".to_string()],
+        })
+        .await;
+
+        assert!(matches!(error, GitServiceError::MergeConflicts { .. }));
+    }
+
+    #[tokio::test]
+    async fn rebase_in_progress_leaves_rebase_target_unchanged() {
+        let error = assert_failed_rebase_preserves_target(GitServiceError::RebaseInProgress).await;
+
+        assert!(matches!(error, GitServiceError::RebaseInProgress));
+    }
+
+    #[tokio::test]
+    async fn generic_rebase_failure_leaves_rebase_target_unchanged() {
+        let error = assert_failed_rebase_preserves_target(GitServiceError::InvalidRepository(
+            "simulated failure".to_string(),
+        ))
+        .await;
+
+        assert!(matches!(error, GitServiceError::InvalidRepository(_)));
+    }
+
+    #[tokio::test]
+    async fn successful_rebase_persists_new_target() {
+        let fixture = rebase_fixture().await;
+
+        let result = rebase_workspace_core(
+            &fixture.pool,
+            fixture.workspace_id,
+            fixture.repo_id,
+            OLD_TARGET,
+            NEW_TARGET,
+            |new_base_branch, old_base_branch| {
+                assert_eq!(new_base_branch, NEW_TARGET);
+                assert_eq!(old_base_branch, OLD_TARGET);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_ok());
+        let (target_branch, _) = persisted_target_state(&fixture).await;
+        assert_eq!(target_branch, NEW_TARGET.as_bytes());
+    }
+}
