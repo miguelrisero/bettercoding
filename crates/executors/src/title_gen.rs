@@ -7,9 +7,17 @@
 //! failure, so callers always fall back to heuristic naming and workspace
 //! creation is never blocked for long or broken by a slow/absent model.
 
-use std::{process::Stdio, time::Duration};
+use std::{
+    io,
+    process::{Output, Stdio},
+    time::Duration,
+};
 
+#[cfg(unix)]
+use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use serde::Deserialize;
+#[cfg(unix)]
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::executors::claude::base_command;
 
@@ -189,15 +197,28 @@ pub async fn generate_workspace_names(first_message: &str) -> Option<WorkspaceNa
     let base = base_command(false);
     let mut parts = base.split_whitespace();
     let program = parts.next()?;
-    let lead_args: Vec<&str> = parts.collect();
+    let mut args: Vec<String> = parts.map(str::to_owned).collect();
+    args.extend([
+        "-p".to_string(),
+        prompt,
+        "--model".to_string(),
+        "haiku".to_string(),
+        "--strict-mcp-config".to_string(),
+    ]);
 
+    generate_workspace_names_with_command(program, &args, CALL_TIMEOUT).await
+}
+
+/// Run and parse a title command. Keeping the program, arguments, and timeout
+/// injectable makes process lifecycle failures testable without invoking npx or
+/// a model.
+async fn generate_workspace_names_with_command(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Option<WorkspaceNames> {
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(&lead_args)
-        .arg("-p")
-        .arg(&prompt)
-        .arg("--model")
-        .arg("haiku")
-        .arg("--strict-mcp-config")
+    cmd.args(args)
         .current_dir(std::env::temp_dir())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -206,19 +227,19 @@ pub async fn generate_workspace_names(first_message: &str) -> Option<WorkspaceNa
 
     // Each branch logs WHY it fell back — the original silent `?` chain made a
     // timed-out/erroring call indistinguishable from "model produced no title".
-    let output = match tokio::time::timeout(CALL_TIMEOUT, cmd.output()).await {
-        Err(_) => {
+    let output = match command_output_with_timeout(&mut cmd, timeout).await {
+        Ok(None) => {
             tracing::warn!(
                 "workspace title generation timed out after {}s; using heuristic naming",
-                CALL_TIMEOUT.as_secs()
+                timeout.as_secs()
             );
             return None;
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             tracing::warn!("workspace title generation could not spawn claude: {e}");
             return None;
         }
-        Ok(Ok(output)) => output,
+        Ok(Some(output)) => output,
     };
     if !output.status.success() {
         tracing::warn!(
@@ -236,6 +257,85 @@ pub async fn generate_workspace_names(first_message: &str) -> Option<WorkspaceNa
         );
     }
     names
+}
+
+#[cfg(unix)]
+async fn command_output_with_timeout(
+    cmd: &mut tokio::process::Command,
+    timeout: Duration,
+) -> io::Result<Option<Output>> {
+    let mut child = cmd.group_spawn()?;
+    let stdout = child
+        .inner()
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("title command stdout was not piped"))?;
+    let stderr = child
+        .inner()
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("title command stderr was not piped"))?;
+
+    let collect_output = async {
+        let (status, stdout, stderr) = tokio::try_join!(
+            wait_for_group_exit(&mut child),
+            read_to_end(stdout),
+            read_to_end(stderr),
+        )?;
+        Ok::<Output, io::Error>(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    };
+
+    match tokio::time::timeout(timeout, collect_output).await {
+        Ok(output) => output.map(Some),
+        Err(_) => {
+            kill_and_reap_group(&mut child).await;
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn command_output_with_timeout(
+    cmd: &mut tokio::process::Command,
+    timeout: Duration,
+) -> io::Result<Option<Output>> {
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(output) => output.map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_group_exit(child: &mut AsyncGroupChild) -> io::Result<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(unix)]
+async fn read_to_end(mut reader: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+async fn kill_and_reap_group(child: &mut AsyncGroupChild) {
+    // command-group retains the PGID captured at spawn, so this SIGKILL reaches
+    // descendants even if the npx group leader has already exited.
+    if let Err(error) = child.start_kill() {
+        tracing::warn!("failed to SIGKILL timed-out title process group: {error}");
+    }
+    if let Err(error) = child.wait().await {
+        tracing::warn!("failed to reap timed-out title process group: {error}");
+    }
 }
 
 /// Extract `{title, branch}` from claude's stdout (which may wrap the JSON in a
@@ -290,7 +390,46 @@ fn slugify(input: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{TITLE_MAX_CHARS, first_line_title_hint, parse_workspace_names, slugify};
+    use std::time::Duration;
+
+    use super::{
+        TITLE_MAX_CHARS, first_line_title_hint, generate_workspace_names_with_command,
+        parse_workspace_names, slugify,
+    };
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_background_grandchild() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let progress_path = temp_dir.path().join("grandchild-progress");
+        let script = r#"
+            while :; do
+                printf x >> "$1"
+                sleep 0.02
+            done &
+            wait
+        "#;
+        let args = vec![
+            "-c".to_string(),
+            script.to_string(),
+            "title-gen-timeout-test".to_string(),
+            progress_path.to_string_lossy().into_owned(),
+        ];
+
+        let names =
+            generate_workspace_names_with_command("/bin/sh", &args, Duration::from_millis(150))
+                .await;
+
+        assert!(names.is_none());
+        let size_after_return = std::fs::metadata(&progress_path).unwrap().len();
+        assert!(size_after_return > 0, "grandchild never wrote progress");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            std::fs::metadata(&progress_path).unwrap().len(),
+            size_after_return,
+            "grandchild kept running after the timeout returned"
+        );
+    }
 
     #[test]
     fn parses_fenced_json() {
