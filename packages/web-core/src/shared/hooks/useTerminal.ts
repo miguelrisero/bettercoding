@@ -71,6 +71,7 @@ export interface TerminalContextType {
     resize: (cols: number, rows: number) => void;
   };
   getTerminalConnection: (tabId: string) => TerminalConnection | null;
+  broadcastTerminalPresence: (tabId: string) => void;
 }
 
 export const TerminalContext = createHmrContext<TerminalContextType | null>(

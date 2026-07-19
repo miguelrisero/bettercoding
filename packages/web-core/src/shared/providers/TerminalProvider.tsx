@@ -272,6 +272,13 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
     []
   );
 
+  const broadcastTerminalPresence = useCallback(
+    (tabId: string) => {
+      broadcastPresence(false, false, tabId);
+    },
+    [broadcastPresence]
+  );
+
   useEffect(() => {
     const handleVisibilityChange = () => {
       broadcastPresence(false, true);
@@ -778,6 +785,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       unregisterTerminalInstance,
       createTerminalConnection,
       getTerminalConnection,
+      broadcastTerminalPresence,
     }),
     [
       getTabsForWorkspace,
@@ -792,6 +800,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       unregisterTerminalInstance,
       createTerminalConnection,
       getTerminalConnection,
+      broadcastTerminalPresence,
     ]
   );
 

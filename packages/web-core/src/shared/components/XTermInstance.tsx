@@ -52,6 +52,21 @@ interface XTermInstanceProps {
   sessionId?: string;
 }
 
+function isTerminalMeasurable(terminal: Terminal): boolean {
+  const element = terminal.element;
+  const parent = element?.parentElement;
+  return Boolean(
+    element &&
+      parent &&
+      element.isConnected &&
+      parent.isConnected &&
+      element.offsetWidth !== 0 &&
+      element.offsetHeight !== 0 &&
+      parent.offsetWidth !== 0 &&
+      parent.offsetHeight !== 0
+  );
+}
+
 export function XTermInstance({
   tabId,
   workspaceId,
@@ -72,6 +87,7 @@ export function XTermInstance({
     getTerminalInstance,
     createTerminalConnection,
     getTerminalConnection,
+    broadcastTerminalPresence,
   } = useTerminal();
 
   // Latest sessionId / onClose for the connection callbacks. The provider
@@ -123,17 +139,7 @@ export function XTermInstance({
   const getEndpoint = useCallback((): string | null => {
     const instance = fitInstance();
     if (!instance) return null;
-    const element = instance.terminal.element;
-    const parent = element?.parentElement;
-    if (
-      !element ||
-      !parent ||
-      !element.isConnected ||
-      element.offsetWidth === 0 ||
-      element.offsetHeight === 0 ||
-      parent.offsetWidth === 0 ||
-      parent.offsetHeight === 0
-    ) {
+    if (!isTerminalMeasurable(instance.terminal)) {
       return null;
     }
     return resolveTerminalEndpoint(
@@ -177,7 +183,7 @@ export function XTermInstance({
         // Re-fit and report the current grid so the PTY/tmux is sized to the
         // pane on every (re)connect (see TerminalProvider ws.onopen).
         const instance = fitInstance();
-        if (!instance) return null;
+        if (!instance || !isTerminalMeasurable(instance.terminal)) return null;
         return { cols: instance.terminal.cols, rows: instance.terminal.rows };
       }
     );
@@ -385,6 +391,7 @@ export function XTermInstance({
       if (terminal.element && terminal.element.parentNode) {
         terminal.element.parentNode.removeChild(terminal.element);
       }
+      broadcastTerminalPresence(tabId);
       terminalRef.current = null;
       fitAddonRef.current = null;
       setLiveTerminal(null);
@@ -395,6 +402,7 @@ export function XTermInstance({
     getTerminalInstance,
     registerTerminalInstance,
     getTerminalConnection,
+    broadcastTerminalPresence,
   ]);
 
   // A session switch must also heal a dead/given-up connection: without this,
