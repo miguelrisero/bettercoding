@@ -48,7 +48,8 @@ const SIZE_SWEEP_TICKS: u8 = 15;
 /// but only briefly; old input must never override an explicit hidden record.
 const FRESH_INPUT_SECS: u64 = 60;
 
-/// Visible browser heartbeats arrive every minute. Five missed heartbeats mean
+/// Visible browser heartbeats arrive every minute (see
+/// `TerminalProvider.tsx::PRESENCE_HEARTBEAT_MS`). Five missed heartbeats mean
 /// the host is gone; visible tabs are not meaningfully timer-throttled.
 const VISIBLE_PRESENCE_STALE_SECS: u64 = 5 * 60;
 
