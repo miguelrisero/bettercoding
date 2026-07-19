@@ -1589,15 +1589,19 @@ struct PtySession {
     /// `Drop` checks this before signalling so it never targets a PID that
     /// was already reaped (and possibly recycled) on the natural-exit path.
     child_reaped: Arc<AtomicBool>,
-    /// PID of the `tmux new-session/attach` client process. This is the stable
-    /// bridge from a web PTY session to tmux's per-client `ignore-size` flag;
-    /// shell sessions (including CLI fallback when tmux is absent) have none.
-    tmux_client_pid: Option<u32>,
-    /// Browser visibility/heartbeat state for this tmux client. Kept beside
-    /// the session so teardown removes the presence record atomically with the
-    /// PTY client it describes.
-    cli_presence: Option<CliClientPresence>,
+    /// Per-client tmux sizing state. Shell sessions (including CLI fallback
+    /// when tmux is absent) have none; PID and presence always exist together.
+    tmux_client: Option<CliTmuxClient>,
     _output_handle: thread::JoinHandle<()>,
+}
+
+struct CliTmuxClient {
+    /// PID of the `tmux new-session/attach` client process. This is the stable
+    /// bridge from a web PTY session to tmux's per-client `ignore-size` flag.
+    pid: u32,
+    /// Kept beside the session so teardown removes the presence record
+    /// atomically with the PTY client it describes.
+    presence: CliClientPresence,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1608,6 +1612,17 @@ pub(crate) struct CliClientPresence {
     /// this timestamp: the sizing sweep compares it with tmux's last input to
     /// decide whether input happened after a delayed hidden transition.
     pub(crate) last_changed_at: Instant,
+}
+
+impl CliClientPresence {
+    fn new(visible: bool) -> Self {
+        let now = Instant::now();
+        Self {
+            visible,
+            last_visible_at: now,
+            last_changed_at: now,
+        }
+    }
 }
 
 impl Drop for PtySession {
@@ -1949,14 +1964,9 @@ impl PtyService {
                 master: pty_pair.master,
                 child_killer,
                 child_reaped,
-                tmux_client_pid,
-                cli_presence: tmux_client_pid.map(|_| {
-                    let now = Instant::now();
-                    CliClientPresence {
-                        visible: !tmux_connect_hidden,
-                        last_visible_at: now,
-                        last_changed_at: now,
-                    }
+                tmux_client: tmux_client_pid.map(|pid| CliTmuxClient {
+                    pid,
+                    presence: CliClientPresence::new(!tmux_connect_hidden),
                 }),
                 _output_handle: output_handle,
             })
@@ -2050,17 +2060,10 @@ impl PtyService {
                 tracing::debug!("CLI presence session {session_id} no longer exists");
                 return;
             };
-            let Some(client_pid) = session.tmux_client_pid else {
+            let Some(tmux_client) = session.tmux_client.as_mut() else {
                 return;
             };
-            let presence = session.cli_presence.get_or_insert_with(|| {
-                let now = Instant::now();
-                CliClientPresence {
-                    visible: true,
-                    last_visible_at: now,
-                    last_changed_at: now,
-                }
-            });
+            let presence = &mut tmux_client.presence;
             let now = Instant::now();
             if presence.visible == visible {
                 if visible {
@@ -2074,7 +2077,7 @@ impl PtyService {
             if visible {
                 presence.last_visible_at = now;
             }
-            client_pid
+            tmux_client.pid
         };
 
         // Two rapid transitions can finish out of order; the periodic sweep
@@ -2114,7 +2117,12 @@ impl PtyService {
         };
         sessions
             .values()
-            .filter_map(|session| Some((session.tmux_client_pid?, session.cli_presence?)))
+            .filter_map(|session| {
+                session
+                    .tmux_client
+                    .as_ref()
+                    .map(|client| (client.pid, client.presence))
+            })
             .collect()
     }
 
@@ -2905,8 +2913,7 @@ mod tests {
             master,
             child_killer,
             child_reaped: child_reaped.clone(),
-            tmux_client_pid: None,
-            cli_presence: None,
+            tmux_client: None,
             _output_handle: output_handle,
         };
         drop(session);
