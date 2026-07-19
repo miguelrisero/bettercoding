@@ -7,6 +7,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
+    time::Instant,
 };
 
 use executors::executors::cli::{CliContinue, CliLaunchSpec, CliPromptArg, CliResume};
@@ -1506,7 +1507,21 @@ struct PtySession {
     /// `Drop` checks this before signalling so it never targets a PID that
     /// was already reaped (and possibly recycled) on the natural-exit path.
     child_reaped: Arc<AtomicBool>,
+    /// PID of the `tmux new-session/attach` client process. This is the stable
+    /// bridge from a web PTY session to tmux's per-client `ignore-size` flag;
+    /// shell sessions (including CLI fallback when tmux is absent) have none.
+    tmux_client_pid: Option<u32>,
+    /// Browser visibility/heartbeat state for this tmux client. Kept beside
+    /// the session so teardown removes the presence record atomically with the
+    /// PTY client it describes.
+    cli_presence: Option<CliClientPresence>,
     _output_handle: thread::JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CliClientPresence {
+    pub(crate) visible: bool,
+    pub(crate) last_visible_at: Instant,
 }
 
 impl Drop for PtySession {
@@ -1745,6 +1760,15 @@ impl PtyService {
                 .spawn_command(cmd)
                 .map_err(|e| PtyError::CreateFailed(e.to_string()))?;
 
+            // `Child` moves into the reader/reaper thread below, so capture its
+            // tmux client PID now. Shell-mode PIDs must never enter the presence
+            // registry: they have no tmux client whose size flag can be changed.
+            let tmux_client_pid = if tmux_workspace.is_some() {
+                child.process_id()
+            } else {
+                None
+            };
+
             // Independent kill handle so teardown can unblock the reader.
             let mut child_killer = child.clone_killer();
             let child_reaped = Arc::new(AtomicBool::new(false));
@@ -1820,6 +1844,11 @@ impl PtyService {
                 master: pty_pair.master,
                 child_killer,
                 child_reaped,
+                tmux_client_pid,
+                cli_presence: tmux_client_pid.map(|_| CliClientPresence {
+                    visible: true,
+                    last_visible_at: Instant::now(),
+                }),
                 _output_handle: output_handle,
             })
         })
@@ -1890,6 +1919,74 @@ impl PtyService {
         Ok(())
     }
 
+    /// Record browser visibility for a CLI tmux client and immediately update
+    /// whether it participates in `window-size smallest`. Shell sessions are a
+    /// silent no-op; tmux lookup/refresh races are best-effort because the slow
+    /// activity sweep repairs the desired flag later.
+    pub async fn set_cli_presence(&self, session_id: Uuid, visible: bool) {
+        let client_pid = {
+            let mut sessions = match self.sessions.lock() {
+                Ok(sessions) => sessions,
+                Err(e) => {
+                    tracing::debug!("Failed to lock CLI presence registry: {e}");
+                    return;
+                }
+            };
+            let Some(session) = sessions.get_mut(&session_id) else {
+                tracing::debug!("CLI presence session {session_id} no longer exists");
+                return;
+            };
+            let Some(client_pid) = session.tmux_client_pid else {
+                return;
+            };
+            let presence = session
+                .cli_presence
+                .get_or_insert_with(|| CliClientPresence {
+                    visible: true,
+                    last_visible_at: Instant::now(),
+                });
+            presence.visible = visible;
+            if visible {
+                presence.last_visible_at = Instant::now();
+            }
+            client_pid
+        };
+
+        let client_name = match cli_tmux_client_name(client_pid).await {
+            Ok(Some(client_name)) => client_name,
+            Ok(None) => {
+                tracing::debug!("tmux client pid {client_pid} not found for CLI presence update");
+                return;
+            }
+            Err(e) => {
+                tracing::debug!("Failed to resolve tmux client pid {client_pid}: {e}");
+                return;
+            }
+        };
+        if let Err(e) = refresh_cli_tmux_client_ignore_size(&client_name, !visible).await {
+            tracing::debug!(
+                "Failed to update ignore-size for tmux client {client_name} (pid {client_pid}): {e}"
+            );
+        }
+    }
+
+    /// Snapshot web presence by the tmux client PID used in `list-clients`.
+    /// A poisoned registry yields an empty view; the sweep then falls back to
+    /// tmux activity instead of letting a monitoring failure affect terminals.
+    pub(crate) fn cli_presence_snapshot(&self) -> HashMap<u32, CliClientPresence> {
+        let sessions = match self.sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                tracing::debug!("Failed to snapshot CLI presence registry: {e}");
+                return HashMap::new();
+            }
+        };
+        sessions
+            .values()
+            .filter_map(|session| Some((session.tmux_client_pid?, session.cli_presence?)))
+            .collect()
+    }
+
     pub async fn close_session(&self, session_id: Uuid) -> Result<(), PtyError> {
         // Dropping the removed session runs the full teardown — VEOF disarm
         // then child kill — in `Drop for PtySession`. Bound OUTSIDE the lock
@@ -1903,6 +2000,59 @@ impl PtyService {
             .remove(&session_id);
         drop(session);
         Ok(())
+    }
+}
+
+async fn cli_tmux_client_name(client_pid: u32) -> Result<Option<String>, String> {
+    let output = tokio::process::Command::new("tmux")
+        .args([
+            "-L",
+            CLI_TMUX_SOCKET,
+            "list-clients",
+            "-F",
+            "#{client_pid}\t#{client_name}",
+        ])
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let (pid, name) = line.split_once('\t')?;
+            (pid.trim().parse::<u32>().ok()? == client_pid).then(|| name.to_string())
+        }))
+}
+
+pub(crate) async fn refresh_cli_tmux_client_ignore_size(
+    client_name: &str,
+    ignore_size: bool,
+) -> Result<(), String> {
+    let flag = if ignore_size {
+        "ignore-size"
+    } else {
+        "!ignore-size"
+    };
+    let output = tokio::process::Command::new("tmux")
+        .args([
+            "-L",
+            CLI_TMUX_SOCKET,
+            "refresh-client",
+            "-t",
+            client_name,
+            "-f",
+            flag,
+        ])
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
 }
 
@@ -2594,6 +2744,8 @@ mod tests {
             master,
             child_killer,
             child_reaped: child_reaped.clone(),
+            tmux_client_pid: None,
+            cli_presence: None,
             _output_handle: output_handle,
         };
         drop(session);
