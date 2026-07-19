@@ -31,7 +31,7 @@ use db::{
 use uuid::Uuid;
 
 use crate::pty::{
-    CLI_TMUX_SOCKET, CliClientPresence, PtyService, cli_tmux_client_name, now_unix_secs,
+    CLI_TMUX_SOCKET, CliClientPresence, PtyService, now_unix_secs,
     refresh_cli_tmux_client_ignore_size, run_cli_tmux, tmux_available, tmux_client_flags_supported,
     workspace_id_from_cli_session_name,
 };
@@ -233,8 +233,13 @@ pub struct CliActivityMonitor;
 
 #[derive(Default)]
 struct ClientSizeSweepState {
-    refresh_failures: HashMap<(u32, String), u8>,
+    refresh_failures: HashMap<u32, ClientSizeRefreshFailure>,
     seen_client_pids: HashSet<u32>,
+}
+
+struct ClientSizeRefreshFailure {
+    client_name: String,
+    count: u8,
 }
 
 struct ClientSizeSweepPermit(Arc<AtomicBool>);
@@ -369,8 +374,8 @@ impl CliActivityMonitor {
 }
 
 /// Reconcile tmux's per-client flag with web presence. One list command gives
-/// every field needed for every workspace; refresh only actual transitions so
-/// steady state stays at a single tmux fork per sweep.
+/// every field needed for every workspace. Steady state stops there; a batch
+/// with transitions takes one fresh PID/name snapshot before any mutation.
 async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepState) {
     if !tmux_client_flags_supported() {
         return;
@@ -410,16 +415,14 @@ async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepSt
         &mut state.seen_client_pids,
         clients.iter().map(|client| client.client_pid).collect(),
     );
-    let live_clients: HashSet<_> = clients
-        .iter()
-        .map(|client| (client.client_pid, client.client_name.clone()))
-        .collect();
-    state
-        .refresh_failures
-        .retain(|client, _| live_clients.contains(client));
+    state.refresh_failures.retain(|client_pid, failure| {
+        clients.iter().any(|client| {
+            client.client_pid == *client_pid && client.client_name == failure.client_name
+        })
+    });
 
+    let mut transitions = Vec::new();
     for client in clients {
-        let failure_key = (client.client_pid, client.client_name.clone());
         let input_idle_secs = now_unix.saturating_sub(client.client_activity).max(0) as u64;
         let sizing_presence = presence
             .get(&client.client_pid)
@@ -432,18 +435,50 @@ async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepSt
             continue;
         };
         if desired_ignore == client.ignore_size {
-            state.refresh_failures.remove(&failure_key);
+            state.refresh_failures.remove(&client.client_pid);
             continue;
         }
+        transitions.push((client, desired_ignore));
+    }
 
+    if transitions.is_empty() {
+        return;
+    }
+
+    let output = match run_cli_tmux(&[
+        "-L",
+        CLI_TMUX_SOCKET,
+        "list-clients",
+        "-F",
+        "#{client_pid}\t#{client_name}",
+    ])
+    .await
+    {
+        Ok(output) => output,
+        Err(e) => {
+            tracing::debug!("Failed to refresh tmux client map for size transitions: {e}");
+            return;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let fresh_clients: HashMap<u32, &str> = stdout
+        .lines()
+        .filter_map(|line| {
+            let (pid, name) = line.split_once('\t')?;
+            let pid = pid.trim().parse().ok()?;
+            (!name.is_empty()).then_some((pid, name))
+        })
+        .collect();
+
+    for (client, desired_ignore) in transitions {
         // `client_name` is a /dev/pts/N path and can be recycled after the
-        // sweep snapshot. Re-resolve this PID immediately before the mutating
-        // command and require the same mapping so a stale row can never target
-        // a different terminal.
-        match cli_tmux_client_name(client.client_pid).await {
-            Ok(Some(fresh_name)) if fresh_name == client.client_name => {}
-            Ok(Some(fresh_name)) => {
-                state.refresh_failures.remove(&failure_key);
+        // sweep snapshot. Require the fresh batch snapshot to preserve every
+        // planned PID/name mapping so a stale row can never target another
+        // terminal.
+        match fresh_clients.get(&client.client_pid).copied() {
+            Some(fresh_name) if fresh_name == client.client_name => {}
+            Some(fresh_name) => {
+                state.refresh_failures.remove(&client.client_pid);
                 tracing::debug!(
                     client_name = %client.client_name,
                     client_pid = client.client_pid,
@@ -452,8 +487,8 @@ async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepSt
                 );
                 continue;
             }
-            Ok(None) => {
-                state.refresh_failures.remove(&failure_key);
+            None => {
+                state.refresh_failures.remove(&client.client_pid);
                 tracing::debug!(
                     client_name = %client.client_name,
                     client_pid = client.client_pid,
@@ -461,25 +496,26 @@ async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepSt
                 );
                 continue;
             }
-            Err(e) => {
-                tracing::debug!(
-                    client_name = %client.client_name,
-                    client_pid = client.client_pid,
-                    error = %e,
-                    "Failed to re-resolve tmux client for size transition"
-                );
-                continue;
-            }
         }
 
         match refresh_cli_tmux_client_ignore_size(&client.client_name, desired_ignore).await {
             Ok(()) => {
-                state.refresh_failures.remove(&failure_key);
+                state.refresh_failures.remove(&client.client_pid);
             }
             Err(e) => {
-                let failures = state.refresh_failures.entry(failure_key).or_default();
-                *failures = failures.saturating_add(1);
-                if *failures == 2 {
+                let failure = state
+                    .refresh_failures
+                    .entry(client.client_pid)
+                    .or_insert_with(|| ClientSizeRefreshFailure {
+                        client_name: client.client_name.clone(),
+                        count: 0,
+                    });
+                if failure.client_name != client.client_name {
+                    failure.client_name.clone_from(&client.client_name);
+                    failure.count = 0;
+                }
+                failure.count = failure.count.saturating_add(1);
+                if failure.count == 2 {
                     tracing::warn!(
                         client_name = %client.client_name,
                         client_pid = client.client_pid,
@@ -494,7 +530,7 @@ async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepSt
                     client_name = %client.client_name,
                     client_pid = client.client_pid,
                     error = %e,
-                    consecutive_failures = *failures,
+                    consecutive_failures = failure.count,
                     "Failed to reconcile tmux client size"
                 );
             }
