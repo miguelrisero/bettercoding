@@ -2142,25 +2142,14 @@ impl PtyService {
 }
 
 pub(crate) async fn cli_tmux_client_name(client_pid: u32) -> Result<Option<String>, String> {
-    let output = tokio::time::timeout(
-        CLI_TMUX_COMMAND_TIMEOUT,
-        tokio::process::Command::new("tmux")
-            .args([
-                "-L",
-                CLI_TMUX_SOCKET,
-                "list-clients",
-                "-F",
-                "#{client_pid}\t#{client_name}",
-            ])
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| "tmux list-clients timed out after 5s".to_string())?
-    .map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
+    let output = run_cli_tmux(&[
+        "-L",
+        CLI_TMUX_SOCKET,
+        "list-clients",
+        "-F",
+        "#{client_pid}\t#{client_name}",
+    ])
+    .await?;
 
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -2183,29 +2172,42 @@ pub(crate) async fn refresh_cli_tmux_client_ignore_size(
     } else {
         "!ignore-size"
     };
+    run_cli_tmux(&[
+        "-L",
+        CLI_TMUX_SOCKET,
+        "refresh-client",
+        "-t",
+        client_name,
+        "-f",
+        flag,
+    ])
+    .await
+    .map(|_| ())
+}
+
+pub(crate) async fn run_cli_tmux(args: &[&str]) -> Result<std::process::Output, String> {
     let output = tokio::time::timeout(
         CLI_TMUX_COMMAND_TIMEOUT,
         tokio::process::Command::new("tmux")
-            .args([
-                "-L",
-                CLI_TMUX_SOCKET,
-                "refresh-client",
-                "-t",
-                client_name,
-                "-f",
-                flag,
-            ])
+            .args(args)
             .kill_on_drop(true)
             .output(),
     )
     .await
-    .map_err(|_| "tmux refresh-client timed out after 5s".to_string())?
+    .map_err(|_| format!("tmux command timed out after {CLI_TMUX_COMMAND_TIMEOUT:?}"))?
     .map_err(|e| e.to_string())?;
+
     if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        return Ok(output);
     }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    Err(if stderr.is_empty() {
+        format!("tmux command exited with {}", output.status)
+    } else {
+        stderr.to_string()
+    })
 }
 
 impl Default for PtyService {

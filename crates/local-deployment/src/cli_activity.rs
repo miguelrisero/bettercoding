@@ -16,7 +16,13 @@
 //! then re-broadcasts the owning workspace's status patch, so the sidebar
 //! moves in near-real-time without any new streaming plumbing.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use db::{
     DBService,
@@ -26,7 +32,7 @@ use uuid::Uuid;
 
 use crate::pty::{
     CLI_TMUX_SOCKET, CliClientPresence, PtyService, cli_tmux_client_name,
-    refresh_cli_tmux_client_ignore_size, tmux_available, tmux_client_flags_supported,
+    refresh_cli_tmux_client_ignore_size, run_cli_tmux, tmux_available, tmux_client_flags_supported,
     workspace_id_from_cli_session_name,
 };
 
@@ -224,6 +230,20 @@ fn subtree_has_claude(root: u32, procs: &ProcSnapshot) -> bool {
 
 pub struct CliActivityMonitor;
 
+#[derive(Default)]
+struct ClientSizeSweepState {
+    refresh_failures: HashMap<(u32, String), u8>,
+    seen_client_pids: HashSet<u32>,
+}
+
+struct ClientSizeSweepPermit(Arc<AtomicBool>);
+
+impl Drop for ClientSizeSweepPermit {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl CliActivityMonitor {
     pub fn spawn(db: DBService, pty: PtyService) {
         tokio::spawn(async move {
@@ -254,8 +274,9 @@ impl CliActivityMonitor {
             let mut interval = tokio::time::interval(POLL_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut size_sweep_ticks = 0;
-            let mut size_refresh_failures: HashMap<(u32, String), u8> = HashMap::new();
-            let mut seen_client_pids = HashSet::new();
+            let size_sweep_running = Arc::new(AtomicBool::new(false));
+            let size_sweep_state =
+                Arc::new(tokio::sync::Mutex::new(ClientSizeSweepState::default()));
 
             loop {
                 interval.tick().await;
@@ -263,12 +284,21 @@ impl CliActivityMonitor {
                 size_sweep_ticks += 1;
                 if size_sweep_ticks == SIZE_SWEEP_TICKS {
                     size_sweep_ticks = 0;
-                    sweep_client_size_flags(
-                        &pty,
-                        &mut size_refresh_failures,
-                        &mut seen_client_pids,
-                    )
-                    .await;
+                    // Sizing repair must never delay the activity state
+                    // machine. Skip this tick instead of queuing overlap.
+                    if size_sweep_running
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        let pty = pty.clone();
+                        let running = size_sweep_running.clone();
+                        let state = size_sweep_state.clone();
+                        tokio::spawn(async move {
+                            let _permit = ClientSizeSweepPermit(running);
+                            let mut state = state.lock().await;
+                            sweep_client_size_flags(&pty, &mut state).await;
+                        });
+                    }
                 }
 
                 // A missing tmux server (no sessions yet, or it died) reads
@@ -340,25 +370,19 @@ impl CliActivityMonitor {
 /// Reconcile tmux's per-client flag with web presence. One list command gives
 /// every field needed for every workspace; refresh only actual transitions so
 /// steady state stays at a single tmux fork per sweep.
-async fn sweep_client_size_flags(
-    pty: &PtyService,
-    refresh_failures: &mut HashMap<(u32, String), u8>,
-    seen_client_pids: &mut HashSet<u32>,
-) {
+async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepState) {
     if !tmux_client_flags_supported() {
         return;
     }
 
-    let output = match tokio::process::Command::new("tmux")
-        .args([
-            "-L",
-            CLI_TMUX_SOCKET,
-            "list-clients",
-            "-F",
-            "#{client_pid}\t#{client_name}\t#{client_activity}\t#{client_flags}\t#{session_name}",
-        ])
-        .output()
-        .await
+    let output = match run_cli_tmux(&[
+        "-L",
+        CLI_TMUX_SOCKET,
+        "list-clients",
+        "-F",
+        "#{client_pid}\t#{client_name}\t#{client_activity}\t#{client_flags}\t#{session_name}",
+    ])
+    .await
     {
         Ok(output) => output,
         Err(e) => {
@@ -366,13 +390,6 @@ async fn sweep_client_size_flags(
             return;
         }
     };
-    if !output.status.success() {
-        tracing::debug!(
-            "tmux client size sweep unavailable: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        return;
-    }
 
     // LOAD-BEARING ORDERING — do not harmlessly swap these snapshots. The
     // sweep reads tmux flags above BEFORE snapshotting presence here, while
@@ -392,14 +409,16 @@ async fn sweep_client_size_flags(
         .filter_map(parse_cli_client_line)
         .collect();
     let previous_client_pids = std::mem::replace(
-        seen_client_pids,
+        &mut state.seen_client_pids,
         clients.iter().map(|client| client.client_pid).collect(),
     );
     let live_clients: HashSet<_> = clients
         .iter()
         .map(|client| (client.client_pid, client.client_name.clone()))
         .collect();
-    refresh_failures.retain(|client, _| live_clients.contains(client));
+    state
+        .refresh_failures
+        .retain(|client, _| live_clients.contains(client));
 
     for client in clients {
         let failure_key = (client.client_pid, client.client_name.clone());
@@ -415,7 +434,7 @@ async fn sweep_client_size_flags(
             continue;
         };
         if desired_ignore == client.ignore_size {
-            refresh_failures.remove(&failure_key);
+            state.refresh_failures.remove(&failure_key);
             continue;
         }
 
@@ -426,7 +445,7 @@ async fn sweep_client_size_flags(
         match cli_tmux_client_name(client.client_pid).await {
             Ok(Some(fresh_name)) if fresh_name == client.client_name => {}
             Ok(Some(fresh_name)) => {
-                refresh_failures.remove(&failure_key);
+                state.refresh_failures.remove(&failure_key);
                 tracing::debug!(
                     client_name = %client.client_name,
                     client_pid = client.client_pid,
@@ -436,7 +455,7 @@ async fn sweep_client_size_flags(
                 continue;
             }
             Ok(None) => {
-                refresh_failures.remove(&failure_key);
+                state.refresh_failures.remove(&failure_key);
                 tracing::debug!(
                     client_name = %client.client_name,
                     client_pid = client.client_pid,
@@ -457,10 +476,10 @@ async fn sweep_client_size_flags(
 
         match refresh_cli_tmux_client_ignore_size(&client.client_name, desired_ignore).await {
             Ok(()) => {
-                refresh_failures.remove(&failure_key);
+                state.refresh_failures.remove(&failure_key);
             }
             Err(e) => {
-                let failures = refresh_failures.entry(failure_key).or_default();
+                let failures = state.refresh_failures.entry(failure_key).or_default();
                 *failures = failures.saturating_add(1);
                 if *failures == 2 {
                     tracing::warn!(
