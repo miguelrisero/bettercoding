@@ -658,7 +658,7 @@ async fn handle_terminal_ws(
                                     let _ = pty_service.resize(session_id_for_input, cols, rows).await;
                                 }
                                 TerminalCommand::Presence { visible } => {
-                                    pty_service.set_cli_presence(session_id_for_input, visible).await;
+                                    pty_service.set_cli_presence(session_id_for_input, visible);
                                 }
                             }
                         }

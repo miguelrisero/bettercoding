@@ -934,6 +934,11 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 256;
 /// server that inherits the backend environment is clearly ours, not shared.
 pub(crate) const CLI_TMUX_SOCKET: &str = "vibe-kanban";
 
+/// Bound every tmux fork used for client-flag reconciliation. These commands
+/// are best-effort and the periodic sweep repairs failures, so a wedged tmux
+/// must never retain a task indefinitely.
+const CLI_TMUX_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// tmux session name for a workspace's CLI-mode terminal. The `vk_` namespace
 /// is ours: creation, attach, and cleanup only ever target these names.
 /// `simple()` (32 hex chars, no hyphens) avoids tmux-special characters.
@@ -2032,11 +2037,12 @@ impl PtyService {
         Ok(())
     }
 
-    /// Record browser visibility for a CLI tmux client and immediately update
-    /// whether it participates in `window-size smallest`. Shell sessions are a
-    /// silent no-op; tmux lookup/refresh races are best-effort because the slow
-    /// activity sweep repairs the desired flag later.
-    pub async fn set_cli_presence(&self, session_id: Uuid, visible: bool) {
+    /// Record browser visibility for a CLI tmux client and schedule an update
+    /// to whether it participates in `window-size smallest`. Shell sessions
+    /// and same-state heartbeats are synchronous no-ops outside the registry;
+    /// transition reconciliation is bounded, fire-and-forget work because the
+    /// periodic activity sweep is the repair path.
+    pub fn set_cli_presence(&self, session_id: Uuid, visible: bool) {
         if !tmux_client_flags_supported() {
             return;
         }
@@ -2065,32 +2071,41 @@ impl PtyService {
                 }
             });
             let now = Instant::now();
-            if presence.visible != visible {
-                presence.visible = visible;
-                presence.last_changed_at = now;
+            if presence.visible == visible {
+                if visible {
+                    presence.last_visible_at = now;
+                }
+                return;
             }
+
+            presence.visible = visible;
+            presence.last_changed_at = now;
             if visible {
                 presence.last_visible_at = now;
             }
             client_pid
         };
 
-        let client_name = match cli_tmux_client_name(client_pid).await {
-            Ok(Some(client_name)) => client_name,
-            Ok(None) => {
-                tracing::debug!("tmux client pid {client_pid} not found for CLI presence update");
-                return;
+        tokio::spawn(async move {
+            let client_name = match cli_tmux_client_name(client_pid).await {
+                Ok(Some(client_name)) => client_name,
+                Ok(None) => {
+                    tracing::debug!(
+                        "tmux client pid {client_pid} not found for CLI presence update"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to resolve tmux client pid {client_pid}: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = refresh_cli_tmux_client_ignore_size(&client_name, !visible).await {
+                tracing::debug!(
+                    "Failed to update ignore-size for tmux client {client_name} (pid {client_pid}): {e}"
+                );
             }
-            Err(e) => {
-                tracing::debug!("Failed to resolve tmux client pid {client_pid}: {e}");
-                return;
-            }
-        };
-        if let Err(e) = refresh_cli_tmux_client_ignore_size(&client_name, !visible).await {
-            tracing::debug!(
-                "Failed to update ignore-size for tmux client {client_name} (pid {client_pid}): {e}"
-            );
-        }
+        });
     }
 
     /// Snapshot web presence by the tmux client PID used in `list-clients`.
@@ -2127,17 +2142,22 @@ impl PtyService {
 }
 
 async fn cli_tmux_client_name(client_pid: u32) -> Result<Option<String>, String> {
-    let output = tokio::process::Command::new("tmux")
-        .args([
-            "-L",
-            CLI_TMUX_SOCKET,
-            "list-clients",
-            "-F",
-            "#{client_pid}\t#{client_name}",
-        ])
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
+    let output = tokio::time::timeout(
+        CLI_TMUX_COMMAND_TIMEOUT,
+        tokio::process::Command::new("tmux")
+            .args([
+                "-L",
+                CLI_TMUX_SOCKET,
+                "list-clients",
+                "-F",
+                "#{client_pid}\t#{client_name}",
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "tmux list-clients timed out after 5s".to_string())?
+    .map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -2163,19 +2183,24 @@ pub(crate) async fn refresh_cli_tmux_client_ignore_size(
     } else {
         "!ignore-size"
     };
-    let output = tokio::process::Command::new("tmux")
-        .args([
-            "-L",
-            CLI_TMUX_SOCKET,
-            "refresh-client",
-            "-t",
-            client_name,
-            "-f",
-            flag,
-        ])
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
+    let output = tokio::time::timeout(
+        CLI_TMUX_COMMAND_TIMEOUT,
+        tokio::process::Command::new("tmux")
+            .args([
+                "-L",
+                CLI_TMUX_SOCKET,
+                "refresh-client",
+                "-t",
+                client_name,
+                "-f",
+                flag,
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "tmux refresh-client timed out after 5s".to_string())?
+    .map_err(|e| e.to_string())?;
     if output.status.success() {
         Ok(())
     } else {
