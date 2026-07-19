@@ -37,15 +37,17 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 /// one `list-clients` fork roughly every 30 seconds instead of every poll.
 const SIZE_SWEEP_TICKS: u8 = 15;
 
-/// Actual keyboard input is authoritative presence even when a visibility
-/// record says hidden (a delayed browser event must not clamp/unclamp against
-/// what the user is demonstrably doing).
+/// Input newer than a hidden transition can disprove a delayed browser event,
+/// but only briefly; old input must never override an explicit hidden record.
 const FRESH_INPUT_SECS: u64 = 60;
 
-/// Visible browser heartbeats arrive every minute. Twenty minutes deliberately
-/// tolerates passive watchers and timer throttling while still releasing tabs
-/// that were discarded or left half-open.
-const PRESENCE_STALE_SECS: u64 = 20 * 60;
+/// Visible browser heartbeats arrive every minute. Five missed heartbeats mean
+/// the host is gone; visible tabs are not meaningfully timer-throttled.
+const VISIBLE_PRESENCE_STALE_SECS: u64 = 5 * 60;
+
+/// Manually attached tmux clients have no browser heartbeat. Keep passive
+/// watchers participating until they have been input-idle for twenty minutes.
+const MANUAL_CLIENT_IDLE_SECS: u64 = 20 * 60;
 
 /// Output newer than this counts as "actively running". claude's TUI repaints
 /// continuously (spinner/progress) while working, so a working pane never
@@ -80,23 +82,24 @@ struct Observation {
 struct SizingPresence {
     visible: bool,
     last_visible_ago_secs: u64,
+    changed_ago_secs: u64,
 }
 
 /// Decide whether one attached tmux client should be excluded from window
 /// sizing. Pure over ordinary ages/booleans so precedence and boundary
 /// semantics cannot be obscured by tmux or clock I/O.
 fn should_ignore_client_size(input_idle_secs: u64, presence: Option<SizingPresence>) -> bool {
-    // Keyboard input always wins, including over a hidden/stale web record.
-    if input_idle_secs < FRESH_INPUT_SECS {
-        return false;
-    }
-
     match presence {
-        Some(presence) if !presence.visible => true,
-        Some(presence) => presence.last_visible_ago_secs >= PRESENCE_STALE_SECS,
-        // Manually attached tmux clients have no web heartbeat. Give them the
-        // same generous passive-watcher window, but only flag AFTER it.
-        None => input_idle_secs > PRESENCE_STALE_SECS,
+        Some(presence) if !presence.visible => {
+            // A delayed hidden browser event loses only to demonstrably newer,
+            // still-fresh input. Input from before the transition cannot make
+            // an explicitly hidden client rejoin sizing.
+            !(input_idle_secs < presence.changed_ago_secs && input_idle_secs < FRESH_INPUT_SECS)
+        }
+        Some(presence) => presence.last_visible_ago_secs >= VISIBLE_PRESENCE_STALE_SECS,
+        // Manual clients have no heartbeat, so use input idleness and flag
+        // only after the generous passive-watcher threshold.
+        None => input_idle_secs > MANUAL_CLIENT_IDLE_SECS,
     }
 }
 
@@ -380,6 +383,9 @@ fn sizing_presence(presence: CliClientPresence, now: std::time::Instant) -> Sizi
         last_visible_ago_secs: now
             .saturating_duration_since(presence.last_visible_at)
             .as_secs(),
+        changed_ago_secs: now
+            .saturating_duration_since(presence.last_changed_at)
+            .as_secs(),
     }
 }
 
@@ -510,29 +516,55 @@ mod tests {
     }
 
     #[test]
-    fn fresh_input_unflags_even_hidden_presence_until_exact_cutoff() {
+    fn hidden_transition_overrides_input_that_came_before_it() {
         let hidden = Some(SizingPresence {
             visible: false,
-            last_visible_ago_secs: 0,
+            last_visible_ago_secs: 10,
+            changed_ago_secs: 10,
         });
-        assert!(!should_ignore_client_size(FRESH_INPUT_SECS - 1, hidden));
-        assert!(should_ignore_client_size(FRESH_INPUT_SECS, hidden));
+        assert!(should_ignore_client_size(30, hidden));
     }
 
     #[test]
-    fn hidden_presence_flags_an_idle_client() {
+    fn input_after_hidden_transition_temporarily_keeps_client_in_sizing() {
         let hidden = Some(SizingPresence {
             visible: false,
-            last_visible_ago_secs: 0,
+            last_visible_ago_secs: 10,
+            changed_ago_secs: 10,
         });
-        assert!(should_ignore_client_size(FRESH_INPUT_SECS, hidden));
+        assert!(!should_ignore_client_size(5, hidden));
+    }
+
+    #[test]
+    fn hidden_input_override_is_strict_at_transition_and_freshness_boundaries() {
+        let hidden_ten_seconds_ago = Some(SizingPresence {
+            visible: false,
+            last_visible_ago_secs: 10,
+            changed_ago_secs: 10,
+        });
+        assert!(should_ignore_client_size(10, hidden_ten_seconds_ago));
+
+        let hidden_before_freshness_window = Some(SizingPresence {
+            visible: false,
+            last_visible_ago_secs: FRESH_INPUT_SECS + 1,
+            changed_ago_secs: FRESH_INPUT_SECS + 1,
+        });
+        assert!(should_ignore_client_size(
+            FRESH_INPUT_SECS,
+            hidden_before_freshness_window
+        ));
+        assert!(!should_ignore_client_size(
+            FRESH_INPUT_SECS - 1,
+            hidden_before_freshness_window
+        ));
     }
 
     #[test]
     fn fresh_visible_heartbeat_keeps_client_in_sizing() {
         let fresh = Some(SizingPresence {
             visible: true,
-            last_visible_ago_secs: PRESENCE_STALE_SECS - 1,
+            last_visible_ago_secs: VISIBLE_PRESENCE_STALE_SECS - 1,
+            changed_ago_secs: VISIBLE_PRESENCE_STALE_SECS - 1,
         });
         assert!(!should_ignore_client_size(FRESH_INPUT_SECS, fresh));
     }
@@ -541,15 +573,16 @@ mod tests {
     fn visible_heartbeat_is_stale_at_exact_threshold() {
         let stale = Some(SizingPresence {
             visible: true,
-            last_visible_ago_secs: PRESENCE_STALE_SECS,
+            last_visible_ago_secs: VISIBLE_PRESENCE_STALE_SECS,
+            changed_ago_secs: VISIBLE_PRESENCE_STALE_SECS,
         });
         assert!(should_ignore_client_size(FRESH_INPUT_SECS, stale));
     }
 
     #[test]
     fn manual_client_is_flagged_only_after_twenty_minutes_idle() {
-        assert!(!should_ignore_client_size(PRESENCE_STALE_SECS, None));
-        assert!(should_ignore_client_size(PRESENCE_STALE_SECS + 1, None));
+        assert!(!should_ignore_client_size(MANUAL_CLIENT_IDLE_SECS, None));
+        assert!(should_ignore_client_size(MANUAL_CLIENT_IDLE_SECS + 1, None));
     }
 
     #[test]

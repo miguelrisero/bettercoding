@@ -1522,6 +1522,10 @@ struct PtySession {
 pub(crate) struct CliClientPresence {
     pub(crate) visible: bool,
     pub(crate) last_visible_at: Instant,
+    /// When `visible` last changed value. Same-value heartbeats must not move
+    /// this timestamp: the sizing sweep compares it with tmux's last input to
+    /// decide whether input happened after a delayed hidden transition.
+    pub(crate) last_changed_at: Instant,
 }
 
 impl Drop for PtySession {
@@ -1845,9 +1849,13 @@ impl PtyService {
                 child_killer,
                 child_reaped,
                 tmux_client_pid,
-                cli_presence: tmux_client_pid.map(|_| CliClientPresence {
-                    visible: true,
-                    last_visible_at: Instant::now(),
+                cli_presence: tmux_client_pid.map(|_| {
+                    let now = Instant::now();
+                    CliClientPresence {
+                        visible: true,
+                        last_visible_at: now,
+                        last_changed_at: now,
+                    }
                 }),
                 _output_handle: output_handle,
             })
@@ -1939,15 +1947,21 @@ impl PtyService {
             let Some(client_pid) = session.tmux_client_pid else {
                 return;
             };
-            let presence = session
-                .cli_presence
-                .get_or_insert_with(|| CliClientPresence {
+            let presence = session.cli_presence.get_or_insert_with(|| {
+                let now = Instant::now();
+                CliClientPresence {
                     visible: true,
-                    last_visible_at: Instant::now(),
-                });
-            presence.visible = visible;
+                    last_visible_at: now,
+                    last_changed_at: now,
+                }
+            });
+            let now = Instant::now();
+            if presence.visible != visible {
+                presence.visible = visible;
+                presence.last_changed_at = now;
+            }
             if visible {
-                presence.last_visible_at = Instant::now();
+                presence.last_visible_at = now;
             }
             client_pid
         };
