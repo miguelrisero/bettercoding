@@ -360,6 +360,15 @@ async fn is_directory(path: &Path) -> Result<bool, ApiError> {
     }
 }
 
+async fn ensure_uploads_gitignore(uploads_dir: &Path) -> Result<(), ApiError> {
+    let gitignore = uploads_dir.join(".gitignore");
+    if !tokio::fs::try_exists(&gitignore).await.unwrap_or(false) {
+        // Fail loudly: a missing .gitignore would let uploads leak into git.
+        tokio::fs::write(&gitignore, "*\n").await?;
+    }
+    Ok(())
+}
+
 /// Resolve the default upload directory, migrating the legacy directory when
 /// possible while preserving it as a lossless fallback on any rename failure.
 async fn resolve_uploads_dir(canonical_base: &Path) -> Result<PathBuf, ApiError> {
@@ -369,10 +378,10 @@ async fn resolve_uploads_dir(canonical_base: &Path) -> Result<PathBuf, ApiError>
     let uploads_exists = is_directory(&uploads_dir).await?;
     let legacy_exists = is_directory(&legacy_uploads_dir).await?;
 
-    match (uploads_exists, legacy_exists) {
-        (true, _) => Ok(uploads_dir),
+    let resolved_dir = match (uploads_exists, legacy_exists) {
+        (true, _) => uploads_dir,
         (false, true) => match tokio::fs::rename(&legacy_uploads_dir, &uploads_dir).await {
-            Ok(()) => Ok(uploads_dir),
+            Ok(()) => uploads_dir,
             Err(_) => {
                 // A concurrent resolver may have won the rename race. Any other
                 // rename failure keeps the legacy directory as the safe fallback.
@@ -380,22 +389,20 @@ async fn resolve_uploads_dir(canonical_base: &Path) -> Result<PathBuf, ApiError>
                     .await
                     .is_ok_and(|metadata| metadata.is_dir())
                 {
-                    Ok(uploads_dir)
+                    uploads_dir
                 } else {
-                    Ok(legacy_uploads_dir)
+                    legacy_uploads_dir
                 }
             }
         },
         (false, false) => {
             tokio::fs::create_dir_all(&uploads_dir).await?;
-            let gitignore = uploads_dir.join(".gitignore");
-            if !tokio::fs::try_exists(&gitignore).await.unwrap_or(false) {
-                // Fail loudly: a missing .gitignore would let uploads leak into git.
-                tokio::fs::write(&gitignore, "*\n").await?;
-            }
-            Ok(uploads_dir)
+            uploads_dir
         }
-    }
+    };
+
+    ensure_uploads_gitignore(&resolved_dir).await?;
+    Ok(resolved_dir)
 }
 
 pub async fn upload_files(
@@ -616,6 +623,7 @@ mod tests {
         let base = tempdir.path();
         let expected = seed_upload_dir(base, UPLOADS_DIR);
         fs::write(expected.join("new.txt"), b"new data").unwrap();
+        fs::remove_file(expected.join(".gitignore")).unwrap();
 
         let resolved = resolve_uploads_dir(base).await.unwrap();
 
@@ -634,6 +642,8 @@ mod tests {
         let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
         fs::write(expected.join("new.txt"), b"new data").unwrap();
         fs::write(legacy.join("legacy.txt"), b"legacy data").unwrap();
+        fs::remove_file(expected.join(".gitignore")).unwrap();
+        fs::remove_file(legacy.join(".gitignore")).unwrap();
 
         let resolved = resolve_uploads_dir(base).await.unwrap();
 
@@ -641,12 +651,12 @@ mod tests {
         assert!(expected.is_dir());
         assert!(legacy.is_dir());
         assert_gitignored(&expected);
-        assert_gitignored(&legacy);
+        assert!(!legacy.join(".gitignore").exists());
         assert_eq!(fs::read(expected.join("new.txt")).unwrap(), b"new data");
         assert_eq!(fs::read(legacy.join("legacy.txt")).unwrap(), b"legacy data");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_uploads_dir_resolvers_preserve_legacy_files() {
         let tempdir = tempfile::tempdir().unwrap();
         let base = tempdir.path().to_path_buf();
@@ -683,6 +693,7 @@ mod tests {
         let base = tempdir.path();
         let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
         fs::write(legacy.join("keep.txt"), b"do not lose me").unwrap();
+        fs::remove_file(legacy.join(".gitignore")).unwrap();
         let blocked_new_path = base.join(UPLOADS_DIR);
         fs::write(&blocked_new_path, b"not a directory").unwrap();
 
