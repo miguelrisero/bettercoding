@@ -857,10 +857,10 @@ fn cli_tmux_conf_path() -> Option<PathBuf> {
 /// first so the append-style options aren't re-applied on every attach.
 /// Best-effort: no server running is the common case and simply a no-op.
 fn ensure_cli_tmux_server_options() {
-    ensure_cli_tmux_server_options_on(CLI_TMUX_SOCKET, tmux_client_flags_supported());
+    ensure_cli_tmux_server_options_on(CLI_TMUX_SOCKET);
 }
 
-fn ensure_cli_tmux_server_options_on(socket: &str, client_flags_supported: bool) {
+fn ensure_cli_tmux_server_options_on(socket: &str) {
     let tmux = |args: &[&str]| {
         std::process::Command::new("tmux")
             .args(["-L", socket])
@@ -876,7 +876,7 @@ fn ensure_cli_tmux_server_options_on(socket: &str, client_flags_supported: bool)
     // the conf don't hand the bootstrap to a fish/csh login shell.
     let _ = tmux(&["set-option", "-g", "default-shell", "/bin/sh"]);
 
-    if client_flags_supported {
+    if tmux_client_flags_supported() {
         // This migration MUST stay above the clipboard probe: a production
         // server commonly already has `set-clipboard on`, which makes the
         // probe return early, but may have started before window-size joined
@@ -2164,10 +2164,6 @@ pub(crate) async fn refresh_cli_tmux_client_ignore_size(
     client_name: &str,
     ignore_size: bool,
 ) -> Result<(), String> {
-    if !tmux_client_flags_supported() {
-        return Ok(());
-    }
-
     let flag = if ignore_size {
         "ignore-size"
     } else {
@@ -2778,7 +2774,7 @@ mod tests {
             String::from_utf8_lossy(&started.stderr)
         );
 
-        ensure_cli_tmux_server_options_on(&socket, true);
+        ensure_cli_tmux_server_options_on(&socket);
 
         let shown = std::process::Command::new("tmux")
             .args(["-L", &socket, "show-options", "-gv", "window-size"])
