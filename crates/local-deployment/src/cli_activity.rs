@@ -16,7 +16,7 @@
 //! then re-broadcasts the owning workspace's status patch, so the sidebar
 //! moves in near-real-time without any new streaming plumbing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use db::{
     DBService,
@@ -25,8 +25,9 @@ use db::{
 use uuid::Uuid;
 
 use crate::pty::{
-    CLI_TMUX_SOCKET, CliClientPresence, PtyService, refresh_cli_tmux_client_ignore_size,
-    tmux_available, tmux_client_flags_supported, workspace_id_from_cli_session_name,
+    CLI_TMUX_SOCKET, CliClientPresence, PtyService, cli_tmux_client_name,
+    refresh_cli_tmux_client_ignore_size, tmux_available, tmux_client_flags_supported,
+    workspace_id_from_cli_session_name,
 };
 
 /// Poll cadence. Two seconds keeps bucket transitions snappy while the cost
@@ -240,6 +241,7 @@ impl CliActivityMonitor {
             let mut interval = tokio::time::interval(POLL_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut size_sweep_ticks = 0;
+            let mut size_refresh_failures: HashMap<(u32, String), u8> = HashMap::new();
 
             loop {
                 interval.tick().await;
@@ -247,7 +249,7 @@ impl CliActivityMonitor {
                 size_sweep_ticks += 1;
                 if size_sweep_ticks == SIZE_SWEEP_TICKS {
                     size_sweep_ticks = 0;
-                    sweep_client_size_flags(&pty).await;
+                    sweep_client_size_flags(&pty, &mut size_refresh_failures).await;
                 }
 
                 // A missing tmux server (no sessions yet, or it died) reads
@@ -319,7 +321,10 @@ impl CliActivityMonitor {
 /// Reconcile tmux's per-client flag with web presence. One list command gives
 /// every field needed for every workspace; refresh only actual transitions so
 /// steady state stays at a single tmux fork per sweep.
-async fn sweep_client_size_flags(pty: &PtyService) {
+async fn sweep_client_size_flags(
+    pty: &PtyService,
+    refresh_failures: &mut HashMap<(u32, String), u8>,
+) {
     if !tmux_client_flags_supported() {
         return;
     }
@@ -349,6 +354,12 @@ async fn sweep_client_size_flags(pty: &PtyService) {
         return;
     }
 
+    // LOAD-BEARING ORDERING — do not harmlessly swap these snapshots. The
+    // sweep reads tmux flags above BEFORE snapshotting presence here, while
+    // the event path writes the presence registry BEFORE refreshing tmux.
+    // A race can therefore only make this sweep re-issue an event decision;
+    // it cannot observe the new tmux flag with the old registry state and
+    // revert that decision.
     let presence = pty.cli_presence_snapshot();
     let now_instant = std::time::Instant::now();
     let now_unix = std::time::SystemTime::now()
@@ -356,27 +367,90 @@ async fn sweep_client_size_flags(pty: &PtyService) {
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0);
 
-    for client in String::from_utf8_lossy(&output.stdout)
+    let clients: Vec<_> = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(parse_cli_client_line)
-    {
+        .collect();
+    let live_clients: HashSet<_> = clients
+        .iter()
+        .map(|client| (client.client_pid, client.client_name.clone()))
+        .collect();
+    refresh_failures.retain(|client, _| live_clients.contains(client));
+
+    for client in clients {
+        let failure_key = (client.client_pid, client.client_name.clone());
         let input_idle_secs = now_unix.saturating_sub(client.client_activity).max(0) as u64;
         let sizing_presence = presence
             .get(&client.client_pid)
             .map(|presence| sizing_presence(*presence, now_instant));
         let desired_ignore = should_ignore_client_size(input_idle_secs, sizing_presence);
         if desired_ignore == client.ignore_size {
+            refresh_failures.remove(&failure_key);
             continue;
         }
 
-        if let Err(e) =
-            refresh_cli_tmux_client_ignore_size(&client.client_name, desired_ignore).await
-        {
-            tracing::debug!(
-                "Failed to reconcile ignore-size for tmux client {} (pid {}): {e}",
-                client.client_name,
-                client.client_pid
-            );
+        // `client_name` is a /dev/pts/N path and can be recycled after the
+        // sweep snapshot. Re-resolve this PID immediately before the mutating
+        // command and require the same mapping so a stale row can never target
+        // a different terminal.
+        match cli_tmux_client_name(client.client_pid).await {
+            Ok(Some(fresh_name)) if fresh_name == client.client_name => {}
+            Ok(Some(fresh_name)) => {
+                refresh_failures.remove(&failure_key);
+                tracing::debug!(
+                    client_name = %client.client_name,
+                    client_pid = client.client_pid,
+                    resolved_name = %fresh_name,
+                    "Skipping stale tmux client size transition"
+                );
+                continue;
+            }
+            Ok(None) => {
+                refresh_failures.remove(&failure_key);
+                tracing::debug!(
+                    client_name = %client.client_name,
+                    client_pid = client.client_pid,
+                    "Skipping vanished tmux client size transition"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    client_name = %client.client_name,
+                    client_pid = client.client_pid,
+                    error = %e,
+                    "Failed to re-resolve tmux client for size transition"
+                );
+                continue;
+            }
+        }
+
+        match refresh_cli_tmux_client_ignore_size(&client.client_name, desired_ignore).await {
+            Ok(()) => {
+                refresh_failures.remove(&failure_key);
+            }
+            Err(e) => {
+                let failures = refresh_failures.entry(failure_key).or_default();
+                *failures = failures.saturating_add(1);
+                if *failures == 2 {
+                    tracing::warn!(
+                        client_name = %client.client_name,
+                        client_pid = client.client_pid,
+                        error = %e,
+                        "Failed to reconcile tmux client size twice consecutively"
+                    );
+                    continue;
+                }
+                // First and later failures stay at debug; the second failure
+                // above is the single operator signal until success resets it.
+                tracing::debug!(
+                    client_name = %client.client_name,
+                    client_pid = client.client_pid,
+                    error = %e,
+                    consecutive_failures = *failures,
+                    "Failed to reconcile tmux client size"
+                );
+            }
         }
     }
 }

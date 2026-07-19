@@ -2141,7 +2141,7 @@ impl PtyService {
     }
 }
 
-async fn cli_tmux_client_name(client_pid: u32) -> Result<Option<String>, String> {
+pub(crate) async fn cli_tmux_client_name(client_pid: u32) -> Result<Option<String>, String> {
     let output = tokio::time::timeout(
         CLI_TMUX_COMMAND_TIMEOUT,
         tokio::process::Command::new("tmux")
