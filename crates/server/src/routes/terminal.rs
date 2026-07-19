@@ -73,6 +73,7 @@ const DEFAULT_ROWS: u16 = 24;
 enum TerminalCommand {
     Input { data: String },
     Resize { cols: u16, rows: u16 },
+    Presence { visible: bool },
 }
 
 #[derive(Debug, Serialize)]
@@ -650,6 +651,9 @@ async fn handle_terminal_ws(
                                 }
                                 TerminalCommand::Resize { cols, rows } => {
                                     let _ = pty_service.resize(session_id_for_input, cols, rows).await;
+                                }
+                                TerminalCommand::Presence { visible } => {
+                                    pty_service.set_cli_presence(session_id_for_input, visible).await;
                                 }
                             }
                         }
