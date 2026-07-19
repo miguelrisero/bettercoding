@@ -31,7 +31,7 @@ use db::{
 use uuid::Uuid;
 
 use crate::pty::{
-    CLI_TMUX_SOCKET, CliClientPresence, PtyService, cli_tmux_client_name,
+    CLI_TMUX_SOCKET, CliClientPresence, PtyService, cli_tmux_client_name, now_unix_secs,
     refresh_cli_tmux_client_ignore_size, run_cli_tmux, tmux_available, tmux_client_flags_supported,
     workspace_id_from_cli_session_name,
 };
@@ -399,10 +399,7 @@ async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepSt
     // revert that decision.
     let presence = pty.cli_presence_snapshot();
     let now_instant = std::time::Instant::now();
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0);
+    let now_unix = now_unix_secs();
 
     let clients: Vec<_> = String::from_utf8_lossy(&output.stdout)
         .lines()

@@ -1333,7 +1333,7 @@ async fn paste_via_tmux_buffer(workspace_id: Uuid, target: &str, text: &str) -> 
 
 /// Seconds since the Unix epoch (best-effort; 0 if the system clock is before
 /// the epoch). Used to turn tmux's `session_activity` epoch into an idle age.
-fn now_unix_secs() -> i64 {
+pub(crate) fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
