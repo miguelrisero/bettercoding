@@ -1,6 +1,10 @@
 use std::path::{Path, PathBuf};
 
 /// Directory name for storing attachments in worktrees
+// TODO(bc-legacy-cleanup): rename deferred - stored free-text prompts and messages embed
+// .vibe-attachments/... links (scratch messages, session history), and the prefix is also
+// synthesized in the workspace create flow which is out of scope for this change; renaming
+// would break historical references.
 pub const VIBE_ATTACHMENTS_DIR: &str = ".vibe-attachments";
 
 /// Directories that should always be skipped regardless of gitignore.
