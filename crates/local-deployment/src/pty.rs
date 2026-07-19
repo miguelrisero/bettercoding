@@ -821,18 +821,7 @@ fn seed_codex_update_dismissal() -> std::io::Result<()> {
 ///   (`vk_p="$(cat …)"`, `{ …; } | …`) — a fish/csh login shell would fail on
 ///   it outright. The pane still ends in the USER'S shell: the bootstrap's
 ///   final `exec "${SHELL:-/bin/sh}"` honors `$SHELL`.
-const CLI_TMUX_CONF_WITH_CLIENT_FLAGS: &str = "\
-# BetterCoding embedded terminal tmux server (socket: vibe-kanban).
-# Written by the backend before each CLI terminal attach - edits are overwritten.
-set -g mouse on
-set -s set-clipboard on
-set -as terminal-features ',xterm*:clipboard'
-set -g window-size smallest
-set -g default-shell /bin/sh
-unbind-key -n MouseDown3Pane
-";
-
-const CLI_TMUX_CONF_WITHOUT_CLIENT_FLAGS: &str = "\
+const CLI_TMUX_CONF: &str = "\
 # BetterCoding embedded terminal tmux server (socket: vibe-kanban).
 # Written by the backend before each CLI terminal attach - edits are overwritten.
 set -g mouse on
@@ -842,12 +831,12 @@ set -g default-shell /bin/sh
 unbind-key -n MouseDown3Pane
 ";
 
-fn cli_tmux_conf(client_flags_supported: bool) -> &'static str {
+fn cli_tmux_conf(client_flags_supported: bool) -> String {
+    let mut conf = CLI_TMUX_CONF.to_string();
     if client_flags_supported {
-        CLI_TMUX_CONF_WITH_CLIENT_FLAGS
-    } else {
-        CLI_TMUX_CONF_WITHOUT_CLIENT_FLAGS
+        conf.push_str("set -g window-size smallest\n");
     }
+    conf
 }
 
 /// Write the embedded server config (idempotent) and return its path.
@@ -856,7 +845,7 @@ fn cli_tmux_conf_path() -> Option<PathBuf> {
     let path = dir.join("cli-tmux.conf");
     let desired = cli_tmux_conf(tmux_client_flags_supported());
     let current = std::fs::read_to_string(&path).ok();
-    if current.as_deref() != Some(desired) {
+    if current.as_deref() != Some(desired.as_str()) {
         std::fs::create_dir_all(&dir).ok()?;
         std::fs::write(&path, desired).ok()?;
     }
