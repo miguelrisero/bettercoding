@@ -2815,6 +2815,7 @@ dependencies = [
  "json-patch 2.0.0",
  "jsonc-parser",
  "lru 0.12.5",
+ "nix 0.29.0",
  "openssl",
  "os_pipe",
  "rand 0.8.5",

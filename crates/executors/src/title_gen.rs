@@ -13,10 +13,10 @@ use std::{
     time::Duration,
 };
 
-#[cfg(unix)]
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
-use serde::Deserialize;
 #[cfg(unix)]
+use nix::{errno::Errno, sys::signal::killpg, unistd::Pid};
+use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::executors::claude::base_command;
@@ -40,6 +40,9 @@ struct RawNames {
 const TITLE_MAX_CHARS: usize = 48;
 const BRANCH_MAX_CHARS: usize = 40;
 const PROMPT_MAX_CHARS: usize = 2000;
+const CAPTURE_MAX_BYTES: usize = 64 * 1024;
+const GROUP_EXIT_BARRIER: Duration = Duration::from_secs(2);
+const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 // Measured successes take 5-17s, while legitimate naming calls can take up to
 // ~47s under load once npx startup and user config parsing are included. Runaway
 // calls are now killed as a whole process group, so a 90s budget is safe.
@@ -264,58 +267,57 @@ async fn generate_workspace_names_with_command(
     names
 }
 
-#[cfg(unix)]
 async fn command_output_with_timeout(
     cmd: &mut tokio::process::Command,
     timeout: Duration,
 ) -> io::Result<Option<Output>> {
-    let mut child = cmd.group_spawn()?;
-    let stdout = child
-        .inner()
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("title command stdout was not piped"))?;
-    let stderr = child
-        .inner()
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("title command stderr was not piped"))?;
+    // command-group maps this to a POSIX process group on Unix and a Job Object
+    // on Windows. The guard remains the sole owner until cleanup is complete;
+    // its Drop path synchronously requests a whole-group kill if this future is
+    // cancelled before any awaited cleanup finishes.
+    let mut child = ChildGroupGuard::new(cmd.group_spawn()?);
 
-    let collect_output = async {
-        let (status, stdout, stderr) = tokio::try_join!(
-            wait_for_group_exit(&mut child),
-            read_to_end(stdout),
-            read_to_end(stderr),
-        )?;
-        Ok::<Output, io::Error>(Output {
-            status,
-            stdout,
-            stderr,
-        })
-    };
+    let result = async {
+        let stdout = child
+            .child_mut()
+            .inner()
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("title command stdout was not piped"))?;
+        let stderr = child
+            .child_mut()
+            .inner()
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("title command stderr was not piped"))?;
 
-    match tokio::time::timeout(timeout, collect_output).await {
-        Ok(output) => output.map(Some),
-        Err(_) => {
-            kill_and_reap_group(&mut child).await;
-            Ok(None)
+        let collect_output = async {
+            let (status, stdout, stderr) = tokio::try_join!(
+                wait_for_leader_exit(child.child_mut()),
+                read_bounded(stdout),
+                read_bounded(stderr),
+            )?;
+            Ok::<Output, io::Error>(Output {
+                status,
+                stdout,
+                stderr,
+            })
+        };
+
+        match tokio::time::timeout(timeout, collect_output).await {
+            Ok(output) => output.map(Some),
+            Err(_) => Ok(None),
         }
     }
+    .await;
+
+    // Cleanup is deliberate even after a zero exit: a leader can exit while a
+    // background descendant keeps running with its stdio redirected elsewhere.
+    child.kill_and_reap().await;
+    result
 }
 
-#[cfg(not(unix))]
-async fn command_output_with_timeout(
-    cmd: &mut tokio::process::Command,
-    timeout: Duration,
-) -> io::Result<Option<Output>> {
-    match tokio::time::timeout(timeout, cmd.output()).await {
-        Ok(output) => output.map(Some),
-        Err(_) => Ok(None),
-    }
-}
-
-#[cfg(unix)]
-async fn wait_for_group_exit(child: &mut AsyncGroupChild) -> io::Result<std::process::ExitStatus> {
+async fn wait_for_leader_exit(child: &mut AsyncGroupChild) -> io::Result<std::process::ExitStatus> {
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
@@ -324,22 +326,180 @@ async fn wait_for_group_exit(child: &mut AsyncGroupChild) -> io::Result<std::pro
     }
 }
 
-#[cfg(unix)]
-async fn read_to_end(mut reader: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
+async fn read_bounded(reader: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
+    let mut reader = reader.take(CAPTURE_MAX_BYTES as u64);
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes).await?;
     Ok(bytes)
 }
 
-#[cfg(unix)]
-async fn kill_and_reap_group(child: &mut AsyncGroupChild) {
-    // command-group retains the PGID captured at spawn, so this SIGKILL reaches
-    // descendants even if the npx group leader has already exited.
-    if let Err(error) = child.start_kill() {
-        tracing::warn!("failed to SIGKILL timed-out title process group: {error}");
+struct ChildGroupGuard {
+    child: Option<AsyncGroupChild>,
+    #[cfg(unix)]
+    pgid: u32,
+}
+
+impl ChildGroupGuard {
+    fn new(child: AsyncGroupChild) -> Self {
+        #[cfg(unix)]
+        let pgid = child
+            .id()
+            .expect("a newly spawned title process group must have a PGID");
+
+        Self {
+            child: Some(child),
+            #[cfg(unix)]
+            pgid,
+        }
     }
-    if let Err(error) = child.wait().await {
-        tracing::warn!("failed to reap timed-out title process group: {error}");
+
+    fn child_mut(&mut self) -> &mut AsyncGroupChild {
+        self.child
+            .as_mut()
+            .expect("title process group guard was already disarmed")
+    }
+
+    async fn kill_and_reap(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+
+        request_group_kill(child);
+        #[cfg(unix)]
+        reap_group_after_kill(child, self.pgid).await;
+        #[cfg(windows)]
+        reap_group_after_kill(child).await;
+
+        // Disarm only after the bounded descendant barrier has completed. If
+        // this method is cancelled at any await, Drop stays armed.
+        self.child.take();
+    }
+}
+
+impl Drop for ChildGroupGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+
+        // start_kill is synchronous: even runtime shutdown cannot skip the
+        // POSIX killpg / Windows TerminateJobObject request.
+        request_group_kill(&mut child);
+
+        #[cfg(unix)]
+        let pgid = self.pgid;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                // Keep the group handle alive in a detached cleanup task long
+                // enough to reap the leader and observe descendant exit.
+                drop(handle.spawn(async move {
+                    #[cfg(unix)]
+                    reap_group_after_kill(&mut child, pgid).await;
+                    #[cfg(windows)]
+                    reap_group_after_kill(&mut child).await;
+                }));
+            }
+            Err(error) => tracing::warn!(
+                "title process group was killed during shutdown but its reap could not be scheduled: {error}"
+            ),
+        }
+    }
+}
+
+fn request_group_kill(child: &mut AsyncGroupChild) {
+    if let Err(error) = child.start_kill() {
+        // A cleanly exited group commonly reports ESRCH/InvalidInput here.
+        if !is_group_already_gone_error(&error) {
+            tracing::warn!("failed to SIGKILL title process group: {error}");
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_group_already_gone_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::InvalidInput
+        || error.kind() == io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(Errno::ESRCH as i32)
+}
+
+#[cfg(windows)]
+fn is_group_already_gone_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::InvalidInput || error.kind() == io::ErrorKind::NotFound
+}
+
+#[cfg(unix)]
+async fn reap_group_after_kill(child: &mut AsyncGroupChild, pgid: u32) {
+    let deadline = tokio::time::Instant::now() + GROUP_EXIT_BARRIER;
+    let mut leader_reaped = false;
+    let mut reap_failed = false;
+    let mut group_gone = false;
+    let mut probe_failed = false;
+
+    loop {
+        if !leader_reaped && !reap_failed {
+            match child.try_wait() {
+                Ok(Some(_)) => leader_reaped = true,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!("failed to reap title process group leader: {error}");
+                    reap_failed = true;
+                }
+            }
+        }
+
+        if !group_gone && !probe_failed {
+            match process_group_is_gone(pgid) {
+                Ok(is_gone) => group_gone = is_gone,
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to probe title process group after SIGKILL; descendants may remain: {error}"
+                    );
+                    probe_failed = true;
+                }
+            }
+        }
+
+        if (leader_reaped || reap_failed) && (group_gone || probe_failed) {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            if !leader_reaped && !reap_failed {
+                tracing::warn!("title process group leader was not reaped within 2s");
+            }
+            if !group_gone && !probe_failed {
+                tracing::warn!(
+                    "title process group still exists 2s after SIGKILL; descendants may remain"
+                );
+            }
+            return;
+        }
+
+        tokio::time::sleep(GROUP_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(unix)]
+fn process_group_is_gone(pgid: u32) -> io::Result<bool> {
+    let pgid = i32::try_from(pgid)
+        .map(Pid::from_raw)
+        .map_err(|_| io::Error::other("title process group ID exceeded i32::MAX"))?;
+    match killpg(pgid, None) {
+        Ok(()) => Ok(false),
+        Err(Errno::ESRCH) => Ok(true),
+        Err(error) => Err(io::Error::from(error)),
+    }
+}
+
+#[cfg(windows)]
+async fn reap_group_after_kill(child: &mut AsyncGroupChild) {
+    // AsyncGroupChild::wait observes the Job Object's completion port, so this
+    // is a descendant barrier as well as a leader reap on Windows.
+    match tokio::time::timeout(GROUP_EXIT_BARRIER, child.wait()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!("failed to reap title process job: {error}"),
+        Err(_) => tracing::warn!(
+            "title process job still exists 2s after termination; descendants may remain"
+        ),
     }
 }
 
@@ -395,45 +555,181 @@ fn slugify(input: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::path::Path;
     use std::time::Duration;
 
     use super::{
-        TITLE_MAX_CHARS, first_line_title_hint, generate_workspace_names_with_command,
-        parse_workspace_names, slugify,
+        CAPTURE_MAX_BYTES, TITLE_MAX_CHARS, first_line_title_hint,
+        generate_workspace_names_with_command, parse_workspace_names, read_bounded, slugify,
     };
+
+    #[tokio::test]
+    async fn capture_is_bounded() {
+        let captured = read_bounded(tokio::io::repeat(b'x')).await.unwrap();
+        assert_eq!(captured.len(), CAPTURE_MAX_BYTES);
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_nonempty_file(path: &Path, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for readiness marker {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_writes_quiesce(path: &Path) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut last_size = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+        let mut stable_since = tokio::time::Instant::now();
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let size = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+            if size == last_size {
+                if stable_since.elapsed() >= Duration::from_millis(200) {
+                    return;
+                }
+            } else {
+                last_size = size;
+                stable_since = tokio::time::Instant::now();
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} kept growing after title generation returned or was cancelled",
+                path.display()
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn timeout_kills_background_grandchild() {
         let temp_dir = tempfile::tempdir().unwrap();
+        let ready_path = temp_dir.path().join("grandchild-ready");
         let progress_path = temp_dir.path().join("grandchild-progress");
         let script = r#"
-            while :; do
-                printf x >> "$1"
-                sleep 0.02
-            done &
+            (
+                printf ready > "$1"
+                while :; do
+                    printf x >> "$2"
+                    sleep 0.02
+                done
+            ) &
             wait
         "#;
         let args = vec![
             "-c".to_string(),
             script.to_string(),
             "title-gen-timeout-test".to_string(),
+            ready_path.to_string_lossy().into_owned(),
+            progress_path.to_string_lossy().into_owned(),
+        ];
+
+        let call = tokio::spawn(async move {
+            generate_workspace_names_with_command("/bin/sh", &args, Duration::from_millis(500))
+                .await
+        });
+
+        wait_for_nonempty_file(&ready_path, Duration::from_secs(1)).await;
+        wait_for_nonempty_file(&progress_path, Duration::from_secs(1)).await;
+        let names = tokio::time::timeout(Duration::from_secs(2), call)
+            .await
+            .expect("title command did not return after its timeout")
+            .unwrap();
+
+        assert!(names.is_none());
+        assert_writes_quiesce(&progress_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_leader_exit_still_kills_background_grandchild() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ready_path = temp_dir.path().join("grandchild-ready");
+        let progress_path = temp_dir.path().join("grandchild-progress");
+        let script = r#"
+            (
+                printf ready > "$1"
+                while :; do
+                    printf x >> "$2"
+                    sleep 0.02
+                done
+            ) </dev/null >/dev/null 2>&1 &
+            while [ ! -s "$1" ] || [ ! -s "$2" ]; do
+                sleep 0.01
+            done
+            exit 0
+        "#;
+        let args = vec![
+            "-c".to_string(),
+            script.to_string(),
+            "title-gen-leader-exit-test".to_string(),
+            ready_path.to_string_lossy().into_owned(),
             progress_path.to_string_lossy().into_owned(),
         ];
 
         let names =
-            generate_workspace_names_with_command("/bin/sh", &args, Duration::from_millis(150))
-                .await;
+            generate_workspace_names_with_command("/bin/sh", &args, Duration::from_secs(2)).await;
 
         assert!(names.is_none());
-        let size_after_return = std::fs::metadata(&progress_path).unwrap().len();
-        assert!(size_after_return > 0, "grandchild never wrote progress");
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(
-            std::fs::metadata(&progress_path).unwrap().len(),
-            size_after_return,
-            "grandchild kept running after the timeout returned"
+        assert!(ready_path.exists(), "grandchild never signalled readiness");
+        assert!(
+            std::fs::metadata(&progress_path).is_ok_and(|metadata| metadata.len() > 0),
+            "grandchild never wrote progress"
         );
+        assert_writes_quiesce(&progress_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_kills_background_grandchild() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ready_path = temp_dir.path().join("grandchild-ready");
+        let progress_path = temp_dir.path().join("grandchild-progress");
+        let script = r#"
+            (
+                printf ready > "$1"
+                while :; do
+                    printf x >> "$2"
+                    sleep 0.02
+                done
+            ) &
+            wait
+        "#;
+        let args = vec![
+            "-c".to_string(),
+            script.to_string(),
+            "title-gen-cancellation-test".to_string(),
+            ready_path.to_string_lossy().into_owned(),
+            progress_path.to_string_lossy().into_owned(),
+        ];
+        let mut call = Box::pin(generate_workspace_names_with_command(
+            "/bin/sh",
+            &args,
+            Duration::from_secs(30),
+        ));
+
+        tokio::select! {
+            _ = wait_for_nonempty_file(&ready_path, Duration::from_secs(1)) => {}
+            result = &mut call => panic!("title command returned before cancellation: {result:?}"),
+        }
+        tokio::select! {
+            _ = wait_for_nonempty_file(&progress_path, Duration::from_secs(1)) => {}
+            result = &mut call => panic!("title command returned before cancellation: {result:?}"),
+        }
+        drop(call);
+
+        assert_writes_quiesce(&progress_path).await;
     }
 
     #[cfg(unix)]
