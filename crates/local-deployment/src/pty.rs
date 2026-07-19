@@ -1436,8 +1436,10 @@ fn tmux_capabilities() -> &'static TmuxCapabilities {
         let output = std::process::Command::new("tmux")
             .arg("-V")
             .stderr(std::process::Stdio::null())
-            .output();
-        let Ok(output) = output else {
+            .output()
+            .ok()
+            .filter(|output| output.status.success());
+        let Some(output) = output else {
             tracing::warn!(
                 "tmux not found on PATH; CLI mode terminals will degrade to ephemeral shells"
             );
@@ -1446,15 +1448,6 @@ fn tmux_capabilities() -> &'static TmuxCapabilities {
                 client_flags: false,
             };
         };
-        if !output.status.success() {
-            tracing::warn!(
-                "tmux not found on PATH; CLI mode terminals will degrade to ephemeral shells"
-            );
-            return TmuxCapabilities {
-                available: false,
-                client_flags: false,
-            };
-        }
 
         let version = String::from_utf8_lossy(&output.stdout);
         let client_flags = tmux_version_supports_client_flags(&version);
