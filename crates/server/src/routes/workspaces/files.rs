@@ -654,6 +654,15 @@ where
     }
 }
 
+/// Resolve the current or legacy default upload directory.
+///
+/// Both-present is an intentional state after rollback and re-upgrade. In that
+/// state neither directory is merged or deleted. An older binary rolled back
+/// after migration hides `.bettercoding-uploads` in its Files panel because its
+/// `is_hidden` exempts only `.vibe-uploads`; the files are not lost, and become
+/// visible again after re-upgrading. Older binaries also ignore `BC_`-prefixed
+/// environment configuration, so keep the matching `VK_` variables set during
+/// a rollback window.
 async fn resolve_uploads_dir(canonical_base: &Path) -> Result<PathBuf, ApiError> {
     resolve_uploads_dir_impl(canonical_base, |_, _| {}).await
 }
