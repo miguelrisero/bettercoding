@@ -874,14 +874,24 @@ fn ensure_cli_tmux_server_options_on(socket: &str) {
     // launch bootstrap) is parsed; apply unconditionally (idempotent, no-op
     // without a running server) so servers started before this option joined
     // the conf don't hand the bootstrap to a fish/csh login shell.
-    let _ = tmux(&["set-option", "-g", "default-shell", "/bin/sh"]);
-
     if tmux_client_flags_supported() {
         // This migration MUST stay above the clipboard probe: a production
         // server commonly already has `set-clipboard on`, which makes the
         // probe return early, but may have started before window-size joined
         // the config.
-        let _ = tmux(&["set-option", "-g", "window-size", "smallest"]);
+        let _ = tmux(&[
+            "set-option",
+            "-g",
+            "default-shell",
+            "/bin/sh",
+            ";",
+            "set-option",
+            "-g",
+            "window-size",
+            "smallest",
+        ]);
+    } else {
+        let _ = tmux(&["set-option", "-g", "default-shell", "/bin/sh"]);
     }
 
     let Ok(probe) = tmux(&["show-options", "-s", "set-clipboard"]) else {
@@ -2738,7 +2748,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_sets_smallest_before_current_clipboard_probe_returns() {
+    fn ensure_sets_shell_and_smallest_before_current_clipboard_probe_returns() {
         if !tmux_client_flags_supported() {
             return;
         }
@@ -2752,7 +2762,11 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("scratch tmux config dir");
         let conf = dir.path().join("old-cli-tmux.conf");
-        std::fs::write(&conf, "set -s set-clipboard on\n").expect("write old-style tmux config");
+        std::fs::write(
+            &conf,
+            "set -s set-clipboard on\nset -g default-shell /bin/bash\n",
+        )
+        .expect("write old-style tmux config");
         let started = std::process::Command::new("tmux")
             .args(["-L", &socket, "-f"])
             .arg(&conf)
@@ -2775,6 +2789,13 @@ mod tests {
             .expect("show scratch window-size");
         assert!(shown.status.success(), "show window-size must succeed");
         assert_eq!(String::from_utf8_lossy(&shown.stdout).trim(), "smallest");
+
+        let shown = std::process::Command::new("tmux")
+            .args(["-L", &socket, "show-options", "-gv", "default-shell"])
+            .output()
+            .expect("show scratch default-shell");
+        assert!(shown.status.success(), "show default-shell must succeed");
+        assert_eq!(String::from_utf8_lossy(&shown.stdout).trim(), "/bin/sh");
 
         drop(server);
     }
