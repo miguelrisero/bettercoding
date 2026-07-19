@@ -1,4 +1,11 @@
-import { useReducer, useMemo, useCallback, useRef, ReactNode } from 'react';
+import {
+  useReducer,
+  useMemo,
+  useCallback,
+  useEffect,
+  useRef,
+  ReactNode,
+} from 'react';
 import type { Terminal } from '@xterm/xterm';
 import type { FitAddon } from '@xterm/addon-fit';
 import {
@@ -13,6 +20,7 @@ interface TerminalConnection {
   ws: WebSocket;
   send: (data: string) => void;
   resize: (cols: number, rows: number) => void;
+  generation: ConnectionGeneration;
 }
 
 /**
@@ -224,6 +232,52 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
   const reconnectStateRef = useRef<Map<string, ConnectionGeneration>>(
     new Map()
   );
+
+  // One document-level broadcaster serves every terminal. The generation
+  // check prevents a socket discarded during a session switch from receiving
+  // a late visibility heartbeat before its close event settles.
+  const broadcastPresence = useCallback(
+    (visible: boolean, resendSize: boolean) => {
+      const presence = JSON.stringify({ type: 'presence', visible });
+      terminalConnectionsRef.current.forEach((connection, tabId) => {
+        if (
+          connection.generation.closed ||
+          reconnectStateRef.current.get(tabId) !== connection.generation ||
+          connection.ws.readyState !== WebSocket.OPEN
+        ) {
+          return;
+        }
+
+        connection.ws.send(presence);
+        if (resendSize) {
+          const size = connectionCallbacksRef.current.get(tabId)?.getSize?.();
+          if (size) {
+            connection.resize(size.cols, size.rows);
+          }
+        }
+      });
+    },
+    []
+  );
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      const visible = document.visibilityState === 'visible';
+      broadcastPresence(visible, visible);
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    const heartbeat = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        broadcastPresence(true, false);
+      }
+    }, 60_000);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.clearInterval(heartbeat);
+    };
+  }, [broadcastPresence]);
 
   const getTabsForWorkspace = useCallback(
     (workspaceId: string): TerminalTab[] => {
@@ -561,10 +615,22 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
                 return;
               }
               generation.retryCount = 0;
+              if (ws.readyState !== WebSocket.OPEN) {
+                return;
+              }
+
+              // Reconnects can complete while the document is hidden. Correct
+              // the backend's visible-by-default presence before syncing size.
+              ws.send(
+                JSON.stringify({
+                  type: 'presence',
+                  visible: document.visibilityState === 'visible',
+                })
+              );
               const size = connectionCallbacksRef.current
                 .get(tabId)
                 ?.getSize?.();
-              if (size && ws.readyState === WebSocket.OPEN) {
+              if (size) {
                 ws.send(
                   JSON.stringify({
                     type: 'resize',
@@ -650,7 +716,12 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
               }
             };
 
-            const connection: TerminalConnection = { ws, send, resize };
+            const connection: TerminalConnection = {
+              ws,
+              send,
+              resize,
+              generation,
+            };
             terminalConnectionsRef.current.set(tabId, connection);
           } catch {
             scheduleReconnect();
