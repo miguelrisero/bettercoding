@@ -416,13 +416,25 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       },
       resize: (cols: number, rows: number) => {
         const connection = terminalConnectionsRef.current.get(tabId);
-        connection?.resize(cols, rows);
+        if (!connection) return;
+        connection.resize(cols, rows);
         // A resize callback comes from a measurable mounted pane. If it was
         // gated off, rejoin sizing immediately after sending the fresh grid.
-        broadcastPresence({ onlyTab: tabId });
+        if (
+          connection.generation.closed ||
+          reconnectStateRef.current.get(tabId) !== connection.generation ||
+          connection.ws.readyState !== WebSocket.OPEN
+        ) {
+          return;
+        }
+        const visible = document.visibilityState === 'visible';
+        if (connection.lastSentPresence === visible) {
+          return;
+        }
+        sendPresence(connection, { cols, rows }, document.visibilityState);
       },
     }),
-    [broadcastPresence]
+    []
   );
 
   const createTerminalConnection = useCallback(
