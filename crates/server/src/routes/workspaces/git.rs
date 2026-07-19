@@ -794,6 +794,31 @@ async fn rollback_branch_renames(
     }
 }
 
+pub(crate) async fn rebase_workspace_core<F, T>(
+    pool: &sqlx::SqlitePool,
+    workspace_id: Uuid,
+    repo_id: Uuid,
+    old_base_branch: &str,
+    new_base_branch: &str,
+    rebase: F,
+) -> Result<Result<T, GitServiceError>, sqlx::Error>
+where
+    F: FnOnce(&str, &str) -> Result<T, GitServiceError> + Send,
+    T: Send,
+{
+    let rebase_result = rebase(new_base_branch, old_base_branch);
+
+    if rebase_result.is_ok() {
+        // If a target-changing rebase conflicts and is later continued, the database
+        // deliberately keeps the old target until the next successful rebase or an
+        // explicit target change. That stale value is non-destructive: it never claims
+        // Git reached a base that the rebase did not complete.
+        WorkspaceRepo::update_target_branch(pool, workspace_id, repo_id, new_base_branch).await?;
+    }
+
+    Ok(rebase_result)
+}
+
 #[axum::debug_handler]
 pub async fn rebase_workspace(
     Extension(workspace): Extension<Workspace>,
@@ -822,15 +847,7 @@ pub async fn rebase_workspace(
         .git()
         .check_branch_exists(&repo.path, &new_base_branch)?
     {
-        true => {
-            WorkspaceRepo::update_target_branch(
-                pool,
-                workspace.id,
-                payload.repo_id,
-                &new_base_branch,
-            )
-            .await?;
-        }
+        true => {}
         false => {
             return Ok(ResponseJson(ApiResponse::error(
                 format!(
@@ -849,13 +866,23 @@ pub async fn rebase_workspace(
     let workspace_path = Path::new(&container_ref);
     let worktree_path = workspace_path.join(&repo.name);
 
-    let result = deployment.git().rebase_branch(
-        &repo.path,
-        &worktree_path,
-        &new_base_branch,
+    let result = rebase_workspace_core(
+        pool,
+        workspace.id,
+        payload.repo_id,
         &old_base_branch,
-        &workspace.branch.clone(),
-    );
+        &new_base_branch,
+        |new_base_branch, old_base_branch| {
+            deployment.git().rebase_branch(
+                &repo.path,
+                &worktree_path,
+                new_base_branch,
+                old_base_branch,
+                &workspace.branch.clone(),
+            )
+        },
+    )
+    .await?;
     if let Err(e) = result {
         return match e {
             GitServiceError::MergeConflicts {
