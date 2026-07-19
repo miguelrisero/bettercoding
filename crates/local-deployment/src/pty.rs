@@ -51,6 +51,10 @@ pub enum PtyCommand {
         /// `--continue` first leg of a brand-new workspace lives just long
         /// enough to swallow the paste and exit, silently discarding it.
         deferred_prompt_pending: bool,
+        /// Browser visibility captured in the WebSocket URL. When supported,
+        /// the tmux client starts with `ignore-size` before it can affect the
+        /// shared grid; later presence messages keep the flag synchronized.
+        connect_hidden: bool,
         /// How to launch the selected agent's interactive CLI — binary, flags
         /// (model/effort/sandbox/approval pre-resolved from the session's
         /// ExecutorConfig), and the resume/prompt/continue forms. Claude is the
@@ -1682,10 +1686,18 @@ impl PtyService {
 
             // CLI mode rides tmux when present; otherwise (and for the
             // default side terminal) spawn the user's shell directly.
-            let (tmux_workspace, tmux_resume_id, tmux_initial_prompt, tmux_deferred, tmux_spec): (
+            let (
+                tmux_workspace,
+                tmux_resume_id,
+                tmux_initial_prompt,
+                tmux_deferred,
+                tmux_connect_hidden,
+                tmux_spec,
+            ): (
                 Option<Uuid>,
                 Option<String>,
                 Option<String>,
+                bool,
                 bool,
                 Option<CliLaunchSpec>,
             ) = match &command {
@@ -1694,16 +1706,21 @@ impl PtyService {
                     resume_session_id,
                     initial_prompt,
                     deferred_prompt_pending,
+                    connect_hidden,
                     spec,
                 } if tmux_available() => (
                     Some(*workspace_id),
                     resume_session_id.clone(),
                     initial_prompt.clone(),
                     *deferred_prompt_pending,
+                    *connect_hidden,
                     Some(spec.clone()),
                 ),
-                _ => (None, None, None, false, None),
+                _ => (None, None, None, false, false, None),
             };
+            // Client flags are the release valve that makes smallest sizing
+            // safe. F9 gates the entire feature on this cached capability.
+            let tmux_connect_hidden = tmux_connect_hidden && tmux_client_flags_supported();
 
             // Never silently break the persistence promise: if CLI mode was
             // requested but tmux is absent, say so in the pane itself.
@@ -1747,6 +1764,10 @@ impl PtyService {
                 cmd.arg("-L");
                 cmd.arg(CLI_TMUX_SOCKET);
                 cmd.arg("new-session");
+                if tmux_connect_hidden {
+                    cmd.arg("-f");
+                    cmd.arg("ignore-size");
+                }
                 // -A: attach if the session exists, else create.
                 //
                 // We deliberately do NOT pass -D (detach other clients): a new
@@ -1936,7 +1957,7 @@ impl PtyService {
                 cli_presence: tmux_client_pid.map(|_| {
                     let now = Instant::now();
                     CliClientPresence {
-                        visible: true,
+                        visible: !tmux_connect_hidden,
                         last_visible_at: now,
                         last_changed_at: now,
                     }

@@ -63,6 +63,10 @@ struct TerminalQuery {
     /// so the terminal joins the exact chat the UI is showing (handover).
     #[serde(default)]
     session_id: Option<Uuid>,
+    /// Connect-time browser visibility. A hidden tmux client must be excluded
+    /// from shared sizing before its first WebSocket message can arrive.
+    #[serde(default)]
+    hidden: bool,
 }
 
 const DEFAULT_COLS: u16 = 80;
@@ -427,6 +431,7 @@ async fn terminal_ws(
                     resume_session_id,
                     initial_prompt: baked_prompt,
                     deferred_prompt_pending,
+                    connect_hidden: query.hidden,
                     spec,
                 },
             )

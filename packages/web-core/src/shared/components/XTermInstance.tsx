@@ -143,6 +143,7 @@ export function XTermInstance({
         host: window.location.host,
         mode,
         sessionId: sessionIdRef.current,
+        hidden: document.visibilityState !== 'visible',
       },
       instance.fitAddon.proposeDimensions()
     );
