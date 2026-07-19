@@ -32,8 +32,8 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use super::file_policy::{
-    self, MAX_LIST_ENTRIES, MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_FILES, MAX_UPLOAD_REQUEST_BYTES,
-    MAX_ZIP_ENTRIES, MAX_ZIP_UNCOMPRESSED_BYTES, VIBE_UPLOADS_DIR,
+    self, LEGACY_UPLOADS_DIR, MAX_LIST_ENTRIES, MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_FILES,
+    MAX_UPLOAD_REQUEST_BYTES, MAX_ZIP_ENTRIES, MAX_ZIP_UNCOMPRESSED_BYTES, UPLOADS_DIR,
 };
 use crate::{DeploymentImpl, error::ApiError, middleware::load_workspace_middleware};
 
@@ -69,7 +69,7 @@ pub struct PathQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct UploadQuery {
-    /// Target directory relative to the worktree root. Absent/empty → `.vibe-uploads/`.
+    /// Target directory relative to the worktree root. Absent/empty → `.bettercoding-uploads/`.
     #[serde(default)]
     pub path: Option<String>,
     /// Allow replacing an existing file. Defaults to false (409 on conflict).
@@ -352,16 +352,50 @@ pub async fn download_zip(
 
 // --- POST /upload ---
 
-/// Ensure the default `.vibe-uploads/` drop folder exists and is git-ignored.
-async fn ensure_uploads_dir(canonical_base: &Path) -> Result<PathBuf, ApiError> {
-    let dir = canonical_base.join(VIBE_UPLOADS_DIR);
-    tokio::fs::create_dir_all(&dir).await?;
-    let gitignore = dir.join(".gitignore");
-    if !tokio::fs::try_exists(&gitignore).await.unwrap_or(false) {
-        // Fail loudly: a missing .gitignore would let uploads leak into git.
-        tokio::fs::write(&gitignore, "*\n").await?;
+async fn is_directory(path: &Path) -> Result<bool, ApiError> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
-    Ok(dir)
+}
+
+/// Resolve the default upload directory, migrating the legacy directory when
+/// possible while preserving it as a lossless fallback on any rename failure.
+async fn resolve_uploads_dir(canonical_base: &Path) -> Result<PathBuf, ApiError> {
+    let uploads_dir = canonical_base.join(UPLOADS_DIR);
+    let legacy_uploads_dir = canonical_base.join(LEGACY_UPLOADS_DIR);
+
+    let uploads_exists = is_directory(&uploads_dir).await?;
+    let legacy_exists = is_directory(&legacy_uploads_dir).await?;
+
+    match (uploads_exists, legacy_exists) {
+        (true, _) => Ok(uploads_dir),
+        (false, true) => match tokio::fs::rename(&legacy_uploads_dir, &uploads_dir).await {
+            Ok(()) => Ok(uploads_dir),
+            Err(_) => {
+                // A concurrent resolver may have won the rename race. Any other
+                // rename failure keeps the legacy directory as the safe fallback.
+                if tokio::fs::metadata(&uploads_dir)
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir())
+                {
+                    Ok(uploads_dir)
+                } else {
+                    Ok(legacy_uploads_dir)
+                }
+            }
+        },
+        (false, false) => {
+            tokio::fs::create_dir_all(&uploads_dir).await?;
+            let gitignore = uploads_dir.join(".gitignore");
+            if !tokio::fs::try_exists(&gitignore).await.unwrap_or(false) {
+                // Fail loudly: a missing .gitignore would let uploads leak into git.
+                tokio::fs::write(&gitignore, "*\n").await?;
+            }
+            Ok(uploads_dir)
+        }
+    }
 }
 
 pub async fn upload_files(
@@ -377,7 +411,7 @@ pub async fn upload_files(
 
     let target_dir = match query.path.as_deref() {
         Some(p) if !p.trim().is_empty() => file_policy::resolve_existing_dir(&base, p)?,
-        _ => ensure_uploads_dir(&canonical_base).await?,
+        _ => resolve_uploads_dir(&canonical_base).await?,
     };
 
     let mut uploaded = Vec::new();
@@ -398,7 +432,7 @@ pub async fn upload_files(
         }
 
         // Stream to a temp file in the target dir (same filesystem → atomic rename).
-        let tmp_path = target_dir.join(format!(".vk-upload-{}.tmp", Uuid::new_v4()));
+        let tmp_path = target_dir.join(format!(".bc-upload-{}.tmp", Uuid::new_v4()));
         let mut out = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -516,9 +550,155 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::Path};
 
     use super::*;
+
+    const GITIGNORE_CONTENTS: &str = "*\n";
+
+    fn seed_upload_dir(base: &Path, name: &str) -> PathBuf {
+        let path = base.join(name);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join(".gitignore"), GITIGNORE_CONTENTS).unwrap();
+        path
+    }
+
+    fn assert_gitignored(path: &Path) {
+        assert_eq!(
+            fs::read_to_string(path.join(".gitignore")).unwrap(),
+            GITIGNORE_CONTENTS
+        );
+    }
+
+    #[tokio::test]
+    async fn uploads_dir_resolver_creates_new_dir_when_neither_exists() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = tempdir.path();
+        let expected = base.join(UPLOADS_DIR);
+
+        let resolved = resolve_uploads_dir(base).await.unwrap();
+
+        assert_eq!(resolved, expected);
+        assert!(expected.is_dir());
+        assert!(!base.join(LEGACY_UPLOADS_DIR).exists());
+        assert_gitignored(&expected);
+    }
+
+    #[tokio::test]
+    async fn uploads_dir_resolver_migrates_legacy_only_dir() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = tempdir.path();
+        let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
+        fs::create_dir_all(legacy.join("nested")).unwrap();
+        fs::write(legacy.join("report.txt"), b"legacy report").unwrap();
+        fs::write(legacy.join("nested/data.bin"), b"legacy data").unwrap();
+        let expected = base.join(UPLOADS_DIR);
+
+        let resolved = resolve_uploads_dir(base).await.unwrap();
+
+        assert_eq!(resolved, expected);
+        assert!(expected.is_dir());
+        assert!(!legacy.exists());
+        assert_gitignored(&expected);
+        assert_eq!(
+            fs::read(expected.join("report.txt")).unwrap(),
+            b"legacy report"
+        );
+        assert_eq!(
+            fs::read(expected.join("nested/data.bin")).unwrap(),
+            b"legacy data"
+        );
+    }
+
+    #[tokio::test]
+    async fn uploads_dir_resolver_returns_new_only_dir_untouched() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = tempdir.path();
+        let expected = seed_upload_dir(base, UPLOADS_DIR);
+        fs::write(expected.join("new.txt"), b"new data").unwrap();
+
+        let resolved = resolve_uploads_dir(base).await.unwrap();
+
+        assert_eq!(resolved, expected);
+        assert!(expected.is_dir());
+        assert!(!base.join(LEGACY_UPLOADS_DIR).exists());
+        assert_gitignored(&expected);
+        assert_eq!(fs::read(expected.join("new.txt")).unwrap(), b"new data");
+    }
+
+    #[tokio::test]
+    async fn uploads_dir_resolver_prefers_new_dir_when_both_exist() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = tempdir.path();
+        let expected = seed_upload_dir(base, UPLOADS_DIR);
+        let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
+        fs::write(expected.join("new.txt"), b"new data").unwrap();
+        fs::write(legacy.join("legacy.txt"), b"legacy data").unwrap();
+
+        let resolved = resolve_uploads_dir(base).await.unwrap();
+
+        assert_eq!(resolved, expected);
+        assert!(expected.is_dir());
+        assert!(legacy.is_dir());
+        assert_gitignored(&expected);
+        assert_gitignored(&legacy);
+        assert_eq!(fs::read(expected.join("new.txt")).unwrap(), b"new data");
+        assert_eq!(fs::read(legacy.join("legacy.txt")).unwrap(), b"legacy data");
+    }
+
+    #[tokio::test]
+    async fn concurrent_uploads_dir_resolvers_preserve_legacy_files() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = tempdir.path().to_path_buf();
+        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
+        fs::create_dir_all(legacy.join("nested")).unwrap();
+        fs::write(legacy.join("first.txt"), b"first").unwrap();
+        fs::write(legacy.join("nested/second.txt"), b"second").unwrap();
+        let expected = base.join(UPLOADS_DIR);
+
+        let mut calls = Vec::new();
+        for _ in 0..4 {
+            let base = base.clone();
+            calls.push(tokio::spawn(
+                async move { resolve_uploads_dir(&base).await },
+            ));
+        }
+        for call in calls {
+            assert_eq!(call.await.unwrap().unwrap(), expected);
+        }
+
+        assert!(expected.is_dir());
+        assert!(!legacy.exists());
+        assert_gitignored(&expected);
+        assert_eq!(fs::read(expected.join("first.txt")).unwrap(), b"first");
+        assert_eq!(
+            fs::read(expected.join("nested/second.txt")).unwrap(),
+            b"second"
+        );
+    }
+
+    #[tokio::test]
+    async fn uploads_dir_resolver_falls_back_to_legacy_on_rename_failure() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = tempdir.path();
+        let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
+        fs::write(legacy.join("keep.txt"), b"do not lose me").unwrap();
+        let blocked_new_path = base.join(UPLOADS_DIR);
+        fs::write(&blocked_new_path, b"not a directory").unwrap();
+
+        let resolved = resolve_uploads_dir(base).await.unwrap();
+
+        assert_eq!(resolved, legacy);
+        assert!(legacy.is_dir());
+        assert_gitignored(&legacy);
+        assert_eq!(
+            fs::read(legacy.join("keep.txt")).unwrap(),
+            b"do not lose me"
+        );
+        assert_eq!(fs::read(blocked_new_path).unwrap(), b"not a directory");
+        // When both paths are directories, new-dir precedence is covered by
+        // uploads_dir_resolver_prefers_new_dir_when_both_exist.
+    }
 
     #[test]
     fn attachment_disposition_is_injection_proof() {
