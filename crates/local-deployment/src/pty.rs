@@ -807,6 +807,8 @@ fn seed_codex_update_dismissal() -> std::io::Result<()> {
 ///   no keystroke.
 /// - right-click is unbound from tmux's context menu so the web terminal can
 ///   use it for paste.
+/// - `window-size smallest`: when several browser clients share a workspace,
+///   the pane grid fits every client that participates in sizing.
 /// - `default-shell /bin/sh`: window command strings (our launch bootstrap)
 ///   are run via `default-shell -c`, and the bootstrap is POSIX sh
 ///   (`vk_p="$(cat …)"`, `{ …; } | …`) — a fish/csh login shell would fail on
@@ -818,6 +820,7 @@ const CLI_TMUX_CONF: &str = "\
 set -g mouse on
 set -s set-clipboard on
 set -as terminal-features ',xterm*:clipboard'
+set -g window-size smallest
 set -g default-shell /bin/sh
 unbind-key -n MouseDown3Pane
 ";
@@ -839,9 +842,13 @@ fn cli_tmux_conf_path() -> Option<PathBuf> {
 /// first so the append-style options aren't re-applied on every attach.
 /// Best-effort: no server running is the common case and simply a no-op.
 fn ensure_cli_tmux_server_options() {
+    ensure_cli_tmux_server_options_on(CLI_TMUX_SOCKET);
+}
+
+fn ensure_cli_tmux_server_options_on(socket: &str) {
     let tmux = |args: &[&str]| {
         std::process::Command::new("tmux")
-            .args(["-L", CLI_TMUX_SOCKET])
+            .args(["-L", socket])
             .args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -853,6 +860,11 @@ fn ensure_cli_tmux_server_options() {
     // without a running server) so servers started before this option joined
     // the conf don't hand the bootstrap to a fish/csh login shell.
     let _ = tmux(&["set-option", "-g", "default-shell", "/bin/sh"]);
+
+    // This migration MUST stay above the clipboard probe: a production server
+    // commonly already has `set-clipboard on`, which makes the probe return
+    // early, but may have started before window-size joined the config.
+    let _ = tmux(&["set-option", "-g", "window-size", "smallest"]);
 
     let Ok(probe) = tmux(&["show-options", "-s", "set-clipboard"]) else {
         return;
@@ -2400,6 +2412,63 @@ mod tests {
         // Window command strings (the POSIX-sh launch bootstrap) are parsed by
         // default-shell; a fish/csh login shell would reject them outright.
         assert!(CLI_TMUX_CONF.contains("set -g default-shell /bin/sh"));
+        assert!(CLI_TMUX_CONF.contains("set -g window-size smallest"));
+    }
+
+    struct ScratchTmuxServer {
+        socket: String,
+    }
+
+    impl Drop for ScratchTmuxServer {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &self.socket, "kill-server"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
+    #[test]
+    fn ensure_sets_smallest_before_current_clipboard_probe_returns() {
+        if !tmux_available() {
+            return;
+        }
+
+        static SOCKET_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SOCKET_SEQ.fetch_add(1, Ordering::Relaxed);
+        let socket = format!("bc-smallest-test-{}-{seq}", std::process::id());
+        let server = ScratchTmuxServer {
+            socket: socket.clone(),
+        };
+
+        let dir = tempfile::tempdir().expect("scratch tmux config dir");
+        let conf = dir.path().join("old-cli-tmux.conf");
+        std::fs::write(&conf, "set -s set-clipboard on\n").expect("write old-style tmux config");
+        let started = std::process::Command::new("tmux")
+            .args(["-L", &socket, "-f"])
+            .arg(&conf)
+            .args(["new-session", "-d", "-s", "old-server"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("start scratch tmux server");
+        assert!(
+            started.status.success(),
+            "scratch tmux server failed: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+
+        ensure_cli_tmux_server_options_on(&socket);
+
+        let shown = std::process::Command::new("tmux")
+            .args(["-L", &socket, "show-options", "-gv", "window-size"])
+            .output()
+            .expect("show scratch window-size");
+        assert!(shown.status.success(), "show window-size must succeed");
+        assert_eq!(String::from_utf8_lossy(&shown.stdout).trim(), "smallest");
+
+        drop(server);
     }
 
     #[test]
