@@ -5,8 +5,10 @@
 //! `.git`/`node_modules` denylist, and size caps live in one place.
 
 use std::{
+    collections::HashMap,
     io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
 };
 
@@ -22,9 +24,13 @@ use axum::{
 use chrono::{DateTime, Utc};
 use db::models::workspace::Workspace;
 use deployment::Deployment;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use services::services::{container::ContainerService, file::FileError};
-use tokio::io::AsyncWriteExt;
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{OwnedRwLockReadGuard, RwLock},
+};
 use tokio_util::io::ReaderStream;
 use ts_rs::TS;
 use utils::response::ApiResponse;
@@ -39,6 +45,33 @@ use crate::{DeploymentImpl, error::ApiError, middleware::load_workspace_middlewa
 
 /// Wall-clock budget for generating a zip archive.
 const ZIP_WALL_TIME: Duration = Duration::from_secs(120);
+
+type WorkspaceFilesystemLock = Arc<RwLock<()>>;
+
+/// Serializes upload-directory migration against every in-process Files request.
+/// Keys are canonical worktree roots so aliases of the same workspace share a lock.
+static WORKSPACE_FILESYSTEM_LOCKS: LazyLock<Mutex<HashMap<PathBuf, WorkspaceFilesystemLock>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn workspace_filesystem_lock(canonical_base: &Path) -> WorkspaceFilesystemLock {
+    let mut locks = WORKSPACE_FILESYSTEM_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks
+        .entry(canonical_base.to_path_buf())
+        .or_insert_with(|| Arc::new(RwLock::new(())))
+        .clone()
+}
+
+/// Stream a file while retaining the workspace read guard until the response
+/// body is fully consumed or dropped.
+fn guarded_file_body(file: tokio::fs::File, guard: OwnedRwLockReadGuard<()>) -> Body {
+    let stream = futures_util::stream::unfold(
+        (ReaderStream::new(file), guard),
+        |(mut reader, guard)| async move { reader.next().await.map(|item| (item, (reader, guard))) },
+    );
+    Body::from_stream(stream)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct WorkspaceFileEntry {
@@ -111,6 +144,8 @@ pub async fn list_files(
     let canonical_base = tokio::fs::canonicalize(&base)
         .await
         .map_err(|_| ApiError::File(FileError::NotFound))?;
+    let filesystem_lock = workspace_filesystem_lock(&canonical_base);
+    let _read_guard = filesystem_lock.read_owned().await;
     let dir = file_policy::resolve_existing_path(&base, &query.path)?;
     if !dir.is_dir() {
         return Err(ApiError::BadRequest("Path is not a directory".to_string()));
@@ -185,6 +220,11 @@ pub async fn download_file(
     Query(query): Query<PathQuery>,
 ) -> Result<Response, ApiError> {
     let base = workspace_root(&deployment, &workspace).await?;
+    let canonical_base = tokio::fs::canonicalize(&base)
+        .await
+        .map_err(|_| ApiError::File(FileError::NotFound))?;
+    let filesystem_lock = workspace_filesystem_lock(&canonical_base);
+    let read_guard = filesystem_lock.read_owned().await;
     let path = file_policy::resolve_existing_path(&base, &query.path)?;
     // Open once, then read metadata from the handle so the streamed bytes and
     // the Content-Length come from the same inode (no reopen/swap race).
@@ -198,7 +238,7 @@ pub async fn download_file(
     if !meta.is_file() {
         return Err(ApiError::File(FileError::NotFound));
     }
-    let body = Body::from_stream(ReaderStream::new(file));
+    let body = guarded_file_body(file, read_guard);
 
     let filename = path
         .file_name()
@@ -319,6 +359,11 @@ pub async fn download_zip(
     Query(query): Query<PathQuery>,
 ) -> Result<Response, ApiError> {
     let base = workspace_root(&deployment, &workspace).await?;
+    let canonical_base = tokio::fs::canonicalize(&base)
+        .await
+        .map_err(|_| ApiError::File(FileError::NotFound))?;
+    let filesystem_lock = workspace_filesystem_lock(&canonical_base);
+    let read_guard = filesystem_lock.read_owned().await;
     let root = file_policy::resolve_existing_path(&base, &query.path)?;
     if !root.is_dir() {
         return Err(ApiError::BadRequest(
@@ -336,7 +381,7 @@ pub async fn download_zip(
         .map_err(zip_io_error)??;
     let file = tokio::fs::File::from_std(std_file);
     let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-    let body = Body::from_stream(ReaderStream::new(file));
+    let body = guarded_file_body(file, read_guard);
 
     Response::builder()
         .header(header::CONTENT_TYPE, "application/zip")
@@ -352,9 +397,17 @@ pub async fn download_zip(
 
 // --- POST /upload ---
 
-async fn is_directory(path: &Path) -> Result<bool, ApiError> {
-    match tokio::fs::metadata(path).await {
-        Ok(metadata) => Ok(metadata.is_dir()),
+async fn is_real_directory(path: &Path) -> Result<bool, ApiError> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn is_symlink(path: &Path) -> Result<bool, ApiError> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => Ok(metadata.file_type().is_symlink()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
@@ -362,47 +415,258 @@ async fn is_directory(path: &Path) -> Result<bool, ApiError> {
 
 async fn ensure_uploads_gitignore(uploads_dir: &Path) -> Result<(), ApiError> {
     let gitignore = uploads_dir.join(".gitignore");
-    if !tokio::fs::try_exists(&gitignore).await.unwrap_or(false) {
-        // Fail loudly: a missing .gitignore would let uploads leak into git.
-        tokio::fs::write(&gitignore, "*\n").await?;
+    loop {
+        match tokio::fs::symlink_metadata(&gitignore).await {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                // A regular .gitignore may contain deliberate user-owned rules;
+                // presence is sufficient, so never overwrite its contents.
+                return Ok(());
+            }
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                tokio::fs::remove_dir_all(&gitignore).await?;
+            }
+            Ok(_) => {
+                // Remove symlinks and other non-regular entries without following
+                // them, then atomically create the replacement below.
+                tokio::fs::remove_file(&gitignore).await?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&gitignore)
+                    .await
+                {
+                    Ok(mut file) => {
+                        // Fail loudly: a missing .gitignore would let uploads leak
+                        // into git. create_new ensures a raced-in symlink is never
+                        // followed outside the worktree.
+                        let write_result = async {
+                            file.write_all(b"*\n").await?;
+                            file.flush().await
+                        }
+                        .await;
+                        if let Err(error) = write_result {
+                            drop(file);
+                            let _ = tokio::fs::remove_file(&gitignore).await;
+                            return Err(error.into());
+                        }
+                        return Ok(());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+async fn canonical_uploads_directory(
+    canonical_base: &Path,
+    directory: &Path,
+) -> Result<PathBuf, ApiError> {
+    let metadata = tokio::fs::symlink_metadata(directory)
+        .await
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ApiError::BadRequest("Upload directory no longer exists".to_string())
+            } else {
+                ApiError::Io(error)
+            }
+        })?;
+    if !metadata.file_type().is_dir() {
+        return Err(ApiError::BadRequest(
+            "Upload directory must be a real directory".to_string(),
+        ));
+    }
+
+    let canonical = tokio::fs::canonicalize(directory).await?;
+    if !canonical.starts_with(canonical_base) {
+        return Err(ApiError::BadRequest(
+            "Upload directory escapes the workspace".to_string(),
+        ));
+    }
+    Ok(canonical)
+}
+
+async fn create_real_uploads_directory(uploads_dir: &Path) -> Result<(), ApiError> {
+    tokio::fs::create_dir_all(uploads_dir).await?;
+    if !is_real_directory(uploads_dir).await? {
+        return Err(ApiError::BadRequest(
+            "Upload directory must be a real directory".to_string(),
+        ));
     }
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum ResolvedUploadsDirectory {
+    Current,
+    Legacy,
+}
+
 /// Resolve the default upload directory, migrating the legacy directory when
 /// possible while preserving it as a lossless fallback on any rename failure.
-async fn resolve_uploads_dir(canonical_base: &Path) -> Result<PathBuf, ApiError> {
+/// The migration takes the per-workspace write lock only with `try_write`, so a
+/// request already holding a read lock is never blocked or renamed underneath.
+async fn resolve_uploads_dir_impl<F>(
+    canonical_base: &Path,
+    after_state_probes: F,
+) -> Result<PathBuf, ApiError>
+where
+    F: FnOnce(&Path, &Path),
+{
     let uploads_dir = canonical_base.join(UPLOADS_DIR);
     let legacy_uploads_dir = canonical_base.join(LEGACY_UPLOADS_DIR);
 
-    let uploads_exists = is_directory(&uploads_dir).await?;
-    let legacy_exists = is_directory(&legacy_uploads_dir).await?;
+    let uploads_exists = is_real_directory(&uploads_dir).await?;
+    let legacy_exists = is_real_directory(&legacy_uploads_dir).await?;
 
+    // Test seam for deterministic cross-process-style create/rename races.
+    after_state_probes(&uploads_dir, &legacy_uploads_dir);
+
+    // A legacy symlink is ignored so a fresh current directory can be created,
+    // but the current name is authoritative: never fall back around a symlink
+    // there, even when a real legacy directory is also present.
+    if is_symlink(&uploads_dir).await? {
+        return Err(ApiError::BadRequest(
+            "Upload directory must be a real directory".to_string(),
+        ));
+    }
+
+    let mut _contention_read_guard = None;
     let resolved_dir = match (uploads_exists, legacy_exists) {
-        (true, _) => uploads_dir,
-        (false, true) => match tokio::fs::rename(&legacy_uploads_dir, &uploads_dir).await {
-            Ok(()) => uploads_dir,
-            Err(_) => {
-                // A concurrent resolver may have won the rename race. Any other
-                // rename failure keeps the legacy directory as the safe fallback.
-                if tokio::fs::metadata(&uploads_dir)
-                    .await
-                    .is_ok_and(|metadata| metadata.is_dir())
-                {
-                    uploads_dir
-                } else {
-                    legacy_uploads_dir
+        (true, _) => ResolvedUploadsDirectory::Current,
+        (false, true) => {
+            let filesystem_lock = workspace_filesystem_lock(canonical_base);
+            match filesystem_lock.try_write() {
+                Ok(_write_guard) => {
+                    match tokio::fs::rename(&legacy_uploads_dir, &uploads_dir).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                old_path = %legacy_uploads_dir.display(),
+                                new_path = %uploads_dir.display(),
+                                "Migrated workspace uploads directory"
+                            );
+                            ResolvedUploadsDirectory::Current
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                old_path = %legacy_uploads_dir.display(),
+                                new_path = %uploads_dir.display(),
+                                error = %error,
+                                "Uploads directory migration rename failed; resolving current state"
+                            );
+                            // Keep this re-check even with the in-process lock: an
+                            // old binary or another process can still win the race.
+                            if is_real_directory(&uploads_dir).await? {
+                                ResolvedUploadsDirectory::Current
+                            } else if is_real_directory(&legacy_uploads_dir).await? {
+                                ResolvedUploadsDirectory::Legacy
+                            } else {
+                                // Both paths may vanish between the probes and the
+                                // failed rename. Re-create the current directory
+                                // instead of returning a dead legacy path.
+                                create_real_uploads_directory(&uploads_dir).await?;
+                                ResolvedUploadsDirectory::Current
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        old_path = %legacy_uploads_dir.display(),
+                        new_path = %uploads_dir.display(),
+                        "Skipping uploads directory migration because the workspace filesystem lock is contended"
+                    );
+
+                    // Usually contention is an in-flight reader, so this takes
+                    // another read guard immediately (including when the caller
+                    // already holds one). If a rename writer is active, wait only
+                    // for that already-started atomic operation; every handler
+                    // would need the same read side before resolving a path.
+                    _contention_read_guard = Some(match filesystem_lock.clone().try_read_owned() {
+                        Ok(guard) => guard,
+                        Err(_) => filesystem_lock.clone().read_owned().await,
+                    });
+
+                    if is_real_directory(&uploads_dir).await? {
+                        ResolvedUploadsDirectory::Current
+                    } else if is_real_directory(&legacy_uploads_dir).await? {
+                        ResolvedUploadsDirectory::Legacy
+                    } else {
+                        create_real_uploads_directory(&uploads_dir).await?;
+                        ResolvedUploadsDirectory::Current
+                    }
                 }
             }
-        },
+        }
         (false, false) => {
-            tokio::fs::create_dir_all(&uploads_dir).await?;
-            uploads_dir
+            create_real_uploads_directory(&uploads_dir).await?;
+            ResolvedUploadsDirectory::Current
         }
     };
 
-    ensure_uploads_gitignore(&resolved_dir).await?;
-    Ok(resolved_dir)
+    // Both-present is intentional. Validate containment before writing either
+    // .gitignore, then assert the ignore file on every real upload directory.
+    let mut current = if is_real_directory(&uploads_dir).await? {
+        Some(canonical_uploads_directory(canonical_base, &uploads_dir).await?)
+    } else {
+        None
+    };
+    let mut legacy = if is_real_directory(&legacy_uploads_dir).await? {
+        Some(canonical_uploads_directory(canonical_base, &legacy_uploads_dir).await?)
+    } else {
+        None
+    };
+
+    if current.is_none() && legacy.is_none() {
+        // The two probes above can straddle another process's atomic legacy ->
+        // current rename (current absent just before it, legacy absent just
+        // after it). A final current-path probe closes that false-neither edge.
+        if is_real_directory(&uploads_dir).await? {
+            current = Some(canonical_uploads_directory(canonical_base, &uploads_dir).await?);
+        } else if is_real_directory(&legacy_uploads_dir).await? {
+            legacy = Some(canonical_uploads_directory(canonical_base, &legacy_uploads_dir).await?);
+        }
+    }
+
+    if let Some(directory) = &current {
+        ensure_uploads_gitignore(directory).await?;
+    }
+    if let Some(directory) = &legacy {
+        ensure_uploads_gitignore(directory).await?;
+    }
+
+    match resolved_dir {
+        ResolvedUploadsDirectory::Current => current
+            .or(legacy)
+            .ok_or_else(|| ApiError::BadRequest("Upload directory no longer exists".to_string())),
+        // A concurrent in-process writer may complete its rename after this
+        // resolver skips migration. Prefer the still-present legacy directory,
+        // but converge on current if legacy moved before the final check.
+        ResolvedUploadsDirectory::Legacy => legacy.or(current).ok_or_else(|| {
+            ApiError::BadRequest("Legacy upload directory no longer exists".to_string())
+        }),
+    }
+}
+
+async fn resolve_uploads_dir(canonical_base: &Path) -> Result<PathBuf, ApiError> {
+    resolve_uploads_dir_impl(canonical_base, |_, _| {}).await
+}
+
+#[cfg(test)]
+async fn resolve_uploads_dir_with_probe_seam<F>(
+    canonical_base: &Path,
+    after_state_probes: F,
+) -> Result<PathBuf, ApiError>
+where
+    F: FnOnce(&Path, &Path),
+{
+    resolve_uploads_dir_impl(canonical_base, after_state_probes).await
 }
 
 pub async fn upload_files(
@@ -416,8 +680,23 @@ pub async fn upload_files(
         .await
         .map_err(|_| ApiError::File(FileError::NotFound))?;
 
-    let target_dir = match query.path.as_deref() {
-        Some(p) if !p.trim().is_empty() => file_policy::resolve_existing_dir(&base, p)?,
+    let filesystem_lock = workspace_filesystem_lock(&canonical_base);
+    let use_default_uploads_dir = !matches!(
+        query.path.as_deref(),
+        Some(path) if !path.trim().is_empty()
+    );
+
+    if use_default_uploads_dir {
+        // Give migration one non-blocking chance before taking this request's
+        // read guard. The result is deliberately discarded: after acquiring the
+        // read side we resolve again, so no other in-process migration can move
+        // the selected directory during multipart streaming and publication.
+        resolve_uploads_dir(&canonical_base).await?;
+    }
+    let _read_guard = filesystem_lock.read_owned().await;
+
+    let target_dir = match (use_default_uploads_dir, query.path.as_deref()) {
+        (false, Some(path)) => file_policy::resolve_existing_dir(&base, path)?,
         _ => resolve_uploads_dir(&canonical_base).await?,
     };
 
@@ -571,6 +850,8 @@ mod tests {
     }
 
     fn assert_gitignored(path: &Path) {
+        let metadata = fs::symlink_metadata(path.join(".gitignore")).unwrap();
+        assert!(metadata.file_type().is_file());
         assert_eq!(
             fs::read_to_string(path.join(".gitignore")).unwrap(),
             GITIGNORE_CONTENTS
@@ -618,6 +899,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uploads_dir_migration_skips_in_flight_request_then_converges() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
+        let temporary = legacy.join(".bc-upload-in-flight.tmp");
+        let published = legacy.join("report.txt");
+        fs::write(&temporary, b"streamed upload").unwrap();
+        let expected = base.join(UPLOADS_DIR);
+
+        let filesystem_lock = workspace_filesystem_lock(&base);
+        let read_guard = filesystem_lock.clone().read_owned().await;
+
+        let resolved_while_streaming = resolve_uploads_dir(&base).await.unwrap();
+
+        assert_eq!(resolved_while_streaming, legacy);
+        assert!(legacy.is_dir());
+        assert!(!expected.exists());
+        fs::rename(&temporary, &published).unwrap();
+        drop(read_guard);
+
+        let resolved_after_publish = resolve_uploads_dir(&base).await.unwrap();
+
+        assert_eq!(resolved_after_publish, expected);
+        assert!(!legacy.exists());
+        assert!(!expected.join(".bc-upload-in-flight.tmp").exists());
+        assert_eq!(
+            fs::read(expected.join("report.txt")).unwrap(),
+            b"streamed upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn uploads_dir_resolver_rechecks_after_losing_rename_race() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = tempdir.path();
+        let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
+        fs::write(legacy.join("report.txt"), b"legacy report").unwrap();
+        let expected = base.join(UPLOADS_DIR);
+
+        let resolved = resolve_uploads_dir_with_probe_seam(base, |current, legacy| {
+            fs::rename(legacy, current).unwrap();
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(resolved, expected);
+        assert!(!legacy.exists());
+        assert_eq!(
+            fs::read(expected.join("report.txt")).unwrap(),
+            b"legacy report"
+        );
+        assert_gitignored(&expected);
+    }
+
+    #[tokio::test]
+    async fn uploads_dir_resolver_converges_when_create_races_rename() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = tempdir.path();
+        let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
+        fs::write(legacy.join("legacy.txt"), b"legacy data").unwrap();
+        let expected = base.join(UPLOADS_DIR);
+
+        let resolved = resolve_uploads_dir_with_probe_seam(base, |current, _legacy| {
+            fs::create_dir(current).unwrap();
+            fs::write(current.join("new.txt"), b"new data").unwrap();
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(resolved, expected);
+        assert!(legacy.is_dir());
+        assert_eq!(fs::read(expected.join("new.txt")).unwrap(), b"new data");
+        assert_eq!(fs::read(legacy.join("legacy.txt")).unwrap(), b"legacy data");
+        assert_gitignored(&expected);
+        assert_gitignored(&legacy);
+    }
+
+    #[tokio::test]
+    async fn uploads_dir_resolver_creates_current_when_legacy_vanishes() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = tempdir.path();
+        let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
+        let expected = base.join(UPLOADS_DIR);
+
+        let resolved = resolve_uploads_dir_with_probe_seam(base, |_current, legacy| {
+            fs::remove_dir_all(legacy).unwrap();
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(resolved, expected);
+        assert!(!legacy.exists());
+        assert!(expected.is_dir());
+        assert_gitignored(&expected);
+    }
+
+    #[tokio::test]
     async fn uploads_dir_resolver_returns_new_only_dir_untouched() {
         let tempdir = tempfile::tempdir().unwrap();
         let base = tempdir.path();
@@ -632,6 +1010,116 @@ mod tests {
         assert!(!base.join(LEGACY_UPLOADS_DIR).exists());
         assert_gitignored(&expected);
         assert_eq!(fs::read(expected.join("new.txt")).unwrap(), b"new data");
+    }
+
+    #[tokio::test]
+    async fn uploads_dir_resolver_preserves_regular_gitignore_contents() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = tempdir.path();
+        let expected = seed_upload_dir(base, UPLOADS_DIR);
+        fs::write(expected.join(".gitignore"), b"*.secret\n").unwrap();
+
+        let resolved = resolve_uploads_dir(base).await.unwrap();
+
+        assert_eq!(resolved, expected);
+        assert_eq!(
+            fs::read_to_string(expected.join(".gitignore")).unwrap(),
+            "*.secret\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn uploads_dir_resolver_replaces_gitignore_directory() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = tempdir.path();
+        let expected = seed_upload_dir(base, UPLOADS_DIR);
+        let gitignore = expected.join(".gitignore");
+        fs::remove_file(&gitignore).unwrap();
+        fs::create_dir(&gitignore).unwrap();
+        fs::write(gitignore.join("nested"), b"not an ignore file").unwrap();
+
+        let resolved = resolve_uploads_dir(base).await.unwrap();
+
+        assert_eq!(resolved, expected);
+        assert_gitignored(&expected);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uploads_dir_resolver_replaces_gitignore_symlink_without_writing_through() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let base = tempdir.path();
+        let expected = seed_upload_dir(base, UPLOADS_DIR);
+        let gitignore = expected.join(".gitignore");
+        let outside_file = outside.path().join("outside-ignore");
+        fs::write(&outside_file, b"outside data").unwrap();
+        fs::remove_file(&gitignore).unwrap();
+        symlink(&outside_file, &gitignore).unwrap();
+
+        let resolved = resolve_uploads_dir(base).await.unwrap();
+
+        assert_eq!(resolved, expected);
+        assert_gitignored(&expected);
+        assert_eq!(fs::read(outside_file).unwrap(), b"outside data");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uploads_dir_resolver_ignores_legacy_symlink_and_creates_real_current_dir() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let base = tempdir.path();
+        let legacy = base.join(LEGACY_UPLOADS_DIR);
+        let expected = base.join(UPLOADS_DIR);
+        symlink(outside.path(), &legacy).unwrap();
+
+        let resolved = resolve_uploads_dir(base).await.unwrap();
+
+        assert_eq!(resolved, expected);
+        assert!(
+            fs::symlink_metadata(&legacy)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::symlink_metadata(&expected)
+                .unwrap()
+                .file_type()
+                .is_dir()
+        );
+        assert_gitignored(&expected);
+        assert!(!outside.path().join(".gitignore").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uploads_dir_resolver_rejects_current_symlink_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let base = tempdir.path();
+        let current = base.join(UPLOADS_DIR);
+        let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
+        symlink(outside.path(), &current).unwrap();
+
+        let error = resolve_uploads_dir(base).await.unwrap_err();
+
+        assert!(matches!(error, ApiError::BadRequest(_)));
+        assert!(
+            fs::symlink_metadata(current)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(legacy.is_dir());
+        assert!(!outside.path().join(".gitignore").exists());
     }
 
     #[tokio::test]
@@ -651,7 +1139,7 @@ mod tests {
         assert!(expected.is_dir());
         assert!(legacy.is_dir());
         assert_gitignored(&expected);
-        assert!(!legacy.join(".gitignore").exists());
+        assert_gitignored(&legacy);
         assert_eq!(fs::read(expected.join("new.txt")).unwrap(), b"new data");
         assert_eq!(fs::read(legacy.join("legacy.txt")).unwrap(), b"legacy data");
     }
