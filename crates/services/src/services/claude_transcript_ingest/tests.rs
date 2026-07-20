@@ -758,7 +758,7 @@ async fn executor_sid_links_and_origins_use_durable_identity() {
         .iter()
         .find(|row| row.uuid.as_deref() == Some("app-user"))
         .unwrap();
-    assert!(user_row.bound_coding_agent_turn_id.is_some());
+    assert!(user_row.bound_turn_execution_process_id.is_some());
     let assistant_row = rows
         .iter()
         .find(|row| row.uuid.as_deref() == Some("executor-assistant"))
@@ -924,10 +924,6 @@ async fn recent_app_dispatch_prefers_the_newest_matching_turn() {
         .execute(&db.pool)
         .await
         .unwrap();
-    let newer_turn = CodingAgentTurn::find_by_execution_process_id(&db.pool, newer_process)
-        .await
-        .unwrap()
-        .unwrap();
     let cwd = effective_cwd(&workspace, &session).unwrap();
     let native_dir = store_dir(&projects_dir, &cwd);
     fs::create_dir_all(&native_dir).unwrap();
@@ -954,7 +950,7 @@ async fn recent_app_dispatch_prefers_the_newest_matching_turn() {
         .into_iter()
         .find(|row| row.uuid.as_deref() == Some("recent-app-user"))
         .unwrap();
-    assert_eq!(row.bound_coding_agent_turn_id, Some(newer_turn.id));
+    assert_eq!(row.bound_turn_execution_process_id, Some(newer_process));
     assert_eq!(
         service.snapshot(session.id).await.unwrap().entries[0].origin,
         NativeFeedOrigin::App
@@ -987,10 +983,6 @@ async fn prompt_fallback_skips_turn_with_uuid_linked_native_record() {
         .bind(newer_process)
         .execute(&db.pool)
         .await
-        .unwrap();
-    let older_turn = CodingAgentTurn::find_by_execution_process_id(&db.pool, older_process)
-        .await
-        .unwrap()
         .unwrap();
     ExecutionNativeLink::insert(&db.pool, newer_process, "newer-executor-native")
         .await
@@ -1033,7 +1025,10 @@ async fn prompt_fallback_skips_turn_with_uuid_linked_native_record() {
         .into_iter()
         .find(|row| row.uuid.as_deref() == Some("fallback-user"))
         .unwrap();
-    assert_eq!(user_row.bound_coding_agent_turn_id, Some(older_turn.id));
+    assert_eq!(
+        user_row.bound_turn_execution_process_id,
+        Some(older_process)
+    );
 }
 
 #[tokio::test]
@@ -1292,10 +1287,6 @@ async fn rescan_purge_frees_prompt_binding_for_rewritten_record() {
     CodingAgentTurn::update_agent_session_id(&db.pool, process_id, sid)
         .await
         .unwrap();
-    let turn = CodingAgentTurn::find_by_execution_process_id(&db.pool, process_id)
-        .await
-        .unwrap()
-        .unwrap();
     let cwd = effective_cwd(&workspace, &session).unwrap();
     let native_dir = store_dir(&projects_dir, &cwd);
     fs::create_dir_all(&native_dir).unwrap();
@@ -1323,7 +1314,7 @@ async fn rescan_purge_frees_prompt_binding_for_rewritten_record() {
         .unwrap()
         .pop()
         .unwrap();
-    assert_eq!(old_row.bound_coding_agent_turn_id, Some(turn.id));
+    assert_eq!(old_row.bound_turn_execution_process_id, Some(process_id));
 
     fs::write(
         &native_file,
@@ -1346,7 +1337,7 @@ async fn rescan_purge_frees_prompt_binding_for_rewritten_record() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].uuid.as_deref(), Some("after-rewrite"));
-    assert_eq!(rows[0].bound_coding_agent_turn_id, Some(turn.id));
+    assert_eq!(rows[0].bound_turn_execution_process_id, Some(process_id));
     assert_eq!(
         service.snapshot(session.id).await.unwrap().entries[0].origin,
         NativeFeedOrigin::App

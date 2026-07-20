@@ -513,12 +513,18 @@ mod tests {
             .expect("metadata consumer did not drain to store closure")
             .unwrap();
 
-        assert_eq!(
-            ExecutionNativeLink::find_execution_id(&db.pool, "late-after-finished")
-                .await
-                .unwrap(),
-            Some(execution_id)
-        );
+        let persisted = sqlx::query_scalar::<_, bool>(
+            r#"SELECT EXISTS(
+                   SELECT 1 FROM execution_native_links
+                   WHERE execution_process_id = ? AND native_uuid = ?
+               )"#,
+        )
+        .bind(execution_id)
+        .bind("late-after-finished")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(persisted);
     }
 }
 

@@ -1936,35 +1936,29 @@ impl ClaudeLogProcessor {
                 }
 
                 if matches!(self.strategy, HistoryStrategy::NativeClaude) && !*is_synthetic {
-                    match &message.content {
-                        ClaudeMessageContent::Array(items) => {
-                            for item in items {
-                                if let ClaudeContentItem::Text { text } = item {
-                                    let entry = NormalizedEntry {
-                                        timestamp: None,
-                                        entry_type: NormalizedEntryType::UserMessage,
-                                        content: text.clone(),
-                                        metadata: Some(
-                                            serde_json::to_value(item)
-                                                .unwrap_or(serde_json::Value::Null),
-                                        ),
-                                    };
-                                    let id = entry_index_provider.next();
-                                    patches
-                                        .push(ConversationPatch::add_normalized_entry(id, entry));
-                                }
-                            }
-                        }
-                        ClaudeMessageContent::Text(text) => {
+                    for item in message.content.items() {
+                        if let ClaudeContentItem::Text { text } = item {
                             let entry = NormalizedEntry {
                                 timestamp: None,
                                 entry_type: NormalizedEntryType::UserMessage,
                                 content: text.clone(),
-                                metadata: Some(serde_json::Value::String(text.clone())),
+                                metadata: Some(
+                                    serde_json::to_value(item).unwrap_or(serde_json::Value::Null),
+                                ),
                             };
                             let id = entry_index_provider.next();
                             patches.push(ConversationPatch::add_normalized_entry(id, entry));
                         }
+                    }
+                    if let Some(text) = message.content.as_text() {
+                        let entry = NormalizedEntry {
+                            timestamp: None,
+                            entry_type: NormalizedEntryType::UserMessage,
+                            content: text.clone(),
+                            metadata: Some(serde_json::Value::String(text.clone())),
+                        };
+                        let id = entry_index_provider.next();
+                        patches.push(ConversationPatch::add_normalized_entry(id, entry));
                     }
                 }
 

@@ -136,7 +136,7 @@ pub fn build_projection(
                 .or(row.bound_turn_execution_process_id);
             let origin = if row.linked_execution_process_id.is_some() {
                 NativeFeedOrigin::Executor
-            } else if row.bound_coding_agent_turn_id.is_some() {
+            } else if row.bound_turn_execution_process_id.is_some() {
                 NativeFeedOrigin::App
             } else {
                 NativeFeedOrigin::Cli

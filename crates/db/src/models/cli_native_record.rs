@@ -65,7 +65,6 @@ pub struct SessionNativeRecord {
     pub kind: String,
     pub ts: Option<String>,
     pub raw: String,
-    pub bound_coding_agent_turn_id: Option<Uuid>,
     pub linked_execution_process_id: Option<Uuid>,
     pub bound_turn_execution_process_id: Option<Uuid>,
     pub seq: i64,
@@ -376,7 +375,6 @@ impl CliNativeRecord {
                       r.kind,
                       r.ts,
                       r.raw,
-                      r.bound_coding_agent_turn_id AS "bound_coding_agent_turn_id: Uuid",
                       (
                           SELECT enl.execution_process_id
                           FROM execution_native_links enl
