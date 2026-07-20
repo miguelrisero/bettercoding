@@ -61,7 +61,6 @@ use crate::services::filesystem_watcher;
 
 const REGISTRY_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const OUTBOX_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_PROJECT_DIR_SCAN: usize = 512;
 const IMPORT_BATCH_LINE_LIMIT: usize = 256;
 
 #[derive(Debug, Clone)]
@@ -659,7 +658,8 @@ impl ClaudeTranscriptIngest {
             .unwrap_or_else(|| Path::new(""))
             .to_string_lossy()
             .into_owned();
-        let metadata = fs::metadata(path)?;
+        let mut file = File::open(path)?;
+        let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Ok(());
         }
@@ -696,7 +696,6 @@ impl ClaudeTranscriptIngest {
             self.quarantined_paths.lock().unwrap().remove(path);
         }
 
-        let mut file = File::open(path)?;
         let verified_hash = if observed_size >= native_file.cursor_offset {
             verify_last_line_hash(&mut file, &native_file)?
         } else {
@@ -853,7 +852,7 @@ impl ClaudeTranscriptIngest {
         {
             return Ok(Some(cached));
         }
-        for entry in fs::read_dir(&self.projects_dir)?.take(MAX_PROJECT_DIR_SCAN) {
+        for entry in fs::read_dir(&self.projects_dir)? {
             let entry = entry?;
             let dir = entry.path();
             if !entry.file_type()?.is_dir() {
@@ -966,7 +965,7 @@ impl ClaudeTranscriptIngest {
 }
 
 /// Best-effort Claude project key. It is never trusted as an ownership signal;
-/// known sid files are verified and located by bounded filename scan.
+/// known sid files are verified and located by an exhaustive one-level scan.
 fn claude_project_slug(cwd: &Path) -> String {
     cwd.to_string_lossy()
         .chars()
@@ -983,8 +982,12 @@ fn claude_project_slug(cwd: &Path) -> String {
 fn first_prompt_snippet(path: &Path, file_session_id: &str) -> Option<String> {
     let file = File::open(path).ok()?;
     for line in BufReader::new(file).lines().take(50) {
-        let line = line.ok()?;
-        let adapted = adapt_native_claude_line(&line, file_session_id).ok()?;
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(adapted) = adapt_native_claude_line(&line, file_session_id) else {
+            continue;
+        };
         if let Some(prompt) = adapted.plain_user_text() {
             let mut snippet = prompt.chars().take(160).collect::<String>();
             if prompt.chars().count() > 160 {

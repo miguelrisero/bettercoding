@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use super::{
     ClaudeTranscriptIngest, ClaudeTranscriptIngestError, DirectoryContext, NativeFeedOrigin,
-    NativeFeedUpdate, claude_project_slug,
+    NativeFeedUpdate, claude_project_slug, first_prompt_snippet,
 };
 
 fn effective_cwd(workspace: &Workspace, session: &Session) -> Option<std::path::PathBuf> {
@@ -170,6 +170,31 @@ fn native_user_record(sid: &str, uuid: &str, text: &str, timestamp: &str) -> Str
             "message": { "role": "user", "content": text }
         })
     )
+}
+
+#[test]
+fn prompt_preview_skips_malformed_lines_within_its_scan_bound() {
+    let temp = TempDir::new().unwrap();
+    let sid = "91919191-9191-4919-8919-919191919191";
+    let path = temp.path().join(format!("{sid}.jsonl"));
+    fs::write(
+        &path,
+        format!(
+            "not-json\n{}",
+            native_user_record(
+                sid,
+                "preview-user",
+                "usable preview",
+                "2026-07-20T20:00:00Z"
+            )
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        first_prompt_snippet(&path, sid).as_deref(),
+        Some("usable preview")
+    );
 }
 
 #[cfg(unix)]
