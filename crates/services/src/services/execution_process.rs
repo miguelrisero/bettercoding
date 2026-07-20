@@ -424,6 +424,66 @@ pub(crate) async fn persist_native_link_with_retry(
     false
 }
 
+async fn read_execution_logs_for_execution(
+    pool: &SqlitePool,
+    execution_id: Uuid,
+) -> Result<Option<String>> {
+    let session_id = if let Some(process) = ExecutionProcess::find_by_id(pool, execution_id).await?
+    {
+        process.session_id
+    } else {
+        return Ok(None);
+    };
+    let path = process_log_file_path(session_id, execution_id);
+
+    match tokio::fs::metadata(&path).await {
+        Ok(_) => Ok(Some(read_execution_log_file(&path).await.with_context(
+            || format!("read execution log file for execution {execution_id}"),
+        )?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if cfg!(debug_assertions) {
+                // Convenience for local development with a clone of a prod db. Read only access to prod logs.
+                if let Ok(prod_asset_dir) = try_prod_asset_dir_path() {
+                    let prod_path =
+                        process_log_file_path_in_root(&prod_asset_dir, session_id, execution_id);
+                    match read_execution_log_file(&prod_path).await {
+                        Ok(contents) => return Ok(Some(contents)),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            return Err(err).with_context(|| {
+                                format!(
+                                    "read execution log file for execution {execution_id} from {}",
+                                    prod_path.display()
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(None)
+        }
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "check execution log file exists for execution {execution_id} at {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn new_spinner(message: &'static str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.yellow} {msg:<12.dim}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner())
+            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
+    );
+    pb.set_message(message);
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    pb
+}
+
 #[cfg(test)]
 mod tests {
     use db::models::{
@@ -526,64 +586,4 @@ mod tests {
         .unwrap();
         assert!(persisted);
     }
-}
-
-async fn read_execution_logs_for_execution(
-    pool: &SqlitePool,
-    execution_id: Uuid,
-) -> Result<Option<String>> {
-    let session_id = if let Some(process) = ExecutionProcess::find_by_id(pool, execution_id).await?
-    {
-        process.session_id
-    } else {
-        return Ok(None);
-    };
-    let path = process_log_file_path(session_id, execution_id);
-
-    match tokio::fs::metadata(&path).await {
-        Ok(_) => Ok(Some(read_execution_log_file(&path).await.with_context(
-            || format!("read execution log file for execution {execution_id}"),
-        )?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if cfg!(debug_assertions) {
-                // Convenience for local development with a clone of a prod db. Read only access to prod logs.
-                if let Ok(prod_asset_dir) = try_prod_asset_dir_path() {
-                    let prod_path =
-                        process_log_file_path_in_root(&prod_asset_dir, session_id, execution_id);
-                    match read_execution_log_file(&prod_path).await {
-                        Ok(contents) => return Ok(Some(contents)),
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(err) => {
-                            return Err(err).with_context(|| {
-                                format!(
-                                    "read execution log file for execution {execution_id} from {}",
-                                    prod_path.display()
-                                )
-                            });
-                        }
-                    }
-                }
-            }
-            Ok(None)
-        }
-        Err(e) => Err(e).with_context(|| {
-            format!(
-                "check execution log file exists for execution {execution_id} at {}",
-                path.display()
-            )
-        }),
-    }
-}
-
-fn new_spinner(message: &'static str) -> ProgressBar {
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.yellow} {msg:<12.dim}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner())
-            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
-    );
-    pb.set_message(message);
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
-    pb
 }
