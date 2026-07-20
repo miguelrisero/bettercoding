@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
-use super::cli_native_file::{CliNativeFile, RegisterCliNativeFile};
+use super::{
+    cli_ingest_outbox::CliIngestOutbox,
+    cli_native_file::{CliNativeFile, RegisterCliNativeFile},
+};
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct CliNativeRecord {
@@ -161,15 +164,7 @@ impl CliNativeRecord {
         .fetch_optional(&mut *tx)
         .await?;
         let next_outbox_seq = if let Some(session_id) = session_id {
-            Some(
-                sqlx::query_scalar!(
-                    r#"SELECT COALESCE(MAX(seq), 0) + 1 AS "seq!: i64"
-                       FROM cli_ingest_outbox WHERE session_id = $1"#,
-                    session_id
-                )
-                .fetch_one(&mut *tx)
-                .await?,
-            )
+            Some(CliIngestOutbox::next_seq_in_transaction(&mut tx, session_id).await?)
         } else {
             None
         };
@@ -237,14 +232,9 @@ impl CliNativeRecord {
         .await?;
 
         let mut next_outbox_seq = if let Some(session_id) = session_id {
-            sqlx::query_scalar!(
-                r#"SELECT COALESCE(MAX(seq), 0) + 1 AS "seq!: i64"
-                   FROM cli_ingest_outbox WHERE session_id = $1"#,
-                session_id
-            )
-            .fetch_one(&mut **tx)
-            .await?
-            .max(minimum_next_outbox_seq.unwrap_or(1))
+            CliIngestOutbox::next_seq_in_transaction(tx, session_id)
+                .await?
+                .max(minimum_next_outbox_seq.unwrap_or(1))
         } else {
             0
         };

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT published_seq\n               FROM cli_ingest_publisher_watermarks WHERE session_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "name": "published_seq",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b6950c97104399097fa6a9cf9952b02528f6e59d83a35429d8bf10ea92b3e688"
+}

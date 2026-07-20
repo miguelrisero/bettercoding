@@ -325,7 +325,10 @@ async fn large_backfill_imports_across_bounded_line_batches() {
         .unwrap()
         .unwrap();
 
-    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), projects_dir));
+    let service = Arc::new(ClaudeTranscriptIngest::new(
+        db.clone(),
+        projects_dir.clone(),
+    ));
     service
         .reconcile_registry(false, CancellationToken::new())
         .await
@@ -378,6 +381,82 @@ async fn large_backfill_imports_across_bounded_line_batches() {
     );
     shutdown.cancel();
     publisher.await.unwrap();
+    assert_eq!(
+        CliIngestOutbox::published_seq(&db.pool, session.id)
+            .await
+            .unwrap(),
+        300
+    );
+
+    let restarted = Arc::new(ClaudeTranscriptIngest::new(db, projects_dir));
+    let mut restarted_updates = restarted.subscribe();
+    let restarted_shutdown = CancellationToken::new();
+    let restarted_publisher = tokio::spawn(
+        restarted
+            .clone()
+            .run_publisher(restarted_shutdown.child_token()),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), restarted_updates.recv())
+            .await
+            .is_err(),
+        "persisted publisher watermark must suppress restart history drain"
+    );
+    restarted_shutdown.cancel();
+    restarted_publisher.await.unwrap();
+}
+
+#[tokio::test]
+async fn publisher_prunes_outbox_rows_for_a_previous_session_owner() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, previous_session) = create_workspace_and_session(&db, &workspace_root).await;
+    let current_session = create_session(&db, workspace.id).await;
+    let cwd = effective_cwd(&workspace, &previous_session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    let sid = "14141414-1414-4414-8414-141414141414";
+    fs::write(
+        native_dir.join(format!("{sid}.jsonl")),
+        native_user_record(sid, "owner-change", "move me", "2026-07-20T20:00:00Z"),
+    )
+    .unwrap();
+    ClaudeSessionLink::assign_manual(&db.pool, sid, previous_session.id, &cwd.to_string_lossy())
+        .await
+        .unwrap()
+        .unwrap();
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), projects_dir));
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+
+    ClaudeSessionLink::assign_manual(&db.pool, sid, current_session.id, &cwd.to_string_lossy())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        CliIngestOutbox::prune_superseded(&db.pool).await.unwrap(),
+        1
+    );
+
+    let previous_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM cli_ingest_outbox WHERE session_id = ?")
+            .bind(previous_session.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let current_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM cli_ingest_outbox WHERE session_id = ?")
+            .bind(current_session.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(previous_count, 0);
+    assert_eq!(current_count, 1);
 }
 
 #[tokio::test]

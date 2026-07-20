@@ -4,6 +4,8 @@ use sqlx::{FromRow, SqlitePool, Type};
 use ts_rs::TS;
 use uuid::Uuid;
 
+use super::cli_ingest_outbox::CliIngestOutbox;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, TS)]
 #[sqlx(type_name = "TEXT", rename_all = "kebab-case")]
 #[serde(rename_all = "kebab-case")]
@@ -179,13 +181,7 @@ impl ClaudeSessionLink {
         // Publish every missing record to the new owner in this same
         // transaction. INSERT OR IGNORE is intentional here: assigning or
         // resolving the same sid repeatedly is an idempotent replay.
-        let next_seq = sqlx::query_scalar!(
-            r#"SELECT COALESCE(MAX(seq), 0) + 1 AS "seq!: i64"
-               FROM cli_ingest_outbox WHERE session_id = $1"#,
-            session_id
-        )
-        .fetch_one(&mut *tx)
-        .await?;
+        let next_seq = CliIngestOutbox::next_seq_in_transaction(&mut tx, session_id).await?;
         let republished_outbox = sqlx::query!(
             r#"INSERT OR IGNORE INTO cli_ingest_outbox
                    (session_id, seq, file_id, line_seq)

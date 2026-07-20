@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO cli_ingest_publisher_watermarks\n                   (session_id, published_seq)\n               VALUES ($1, $2)\n               ON CONFLICT(session_id) DO UPDATE SET\n                   published_seq = MAX(published_seq, excluded.published_seq),\n                   updated_at = datetime('now', 'subsec')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "c805f1857966658142a6d064941d0bebf8cca8bdaaedd173529428131c972cc3"
+}

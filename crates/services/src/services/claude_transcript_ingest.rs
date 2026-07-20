@@ -64,7 +64,7 @@ use self::{
 use crate::services::filesystem_watcher;
 
 const REGISTRY_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
-const OUTBOX_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const OUTBOX_SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const IMPORT_BATCH_LINE_LIMIT: usize = 256;
 
 #[derive(Debug, Clone)]
@@ -946,15 +946,15 @@ impl ClaudeTranscriptIngest {
     }
 
     async fn run_publisher(self: Arc<Self>, shutdown: CancellationToken) {
-        // Redrain the durable outbox after restart. New subscribers still use
-        // a snapshot, while this closes the startup race for a subscriber that
-        // connects during initial backfill.
-        let mut published = HashMap::<Uuid, (i64, u64)>::new();
-        let mut interval = tokio::time::interval(OUTBOX_POLL_INTERVAL);
+        // Notifications drive ordinary delivery. The slow poll recovers a
+        // notification lost to a crash; persisted watermarks keep that safety
+        // pass from redraining already published history after restart.
+        let mut safety_interval = tokio::time::interval(OUTBOX_SAFETY_POLL_INTERVAL);
+        safety_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
-                _ = interval.tick() => {},
+                _ = safety_interval.tick() => {},
                 _ = self.publisher_notify.notified() => {},
             }
             let maxima = match CliIngestOutbox::session_maxima(&self.db.pool).await {
@@ -966,16 +966,31 @@ impl ClaudeTranscriptIngest {
             };
             for maximum in maxima {
                 let revision = self.revision(maximum.session_id).await;
-                let state = published.entry(maximum.session_id).or_insert((0, revision));
-                if state.1 == revision && state.0 >= maximum.max_seq {
-                    continue;
-                }
-                *state = (maximum.max_seq, revision);
                 let _ = self.feed_updates.send(NativeFeedUpdate::RecordsAppended {
                     session_id: maximum.session_id,
                     seq: maximum.max_seq,
                     revision,
                 });
+                if let Err(error) = CliIngestOutbox::mark_published(
+                    &self.db.pool,
+                    maximum.session_id,
+                    maximum.max_seq,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        ?error,
+                        session_id = %maximum.session_id,
+                        seq = maximum.max_seq,
+                        "failed to persist native transcript publisher watermark"
+                    );
+                }
+            }
+            if let Err(error) = CliIngestOutbox::prune_superseded(&self.db.pool).await {
+                tracing::warn!(
+                    ?error,
+                    "failed to prune superseded native transcript outbox rows"
+                );
             }
         }
     }
