@@ -196,8 +196,7 @@ pub fn get_vibe_kanban_temp_dir() -> PathBuf {
 
 enum DirectoryProbe {
     NonEmpty,
-    Empty,
-    Absent,
+    EmptyOrAbsent,
     Unknown(std::io::Error),
 }
 
@@ -246,30 +245,19 @@ fn resolve_worktree_base_dir_with_reason(
         };
     }
 
-    // Worktree-base access is deferrable: consumers can surface later I/O errors,
-    // so preserve a possibly populated candidate with a warning instead of guessing.
-    match is_non_empty_dir(&bettercoding_candidate) {
+    let bettercoding_probe = is_non_empty_dir(&bettercoding_candidate);
+    match &bettercoding_probe {
         DirectoryProbe::NonEmpty => {
             return WorktreeBaseResolution {
                 path: bettercoding_candidate,
                 reason: WorktreeBaseReason::Bettercoding,
             };
         }
-        DirectoryProbe::Unknown(error) => {
-            tracing::warn!(
-                path = %bettercoding_candidate.display(),
-                error = %error,
-                "Could not inspect worktree base candidate; adopting it to avoid skipping existing state"
-            );
-            return WorktreeBaseResolution {
-                path: bettercoding_candidate,
-                reason: WorktreeBaseReason::Bettercoding,
-            };
-        }
-        DirectoryProbe::Empty | DirectoryProbe::Absent => {}
+        DirectoryProbe::EmptyOrAbsent | DirectoryProbe::Unknown(_) => {}
     }
 
-    match is_non_empty_dir(&legacy_candidate) {
+    let legacy_probe = is_non_empty_dir(&legacy_candidate);
+    match &legacy_probe {
         DirectoryProbe::NonEmpty => {
             // TODO(bc-legacy-cleanup): remove when no vibe-kanban installs remain.
             return WorktreeBaseResolution {
@@ -277,19 +265,35 @@ fn resolve_worktree_base_dir_with_reason(
                 reason: WorktreeBaseReason::LegacyAdopt,
             };
         }
-        DirectoryProbe::Unknown(error) => {
-            tracing::warn!(
-                path = %legacy_candidate.display(),
-                error = %error,
-                "Could not inspect worktree base candidate; adopting it to avoid skipping existing state"
-            );
-            // TODO(bc-legacy-cleanup): remove when no vibe-kanban installs remain.
-            return WorktreeBaseResolution {
-                path: legacy_candidate,
-                reason: WorktreeBaseReason::LegacyAdopt,
-            };
-        }
-        DirectoryProbe::Empty | DirectoryProbe::Absent => {}
+        DirectoryProbe::EmptyOrAbsent | DirectoryProbe::Unknown(_) => {}
+    }
+
+    // Worktree-base access is deferrable: consumers can surface later I/O errors,
+    // so preserve an unknowable candidate with a warning instead of guessing. Known
+    // non-empty state above wins over an unknowable candidate in the preferred home.
+    if let DirectoryProbe::Unknown(error) = bettercoding_probe {
+        tracing::warn!(
+            path = %bettercoding_candidate.display(),
+            error = %error,
+            "Could not inspect worktree base candidate; adopting it to avoid skipping existing state"
+        );
+        return WorktreeBaseResolution {
+            path: bettercoding_candidate,
+            reason: WorktreeBaseReason::Bettercoding,
+        };
+    }
+
+    if let DirectoryProbe::Unknown(error) = legacy_probe {
+        tracing::warn!(
+            path = %legacy_candidate.display(),
+            error = %error,
+            "Could not inspect worktree base candidate; adopting it to avoid skipping existing state"
+        );
+        // TODO(bc-legacy-cleanup): remove when no vibe-kanban installs remain.
+        return WorktreeBaseResolution {
+            path: legacy_candidate,
+            reason: WorktreeBaseReason::LegacyAdopt,
+        };
     }
 
     if let Err(error) = std::fs::create_dir_all(&bettercoding_candidate) {
@@ -307,11 +311,26 @@ fn resolve_worktree_base_dir_with_reason(
 
 fn is_non_empty_dir(path: &Path) -> DirectoryProbe {
     match std::fs::read_dir(path) {
-        Ok(mut entries) => match entries.next() {
-            Some(_) => DirectoryProbe::NonEmpty,
-            None => DirectoryProbe::Empty,
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DirectoryProbe::Absent,
+        Ok(entries) => {
+            // Only directories represent app state here (`worktrees/` and `qa-repos/`).
+            // The port file is written beside them on every boot, and other plain junk
+            // files must not make an otherwise fresh install adopt the legacy home.
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => return DirectoryProbe::Unknown(error),
+                };
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(error) => return DirectoryProbe::Unknown(error),
+                };
+                if file_type.is_dir() {
+                    return DirectoryProbe::NonEmpty;
+                }
+            }
+            DirectoryProbe::EmptyOrAbsent
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DirectoryProbe::EmptyOrAbsent,
         Err(error) => DirectoryProbe::Unknown(error),
     }
 }
@@ -339,8 +358,7 @@ mod tests {
     }
 
     fn seed_dir(dir: &Path) {
-        fs::create_dir_all(dir).expect("create scratch worktree directory");
-        fs::write(dir.join("entry"), b"scratch worktree").expect("seed scratch worktree");
+        fs::create_dir_all(dir.join("worktrees")).expect("seed scratch worktree directory");
     }
 
     #[test]
@@ -383,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn uses_legacy_dir_when_only_legacy_is_non_empty() {
+    fn uses_legacy_dir_when_it_contains_one_subdirectory() {
         let root = TempDir::new().expect("create scratch directory");
         let (bettercoding_dir, legacy_dir) = temp_dir_candidates(&root);
         seed_dir(&legacy_dir);
@@ -433,6 +451,20 @@ mod tests {
     }
 
     #[test]
+    fn ignores_plain_files_in_legacy_candidate() {
+        let root = TempDir::new().expect("create scratch directory");
+        let (bettercoding_dir, legacy_dir) = temp_dir_candidates(&root);
+        fs::create_dir_all(&legacy_dir).expect("create legacy directory");
+        fs::write(legacy_dir.join("vibe-kanban.port"), b"3000").expect("seed legacy port file");
+
+        assert_eq!(
+            resolve_worktree_base_dir(None, bettercoding_dir.clone(), legacy_dir),
+            bettercoding_dir
+        );
+        assert!(bettercoding_dir.is_dir());
+    }
+
+    #[test]
     fn override_wins_when_both_are_non_empty() {
         let root = TempDir::new().expect("create scratch directory");
         let (bettercoding_dir, legacy_dir) = temp_dir_candidates(&root);
@@ -448,11 +480,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn adopts_bettercoding_candidate_when_probe_is_unknown() {
+    fn known_legacy_state_beats_unknown_bettercoding_candidate() {
         let root = TempDir::new().expect("create scratch directory");
         let (bettercoding_dir, legacy_dir) = temp_dir_candidates(&root);
         fs::create_dir(&bettercoding_dir).expect("create BetterCoding directory");
         seed_dir(&legacy_dir);
+        fs::set_permissions(&bettercoding_dir, fs::Permissions::from_mode(0o000))
+            .expect("block candidate probe");
+
+        let resolved =
+            resolve_worktree_base_dir(None, bettercoding_dir.clone(), legacy_dir.clone());
+
+        fs::set_permissions(&bettercoding_dir, fs::Permissions::from_mode(0o700))
+            .expect("restore BetterCoding directory permissions");
+        assert_eq!(resolved, legacy_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopts_bettercoding_candidate_when_probe_is_unknown_and_legacy_is_absent() {
+        let root = TempDir::new().expect("create scratch directory");
+        let (bettercoding_dir, legacy_dir) = temp_dir_candidates(&root);
+        fs::create_dir(&bettercoding_dir).expect("create BetterCoding directory");
         fs::set_permissions(&bettercoding_dir, fs::Permissions::from_mode(0o000))
             .expect("block candidate probe");
 
