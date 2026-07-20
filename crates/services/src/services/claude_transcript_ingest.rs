@@ -1070,8 +1070,8 @@ fn file_identity(metadata: &Metadata) -> (i64, i64) {
 
 #[cfg(not(unix))]
 fn file_identity(_metadata: &Metadata) -> (i64, i64) {
-    // Windows file ids are not exposed through std. Truncate and last-line
-    // verification still detect replacements; generation remains portable.
+    // Windows std metadata exposes no stable dev/inode identity. The (0, 0)
+    // sentinel means replacements rely only on truncation and last-line hash.
     (0, 0)
 }
 
