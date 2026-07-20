@@ -200,13 +200,25 @@ export function XTermInstance({
     if (!instance) return;
     const conn = getTerminalConnection(tabId);
     if (conn) {
+      if (!isTerminalMeasurable(instance.terminal)) {
+        // FitAddon clamps a zero-box pane to a tiny positive grid. Never send
+        // that grid: exclude this tab from shared tmux sizing instead.
+        broadcastTerminalPresence(tabId);
+        return;
+      }
       conn.resize(instance.terminal.cols, instance.terminal.rows);
     } else {
       // The initial connect was deferred because the pane was unmeasured at
       // mount; now that the ResizeObserver reports a real size, open it.
       ensureConnection();
     }
-  }, [tabId, fitInstance, getTerminalConnection, ensureConnection]);
+  }, [
+    tabId,
+    fitInstance,
+    getTerminalConnection,
+    ensureConnection,
+    broadcastTerminalPresence,
+  ]);
 
   // Terminal + connection lifecycle. Every run of this effect MUST register
   // the same cleanup: an early return without one leaves `terminalRef`
