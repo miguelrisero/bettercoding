@@ -1,7 +1,10 @@
-import { describe, it, expect } from 'vitest';
+import type { Terminal } from '@xterm/xterm';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ArrowKey } from './terminalKeySequences';
+import { getTerminalMobileState } from './terminalMobileState';
 import {
+  BADGE_OFFSET_PX,
   createTouchGestureController,
   DEMOTE_GUARD_MS,
   dpadBadgeText,
@@ -11,6 +14,7 @@ import {
   DOUBLE_TAP_MS,
   DPAD_DEAD_ZONE_PX,
   DPAD_ZONES,
+  installTerminalTouchGestures,
   LONG_PRESS_MS,
   MIN_ARROW_INTERVAL_MS,
   TAP_SLOP_PX,
@@ -657,5 +661,340 @@ describe('coalesced multi-touch + cancellation semantics (review round 1)', () =
     ctrl.onTouchStart(p(100, 100), 200);
     ctrl.onTouchEnd(0, 230);
     expect(events).toEqual([]); // cancelled sequence must not complete a pair
+  });
+});
+
+type CapturedTouchListener = EventListenerOrEventListenerObject;
+
+class FakeTouchEventTarget {
+  private readonly listeners = new Map<string, Set<CapturedTouchListener>>();
+
+  addEventListener(type: string, listener: CapturedTouchListener) {
+    const listeners = this.listeners.get(type) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  removeEventListener(type: string, listener: CapturedTouchListener) {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  dispatch(type: string, event: TouchEvent) {
+    for (const listener of [...(this.listeners.get(type) ?? [])]) {
+      if (typeof listener === 'function') {
+        listener(event);
+      } else {
+        listener.handleEvent(event);
+      }
+    }
+  }
+
+  listenerCount(type: string) {
+    return this.listeners.get(type)?.size ?? 0;
+  }
+}
+
+class FakeOverlay {
+  className = '';
+  textContent: string | null = null;
+  readonly style: Record<string, string> = {};
+  readonly offsetWidth = 40;
+  readonly offsetHeight = 28;
+  readonly remove = vi.fn();
+}
+
+class FakeTerminalElement extends FakeTouchEventTarget {
+  overlay: FakeOverlay | null = null;
+
+  constructor(readonly bounds = { left: 0, top: 0, width: 390, height: 600 }) {
+    super();
+  }
+
+  appendChild(overlay: FakeOverlay) {
+    this.overlay = overlay;
+  }
+
+  contains(target: unknown) {
+    return target === this || target === this.overlay;
+  }
+
+  getBoundingClientRect() {
+    const { left, top, width, height } = this.bounds;
+    return {
+      left,
+      top,
+      width,
+      height,
+      x: left,
+      y: top,
+      right: left + width,
+      bottom: top + height,
+      toJSON: () => ({}),
+    };
+  }
+}
+
+class FakeDocument extends FakeTouchEventTarget {
+  readonly createElement = vi.fn(() => new FakeOverlay());
+}
+
+interface FakeTouch {
+  identifier: number;
+  clientX: number;
+  clientY: number;
+}
+
+function touch(
+  identifier: number,
+  clientX: number,
+  clientY: number
+): FakeTouch {
+  return { identifier, clientX, clientY };
+}
+
+function touchEvent({
+  target,
+  targetTouches,
+  touches = targetTouches,
+  changedTouches = targetTouches,
+  timeStamp = performance.now(),
+}: {
+  target: unknown;
+  targetTouches: FakeTouch[];
+  touches?: FakeTouch[];
+  changedTouches?: FakeTouch[];
+  timeStamp?: number;
+}): TouchEvent {
+  return {
+    target,
+    targetTouches,
+    touches,
+    changedTouches,
+    timeStamp,
+    cancelable: true,
+    preventDefault: vi.fn(),
+  } as unknown as TouchEvent;
+}
+
+const adapterDisposers: Array<() => void> = [];
+
+function adapterHarness(bounds = { left: 0, top: 0, width: 390, height: 600 }) {
+  const documentTarget = new FakeDocument();
+  const element = new FakeTerminalElement(bounds);
+  vi.stubGlobal('document', documentTarget);
+  const terminal = { element } as unknown as Terminal;
+  const arrows: ArrowKey[] = [];
+  const events: string[] = [];
+  const dispose = installTerminalTouchGestures(terminal, {
+    sendArrow: (direction) => arrows.push(direction),
+    sendTab: () => events.push('tab'),
+    paste: () => events.push('paste'),
+  });
+  adapterDisposers.push(dispose);
+
+  return {
+    terminal,
+    element,
+    documentTarget,
+    overlay: element.overlay!,
+    arrows,
+    events,
+    dispatchTerminal(type: string, event: TouchEvent) {
+      element.dispatch(type, event);
+    },
+  };
+}
+
+describe('terminal touch gesture DOM adapter', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    for (const dispose of adapterDisposers.splice(0)) dispose();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('ends the D-pad when its terminal touch lifts before an outside touch', async () => {
+    const harness = adapterHarness();
+    const primary = touch(1, 100, 100);
+    harness.dispatchTerminal(
+      'touchstart',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [primary],
+        changedTouches: [primary],
+        timeStamp: 0,
+      })
+    );
+    await vi.advanceTimersByTimeAsync(LONG_PRESS_MS);
+    await vi.advanceTimersByTimeAsync(MIN_ARROW_INTERVAL_MS);
+    const draggedPrimary = touch(1, 100, 170);
+    harness.dispatchTerminal(
+      'touchmove',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [draggedPrimary],
+        changedTouches: [draggedPrimary],
+      })
+    );
+    expect(getTerminalMobileState(harness.terminal).dpadActive).toBe(true);
+    expect(harness.arrows).toEqual(['down']);
+
+    const outside = touch(2, 20, 20);
+    harness.dispatchTerminal(
+      'touchend',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [],
+        touches: [outside],
+        changedTouches: [draggedPrimary],
+      })
+    );
+
+    expect(getTerminalMobileState(harness.terminal).dpadActive).toBe(false);
+    expect(harness.documentTarget.listenerCount('touchstart')).toBe(0);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(harness.arrows).toEqual(['down']);
+  });
+
+  it('cancels an active D-pad when a touch starts elsewhere in the document', async () => {
+    const harness = adapterHarness();
+    const primary = touch(1, 100, 100);
+    harness.dispatchTerminal(
+      'touchstart',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [primary],
+        changedTouches: [primary],
+        timeStamp: 0,
+      })
+    );
+    await vi.advanceTimersByTimeAsync(LONG_PRESS_MS);
+    expect(harness.documentTarget.listenerCount('touchstart')).toBe(1);
+
+    const outsideTarget = {};
+    const outside = touch(2, 20, 20);
+    harness.documentTarget.dispatch(
+      'touchstart',
+      touchEvent({
+        target: outsideTarget,
+        targetTouches: [outside],
+        touches: [primary, outside],
+        changedTouches: [outside],
+      })
+    );
+
+    expect(getTerminalMobileState(harness.terminal).dpadActive).toBe(false);
+    expect(harness.documentTarget.listenerCount('touchstart')).toBe(0);
+    expect(harness.overlay.style.display).toBe('none');
+  });
+
+  it('positions the badge opposite every engaged drag direction', async () => {
+    const harness = adapterHarness();
+    const primary = touch(1, 200, 200);
+    harness.dispatchTerminal(
+      'touchstart',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [primary],
+        changedTouches: [primary],
+        timeStamp: 0,
+      })
+    );
+    await vi.advanceTimersByTimeAsync(LONG_PRESS_MS);
+
+    expect(harness.overlay.style.cssText).toContain('pointer-events:none');
+    expect(harness.overlay.style.left).toBe('180px');
+    expect(harness.overlay.style.top).toBe(
+      `${200 - BADGE_OFFSET_PX - harness.overlay.offsetHeight}px`
+    );
+
+    for (const [x, y, expectedLeft, expectedTop] of [
+      [200, 130, 180, 200 + BADGE_OFFSET_PX],
+      [200, 270, 180, 200 - BADGE_OFFSET_PX - 28],
+      [130, 200, 200 + BADGE_OFFSET_PX, 186],
+      [270, 200, 200 - BADGE_OFFSET_PX - 40, 186],
+    ] as const) {
+      await vi.advanceTimersByTimeAsync(MIN_ARROW_INTERVAL_MS);
+      const movedPrimary = touch(1, x, y);
+      harness.dispatchTerminal(
+        'touchmove',
+        touchEvent({
+          target: harness.element,
+          targetTouches: [movedPrimary],
+          changedTouches: [movedPrimary],
+        })
+      );
+      expect(harness.overlay.style.left).toBe(`${expectedLeft}px`);
+      expect(harness.overlay.style.top).toBe(`${expectedTop}px`);
+    }
+  });
+
+  it('flips the neutral badge before clamping at the top edge', async () => {
+    const harness = adapterHarness({
+      left: 0,
+      top: 0,
+      width: 200,
+      height: 200,
+    });
+    const primary = touch(1, 100, 20);
+    harness.dispatchTerminal(
+      'touchstart',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [primary],
+        changedTouches: [primary],
+        timeStamp: 0,
+      })
+    );
+    await vi.advanceTimersByTimeAsync(LONG_PRESS_MS);
+
+    expect(harness.overlay.style.top).toBe(`${20 + BADGE_OFFSET_PX}px`);
+    expect(
+      Number.parseFloat(harness.overlay.style.left)
+    ).toBeGreaterThanOrEqual(0);
+    expect(
+      Number.parseFloat(harness.overlay.style.top) +
+        harness.overlay.offsetHeight
+    ).toBeLessThanOrEqual(200);
+  });
+
+  it('flips a horizontal badge before clamping at the side edge', async () => {
+    const harness = adapterHarness({
+      left: 0,
+      top: 0,
+      width: 200,
+      height: 200,
+    });
+    const primary = touch(1, 20, 100);
+    harness.dispatchTerminal(
+      'touchstart',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [primary],
+        changedTouches: [primary],
+        timeStamp: 0,
+      })
+    );
+    await vi.advanceTimersByTimeAsync(LONG_PRESS_MS);
+    await vi.advanceTimersByTimeAsync(MIN_ARROW_INTERVAL_MS);
+    const movedPrimary = touch(1, 90, 100);
+    harness.dispatchTerminal(
+      'touchmove',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [movedPrimary],
+        changedTouches: [movedPrimary],
+      })
+    );
+
+    expect(harness.overlay.style.left).toBe(`${20 + BADGE_OFFSET_PX}px`);
+    expect(
+      Number.parseFloat(harness.overlay.style.left) +
+        harness.overlay.offsetWidth
+    ).toBeLessThanOrEqual(200);
   });
 });

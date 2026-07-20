@@ -52,6 +52,8 @@ export const ZONE_HYSTERESIS_PX = 8;
  * if it crosses more quickly than the repeat cadence.
  */
 export const MIN_ARROW_INTERVAL_MS = 120;
+/** Gap between the press origin and the D-pad feedback badge. */
+export const BADGE_OFFSET_PX = 56;
 /** Max age (ms) of a touch sequence still counting as a three-finger tap. */
 export const MULTI_TAP_MS = 500;
 
@@ -529,6 +531,8 @@ export function installTerminalTouchGestures(
   let timerTargetAt: number | null = null;
   let gestureBounds: DOMRect | null = null;
   let gestureOrigin = { clientX: 0, clientY: 0 };
+  let primaryTouchIdentifier: number | null = null;
+  let documentTouchStartAttached = false;
 
   const controller = createTouchGestureController({
     isEnabled: () => !getTerminalMobileState(terminal).selectMode,
@@ -538,10 +542,12 @@ export function installTerminalTouchGestures(
     setDpad: (active, dirNow, zoneNow, origin) => {
       patchTerminalMobileState(terminal, { dpadActive: active });
       if (!active) {
+        detachDocumentTouchStart();
         overlay.style.display = 'none';
         gestureBounds = null;
         return;
       }
+      attachDocumentTouchStart();
 
       if (gestureBounds === null) {
         // The terminal can resize during a gesture, but keeping the engage-time
@@ -554,28 +560,127 @@ export function installTerminalTouchGestures(
       overlay.textContent = dpadBadgeText(dirNow, zoneNow);
       overlay.style.display = 'block';
 
-      const desiredLeft =
-        gestureOrigin.clientX - gestureBounds.left - overlay.offsetWidth / 2;
-      const desiredTop =
-        gestureOrigin.clientY - gestureBounds.top - 56 - overlay.offsetHeight;
+      type BadgeSide = 'above' | 'below' | 'left' | 'right';
+      const originLeft = gestureOrigin.clientX - gestureBounds.left;
+      const originTop = gestureOrigin.clientY - gestureBounds.top;
+      // Sit behind the contact, opposite its drag direction; the spatial
+      // offset doubles as direction feedback before the glyph is read.
+      const initialSide: BadgeSide =
+        dirNow === 'up'
+          ? 'below'
+          : dirNow === 'left'
+            ? 'right'
+            : dirNow === 'right'
+              ? 'left'
+              : 'above';
+      const oppositeSide: Record<BadgeSide, BadgeSide> = {
+        above: 'below',
+        below: 'above',
+        left: 'right',
+        right: 'left',
+      };
+      const positionFor = (side: BadgeSide) => {
+        switch (side) {
+          case 'above':
+            return {
+              left: originLeft - overlay.offsetWidth / 2,
+              top: originTop - BADGE_OFFSET_PX - overlay.offsetHeight,
+            };
+          case 'below':
+            return {
+              left: originLeft - overlay.offsetWidth / 2,
+              top: originTop + BADGE_OFFSET_PX,
+            };
+          case 'left':
+            return {
+              left: originLeft - BADGE_OFFSET_PX - overlay.offsetWidth,
+              top: originTop - overlay.offsetHeight / 2,
+            };
+          case 'right':
+            return {
+              left: originLeft + BADGE_OFFSET_PX,
+              top: originTop - overlay.offsetHeight / 2,
+            };
+        }
+      };
+      const fitsInsideTerminal = (position: { left: number; top: number }) =>
+        position.left >= 0 &&
+        position.top >= 0 &&
+        position.left + overlay.offsetWidth <= gestureBounds!.width &&
+        position.top + overlay.offsetHeight <= gestureBounds!.height;
+
+      let side = initialSide;
+      let position = positionFor(side);
+      if (!fitsInsideTerminal(position)) {
+        // Standard tooltip flip: try the opposite side before clamping. This
+        // preserves separation from the contact instead of pinning the badge
+        // underneath the user's finger at a terminal edge.
+        side = oppositeSide[side];
+        position = positionFor(side);
+      }
       const maxLeft = Math.max(0, gestureBounds.width - overlay.offsetWidth);
       const maxTop = Math.max(0, gestureBounds.height - overlay.offsetHeight);
-      overlay.style.left = `${Math.min(Math.max(0, desiredLeft), maxLeft)}px`;
-      overlay.style.top = `${Math.min(Math.max(0, desiredTop), maxTop)}px`;
+      overlay.style.left = `${Math.min(Math.max(0, position.left), maxLeft)}px`;
+      overlay.style.top = `${Math.min(Math.max(0, position.top), maxTop)}px`;
     },
   });
+
+  function attachDocumentTouchStart() {
+    if (documentTouchStartAttached) return;
+    documentTouchStartAttached = true;
+    document.addEventListener('touchstart', onDocumentTouchStart, {
+      capture: true,
+      passive: true,
+    });
+  }
+
+  function detachDocumentTouchStart() {
+    if (!documentTouchStartAttached) return;
+    documentTouchStartAttached = false;
+    document.removeEventListener('touchstart', onDocumentTouchStart, true);
+  }
+
+  const touchWithIdentifier = (
+    touches: TouchList,
+    identifier: number
+  ): Touch | null => {
+    for (let index = 0; index < touches.length; index += 1) {
+      const touch = touches[index];
+      if (touch.identifier === identifier) return touch;
+    }
+    return null;
+  };
+
+  const toOwnedPoint = (e: TouchEvent): GesturePoint | null => {
+    if (primaryTouchIdentifier === null) return null;
+    const primary = touchWithIdentifier(
+      e.targetTouches,
+      primaryTouchIdentifier
+    );
+    if (!primary) return null;
+    return {
+      touches: e.targetTouches.length,
+      clientX: primary.clientX,
+      clientY: primary.clientY,
+    };
+  };
+
+  const clearTimerHandle = (
+    handle: ReturnType<typeof setTimeout> | null
+  ): null => {
+    if (handle !== null) clearTimeout(handle);
+    return null;
+  };
 
   const reschedule = () => {
     const at = controller.nextTimerAt();
     if (at === timerTargetAt) return; // same deadline — keep the timer
-    if (timer) {
-      clearTimeout(timer);
-      timer = null;
-    }
+    timer = clearTimerHandle(timer);
     timerTargetAt = at;
     if (at === null) return;
     timer = setTimeout(
       () => {
+        timer = null;
         timerTargetAt = null;
         controller.onTimer(performance.now());
         reschedule();
@@ -584,26 +689,41 @@ export function installTerminalTouchGestures(
     );
   };
 
-  const toPoint = (e: TouchEvent): GesturePoint => {
-    const t = e.touches[0] ?? e.changedTouches[0];
-    return {
-      touches: e.touches.length,
-      clientX: t?.clientX ?? 0,
-      clientY: t?.clientY ?? 0,
-    };
+  const releaseTouchOwnership = () => {
+    primaryTouchIdentifier = null;
+    detachDocumentTouchStart();
   };
+
+  const cancelGesture = () => {
+    controller.cancel();
+    releaseTouchOwnership();
+    reschedule();
+  };
+
+  function onDocumentTouchStart(e: TouchEvent) {
+    if (e.target === el || (e.target && el!.contains(e.target as Node))) return;
+    cancelGesture();
+  }
 
   // e.timeStamp shares performance.now()'s monotonic origin and carries the
   // moment the touch actually happened — not when a busy main thread got
   // around to delivering it.
   const onStart = (e: TouchEvent) => {
-    controller.onTouchStart(toPoint(e), e.timeStamp);
+    if (primaryTouchIdentifier === null) {
+      const initiatingTouch = e.changedTouches[0] ?? e.targetTouches[0];
+      if (!initiatingTouch) return;
+      primaryTouchIdentifier = initiatingTouch.identifier;
+    }
+    const point = toOwnedPoint(e);
+    if (!point) return;
+    controller.onTouchStart(point, e.timeStamp);
     reschedule();
   };
   const onMove = (e: TouchEvent) => {
+    const point = toOwnedPoint(e);
+    if (!point) return;
     if (
-      controller.onTouchMove(toPoint(e), e.timeStamp, performance.now())
-        .prevent &&
+      controller.onTouchMove(point, e.timeStamp, performance.now()).prevent &&
       e.cancelable
     ) {
       e.preventDefault();
@@ -611,15 +731,28 @@ export function installTerminalTouchGestures(
     reschedule();
   };
   const onEnd = (e: TouchEvent) => {
-    controller.onTouchEnd(e.touches.length, e.timeStamp);
+    if (primaryTouchIdentifier === null) return;
+    const primaryStillOwned = touchWithIdentifier(
+      e.targetTouches,
+      primaryTouchIdentifier
+    );
+    if (!primaryStillOwned) {
+      // End when OUR initiating contact is gone. Global `touches` may still
+      // contain contacts that began on nav/key bars and will never emit an
+      // event on this terminal, so waiting for the global last finger strands
+      // D-pad suppression and its timer indefinitely.
+      controller.onTouchEnd(0, e.timeStamp);
+      releaseTouchOwnership();
+    } else {
+      controller.onTouchEnd(e.targetTouches.length, e.timeStamp);
+    }
     reschedule();
   };
   const onCancel = () => {
     // A cancelled sequence (system gesture, palm rejection, browser
     // interruption) must not fire tap/paste actions — and may never deliver
     // another event for the remaining fingers, so don't wait for them.
-    controller.cancel();
-    reschedule();
+    cancelGesture();
   };
 
   el.addEventListener('touchstart', onStart, { passive: true });
@@ -630,7 +763,10 @@ export function installTerminalTouchGestures(
   activeGestureCancels.set(terminal, onCancel);
 
   return () => {
-    if (timer) clearTimeout(timer);
+    timer = clearTimerHandle(timer);
+    timerTargetAt = null;
+    controller.cancel();
+    releaseTouchOwnership();
     activeGestureCancels.delete(terminal);
     el.removeEventListener('touchstart', onStart);
     el.removeEventListener('touchmove', onMove);
