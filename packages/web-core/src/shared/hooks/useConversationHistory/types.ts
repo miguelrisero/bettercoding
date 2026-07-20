@@ -1,13 +1,16 @@
 import {
   ExecutionProcess,
   ExecutorAction,
+  NativeFeedEntry,
+  NativeFeedFork,
   PatchType,
-  Workspace,
 } from 'shared/types';
+import type { WorkspaceWithSession } from '@/shared/types/attempt';
 
 export type PatchTypeWithKey = PatchType & {
   patchKey: string;
   executionProcessId: string;
+  nativeEntry?: NativeFeedEntry;
 };
 
 /**
@@ -94,6 +97,14 @@ export type AddEntryType = 'initial' | 'running' | 'historic' | 'plan';
 export interface ConversationTimelineSource {
   executionProcessState: ExecutionProcessStateStore;
   liveExecutionProcesses: ExecutionProcess[];
+  nativeFeed?: NativeConversationTimelineSource;
+}
+
+export interface NativeConversationTimelineSource {
+  revision: bigint;
+  seq: bigint;
+  entries: NativeFeedEntry[];
+  forks: NativeFeedFork[];
 }
 
 export type OnEntriesUpdated = (
@@ -123,7 +134,7 @@ export type ExecutionProcessState = {
 export type ExecutionProcessStateStore = Record<string, ExecutionProcessState>;
 
 export interface UseConversationHistoryParams {
-  attempt: Workspace;
+  attempt: WorkspaceWithSession;
   onTimelineUpdated?: OnTimelineUpdated;
   onEntriesUpdated?: OnEntriesUpdated;
   scopeKey: string;

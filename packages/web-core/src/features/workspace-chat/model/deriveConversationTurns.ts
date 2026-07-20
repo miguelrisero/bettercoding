@@ -1,6 +1,7 @@
 import {
   type CommandExitStatus,
   type ExecutorAction,
+  type NativeFeedEntry,
   type TokenUsageInfo,
   type ToolStatus,
 } from 'shared/types';
@@ -8,6 +9,10 @@ import {
 import type { ConversationSemanticProcessItem } from './deriveConversationSemanticTimeline';
 import { deriveConversationSemanticTimeline } from './deriveConversationSemanticTimeline';
 import type { ConversationTimelineSource } from '@/shared/hooks/useConversationHistory/types';
+import {
+  mergeConversationTimelineItems,
+  type ExecutorConversationBlock,
+} from './mergeConversationTimeline';
 
 type ScriptTurnKind =
   | 'setup_script'
@@ -48,7 +53,16 @@ export interface ConversationScriptTurn {
   readonly processes: ReadonlyArray<ConversationScriptTurnProcess>;
 }
 
-export type ConversationTurn = ConversationAgentTurn | ConversationScriptTurn;
+export interface ConversationNativeTurn {
+  readonly key: string;
+  readonly kind: 'native';
+  readonly entry: NativeFeedEntry;
+}
+
+export type ConversationTurn =
+  | ConversationAgentTurn
+  | ConversationScriptTurn
+  | ConversationNativeTurn;
 
 export interface ConversationTurns {
   readonly turns: ConversationTurn[];
@@ -66,6 +80,26 @@ function isAgentTurn(turn: ConversationTurn): turn is ConversationAgentTurn {
     turn.kind === 'agent_pending_approval' ||
     turn.kind === 'agent_failed'
   );
+}
+
+function toExecutorConversationBlock(
+  turn: ConversationAgentTurn | ConversationScriptTurn
+): ExecutorConversationBlock<ConversationAgentTurn | ConversationScriptTurn> {
+  if (isAgentTurn(turn)) {
+    return {
+      item: turn,
+      processIds: [turn.process.executionProcessId],
+      createdAt: turn.process.executionProcess.created_at,
+    };
+  }
+
+  return {
+    item: turn,
+    processIds: turn.processes.map(({ process }) => process.executionProcessId),
+    createdAt:
+      turn.processes[0]?.process.executionProcess.created_at ??
+      new Date(0).toISOString(),
+  };
 }
 
 function getPromptFromActionChain(
@@ -261,7 +295,8 @@ export function deriveConversationTurns(
   source: ConversationTimelineSource
 ): ConversationTurns {
   const semanticTimeline = deriveConversationSemanticTimeline(source);
-  const turns: ConversationTurn[] = [];
+  const executorTurns: Array<ConversationAgentTurn | ConversationScriptTurn> =
+    [];
   const typedProcesses = semanticTimeline.processes
     .map((process) => {
       const scriptKind = toScriptTurnKind(process);
@@ -283,7 +318,7 @@ export function deriveConversationTurns(
     const isLastTurn = index === typedProcesses.length - 1;
 
     if (item.process.kind === 'agent') {
-      turns.push(
+      executorTurns.push(
         deriveAgentTurn(
           item.process,
           semanticTimeline.hasSetupScriptWithPrompt,
@@ -296,13 +331,13 @@ export function deriveConversationTurns(
     const kind = item.scriptKind;
     if (!kind) continue;
 
-    const previousTurn = turns.at(-1);
+    const previousTurn = executorTurns.at(-1);
     if (
       previousTurn &&
       !isAgentTurn(previousTurn) &&
       previousTurn.kind === kind
     ) {
-      turns[turns.length - 1] = {
+      executorTurns[executorTurns.length - 1] = {
         ...previousTurn,
         processes: [
           ...previousTurn.processes,
@@ -312,12 +347,27 @@ export function deriveConversationTurns(
       continue;
     }
 
-    turns.push({
+    executorTurns.push({
       key: item.process.executionProcessId,
       kind,
       processes: [deriveScriptTurnProcess(item.process, kind, index === 0)],
     });
   }
+
+  const turns: ConversationTurn[] = source.nativeFeed
+    ? mergeConversationTimelineItems(
+        executorTurns.map(toExecutorConversationBlock),
+        source.nativeFeed.entries
+      ).map((item) =>
+        item.kind === 'executor'
+          ? item.item
+          : {
+              key: `native:${item.entry.claude_session_id}:${item.entry.seq}:${item.nativeIndex}`,
+              kind: 'native',
+              entry: item.entry,
+            }
+      )
+    : executorTurns;
 
   return {
     turns,
