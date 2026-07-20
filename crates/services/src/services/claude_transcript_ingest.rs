@@ -88,11 +88,17 @@ pub struct UnassignedCliSession {
     pub first_prompt_snippet: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct NativeFeedUpdate {
-    pub session_id: Uuid,
-    pub seq: i64,
-    pub revision: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeFeedUpdate {
+    RecordsAppended {
+        session_id: Uuid,
+        seq: i64,
+        revision: u64,
+    },
+    RevisionInvalidated {
+        session_id: Uuid,
+        revision: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +121,8 @@ pub struct ClaudeTranscriptIngest {
     revisions: RwLock<HashMap<Uuid, u64>>,
     feed_updates: broadcast::Sender<NativeFeedUpdate>,
     publisher_notify: Notify,
+    #[cfg(test)]
+    snapshot_watermark_barrier: tokio::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 impl ClaudeTranscriptIngest {
@@ -149,6 +157,8 @@ impl ClaudeTranscriptIngest {
             revisions: RwLock::new(HashMap::new()),
             feed_updates,
             publisher_notify: Notify::new(),
+            #[cfg(test)]
+            snapshot_watermark_barrier: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -163,9 +173,16 @@ impl ClaudeTranscriptIngest {
         let session = Session::find_by_id(&self.db.pool, session_id)
             .await?
             .ok_or(ClaudeTranscriptIngestError::SessionNotFound(session_id))?;
-        let rows = CliNativeRecord::list_for_session(&self.db.pool, session_id).await?;
-        let seq = CliIngestOutbox::latest_seq(&self.db.pool, session_id).await?;
+
+        // Capture both live-stream watermarks before reading projection rows.
+        // With subscribe-before-snapshot, a later import/reset is queued for
+        // the subscriber, while anything included in `seq` is guaranteed to
+        // be visible to the subsequent rows query after its atomic commit.
         let revision = self.revision(session_id).await;
+        let seq = CliIngestOutbox::latest_seq(&self.db.pool, session_id).await?;
+        #[cfg(test)]
+        self.wait_at_snapshot_watermark().await;
+        let rows = CliNativeRecord::list_for_session(&self.db.pool, session_id).await?;
         let cli_session_active = WorkspaceCliActivity::find_all(&self.db.pool)
             .await?
             .into_iter()
@@ -201,6 +218,15 @@ impl ClaudeTranscriptIngest {
             health,
             cli_session_active,
         ))
+    }
+
+    #[cfg(test)]
+    async fn wait_at_snapshot_watermark(&self) {
+        let barrier = self.snapshot_watermark_barrier.lock().await.clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
     }
 
     pub async fn list_unassigned(
@@ -555,7 +581,7 @@ impl ClaudeTranscriptIngest {
         if let Some(reason) = reason {
             native_file = CliNativeFile::bump_generation(&self.db.pool, &registration).await?;
             self.rescans.fetch_add(1, Ordering::Relaxed);
-            self.bump_revision(link.session_id).await;
+            self.invalidate_revision(link.session_id).await;
             tracing::info!(?reason, path = %path.display(), generation = native_file.generation, "rescanning native transcript generation");
             file.seek(SeekFrom::Start(0))?;
         } else {
@@ -663,9 +689,19 @@ impl ClaudeTranscriptIngest {
             .unwrap_or(0)
     }
 
-    async fn bump_revision(&self, session_id: Uuid) {
-        let mut revisions = self.revisions.write().await;
-        *revisions.entry(session_id).or_insert(0) += 1;
+    async fn invalidate_revision(&self, session_id: Uuid) {
+        let revision = {
+            let mut revisions = self.revisions.write().await;
+            let revision = revisions.entry(session_id).or_insert(0);
+            *revision += 1;
+            *revision
+        };
+        let _ = self
+            .feed_updates
+            .send(NativeFeedUpdate::RevisionInvalidated {
+                session_id,
+                revision,
+            });
     }
 
     async fn run_publisher(self: Arc<Self>, shutdown: CancellationToken) {
@@ -710,7 +746,7 @@ impl ClaudeTranscriptIngest {
                     let revision = self.revision(maximum.session_id).await;
                     for row in rows {
                         *cursor = row.seq;
-                        let _ = self.feed_updates.send(NativeFeedUpdate {
+                        let _ = self.feed_updates.send(NativeFeedUpdate::RecordsAppended {
                             session_id: maximum.session_id,
                             seq: row.seq,
                             revision,

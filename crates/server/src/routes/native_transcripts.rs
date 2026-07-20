@@ -9,7 +9,8 @@ use axum::{
 use deployment::Deployment;
 use serde::Deserialize;
 use services::services::claude_transcript_ingest::{
-    ClaudeTranscriptIngest, ClaudeTranscriptIngestError, NativeFeedSnapshot, UnassignedCliSession,
+    ClaudeTranscriptIngest, ClaudeTranscriptIngestError, NativeFeedSnapshot, NativeFeedUpdate,
+    UnassignedCliSession,
 };
 use ts_rs::TS;
 use utils::{log_msg::LogMsg, response::ApiResponse};
@@ -95,6 +96,47 @@ async fn send_snapshot(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResnapshotReason {
+    sequence_gap: bool,
+    revision_changed: bool,
+}
+
+fn resnapshot_reason(
+    update: NativeFeedUpdate,
+    session_id: Uuid,
+    last_seq: i64,
+    revision: u64,
+) -> Option<ResnapshotReason> {
+    match update {
+        NativeFeedUpdate::RecordsAppended {
+            session_id: update_session_id,
+            seq,
+            revision: update_revision,
+        } => {
+            if update_session_id != session_id
+                || update_revision < revision
+                || (update_revision == revision && seq <= last_seq)
+            {
+                return None;
+            }
+            Some(ResnapshotReason {
+                sequence_gap: seq != last_seq + 1,
+                revision_changed: update_revision > revision,
+            })
+        }
+        NativeFeedUpdate::RevisionInvalidated {
+            session_id: update_session_id,
+            revision: update_revision,
+        } => (update_session_id == session_id && update_revision > revision).then_some(
+            ResnapshotReason {
+                sequence_gap: false,
+                revision_changed: true,
+            },
+        ),
+    }
+}
+
 async fn handle_native_feed_ws(
     mut socket: MaybeSignedWebSocket,
     ingest: Arc<ClaudeTranscriptIngest>,
@@ -116,13 +158,22 @@ async fn handle_native_feed_ws(
         tokio::select! {
             update = updates.recv() => {
                 match update {
-                    Ok(update) if update.session_id != session_id => continue,
-                    Ok(update) if update.seq <= last_seq => continue,
                     Ok(update) => {
-                        let gap = update.seq != last_seq + 1;
-                        let generation_changed = update.revision != revision;
-                        if gap || generation_changed {
-                            tracing::debug!(%session_id, gap, generation_changed, "resnapshotting native transcript feed");
+                        let Some(reason) = resnapshot_reason(
+                            update,
+                            session_id,
+                            last_seq,
+                            revision,
+                        ) else {
+                            continue;
+                        };
+                        if reason.sequence_gap || reason.revision_changed {
+                            tracing::debug!(
+                                %session_id,
+                                sequence_gap = reason.sequence_gap,
+                                revision_changed = reason.revision_changed,
+                                "resnapshotting native transcript feed"
+                            );
                         }
                         // A native record can replace an earlier tool-use entry
                         // or change fork membership. Rebuilding the canonical
@@ -195,4 +246,39 @@ pub fn router() -> Router<DeploymentImpl> {
             get(get_unassigned),
         )
         .route("/native-cli-sessions/assign", post(assign_unassigned))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revision_invalidation_forces_resnapshot_without_sequence_advance() {
+        let session_id = Uuid::new_v4();
+        let reason = resnapshot_reason(
+            NativeFeedUpdate::RevisionInvalidated {
+                session_id,
+                revision: 8,
+            },
+            session_id,
+            42,
+            7,
+        )
+        .expect("newer revision must invalidate a snapshot at the same sequence");
+
+        assert!(!reason.sequence_gap);
+        assert!(reason.revision_changed);
+        assert!(
+            resnapshot_reason(
+                NativeFeedUpdate::RevisionInvalidated {
+                    session_id,
+                    revision: 8,
+                },
+                session_id,
+                42,
+                8,
+            )
+            .is_none()
+        );
+    }
 }
