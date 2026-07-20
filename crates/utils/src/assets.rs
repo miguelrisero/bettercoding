@@ -10,10 +10,10 @@ use rust_embed::RustEmbed;
 use crate::env::env_path_override;
 
 const PROJECT_ROOT: &str = env!("CARGO_MANIFEST_DIR");
-const DATABASE_FILE_NAME: &str = "db.v2.sqlite";
-const LEGACY_DATABASE_FILE_NAME: &str = "db.sqlite";
+pub const DB_FILE_NAME: &str = "db.v2.sqlite";
+pub const LEGACY_DB_FILE_NAME: &str = "db.sqlite";
 
-static PROD_ASSET_DIR: OnceLock<PathBuf> = OnceLock::new();
+static PROD_ASSET_DIR: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 static DATA_DIR_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 fn data_dir_env_override() -> Option<&'static Path> {
@@ -25,7 +25,7 @@ fn data_dir_env_override() -> Option<&'static Path> {
 pub fn asset_dir() -> std::path::PathBuf {
     let path = if cfg!(debug_assertions) {
         match data_dir_env_override() {
-            Some(override_dir) => cached_prod_asset_dir_path(Some(override_dir.to_path_buf())),
+            Some(_) => prod_asset_dir_path(),
             None => std::path::PathBuf::from(PROJECT_ROOT).join("../../dev_assets"),
         }
     } else {
@@ -50,45 +50,55 @@ pub fn asset_dir() -> std::path::PathBuf {
 /// relative value is made absolute, or retained with a warning if that fails.
 /// Without an override, [`asset_dir`] keeps using `dev_assets` in debug builds.
 /// Unit tests exercise [`resolve_data_dir`] directly and never mutate process env.
+/// Startup-critical consumers deliberately panic if resolution is unknowable;
+/// best-effort consumers should use [`try_prod_asset_dir_path`] instead.
 pub fn prod_asset_dir_path() -> PathBuf {
+    try_prod_asset_dir_path().unwrap_or_else(|error| {
+        panic!("Cannot safely resolve the startup-critical data directory: {error}")
+    })
+}
+
+/// Tries to return the cached production data directory without panicking.
+///
+/// Both successful resolution and failure are cached so best-effort consumers
+/// do not repeat an unknowable filesystem probe.
+pub fn try_prod_asset_dir_path() -> Result<PathBuf, String> {
     cached_prod_asset_dir_path(data_dir_env_override().map(Path::to_path_buf))
 }
 
-fn cached_prod_asset_dir_path(override_dir: Option<PathBuf>) -> PathBuf {
+fn cached_prod_asset_dir_path(override_dir: Option<PathBuf>) -> Result<PathBuf, String> {
     PROD_ASSET_DIR
         .get_or_init(|| {
+            // Ambiguity is returned and cached here. Panicking is the policy of the
+            // startup-critical wrapper; `try_prod_asset_dir_path` lets best-effort
+            // consumers skip work that depends on the production directory.
             let resolution = if let Some(override_dir) = override_dir {
-                resolve_data_dir(Some(override_dir), PathBuf::new(), PathBuf::new()).map(|path| {
-                    DataDirResolution {
+                resolve_data_dir(Some(override_dir), PathBuf::new(), PathBuf::new())
+                    .map(|path| DataDirResolution {
                         path,
                         reason: DataDirReason::Override,
-                    }
-                })
+                    })
+                    .map_err(|error| error.to_string())
             } else {
                 let bettercoding_dir = ProjectDirs::from("ai", "bloop", "bettercoding")
-                    .expect("OS didn't give us a home directory")
+                    .ok_or_else(|| "OS didn't give us a home directory".to_string())?
                     .data_dir()
                     .to_path_buf();
                 let legacy_dir = ProjectDirs::from("ai", "bloop", "vibe-kanban")
-                    .expect("OS didn't give us a home directory")
+                    .ok_or_else(|| "OS didn't give us a home directory".to_string())?
                     .data_dir()
                     .to_path_buf();
 
                 resolve_data_dir_with_reason(None, bettercoding_dir, legacy_dir)
-            }
-            // The data directory is a startup prerequisite. Unlike the deferrable
-            // worktree base, guessing here can create an empty DB and destroy state,
-            // so an unknowable candidate must fail loudly.
-            .unwrap_or_else(|error| {
-                panic!("Cannot safely resolve the startup-critical data directory: {error}")
-            });
+                    .map_err(|error| error.to_string())
+            }?;
 
             tracing::info!(
                 path = %resolution.path.display(),
                 reason = resolution.reason.as_str(),
                 "Resolved data directory"
             );
-            resolution.path
+            Ok(resolution.path)
         })
         .clone()
 }
@@ -154,7 +164,7 @@ fn resolve_data_dir_with_reason(
         });
     }
 
-    match probe_file(&bettercoding_dir.join(DATABASE_FILE_NAME)) {
+    match probe_file(&bettercoding_dir.join(DB_FILE_NAME)) {
         FileProbe::Present => {
             return Ok(DataDirResolution {
                 path: bettercoding_dir,
@@ -186,7 +196,7 @@ fn resolve_data_dir_with_reason(
 fn probe_legacy_database(legacy_dir: &Path) -> FileProbe {
     let mut first_unknown = None;
 
-    for file_name in [DATABASE_FILE_NAME, LEGACY_DATABASE_FILE_NAME] {
+    for file_name in [DB_FILE_NAME, LEGACY_DB_FILE_NAME] {
         match probe_file(&legacy_dir.join(file_name)) {
             FileProbe::Present => return FileProbe::Present,
             FileProbe::Absent => {}
@@ -261,7 +271,7 @@ mod tests {
     }
 
     fn seed_database(dir: &Path) {
-        seed_database_named(dir, DATABASE_FILE_NAME);
+        seed_database_named(dir, DB_FILE_NAME);
     }
 
     fn seed_database_named(dir: &Path, file_name: &str) {
@@ -286,7 +296,7 @@ mod tests {
     fn uses_legacy_dir_when_it_only_has_pre_v2_database() {
         let root = TempDir::new().expect("create scratch directory");
         let (bettercoding_dir, legacy_dir) = candidates(&root);
-        seed_database_named(&legacy_dir, LEGACY_DATABASE_FILE_NAME);
+        seed_database_named(&legacy_dir, LEGACY_DB_FILE_NAME);
 
         assert_eq!(
             resolve_data_dir(None, bettercoding_dir, legacy_dir.clone())
@@ -299,7 +309,7 @@ mod tests {
     fn ignores_pre_v2_database_in_bettercoding_dir() {
         let root = TempDir::new().expect("create scratch directory");
         let (bettercoding_dir, legacy_dir) = candidates(&root);
-        seed_database_named(&bettercoding_dir, LEGACY_DATABASE_FILE_NAME);
+        seed_database_named(&bettercoding_dir, LEGACY_DB_FILE_NAME);
         seed_database(&legacy_dir);
 
         assert_eq!(
@@ -380,7 +390,7 @@ mod tests {
         fs::set_permissions(&blocked_parent, fs::Permissions::from_mode(0o700))
             .expect("restore blocked parent permissions");
         let error = result.expect_err("unknown preferred candidate must fail resolution");
-        assert_eq!(error.path, bettercoding_dir.join(DATABASE_FILE_NAME));
+        assert_eq!(error.path, bettercoding_dir.join(DB_FILE_NAME));
         assert_eq!(error.source.kind(), io::ErrorKind::PermissionDenied);
     }
 
@@ -400,7 +410,7 @@ mod tests {
         fs::set_permissions(&blocked_parent, fs::Permissions::from_mode(0o700))
             .expect("restore blocked parent permissions");
         let error = result.expect_err("unknown legacy candidate must fail resolution");
-        assert_eq!(error.path, legacy_dir.join(DATABASE_FILE_NAME));
+        assert_eq!(error.path, legacy_dir.join(DB_FILE_NAME));
         assert_eq!(error.source.kind(), io::ErrorKind::PermissionDenied);
     }
 }
