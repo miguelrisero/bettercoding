@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 import { Outlet } from '@tanstack/react-router';
 import { SyncErrorProvider } from '@/shared/providers/SyncErrorProvider';
 import { useIsMobile } from '@/shared/hooks/useIsMobile';
-import { useVisualViewportHeight } from '@/shared/hooks/useVisualViewportHeight';
+import { useVisualViewportGeometry } from '@/shared/hooks/useVisualViewportGeometry';
 import { useUiPreferencesStore } from '@/shared/stores/useUiPreferencesStore';
 import { cn } from '@/shared/lib/utils';
 
@@ -18,7 +18,8 @@ import { WorkspacesSidebarReopenTag } from '@vibe/ui/components/WorkspacesSideba
 export function SharedAppLayout() {
   const currentDestination = useCurrentAppDestination();
   const isMobile = useIsMobile();
-  const visualViewportHeight = useVisualViewportHeight();
+  const { height: visualViewportHeight, offsetTop: visualViewportOffsetTop } =
+    useVisualViewportGeometry();
   const mobileFontScale = useUiPreferencesStore((s) => s.mobileFontScale);
   const isLeftSidebarVisible = useUiPreferencesStore(
     (s) => s.isLeftSidebarVisible
@@ -60,17 +61,24 @@ export function SharedAppLayout() {
             : 'grid grid-rows-[auto_1fr] h-screen'
         )}
         style={
-          // Track the VISUAL viewport so the app (and the terminal's input
-          // line) ends above the on-screen keyboard instead of underneath it —
-          // iOS never shrinks the layout viewport (see useVisualViewportHeight).
-          // Applied on BOTH layout branches: the hook is non-null only on
-          // touch devices, which includes tablets wide enough for the desktop
-          // layout (their on-screen keyboard covers the terminal all the
-          // same). The explicit height wins over `bottom: 0` / `h-screen`;
-          // when the hook has no value (no touch / no visualViewport /
-          // pinch-zoomed) the classes alone keep the pre-existing behavior.
+          // Both touch layouts use the visual height so the app ends above the
+          // keyboard. The fixed mobile branch also follows residual iOS focus
+          // pan via `top`; the statically positioned desktop/tablet branch gets
+          // height only because `top` cannot move it. Residual pan on a wide
+          // iPad is therefore a known limitation. When geometry is unavailable
+          // (non-touch, no visualViewport, or pinch zoom), classes retain the
+          // pre-existing layout.
           visualViewportHeight !== null
-            ? { height: visualViewportHeight, bottom: 'auto' }
+            ? isMobile
+              ? {
+                  height: visualViewportHeight,
+                  bottom: 'auto',
+                  top:
+                    visualViewportOffsetTop > 0
+                      ? visualViewportOffsetTop
+                      : undefined,
+                }
+              : { height: visualViewportHeight }
             : undefined
         }
       >
