@@ -50,6 +50,8 @@ type WorkspaceFilesystemLock = Arc<RwLock<()>>;
 
 /// Serializes upload-directory migration against every in-process Files request.
 /// Keys are canonical worktree roots so aliases of the same workspace share a lock.
+// TODO: Entries are never evicted (bounded by distinct workspace count, not
+// requests); eviction belongs in the workspace-deletion path.
 static WORKSPACE_FILESYSTEM_LOCKS: LazyLock<Mutex<HashMap<PathBuf, WorkspaceFilesystemLock>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -671,11 +673,17 @@ pub async fn upload_files(
     let custom_path = query.path.as_deref().filter(|path| !path.trim().is_empty());
 
     if custom_path.is_none() {
-        // Give migration one non-blocking chance before taking this request's
-        // read guard. The result is deliberately discarded: after acquiring the
-        // read side we resolve again, so no other in-process migration can move
-        // the selected directory during multipart streaming and publication.
-        resolve_uploads_dir(&canonical_base).await?;
+        // Give migration one non-blocking, best-effort chance before taking this
+        // request's read guard. The result is deliberately discarded: after
+        // acquiring the read side we resolve again, so no other in-process
+        // migration can move the selected directory during multipart streaming
+        // and publication. That guarded resolve remains authoritative.
+        if let Err(error) = resolve_uploads_dir(&canonical_base).await {
+            tracing::warn!(
+                error = %error,
+                "Best-effort uploads directory resolve failed before acquiring the workspace filesystem lock"
+            );
+        }
     }
     let _read_guard = filesystem_lock.read_owned().await;
 
@@ -845,10 +853,10 @@ mod tests {
     #[tokio::test]
     async fn uploads_dir_resolver_creates_new_dir_when_neither_exists() {
         let tempdir = tempfile::tempdir().unwrap();
-        let base = tempdir.path();
+        let base = fs::canonicalize(tempdir.path()).unwrap();
         let expected = base.join(UPLOADS_DIR);
 
-        let resolved = resolve_uploads_dir(base).await.unwrap();
+        let resolved = resolve_uploads_dir(&base).await.unwrap();
 
         assert_eq!(resolved, expected);
         assert!(expected.is_dir());
@@ -859,14 +867,14 @@ mod tests {
     #[tokio::test]
     async fn uploads_dir_resolver_migrates_legacy_only_dir() {
         let tempdir = tempfile::tempdir().unwrap();
-        let base = tempdir.path();
-        let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
         fs::create_dir_all(legacy.join("nested")).unwrap();
         fs::write(legacy.join("report.txt"), b"legacy report").unwrap();
         fs::write(legacy.join("nested/data.bin"), b"legacy data").unwrap();
         let expected = base.join(UPLOADS_DIR);
 
-        let resolved = resolve_uploads_dir(base).await.unwrap();
+        let resolved = resolve_uploads_dir(&base).await.unwrap();
 
         assert_eq!(resolved, expected);
         assert!(expected.is_dir());
@@ -917,12 +925,12 @@ mod tests {
     #[tokio::test]
     async fn uploads_dir_resolver_rechecks_after_losing_rename_race() {
         let tempdir = tempfile::tempdir().unwrap();
-        let base = tempdir.path();
-        let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
         fs::write(legacy.join("report.txt"), b"legacy report").unwrap();
         let expected = base.join(UPLOADS_DIR);
 
-        let resolved = resolve_uploads_dir_impl(base, |current, legacy| {
+        let resolved = resolve_uploads_dir_impl(&base, |current, legacy| {
             fs::rename(legacy, current).unwrap();
         })
         .await
@@ -940,12 +948,12 @@ mod tests {
     #[tokio::test]
     async fn uploads_dir_resolver_converges_when_create_races_rename() {
         let tempdir = tempfile::tempdir().unwrap();
-        let base = tempdir.path();
-        let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
         fs::write(legacy.join("legacy.txt"), b"legacy data").unwrap();
         let expected = base.join(UPLOADS_DIR);
 
-        let resolved = resolve_uploads_dir_impl(base, |current, _legacy| {
+        let resolved = resolve_uploads_dir_impl(&base, |current, _legacy| {
             fs::create_dir(current).unwrap();
             fs::write(current.join("new.txt"), b"new data").unwrap();
         })
@@ -963,11 +971,11 @@ mod tests {
     #[tokio::test]
     async fn uploads_dir_resolver_creates_current_when_legacy_vanishes() {
         let tempdir = tempfile::tempdir().unwrap();
-        let base = tempdir.path();
-        let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
         let expected = base.join(UPLOADS_DIR);
 
-        let resolved = resolve_uploads_dir_impl(base, |_current, legacy| {
+        let resolved = resolve_uploads_dir_impl(&base, |_current, legacy| {
             fs::remove_dir_all(legacy).unwrap();
         })
         .await
@@ -982,12 +990,12 @@ mod tests {
     #[tokio::test]
     async fn uploads_dir_resolver_returns_new_only_dir_untouched() {
         let tempdir = tempfile::tempdir().unwrap();
-        let base = tempdir.path();
-        let expected = seed_upload_dir(base, UPLOADS_DIR);
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let expected = seed_upload_dir(&base, UPLOADS_DIR);
         fs::write(expected.join("new.txt"), b"new data").unwrap();
         fs::remove_file(expected.join(".gitignore")).unwrap();
 
-        let resolved = resolve_uploads_dir(base).await.unwrap();
+        let resolved = resolve_uploads_dir(&base).await.unwrap();
 
         assert_eq!(resolved, expected);
         assert!(expected.is_dir());
@@ -999,11 +1007,11 @@ mod tests {
     #[tokio::test]
     async fn uploads_dir_resolver_preserves_regular_gitignore_contents() {
         let tempdir = tempfile::tempdir().unwrap();
-        let base = tempdir.path();
-        let expected = seed_upload_dir(base, UPLOADS_DIR);
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let expected = seed_upload_dir(&base, UPLOADS_DIR);
         fs::write(expected.join(".gitignore"), b"*.secret\n").unwrap();
 
-        let resolved = resolve_uploads_dir(base).await.unwrap();
+        let resolved = resolve_uploads_dir(&base).await.unwrap();
 
         assert_eq!(resolved, expected);
         assert_eq!(
@@ -1015,14 +1023,14 @@ mod tests {
     #[tokio::test]
     async fn uploads_dir_resolver_replaces_gitignore_directory() {
         let tempdir = tempfile::tempdir().unwrap();
-        let base = tempdir.path();
-        let expected = seed_upload_dir(base, UPLOADS_DIR);
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let expected = seed_upload_dir(&base, UPLOADS_DIR);
         let gitignore = expected.join(".gitignore");
         fs::remove_file(&gitignore).unwrap();
         fs::create_dir(&gitignore).unwrap();
         fs::write(gitignore.join("nested"), b"not an ignore file").unwrap();
 
-        let resolved = resolve_uploads_dir(base).await.unwrap();
+        let resolved = resolve_uploads_dir(&base).await.unwrap();
 
         assert_eq!(resolved, expected);
         assert_gitignored(&expected);
@@ -1035,15 +1043,15 @@ mod tests {
 
         let tempdir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let base = tempdir.path();
-        let expected = seed_upload_dir(base, UPLOADS_DIR);
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let expected = seed_upload_dir(&base, UPLOADS_DIR);
         let gitignore = expected.join(".gitignore");
         let outside_file = outside.path().join("outside-ignore");
         fs::write(&outside_file, b"outside data").unwrap();
         fs::remove_file(&gitignore).unwrap();
         symlink(&outside_file, &gitignore).unwrap();
 
-        let resolved = resolve_uploads_dir(base).await.unwrap();
+        let resolved = resolve_uploads_dir(&base).await.unwrap();
 
         assert_eq!(resolved, expected);
         assert_gitignored(&expected);
@@ -1057,12 +1065,12 @@ mod tests {
 
         let tempdir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let base = tempdir.path();
+        let base = fs::canonicalize(tempdir.path()).unwrap();
         let legacy = base.join(LEGACY_UPLOADS_DIR);
         let expected = base.join(UPLOADS_DIR);
         symlink(outside.path(), &legacy).unwrap();
 
-        let resolved = resolve_uploads_dir(base).await.unwrap();
+        let resolved = resolve_uploads_dir(&base).await.unwrap();
 
         assert_eq!(resolved, expected);
         assert!(
@@ -1088,12 +1096,12 @@ mod tests {
 
         let tempdir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let base = tempdir.path();
+        let base = fs::canonicalize(tempdir.path()).unwrap();
         let current = base.join(UPLOADS_DIR);
-        let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
+        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
         symlink(outside.path(), &current).unwrap();
 
-        let error = resolve_uploads_dir(base).await.unwrap_err();
+        let error = resolve_uploads_dir(&base).await.unwrap_err();
 
         assert!(matches!(error, ApiError::BadRequest(_)));
         assert!(
@@ -1109,15 +1117,15 @@ mod tests {
     #[tokio::test]
     async fn uploads_dir_resolver_prefers_new_dir_when_both_exist() {
         let tempdir = tempfile::tempdir().unwrap();
-        let base = tempdir.path();
-        let expected = seed_upload_dir(base, UPLOADS_DIR);
-        let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let expected = seed_upload_dir(&base, UPLOADS_DIR);
+        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
         fs::write(expected.join("new.txt"), b"new data").unwrap();
         fs::write(legacy.join("legacy.txt"), b"legacy data").unwrap();
         fs::remove_file(expected.join(".gitignore")).unwrap();
         fs::remove_file(legacy.join(".gitignore")).unwrap();
 
-        let resolved = resolve_uploads_dir(base).await.unwrap();
+        let resolved = resolve_uploads_dir(&base).await.unwrap();
 
         assert_eq!(resolved, expected);
         assert!(expected.is_dir());
@@ -1131,7 +1139,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_uploads_dir_resolvers_preserve_legacy_files() {
         let tempdir = tempfile::tempdir().unwrap();
-        let base = tempdir.path().to_path_buf();
+        let base = fs::canonicalize(tempdir.path()).unwrap();
         let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
         fs::create_dir_all(legacy.join("nested")).unwrap();
         fs::write(legacy.join("first.txt"), b"first").unwrap();
@@ -1162,14 +1170,14 @@ mod tests {
     #[tokio::test]
     async fn uploads_dir_resolver_falls_back_to_legacy_on_rename_failure() {
         let tempdir = tempfile::tempdir().unwrap();
-        let base = tempdir.path();
-        let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
         fs::write(legacy.join("keep.txt"), b"do not lose me").unwrap();
         fs::remove_file(legacy.join(".gitignore")).unwrap();
         let blocked_new_path = base.join(UPLOADS_DIR);
         fs::write(&blocked_new_path, b"not a directory").unwrap();
 
-        let resolved = resolve_uploads_dir(base).await.unwrap();
+        let resolved = resolve_uploads_dir(&base).await.unwrap();
 
         assert_eq!(resolved, legacy);
         assert!(legacy.is_dir());
