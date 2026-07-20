@@ -54,7 +54,18 @@ const PIPE_EOF_GRACE: Duration = Duration::from_millis(400);
 const GROUP_EXIT_BARRIER: Duration = Duration::from_secs(2);
 #[cfg(unix)]
 const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const DISALLOWED_TOOLS: &str = "Bash,Edit,Write,WebFetch,WebSearch,NotebookEdit";
+const DISALLOWED_TOOLS: &[&str] = &[
+    "Bash",
+    "Edit",
+    "Write",
+    "WebFetch",
+    "WebSearch",
+    "NotebookEdit",
+    "Read",
+    "Glob",
+    "Grep",
+    "Task",
+];
 // Measured successes take 5-17s, while legitimate naming calls can take up to
 // ~47s under load once npx startup and user config parsing are included. Runaway
 // calls are now killed as a whole process group, so a 90s budget is safe.
@@ -237,13 +248,14 @@ fn build_title_request(first_message: &str, nonce: u64) -> Option<TitleRequest> 
          {end_delimiter}"
     );
 
-    // Reuse the executor's pinned claude CLI (`npx -y @anthropic-ai/claude-code@X`),
-    // headless with no MCP servers, one turn, and mutating/network tools denied.
-    // The prompt is intentionally absent from argv and is written over stdin.
+    // Reuse the executor's pinned claude CLI (`npx -y @anthropic-ai/claude-code@X`).
+    // Naming is a pure text transformation: it must not read the repo or persist
+    // a session. The prompt is intentionally absent from argv and goes over stdin.
     let base = base_command(false);
     let mut parts = base.split_whitespace();
     let program = parts.next()?;
     let mut args: Vec<String> = parts.map(str::to_owned).collect();
+    let disallowed_tools = DISALLOWED_TOOLS.join(",");
     args.extend([
         "-p".to_string(),
         "--model".to_string(),
@@ -251,8 +263,11 @@ fn build_title_request(first_message: &str, nonce: u64) -> Option<TitleRequest> 
         "--strict-mcp-config".to_string(),
         "--max-turns".to_string(),
         "1".to_string(),
+        "--allowedTools".to_string(),
+        String::new(),
         "--disallowedTools".to_string(),
-        DISALLOWED_TOOLS.to_string(),
+        disallowed_tools,
+        "--no-session-persistence".to_string(),
     ]);
 
     Some(TitleRequest {
@@ -1066,13 +1081,26 @@ printf 'I would implement the requested task by editing the handler.\n'
             request
                 .args
                 .windows(2)
-                .any(|pair| pair == ["--disallowedTools", DISALLOWED_TOOLS])
+                .any(|pair| pair == ["--allowedTools", ""])
         );
+        let denied = request
+            .args
+            .windows(2)
+            .find_map(|pair| {
+                (pair[0] == "--disallowedTools").then(|| pair[1].split(',').collect::<Vec<_>>())
+            })
+            .expect("--disallowedTools was not passed");
+        assert_eq!(denied, DISALLOWED_TOOLS);
         assert!(request.args.iter().any(|arg| arg == "-p"));
         assert!(request.args.iter().any(|arg| arg == "--strict-mcp-config"));
+        assert!(
+            request
+                .args
+                .iter()
+                .any(|arg| arg == "--no-session-persistence")
+        );
         assert!(request.args.iter().all(|arg| !arg.contains(task)));
 
-        let denied = DISALLOWED_TOOLS.split(',').collect::<Vec<_>>();
         for tool in [
             "Bash",
             "Edit",
@@ -1080,6 +1108,10 @@ printf 'I would implement the requested task by editing the handler.\n'
             "WebFetch",
             "WebSearch",
             "NotebookEdit",
+            "Read",
+            "Glob",
+            "Grep",
+            "Task",
         ] {
             assert!(denied.contains(&tool), "{tool} was not denied");
         }
