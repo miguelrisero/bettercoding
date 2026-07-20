@@ -57,6 +57,14 @@ export const BADGE_OFFSET_PX = 56;
 /** Max age (ms) of a touch sequence still counting as a three-finger tap. */
 export const MULTI_TAP_MS = 500;
 
+// Owner-specified product behavior ("1 per 0.5 seconds, even more 4 per
+// second"): roughly 1/2/4 arrows per second. Felt-speed changes are deliberately
+// one-line edits to these constants; nothing else in the state machine encodes
+// a rate.
+export const DPAD_REPEAT_SLOW_MS = 1_000;
+export const DPAD_REPEAT_MEDIUM_MS = 500;
+export const DPAD_REPEAT_FAST_MS = 250;
+
 /**
  * D-pad distance/rate tuning. Rows are ordered by inclusive minimum distance.
  * Zone 1: [dead zone, 48px) — one arrow per outward entry, no auto-repeat.
@@ -65,14 +73,12 @@ export const MULTI_TAP_MS = 500;
  * Zone 4: [128px, ∞) — fast auto-repeat, about four arrows per second.
  * Pulling the thresholds inward keeps zone 4 reachable from natural left- and
  * right-thumb origins on a 390px viewport, rather than only near its center.
- * Keep the owner's specified repeat rates exactly at 1000 / 500 / 250ms; they
- * are intentional product behavior, not values to "fix" during tuning.
  */
 export const DPAD_ZONES = [
   { minDistance: DPAD_DEAD_ZONE_PX, repeatMs: null },
-  { minDistance: 48, repeatMs: 1_000 },
-  { minDistance: 88, repeatMs: 500 },
-  { minDistance: 128, repeatMs: 250 },
+  { minDistance: 48, repeatMs: DPAD_REPEAT_SLOW_MS },
+  { minDistance: 88, repeatMs: DPAD_REPEAT_MEDIUM_MS },
+  { minDistance: 128, repeatMs: DPAD_REPEAT_FAST_MS },
 ] as const;
 
 export type DpadZone = 1 | 2 | 3 | 4;

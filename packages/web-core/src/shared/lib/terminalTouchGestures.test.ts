@@ -13,6 +13,8 @@ import {
   dpadZoneWithHysteresis,
   DOUBLE_TAP_MS,
   DPAD_DEAD_ZONE_PX,
+  DPAD_REPEAT_FAST_MS,
+  DPAD_REPEAT_SLOW_MS,
   DPAD_ZONES,
   installTerminalTouchGestures,
   LONG_PRESS_MS,
@@ -186,22 +188,22 @@ describe('long-press D-pad', () => {
     expect(ctrl.nextTimerAt()).toBeNull();
   });
 
-  it('repeats zone 2 every 1000ms', () => {
+  it(`repeats zone 2 every ${DPAD_REPEAT_SLOW_MS}ms`, () => {
     const { ctrl, arrows } = harness();
     ctrl.onTouchStart(p(100, 100), 0);
     runTimersUntil(ctrl, LONG_PRESS_MS);
     const t0 = LONG_PRESS_MS + 10;
     ctrl.onTouchMove(p(100, 164), t0);
-    expect(DPAD_ZONES[1].repeatMs).toBe(1_000);
+    expect(DPAD_ZONES[1].repeatMs).toBe(DPAD_REPEAT_SLOW_MS);
     expect(arrows).toEqual(['down']);
-    expect(ctrl.nextTimerAt()).toBe(t0 + 1_000);
-    ctrl.onTimer(t0 + 999);
+    expect(ctrl.nextTimerAt()).toBe(t0 + DPAD_REPEAT_SLOW_MS);
+    ctrl.onTimer(t0 + DPAD_REPEAT_SLOW_MS - 1);
     expect(arrows).toEqual(['down']);
-    runTimersUntil(ctrl, t0 + 2_000);
+    runTimersUntil(ctrl, t0 + DPAD_REPEAT_SLOW_MS * 2);
     expect(arrows).toEqual(['down', 'down', 'down']);
   });
 
-  it('fires immediately on an outward jump to zone 4, then every 250ms', () => {
+  it(`fires immediately on an outward jump to zone 4, then every ${DPAD_REPEAT_FAST_MS}ms`, () => {
     const { ctrl, arrows } = harness();
     ctrl.onTouchStart(p(100, 100), 0);
     runTimersUntil(ctrl, LONG_PRESS_MS);
@@ -212,10 +214,10 @@ describe('long-press D-pad', () => {
     );
     const outwardAt = t0 + MIN_ARROW_INTERVAL_MS;
     ctrl.onTouchMove(p(100, 264), outwardAt);
-    expect(DPAD_ZONES[3].repeatMs).toBe(250);
+    expect(DPAD_ZONES[3].repeatMs).toBe(DPAD_REPEAT_FAST_MS);
     expect(arrows).toEqual(['down', 'down']);
-    expect(ctrl.nextTimerAt()).toBe(outwardAt + 250);
-    runTimersUntil(ctrl, outwardAt + 500);
+    expect(ctrl.nextTimerAt()).toBe(outwardAt + DPAD_REPEAT_FAST_MS);
+    runTimersUntil(ctrl, outwardAt + DPAD_REPEAT_FAST_MS * 2);
     expect(arrows).toEqual(['down', 'down', 'down', 'down']);
   });
 
@@ -225,15 +227,17 @@ describe('long-press D-pad', () => {
     runTimersUntil(ctrl, LONG_PRESS_MS);
     const t0 = LONG_PRESS_MS + 10;
     ctrl.onTouchMove(p(100, 264), t0);
-    expect(ctrl.nextTimerAt()).toBe(t0 + 250);
+    expect(ctrl.nextTimerAt()).toBe(t0 + DPAD_REPEAT_FAST_MS);
 
     ctrl.onTouchMove(p(100, 164), t0 + 100);
     expect(arrows).toEqual(['down']);
     // Keep the sooner zone-4 deadline, then adopt zone 2's slower cadence.
-    expect(ctrl.nextTimerAt()).toBe(t0 + 250);
-    ctrl.onTimer(t0 + 250);
+    expect(ctrl.nextTimerAt()).toBe(t0 + DPAD_REPEAT_FAST_MS);
+    ctrl.onTimer(t0 + DPAD_REPEAT_FAST_MS);
     expect(arrows).toEqual(['down', 'down']);
-    expect(ctrl.nextTimerAt()).toBe(t0 + 1_250);
+    expect(ctrl.nextTimerAt()).toBe(
+      t0 + DPAD_REPEAT_FAST_MS + DPAD_REPEAT_SLOW_MS
+    );
   });
 
   it('stops repeats when retreating to zone 1', () => {
@@ -262,10 +266,10 @@ describe('long-press D-pad', () => {
     ctrl.onTouchMove(p(100, 170), t0);
     ctrl.onTouchMove(p(170, 100), t0 + 400);
     expect(arrows).toEqual(['down', 'right']);
-    expect(ctrl.nextTimerAt()).toBe(t0 + 1_400);
-    ctrl.onTimer(t0 + 1_000);
+    expect(ctrl.nextTimerAt()).toBe(t0 + 400 + DPAD_REPEAT_SLOW_MS);
+    ctrl.onTimer(t0 + DPAD_REPEAT_SLOW_MS);
     expect(arrows).toEqual(['down', 'right']);
-    ctrl.onTimer(t0 + 1_400);
+    ctrl.onTimer(t0 + 400 + DPAD_REPEAT_SLOW_MS);
     expect(arrows).toEqual(['down', 'right', 'right']);
   });
 
@@ -604,7 +608,7 @@ describe('timer starvation + cancellation (council round 1)', () => {
     ctrl.onTouchMove(p(100, 240), 400, 1_000);
 
     expect(arrows).toEqual(['down']);
-    expect(ctrl.nextTimerAt()).toBe(1_250);
+    expect(ctrl.nextTimerAt()).toBe(1_000 + DPAD_REPEAT_FAST_MS);
     ctrl.onTimer(1_000);
     expect(arrows).toEqual(['down']);
   });
