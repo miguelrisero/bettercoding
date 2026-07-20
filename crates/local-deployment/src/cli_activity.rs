@@ -33,8 +33,8 @@ use uuid::Uuid;
 
 use crate::pty::{
     CliClientPresence, PtyService, cli_tmux_socket, legacy_cli_tmux_socket, now_unix_secs,
-    refresh_cli_tmux_client_ignore_size, run_cli_tmux, tmux_available, tmux_client_flags_supported,
-    workspace_id_from_cli_session_name,
+    refresh_cli_tmux_client_ignore_size, run_cli_tmux, run_cli_tmux_output, tmux_available,
+    tmux_client_flags_supported, workspace_id_from_cli_session_name,
 };
 
 /// Poll cadence. Two seconds keeps bucket transitions snappy while the cost
@@ -86,6 +86,17 @@ struct Observation {
     last_activity: i64,
     /// Whether any client (browser terminal) is attached.
     attached: bool,
+}
+
+struct TmuxObservationSnapshot {
+    observations: HashMap<Uuid, Observation>,
+    complete: bool,
+}
+
+enum TmuxPaneSocketSnapshot {
+    Rows(Vec<u8>),
+    Empty,
+    Failed(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -320,9 +331,8 @@ impl CliActivityMonitor {
                     }
                 }
 
-                // A missing tmux server (no sessions yet, or it died) reads
-                // as "no sessions": every known session is gone.
-                let observations = observe_tmux().await.unwrap_or_default();
+                let snapshot = observe_tmux().await;
+                let observations = &snapshot.observations;
 
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -330,7 +340,7 @@ impl CliActivityMonitor {
                     .unwrap_or(0);
 
                 // Sessions present in tmux: run the state machine.
-                for (workspace_id, obs) in &observations {
+                for (workspace_id, obs) in observations {
                     let prev = states
                         .get(workspace_id)
                         .copied()
@@ -356,7 +366,11 @@ impl CliActivityMonitor {
                 let gone: Vec<Uuid> = states
                     .iter()
                     .filter(|(id, state)| {
-                        !observations.contains_key(*id) && **state != CliActivityState::Idle
+                        should_transition_missing_to_idle(
+                            snapshot.complete,
+                            observations.contains_key(*id),
+                            **state,
+                        )
                     })
                     .map(|(id, _)| *id)
                     .collect();
@@ -637,10 +651,19 @@ fn next_state(
     }
 }
 
+fn should_transition_missing_to_idle(
+    snapshot_complete: bool,
+    observed: bool,
+    previous: CliActivityState,
+) -> bool {
+    snapshot_complete && !observed && previous != CliActivityState::Idle
+}
+
 /// Snapshot current `bc_*` and legacy `vk_*` sessions across both tmux sockets.
-/// Returns `None` when neither server is running (which is treated as "no
-/// sessions").
-async fn observe_tmux() -> Option<HashMap<Uuid, Observation>> {
+/// Normal no-server exits are complete empty snapshots. A failed socket keeps
+/// rows observed elsewhere but marks the aggregate incomplete so missing
+/// sessions cannot be declared gone.
+async fn observe_tmux() -> TmuxObservationSnapshot {
     observe_tmux_on(&[
         cli_tmux_socket(),
         // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
@@ -649,31 +672,25 @@ async fn observe_tmux() -> Option<HashMap<Uuid, Observation>> {
     .await
 }
 
-async fn observe_tmux_on(sockets: &[&str]) -> Option<HashMap<Uuid, Observation>> {
+async fn observe_tmux_on(sockets: &[&str]) -> TmuxObservationSnapshot {
     let mut outputs = Vec::new();
+    let mut complete = true;
     for socket in sockets {
-        let output = tokio::process::Command::new("tmux")
-            .args([
-                "-L",
-                socket,
-                "list-panes",
-                "-a",
-                "-F",
-                "#{session_name}|#{pane_pid}|#{window_activity}|#{session_attached}",
-            ])
-            .output()
-            .await;
-        if let Ok(output) = output
-            && output.status.success()
-        {
-            outputs.push(output.stdout);
+        match observe_tmux_socket_on(socket).await {
+            TmuxPaneSocketSnapshot::Rows(rows) => outputs.push(rows),
+            TmuxPaneSocketSnapshot::Empty => {}
+            TmuxPaneSocketSnapshot::Failed(error) => {
+                complete = false;
+                tracing::warn!(socket, error, "CLI activity tmux pane snapshot failed");
+            }
         }
     }
-    if outputs.is_empty() {
-        return None;
-    }
 
-    let procs = snapshot_processes();
+    let procs = if outputs.is_empty() {
+        ProcSnapshot::new()
+    } else {
+        snapshot_processes()
+    };
 
     let mut observations: HashMap<Uuid, Observation> = HashMap::new();
     for output in outputs {
@@ -713,7 +730,49 @@ async fn observe_tmux_on(sockets: &[&str]) -> Option<HashMap<Uuid, Observation>>
         }
     }
 
-    Some(observations)
+    TmuxObservationSnapshot {
+        observations,
+        complete,
+    }
+}
+
+async fn observe_tmux_socket_on(socket: &str) -> TmuxPaneSocketSnapshot {
+    let output = match run_cli_tmux_output(&[
+        "-L",
+        socket,
+        "list-panes",
+        "-a",
+        "-F",
+        "#{session_name}|#{pane_pid}|#{window_activity}|#{session_attached}",
+    ])
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => return TmuxPaneSocketSnapshot::Failed(error),
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if tmux_list_panes_exit_is_definitively_empty(&stderr) {
+            return TmuxPaneSocketSnapshot::Empty;
+        }
+        return TmuxPaneSocketSnapshot::Failed(format!(
+            "tmux list-panes exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+    if output.stdout.is_empty() {
+        TmuxPaneSocketSnapshot::Empty
+    } else {
+        TmuxPaneSocketSnapshot::Rows(output.stdout)
+    }
+}
+
+fn tmux_list_panes_exit_is_definitively_empty(stderr: &str) -> bool {
+    stderr.contains("no server running")
+        || stderr.contains("No such file or directory")
+        || stderr.contains("Connection refused")
 }
 
 #[cfg(test)]
@@ -735,6 +794,30 @@ mod tests {
             .iter()
             .map(|(pid, ppid, claude)| (*pid, (*ppid, *claude)))
             .collect()
+    }
+
+    #[test]
+    fn partial_snapshot_suppresses_missing_session_idle_transition() {
+        assert!(should_transition_missing_to_idle(
+            true,
+            false,
+            CliActivityState::Running
+        ));
+        assert!(!should_transition_missing_to_idle(
+            false,
+            false,
+            CliActivityState::Running
+        ));
+        assert!(!should_transition_missing_to_idle(
+            false,
+            false,
+            CliActivityState::Attention
+        ));
+        assert!(!should_transition_missing_to_idle(
+            true,
+            true,
+            CliActivityState::Running
+        ));
     }
 
     #[test]
