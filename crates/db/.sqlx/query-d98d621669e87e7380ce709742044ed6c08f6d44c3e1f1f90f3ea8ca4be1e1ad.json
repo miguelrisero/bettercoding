@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT cat.id AS \"id!: Uuid\"\n                               FROM coding_agent_turns cat\n                               JOIN execution_processes ep\n                                 ON ep.id = cat.execution_process_id\n                               WHERE ep.session_id = $1\n                                 AND ep.run_reason = 'codingagent'\n                                 AND ep.dropped = FALSE\n                                 AND cat.prompt = $2\n                                 AND cat.created_at >= $3\n                                 AND cat.created_at <= $4\n                                 AND NOT EXISTS (\n                                     SELECT 1 FROM cli_native_records existing\n                                     WHERE existing.bound_coding_agent_turn_id = cat.id\n                                 )\n                                 AND NOT EXISTS (\n                                     SELECT 1\n                                     FROM cli_native_records native_record\n                                     JOIN execution_native_links enl\n                                       ON enl.native_uuid = native_record.uuid\n                                     WHERE enl.execution_process_id = cat.execution_process_id\n                                 )\n                               ORDER BY cat.created_at DESC\n                               LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "d98d621669e87e7380ce709742044ed6c08f6d44c3e1f1f90f3ea8ca4be1e1ad"
+}

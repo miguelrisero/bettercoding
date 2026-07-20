@@ -1,5 +1,6 @@
 use std::{collections::HashSet, fs, path::Path, sync::Arc, time::Duration};
 
+use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use db::{
     DBService,
     models::{
@@ -546,11 +547,13 @@ async fn executor_sid_links_and_origins_use_durable_identity() {
     let native_dir = store_dir(&projects_dir, &cwd);
     fs::create_dir_all(&native_dir).unwrap();
     let native_file = native_dir.join(format!("{sid}.jsonl"));
+    let recorded_at =
+        (Utc::now() + ChronoDuration::seconds(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
     let user = serde_json::json!({
         "type": "user",
         "sessionId": sid,
         "uuid": "app-user",
-        "timestamp": "2099-07-20T20:00:00Z",
+        "timestamp": recorded_at,
         "message": { "role": "user", "content": "app prompt" }
     });
     let assistant = serde_json::json!({
@@ -558,7 +561,8 @@ async fn executor_sid_links_and_origins_use_durable_identity() {
         "sessionId": sid,
         "uuid": "executor-assistant",
         "parentUuid": "app-user",
-        "timestamp": "2099-07-20T20:00:01Z",
+        "timestamp": (Utc::now() + ChronoDuration::seconds(2))
+            .to_rfc3339_opts(SecondsFormat::Millis, true),
         "message": { "role": "assistant", "content": [{"type": "text", "text": "done"}] }
     });
     fs::write(&native_file, format!("{user}\n{assistant}\n")).unwrap();
@@ -598,6 +602,241 @@ async fn executor_sid_links_and_origins_use_durable_identity() {
             && entry.origin == NativeFeedOrigin::Executor
             && entry.linked_execution_process_id == Some(process_id)
     }));
+}
+
+#[tokio::test]
+async fn same_prompt_hours_after_dispatch_remains_cli_origin() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, &workspace_root).await;
+    let sid = "23232323-2323-4323-8323-232323232323";
+    let process_id = create_coding_turn(&db, session.id, "continue").await;
+    CodingAgentTurn::update_agent_session_id(&db.pool, process_id, sid)
+        .await
+        .unwrap();
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    let much_later =
+        (Utc::now() + ChronoDuration::hours(2)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    fs::write(
+        native_dir.join(format!("{sid}.jsonl")),
+        native_user_record(sid, "later-cli", "continue", &much_later),
+    )
+    .unwrap();
+
+    let service = Arc::new(ClaudeTranscriptIngest::new(db, projects_dir));
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let entry = service
+        .snapshot(session.id)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.uuid.as_deref() == Some("later-cli"))
+        .unwrap();
+    assert_eq!(entry.origin, NativeFeedOrigin::Cli);
+}
+
+#[tokio::test]
+async fn recent_app_dispatch_prefers_the_newest_matching_turn() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, &workspace_root).await;
+    let sid = "24242424-2424-4424-8424-242424242424";
+    let older_process = create_coding_turn(&db, session.id, "same prompt").await;
+    let newer_process = create_coding_turn(&db, session.id, "same prompt").await;
+    CodingAgentTurn::update_agent_session_id(&db.pool, newer_process, sid)
+        .await
+        .unwrap();
+    let reference = Utc::now();
+    sqlx::query("UPDATE coding_agent_turns SET created_at = ? WHERE execution_process_id = ?")
+        .bind(reference - ChronoDuration::minutes(5))
+        .bind(older_process)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE coding_agent_turns SET created_at = ? WHERE execution_process_id = ?")
+        .bind(reference - ChronoDuration::minutes(1))
+        .bind(newer_process)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let newer_turn = CodingAgentTurn::find_by_execution_process_id(&db.pool, newer_process)
+        .await
+        .unwrap()
+        .unwrap();
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    fs::write(
+        native_dir.join(format!("{sid}.jsonl")),
+        native_user_record(
+            sid,
+            "recent-app-user",
+            "same prompt",
+            &reference.to_rfc3339_opts(SecondsFormat::Millis, true),
+        ),
+    )
+    .unwrap();
+
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), projects_dir));
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let row = CliNativeRecord::list_for_session(&db.pool, session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.uuid.as_deref() == Some("recent-app-user"))
+        .unwrap();
+    assert_eq!(row.bound_coding_agent_turn_id, Some(newer_turn.id));
+    assert_eq!(
+        service.snapshot(session.id).await.unwrap().entries[0].origin,
+        NativeFeedOrigin::App
+    );
+}
+
+#[tokio::test]
+async fn timestampless_user_record_uses_import_clock_for_prompt_binding() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, &workspace_root).await;
+    let sid = "25252525-2525-4525-8525-252525252525";
+    let process_id = create_coding_turn(&db, session.id, "no timestamp").await;
+    CodingAgentTurn::update_agent_session_id(&db.pool, process_id, sid)
+        .await
+        .unwrap();
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    let record = serde_json::json!({
+        "type": "user",
+        "sessionId": sid,
+        "uuid": "timestampless-user",
+        "message": { "role": "user", "content": "no timestamp" }
+    });
+    fs::write(
+        native_dir.join(format!("{sid}.jsonl")),
+        format!("{record}\n"),
+    )
+    .unwrap();
+
+    let service = Arc::new(ClaudeTranscriptIngest::new(db, projects_dir));
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let entry = service
+        .snapshot(session.id)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.uuid.as_deref() == Some("timestampless-user"))
+        .unwrap();
+    assert_eq!(entry.origin, NativeFeedOrigin::App);
+}
+
+#[tokio::test]
+async fn ordinary_outbox_constraint_failure_rolls_back_for_scan_retry() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, &workspace_root).await;
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    let first_sid = "26262626-2626-4626-8626-262626262626";
+    fs::write(
+        native_dir.join(format!("{first_sid}.jsonl")),
+        native_user_record(first_sid, "first", "first", "2026-07-20T20:00:00Z"),
+    )
+    .unwrap();
+    ClaudeSessionLink::assign_manual(&db.pool, first_sid, session.id, &cwd.to_string_lossy())
+        .await
+        .unwrap()
+        .unwrap();
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), projects_dir));
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+
+    // This secondary constraint models any unexpected outbox invariant. A
+    // strict append must abort the raw-record/cursor transaction rather than
+    // silently accepting a partially published import.
+    sqlx::query(
+        "CREATE UNIQUE INDEX test_outbox_line_seq ON cli_ingest_outbox(session_id, line_seq)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let retry_sid = "27272727-2727-4727-8727-272727272727";
+    fs::write(
+        native_dir.join(format!("{retry_sid}.jsonl")),
+        native_user_record(retry_sid, "retry", "retry", "2026-07-20T20:00:01Z"),
+    )
+    .unwrap();
+    ClaudeSessionLink::assign_manual(&db.pool, retry_sid, session.id, &cwd.to_string_lossy())
+        .await
+        .unwrap()
+        .unwrap();
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+    let retry_file = CliNativeFile::list_latest_by_sid(&db.pool, retry_sid)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        CliNativeRecord::count_for_file(&db.pool, retry_file.id)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(retry_file.cursor_offset, 0);
+
+    sqlx::query("DROP INDEX test_outbox_line_seq")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        CliNativeRecord::count_for_file(&db.pool, retry_file.id)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        CliIngestOutbox::latest_seq(&db.pool, session.id)
+            .await
+            .unwrap(),
+        2
+    );
 }
 
 #[tokio::test]

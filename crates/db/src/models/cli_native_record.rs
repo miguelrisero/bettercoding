@@ -77,6 +77,7 @@ impl CliNativeRecord {
         cursor: &ImportedCursor<'_>,
     ) -> Result<ImportBatchResult, sqlx::Error> {
         let mut tx = pool.begin().await?;
+        let imported_at = Utc::now();
 
         let session_id = sqlx::query_scalar!(
             r#"SELECT l.session_id AS "session_id!: Uuid"
@@ -119,9 +120,14 @@ impl CliNativeRecord {
             };
 
             let bound_turn_id = if record.kind == "user" && !linked_to_execution {
-                match (record.user_prompt.as_deref(), record.recorded_at) {
-                    (Some(prompt), Some(recorded_at)) if session_id.is_some() => {
-                        let session_id = session_id.expect("checked above");
+                match (record.user_prompt.as_deref(), session_id) {
+                    (Some(prompt), Some(session_id)) => {
+                        // Prompt equality is only a backfill bridge for an app
+                        // dispatch close to this native record. Native records
+                        // without a timestamp use this import's clock so they
+                        // can still reconcile without matching old turns.
+                        let reference_time = record.recorded_at.unwrap_or(imported_at);
+                        let window_start = reference_time - chrono::Duration::minutes(15);
                         sqlx::query_scalar!(
                             r#"SELECT cat.id AS "id!: Uuid"
                                FROM coding_agent_turns cat
@@ -131,16 +137,25 @@ impl CliNativeRecord {
                                  AND ep.run_reason = 'codingagent'
                                  AND ep.dropped = FALSE
                                  AND cat.prompt = $2
-                                 AND cat.created_at <= $3
+                                 AND cat.created_at >= $3
+                                 AND cat.created_at <= $4
                                  AND NOT EXISTS (
                                      SELECT 1 FROM cli_native_records existing
                                      WHERE existing.bound_coding_agent_turn_id = cat.id
                                  )
-                               ORDER BY cat.created_at ASC
+                                 AND NOT EXISTS (
+                                     SELECT 1
+                                     FROM cli_native_records native_record
+                                     JOIN execution_native_links enl
+                                       ON enl.native_uuid = native_record.uuid
+                                     WHERE enl.execution_process_id = cat.execution_process_id
+                                 )
+                               ORDER BY cat.created_at DESC
                                LIMIT 1"#,
                             session_id,
                             prompt,
-                            recorded_at
+                            window_start,
+                            reference_time
                         )
                         .fetch_optional(&mut *tx)
                         .await?
@@ -179,7 +194,7 @@ impl CliNativeRecord {
                 continue;
             };
             let outbox_inserted = sqlx::query!(
-                r#"INSERT OR IGNORE INTO cli_ingest_outbox
+                r#"INSERT INTO cli_ingest_outbox
                        (session_id, seq, file_id, line_seq)
                    VALUES ($1, $2, $3, $4)"#,
                 session_id,
