@@ -1048,7 +1048,7 @@ fn resolved_cli_tmux_sockets() -> &'static CliTmuxSockets {
     })
 }
 
-fn is_legacy_home_enabled() -> bool {
+pub(crate) fn is_legacy_home_enabled() -> bool {
     resolved_cli_tmux_sockets().legacy_home_enabled
 }
 

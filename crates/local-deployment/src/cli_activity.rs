@@ -32,9 +32,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::pty::{
-    CliClientPresence, PtyService, cli_tmux_socket, legacy_cli_tmux_socket, now_unix_secs,
-    refresh_cli_tmux_client_ignore_size, run_cli_tmux, run_cli_tmux_output, tmux_available,
-    tmux_client_flags_supported, workspace_id_from_cli_session_name,
+    CliClientPresence, PtyService, cli_tmux_socket, is_legacy_home_enabled, legacy_cli_tmux_socket,
+    now_unix_secs, refresh_cli_tmux_client_ignore_size, run_cli_tmux, run_cli_tmux_output,
+    tmux_available, tmux_client_flags_supported, workspace_id_from_cli_session_name,
 };
 
 /// Poll cadence. Two seconds keeps bucket transitions snappy while the cost
@@ -443,13 +443,13 @@ async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepSt
         return;
     }
 
-    let sockets = [
-        cli_tmux_socket(),
+    let mut sockets = vec![cli_tmux_socket()];
+    if is_legacy_home_enabled() {
         // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
-        legacy_cli_tmux_socket(),
-    ];
+        sockets.push(legacy_cli_tmux_socket());
+    }
     let mut clients = Vec::new();
-    for socket in sockets {
+    for &socket in &sockets {
         match list_cli_tmux_clients_on(socket).await {
             Ok(rows) => clients.extend(
                 rows.into_iter()
@@ -509,7 +509,7 @@ async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepSt
             .push((client, desired_ignore));
     }
 
-    for socket in sockets {
+    for &socket in &sockets {
         let Some(socket_transitions) = transitions.remove(socket) else {
             continue;
         };
@@ -664,12 +664,12 @@ fn should_transition_missing_to_idle(
 /// rows observed elsewhere but marks the aggregate incomplete so missing
 /// sessions cannot be declared gone.
 async fn observe_tmux() -> TmuxObservationSnapshot {
-    observe_tmux_on(&[
-        cli_tmux_socket(),
+    let mut sockets = vec![cli_tmux_socket()];
+    if is_legacy_home_enabled() {
         // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
-        legacy_cli_tmux_socket(),
-    ])
-    .await
+        sockets.push(legacy_cli_tmux_socket());
+    }
+    observe_tmux_on(&sockets).await
 }
 
 async fn observe_tmux_on(sockets: &[&str]) -> TmuxObservationSnapshot {
