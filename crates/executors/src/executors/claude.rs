@@ -1198,6 +1198,7 @@ impl ClaudeLogProcessor {
             let mut processor = Self::new_with_strategy(strategy);
             // Track pending assistant UUID - only committed when we see a Result message
             let mut pending_assistant_uuid: Option<String> = None;
+            let mut last_native_uuid: Option<String> = None;
 
             while let Some(Ok(msg)) = stream.next().await {
                 let chunk = match msg {
@@ -1247,23 +1248,34 @@ impl ClaudeLogProcessor {
                             // - Assistant messages: may have incomplete tool calls, store as pending
                             // - Result messages: confirms assistant turn is complete, commit pending
                             match &claude_json {
-                                ClaudeJson::User { uuid, .. } => {
+                                ClaudeJson::User {
+                                    uuid, is_replay, ..
+                                } => {
                                     pending_assistant_uuid = None;
-                                    if let Some(uuid) = uuid {
-                                        msg_store.push_native_uuid(uuid.clone());
+                                    if !*is_replay && let Some(uuid) = uuid {
+                                        if last_native_uuid.as_ref() != Some(uuid) {
+                                            msg_store.push_native_uuid(uuid.clone());
+                                            last_native_uuid = Some(uuid.clone());
+                                        }
                                         msg_store.push_message_id(uuid.clone());
                                     }
                                 }
                                 ClaudeJson::Assistant { uuid, .. } => {
-                                    if let Some(uuid) = uuid {
+                                    if let Some(uuid) = uuid
+                                        && last_native_uuid.as_ref() != Some(uuid)
+                                    {
                                         msg_store.push_native_uuid(uuid.clone());
+                                        last_native_uuid = Some(uuid.clone());
                                     }
                                     pending_assistant_uuid = uuid.clone();
                                 }
                                 ClaudeJson::StreamEvent {
                                     uuid: Some(uuid), ..
                                 } => {
-                                    msg_store.push_native_uuid(uuid.clone());
+                                    if last_native_uuid.as_ref() != Some(uuid) {
+                                        msg_store.push_native_uuid(uuid.clone());
+                                        last_native_uuid = Some(uuid.clone());
+                                    }
                                 }
                                 ClaudeJson::Result { .. } => {
                                     if let Some(uuid) = pending_assistant_uuid.take() {
@@ -3595,7 +3607,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emits_every_observed_stream_uuid_for_native_linking() {
+    async fn emits_each_consecutive_live_uuid_once_for_native_linking() {
         let msg_store = Arc::new(MsgStore::new());
         let processor = ClaudeLogProcessor::process_logs(
             msg_store.clone(),
@@ -3605,8 +3617,11 @@ mod tests {
         );
         msg_store.push_stdout(
             concat!(
+                "{\"type\":\"user\",\"uuid\":\"replayed-uuid\",\"isReplay\":true,\"message\":{\"role\":\"user\",\"content\":\"history\"}}\n",
                 "{\"type\":\"user\",\"uuid\":\"user-uuid\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
                 "{\"type\":\"assistant\",\"uuid\":\"assistant-uuid\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
+                "{\"type\":\"stream_event\",\"uuid\":\"assistant-uuid\",\"event\":{\"type\":\"message_stop\"}}\n",
+                "{\"type\":\"stream_event\",\"uuid\":\"event-uuid\",\"event\":{\"type\":\"message_stop\"}}\n",
                 "{\"type\":\"stream_event\",\"uuid\":\"event-uuid\",\"event\":{\"type\":\"message_stop\"}}\n"
             )
             .to_string(),
@@ -3621,13 +3636,13 @@ mod tests {
                 LogMsg::NativeUuid(uuid) => Some(uuid),
                 _ => None,
             })
-            .collect::<std::collections::HashSet<_>>();
+            .collect::<Vec<_>>();
         assert_eq!(
             native_uuids,
             ["user-uuid", "assistant-uuid", "event-uuid"]
                 .into_iter()
                 .map(str::to_string)
-                .collect()
+                .collect::<Vec<_>>()
         );
     }
 
