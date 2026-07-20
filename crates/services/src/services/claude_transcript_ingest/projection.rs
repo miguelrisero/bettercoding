@@ -73,7 +73,7 @@ pub struct NativeFeedSnapshot {
     pub entries: Vec<NativeFeedEntry>,
     pub forks: Vec<NativeFeedFork>,
     pub health: NativeIngestHealth,
-    /// Coarse hint sourced from the existing workspace CLI activity poller.
+    // Coarse hint sourced from the existing workspace CLI activity poller.
     pub cli_session_active: bool,
 }
 

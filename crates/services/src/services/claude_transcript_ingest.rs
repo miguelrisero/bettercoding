@@ -36,6 +36,7 @@ use db::{
     },
 };
 use executors::executors::claude::native::adapt_native_claude_line;
+pub use forks::{NativeForkBranch, NativeForkView};
 use futures::StreamExt;
 pub use projection::{
     NativeBranchMetadata, NativeFeedEntry, NativeFeedFork, NativeFeedOrigin, NativeFeedSnapshot,

@@ -345,6 +345,28 @@ fire_at: string,
  */
 prompt: string | null, };
 
+export type NativeFeedOrigin = "cli" | "app" | "executor";
+
+export type NativeBranchMetadata = { fork_parent_uuid: string, branch_index: number, branch_label: string, is_default: boolean, };
+
+export type NativeFeedEntry = { normalized_entry: NormalizedEntry, claude_session_id: string, uuid: string | null, parent_uuid: string | null, ts: string | null, origin: NativeFeedOrigin, linked_execution_process_id: string | null, git_branch: string | null, version: string | null, branch: NativeBranchMetadata | null, seq: bigint, };
+
+export type NativeForkBranch = { label: string, root_uuid: string, node_uuids: Array<string>, leaf_uuids: Array<string>, };
+
+export type NativeForkView = { fork_parent_uuid: string, prefix_uuids: Array<string>, branches: Array<NativeForkBranch>, default_branch: number | null, };
+
+export type NativeFeedFork = { claude_session_id: string, file_id: string, fork: NativeForkView, };
+
+export type NativeFileImportHealth = { claude_session_id: string, file_name: string, generation: bigint, last_import_at: string | null, };
+
+export type NativeIngestHealth = { unknown_kinds: bigint, rescans: bigint, quarantined_files: bigint, watch_degraded: boolean, files: Array<NativeFileImportHealth>, };
+
+export type NativeFeedSnapshot = { revision: bigint, seq: bigint, entries: Array<NativeFeedEntry>, forks: Array<NativeFeedFork>, health: NativeIngestHealth, cli_session_active: boolean, };
+
+export type UnassignedCliSession = { claude_session_id: string, cwd: string, dir_path: string, file_name: string, mtime_ms: bigint | null, first_prompt_snippet: string | null, };
+
+export type AssignNativeCliSessionRequest = { claude_session_id: string, session_id: string, };
+
 export type StartSpake2EnrollmentRequest = { enrollment_code: string, client_message_b64: string, };
 
 export type FinishSpake2EnrollmentRequest = { enrollment_id: string, client_id: string, client_name: string, client_browser: string, client_os: string, client_device: string, public_key_b64: string, client_proof_b64: string, };
