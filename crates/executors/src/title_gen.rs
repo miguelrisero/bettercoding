@@ -13,11 +13,15 @@ use std::{
     time::Duration,
 };
 
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
+use command_group::AsyncGroupChild;
 #[cfg(unix)]
 use nix::{errno::Errno, sys::signal::killpg, unistd::Pid};
 use serde::Deserialize;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    process::{ChildStderr, ChildStdin, ChildStdout},
+};
+use workspace_utils::command_ext::GroupSpawnNoWindowExt;
 
 use crate::executors::claude::base_command;
 
@@ -335,27 +339,10 @@ async fn command_output_with_timeout(
     // on Windows. The guard remains the sole owner until cleanup is complete;
     // its Drop path synchronously requests a whole-group kill if this future is
     // cancelled before any awaited cleanup finishes.
-    let mut child = ChildGroupGuard::new(cmd.group_spawn()?);
+    let mut child = ChildGroupGuard::new(cmd.group_spawn_no_window()?);
 
     let result = async {
-        let mut stdin = child
-            .child_mut()
-            .inner()
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("title command stdin was not piped"))?;
-        let stdout = child
-            .child_mut()
-            .inner()
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("title command stdout was not piped"))?;
-        let stderr = child
-            .child_mut()
-            .inner()
-            .stderr
-            .take()
-            .ok_or_else(|| io::Error::other("title command stderr was not piped"))?;
+        let (mut stdin, stdout, stderr) = take_child_stdio(child.child_mut())?;
 
         let collect_output = async {
             let write_prompt = async {
@@ -389,12 +376,29 @@ async fn command_output_with_timeout(
 }
 
 async fn wait_for_leader_exit(child: &mut AsyncGroupChild) -> io::Result<std::process::ExitStatus> {
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // AsyncGroupChild::wait waits for the entire group and can enter an
+    // uncancellable blocking wait on Unix. Waiting on its Tokio child directly
+    // is event-driven and cancel-safe while preserving leader-only semantics.
+    child.inner().wait().await
+}
+
+fn take_child_stdio(
+    child: &mut AsyncGroupChild,
+) -> io::Result<(ChildStdin, ChildStdout, ChildStderr)> {
+    let child = child.inner();
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("title command stdin was not piped"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("title command stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("title command stderr was not piped"))?;
+    Ok((stdin, stdout, stderr))
 }
 
 async fn read_bounded(reader: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
@@ -406,21 +410,14 @@ async fn read_bounded(reader: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
 
 struct ChildGroupGuard {
     child: Option<AsyncGroupChild>,
-    #[cfg(unix)]
-    pgid: u32,
+    reaper: GroupReaper,
 }
 
 impl ChildGroupGuard {
     fn new(child: AsyncGroupChild) -> Self {
-        #[cfg(unix)]
-        let pgid = child
-            .id()
-            .expect("a newly spawned title process group must have a PGID");
-
         Self {
+            reaper: GroupReaper::new(&child),
             child: Some(child),
-            #[cfg(unix)]
-            pgid,
         }
     }
 
@@ -436,10 +433,7 @@ impl ChildGroupGuard {
         };
 
         request_group_kill(child);
-        #[cfg(unix)]
-        reap_group_after_kill(child, self.pgid).await;
-        #[cfg(windows)]
-        reap_group_after_kill(child).await;
+        self.reaper.reap_after_kill(child).await;
 
         // Disarm only after the bounded descendant barrier has completed. If
         // this method is cancelled at any await, Drop stays armed.
@@ -457,23 +451,49 @@ impl Drop for ChildGroupGuard {
         // POSIX killpg / Windows TerminateJobObject request.
         request_group_kill(&mut child);
 
-        #[cfg(unix)]
-        let pgid = self.pgid;
+        let reaper = self.reaper;
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 // Keep the group handle alive in a detached cleanup task long
                 // enough to reap the leader and observe descendant exit.
                 drop(handle.spawn(async move {
-                    #[cfg(unix)]
-                    reap_group_after_kill(&mut child, pgid).await;
-                    #[cfg(windows)]
-                    reap_group_after_kill(&mut child).await;
+                    reaper.reap_after_kill(&mut child).await;
                 }));
             }
             Err(error) => tracing::warn!(
                 "title process group was killed during shutdown but its reap could not be scheduled: {error}"
             ),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GroupReaper {
+    #[cfg(unix)]
+    pgid: u32,
+}
+
+impl GroupReaper {
+    fn new(child: &AsyncGroupChild) -> Self {
+        #[cfg(unix)]
+        {
+            let pgid = child
+                .id()
+                .expect("a newly spawned title process group must have a PGID");
+            Self { pgid }
+        }
+        #[cfg(windows)]
+        {
+            let _ = child;
+            Self {}
+        }
+    }
+
+    async fn reap_after_kill(self, child: &mut AsyncGroupChild) {
+        #[cfg(unix)]
+        reap_process_group_after_kill(child, self.pgid).await;
+        #[cfg(windows)]
+        reap_process_job_after_kill(child).await;
     }
 }
 
@@ -486,66 +506,49 @@ fn request_group_kill(child: &mut AsyncGroupChild) {
     }
 }
 
-#[cfg(unix)]
 fn is_group_already_gone_error(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::InvalidInput
-        || error.kind() == io::ErrorKind::NotFound
-        || error.raw_os_error() == Some(Errno::ESRCH as i32)
-}
-
-#[cfg(windows)]
-fn is_group_already_gone_error(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::InvalidInput || error.kind() == io::ErrorKind::NotFound
+    let is_gone = matches!(
+        error.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::NotFound
+    );
+    #[cfg(unix)]
+    let is_gone = is_gone || error.raw_os_error() == Some(Errno::ESRCH as i32);
+    is_gone
 }
 
 #[cfg(unix)]
-async fn reap_group_after_kill(child: &mut AsyncGroupChild, pgid: u32) {
+async fn reap_process_group_after_kill(child: &mut AsyncGroupChild, pgid: u32) {
     let deadline = tokio::time::Instant::now() + GROUP_EXIT_BARRIER;
-    let mut leader_reaped = false;
-    let mut reap_failed = false;
-    let mut group_gone = false;
-    let mut probe_failed = false;
+
+    match tokio::time::timeout_at(deadline, wait_for_leader_exit(child)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!("failed to reap title process group leader: {error}");
+        }
+        Err(_) => tracing::warn!("title process group leader was not reaped within 2s"),
+    }
 
     loop {
-        if !leader_reaped && !reap_failed {
-            match child.try_wait() {
-                Ok(Some(_)) => leader_reaped = true,
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!("failed to reap title process group leader: {error}");
-                    reap_failed = true;
-                }
-            }
-        }
-
-        if !group_gone && !probe_failed {
-            match process_group_is_gone(pgid) {
-                Ok(is_gone) => group_gone = is_gone,
-                Err(error) => {
-                    tracing::warn!(
-                        "failed to probe title process group after SIGKILL; descendants may remain: {error}"
-                    );
-                    probe_failed = true;
-                }
-            }
-        }
-
-        if (leader_reaped || reap_failed) && (group_gone || probe_failed) {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            if !leader_reaped && !reap_failed {
-                tracing::warn!("title process group leader was not reaped within 2s");
-            }
-            if !group_gone && !probe_failed {
+        match process_group_is_gone(pgid) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
                 tracing::warn!(
-                    "title process group still exists 2s after SIGKILL; descendants may remain"
+                    "failed to probe title process group after SIGKILL; descendants may remain: {error}"
                 );
+                return;
             }
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            tracing::warn!(
+                "title process group still exists 2s after SIGKILL; descendants may remain"
+            );
             return;
         }
 
-        tokio::time::sleep(GROUP_POLL_INTERVAL).await;
+        tokio::time::sleep(GROUP_POLL_INTERVAL.min(deadline - now)).await;
     }
 }
 
@@ -562,7 +565,7 @@ fn process_group_is_gone(pgid: u32) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
-async fn reap_group_after_kill(child: &mut AsyncGroupChild) {
+async fn reap_process_job_after_kill(child: &mut AsyncGroupChild) {
     // AsyncGroupChild::wait observes the Job Object's completion port, so this
     // is a descendant barrier as well as a leader reap on Windows.
     match tokio::time::timeout(GROUP_EXIT_BARRIER, child.wait()).await {
