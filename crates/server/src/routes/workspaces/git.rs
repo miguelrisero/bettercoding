@@ -819,10 +819,14 @@ where
         // target/upstream selection
         // (packages/web-core/src/shared/dialogs/command-bar/RebaseDialog.tsx).
         //
-        // This divergence is direction-safe: the database never claims a base Git did
-        // not reach. It self-heals on the next successful rebase or an explicit target
-        // change. A filed follow-up tracks the durable fix: persist the intended target
-        // when continue_workspace_rebase completes.
+        // Unlike rename_workspace_branch, which uses rollback_branch_renames when its
+        // DB write fails, this does not compensate: renames are trivially reversible,
+        // while undoing a completed rebase would destroy work Git performed correctly
+        // and risks conflicts of its own. The accepted divergence is direction-safe:
+        // the database never claims a base Git did not reach, and it self-heals on the
+        // next successful rebase or an explicit target change. The persist-on-continue
+        // fix is listed in the PR #33 description's Follow-up section and tracked on
+        // the run board.
         let target_update =
             WorkspaceRepo::update_target_branch(pool, workspace_id, repo_id, new_base_branch).await;
         if let Err(error) = &target_update {
