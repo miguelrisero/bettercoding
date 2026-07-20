@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -15,6 +16,31 @@ pub const VIBE_ATTACHMENTS_DIR: &str = ".vibe-attachments";
 /// Directories that should always be skipped regardless of gitignore.
 /// .git is not in .gitignore but should never be watched.
 pub const ALWAYS_SKIP_DIRS: &[&str] = &[".git", "node_modules"];
+
+pub(crate) fn normalize_override(value: Option<OsString>) -> Option<PathBuf> {
+    let value = value?;
+    if value.is_empty() {
+        tracing::warn!("Ignoring empty path override; treating it as unset");
+        return None;
+    }
+
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return Some(path);
+    }
+
+    match std::path::absolute(&path) {
+        Ok(absolute_path) => Some(absolute_path),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "Failed to make relative path override absolute; using it as-is"
+            );
+            Some(path)
+        }
+    }
+}
 
 /// Convert absolute paths to relative paths based on worktree path
 /// This is a robust implementation that handles symlinks and edge cases
@@ -117,36 +143,86 @@ pub fn normalize_macos_private_alias<P: AsRef<Path>>(p: P) -> PathBuf {
 // TODO(bc-legacy-cleanup): keep the persisted public function name until callers can migrate.
 /// Returns the worktree base directory, resolving and caching it once per process.
 ///
-/// `BC_WORKTREE_BASE` is a hard override intended for test and development use.
-/// Unit tests exercise [`resolve_worktree_base_dir`] directly and never mutate
-/// process env.
+/// `BC_WORKTREE_BASE` is read before platform base-directory calculation and is a
+/// hard override in both debug and release builds. An empty value is ignored with
+/// a warning. A relative value is made absolute, or retained with a warning if
+/// that fails. Without an override, debug builds keep their `-dev` directory names.
+/// Unit tests exercise [`resolve_worktree_base_dir`] directly and never mutate env.
 pub fn get_vibe_kanban_temp_dir() -> PathBuf {
     WORKTREE_BASE_DIR
         .get_or_init(|| {
-            let (bettercoding_dir_name, legacy_dir_name) = if cfg!(debug_assertions) {
-                ("bettercoding-dev", "vibe-kanban-dev")
+            let override_dir = normalize_override(std::env::var_os("BC_WORKTREE_BASE"));
+            let resolution = if let Some(override_dir) = override_dir {
+                let path =
+                    resolve_worktree_base_dir(Some(override_dir), PathBuf::new(), PathBuf::new());
+                WorktreeBaseResolution {
+                    path,
+                    reason: WorktreeBaseReason::Override,
+                }
             } else {
-                ("bettercoding", "vibe-kanban")
+                let (bettercoding_dir_name, legacy_dir_name) = if cfg!(debug_assertions) {
+                    ("bettercoding-dev", "vibe-kanban-dev")
+                } else {
+                    ("bettercoding", "vibe-kanban")
+                };
+
+                let base_dir = if cfg!(target_os = "macos") {
+                    // macOS already uses /var/folders/... which is persistent storage
+                    std::env::temp_dir()
+                } else if cfg!(target_os = "linux") {
+                    // Linux: use /var/tmp instead of /tmp to avoid RAM usage
+                    PathBuf::from("/var/tmp")
+                } else {
+                    // Windows and other platforms: use temp dir with a product subdirectory
+                    std::env::temp_dir()
+                };
+
+                resolve_worktree_base_dir_with_reason(
+                    None,
+                    base_dir.join(bettercoding_dir_name),
+                    base_dir.join(legacy_dir_name),
+                )
             };
 
-            let base_dir = if cfg!(target_os = "macos") {
-                // macOS already uses /var/folders/... which is persistent storage
-                std::env::temp_dir()
-            } else if cfg!(target_os = "linux") {
-                // Linux: use /var/tmp instead of /tmp to avoid RAM usage
-                PathBuf::from("/var/tmp")
-            } else {
-                // Windows and other platforms: use temp dir with a product subdirectory
-                std::env::temp_dir()
-            };
-
-            resolve_worktree_base_dir(
-                std::env::var_os("BC_WORKTREE_BASE").map(PathBuf::from),
-                base_dir.join(bettercoding_dir_name),
-                base_dir.join(legacy_dir_name),
-            )
+            tracing::info!(
+                path = %resolution.path.display(),
+                reason = resolution.reason.as_str(),
+                "Resolved worktree base directory"
+            );
+            resolution.path
         })
         .clone()
+}
+
+enum DirectoryProbe {
+    NonEmpty,
+    Empty,
+    Absent,
+    Unknown(std::io::Error),
+}
+
+#[derive(Clone, Copy)]
+enum WorktreeBaseReason {
+    Override,
+    Bettercoding,
+    LegacyAdopt,
+    Fresh,
+}
+
+impl WorktreeBaseReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Override => "override",
+            Self::Bettercoding => "bettercoding",
+            Self::LegacyAdopt => "legacy-adopt",
+            Self::Fresh => "fresh",
+        }
+    }
+}
+
+struct WorktreeBaseResolution {
+    path: PathBuf,
+    reason: WorktreeBaseReason,
 }
 
 fn resolve_worktree_base_dir(
@@ -154,25 +230,90 @@ fn resolve_worktree_base_dir(
     bettercoding_candidate: PathBuf,
     legacy_candidate: PathBuf,
 ) -> PathBuf {
-    if let Some(override_dir) = override_dir {
-        return override_dir;
-    }
-
-    if is_non_empty_dir(&bettercoding_candidate) {
-        return bettercoding_candidate;
-    }
-
-    if is_non_empty_dir(&legacy_candidate) {
-        // TODO(bc-legacy-cleanup): remove when no vibe-kanban installs remain.
-        return legacy_candidate;
-    }
-
-    let _ = std::fs::create_dir_all(&bettercoding_candidate);
-    bettercoding_candidate
+    resolve_worktree_base_dir_with_reason(override_dir, bettercoding_candidate, legacy_candidate)
+        .path
 }
 
-fn is_non_empty_dir(path: &Path) -> bool {
-    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
+fn resolve_worktree_base_dir_with_reason(
+    override_dir: Option<PathBuf>,
+    bettercoding_candidate: PathBuf,
+    legacy_candidate: PathBuf,
+) -> WorktreeBaseResolution {
+    if let Some(override_dir) = override_dir {
+        return WorktreeBaseResolution {
+            path: override_dir,
+            reason: WorktreeBaseReason::Override,
+        };
+    }
+
+    // Worktree-base access is deferrable: consumers can surface later I/O errors,
+    // so preserve a possibly populated candidate with a warning instead of guessing.
+    match is_non_empty_dir(&bettercoding_candidate) {
+        DirectoryProbe::NonEmpty => {
+            return WorktreeBaseResolution {
+                path: bettercoding_candidate,
+                reason: WorktreeBaseReason::Bettercoding,
+            };
+        }
+        DirectoryProbe::Unknown(error) => {
+            tracing::warn!(
+                path = %bettercoding_candidate.display(),
+                error = %error,
+                "Could not inspect worktree base candidate; adopting it to avoid skipping existing state"
+            );
+            return WorktreeBaseResolution {
+                path: bettercoding_candidate,
+                reason: WorktreeBaseReason::Bettercoding,
+            };
+        }
+        DirectoryProbe::Empty | DirectoryProbe::Absent => {}
+    }
+
+    match is_non_empty_dir(&legacy_candidate) {
+        DirectoryProbe::NonEmpty => {
+            // TODO(bc-legacy-cleanup): remove when no vibe-kanban installs remain.
+            return WorktreeBaseResolution {
+                path: legacy_candidate,
+                reason: WorktreeBaseReason::LegacyAdopt,
+            };
+        }
+        DirectoryProbe::Unknown(error) => {
+            tracing::warn!(
+                path = %legacy_candidate.display(),
+                error = %error,
+                "Could not inspect worktree base candidate; adopting it to avoid skipping existing state"
+            );
+            // TODO(bc-legacy-cleanup): remove when no vibe-kanban installs remain.
+            return WorktreeBaseResolution {
+                path: legacy_candidate,
+                reason: WorktreeBaseReason::LegacyAdopt,
+            };
+        }
+        DirectoryProbe::Empty | DirectoryProbe::Absent => {}
+    }
+
+    if let Err(error) = std::fs::create_dir_all(&bettercoding_candidate) {
+        tracing::warn!(
+            path = %bettercoding_candidate.display(),
+            error = %error,
+            "Failed to create fresh worktree base directory; continuing with the selected path"
+        );
+    }
+    WorktreeBaseResolution {
+        path: bettercoding_candidate,
+        reason: WorktreeBaseReason::Fresh,
+    }
+}
+
+fn is_non_empty_dir(path: &Path) -> DirectoryProbe {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => match entries.next() {
+            Some(_) => DirectoryProbe::NonEmpty,
+            None => DirectoryProbe::Empty,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DirectoryProbe::Absent,
+        Err(error) => DirectoryProbe::Unknown(error),
+    }
 }
 
 /// Expand leading ~ to user's home directory.
@@ -182,7 +323,9 @@ pub fn expand_tilde(path_str: &str) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::{ffi::OsString, fs};
 
     use tempfile::TempDir;
 
@@ -218,6 +361,24 @@ mod tests {
         assert_eq!(
             make_path_relative("/other/path/file.js", "/tmp/test-worktree"),
             "/other/path/file.js"
+        );
+    }
+
+    #[test]
+    fn empty_override_is_treated_as_unset() {
+        assert_eq!(normalize_override(Some(OsString::new())), None);
+    }
+
+    #[test]
+    fn relative_override_is_made_absolute() {
+        let relative = PathBuf::from("relative-worktree-base");
+        let normalized = normalize_override(Some(relative.clone().into_os_string()))
+            .expect("normalize relative override");
+
+        assert!(normalized.is_absolute());
+        assert_eq!(
+            normalized,
+            std::path::absolute(relative).expect("make expected path absolute")
         );
     }
 
@@ -280,9 +441,42 @@ mod tests {
         seed_dir(&legacy_dir);
 
         assert_eq!(
-            resolve_worktree_base_dir(Some(override_dir.clone()), bettercoding_dir, legacy_dir,),
+            resolve_worktree_base_dir(Some(override_dir.clone()), bettercoding_dir, legacy_dir),
             override_dir
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopts_bettercoding_candidate_when_probe_is_unknown() {
+        let root = TempDir::new().expect("create scratch directory");
+        let (bettercoding_dir, legacy_dir) = temp_dir_candidates(&root);
+        fs::create_dir(&bettercoding_dir).expect("create BetterCoding directory");
+        seed_dir(&legacy_dir);
+        fs::set_permissions(&bettercoding_dir, fs::Permissions::from_mode(0o000))
+            .expect("block candidate probe");
+
+        let resolved = resolve_worktree_base_dir(None, bettercoding_dir.clone(), legacy_dir);
+
+        fs::set_permissions(&bettercoding_dir, fs::Permissions::from_mode(0o700))
+            .expect("restore BetterCoding directory permissions");
+        assert_eq!(resolved, bettercoding_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopts_legacy_candidate_when_probe_is_unknown() {
+        let root = TempDir::new().expect("create scratch directory");
+        let (bettercoding_dir, legacy_dir) = temp_dir_candidates(&root);
+        fs::create_dir(&legacy_dir).expect("create legacy directory");
+        fs::set_permissions(&legacy_dir, fs::Permissions::from_mode(0o000))
+            .expect("block candidate probe");
+
+        let resolved = resolve_worktree_base_dir(None, bettercoding_dir, legacy_dir.clone());
+
+        fs::set_permissions(&legacy_dir, fs::Permissions::from_mode(0o700))
+            .expect("restore legacy directory permissions");
+        assert_eq!(resolved, legacy_dir);
     }
 
     #[cfg(target_os = "macos")]
