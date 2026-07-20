@@ -942,6 +942,81 @@ async fn recent_app_dispatch_prefers_the_newest_matching_turn() {
 }
 
 #[tokio::test]
+async fn prompt_fallback_skips_turn_with_uuid_linked_native_record() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, &workspace_root).await;
+    let sid = "24545454-2454-4454-8454-245454545454";
+    let older_process = create_coding_turn(&db, session.id, "same prompt").await;
+    let newer_process = create_coding_turn(&db, session.id, "same prompt").await;
+    CodingAgentTurn::update_agent_session_id(&db.pool, newer_process, sid)
+        .await
+        .unwrap();
+    let reference = Utc::now();
+    sqlx::query("UPDATE coding_agent_turns SET created_at = ? WHERE execution_process_id = ?")
+        .bind(reference - ChronoDuration::minutes(5))
+        .bind(older_process)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE coding_agent_turns SET created_at = ? WHERE execution_process_id = ?")
+        .bind(reference - ChronoDuration::minutes(1))
+        .bind(newer_process)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let older_turn = CodingAgentTurn::find_by_execution_process_id(&db.pool, older_process)
+        .await
+        .unwrap()
+        .unwrap();
+    ExecutionNativeLink::insert(&db.pool, newer_process, "newer-executor-native")
+        .await
+        .unwrap();
+
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    let assistant = serde_json::json!({
+        "type": "assistant",
+        "sessionId": sid,
+        "uuid": "newer-executor-native",
+        "timestamp": reference.to_rfc3339_opts(SecondsFormat::Millis, true),
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "executor evidence"}]
+        }
+    });
+    let user = native_user_record(
+        sid,
+        "fallback-user",
+        "same prompt",
+        &reference.to_rfc3339_opts(SecondsFormat::Millis, true),
+    );
+    fs::write(
+        native_dir.join(format!("{sid}.jsonl")),
+        format!("{assistant}\n{user}"),
+    )
+    .unwrap();
+
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), projects_dir));
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let user_row = CliNativeRecord::list_for_session(&db.pool, session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.uuid.as_deref() == Some("fallback-user"))
+        .unwrap();
+    assert_eq!(user_row.bound_coding_agent_turn_id, Some(older_turn.id));
+}
+
+#[tokio::test]
 async fn timestampless_user_record_uses_import_clock_for_prompt_binding() {
     let temp = TempDir::new().unwrap();
     let workspace_root = temp.path().join("worktree");
