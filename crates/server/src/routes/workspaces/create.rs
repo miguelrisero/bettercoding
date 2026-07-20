@@ -20,6 +20,8 @@ use crate::{
     },
 };
 
+static TITLE_GENERATION_SEMAPHORE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 pub(crate) async fn create_workspace_record(
     deployment: &DeploymentImpl,
     name: Option<String>,
@@ -363,8 +365,19 @@ async fn apply_generated_workspace_names(
         return;
     }
 
-    // Path 2: ask Haiku for a `keyword -> gist` title + branch slug.
-    let Some(names) = executors::title_gen::generate_workspace_names(first_message).await else {
+    // Path 2: ask Haiku for a `keyword -> gist` title + branch slug, but never
+    // queue an unbounded number of npx/model processes during creation bursts.
+    let names = {
+        let Ok(_permit) = TITLE_GENERATION_SEMAPHORE.try_acquire() else {
+            tracing::debug!(
+                workspace_id = %workspace.id,
+                "Skipping model-generated workspace title: concurrency limit reached"
+            );
+            return;
+        };
+        executors::title_gen::generate_workspace_names(first_message).await
+    };
+    let Some(names) = names else {
         return;
     };
     apply_name_and_branch(deployment, workspace, &names.title, &names.branch_slug).await;
