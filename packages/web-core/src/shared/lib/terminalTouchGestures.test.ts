@@ -3,11 +3,12 @@ import { describe, it, expect } from 'vitest';
 import type { ArrowKey } from './terminalKeySequences';
 import {
   createTouchGestureController,
+  dpadBadgeText,
   dpadDirection,
-  dpadInterval,
+  dpadZone,
   DOUBLE_TAP_MS,
   DPAD_DEAD_ZONE_PX,
-  DPAD_TIERS,
+  DPAD_ZONES,
   LONG_PRESS_MS,
   TAP_SLOP_PX,
 } from './terminalTouchGestures';
@@ -61,11 +62,39 @@ describe('dpadDirection', () => {
   });
 });
 
-describe('dpadInterval', () => {
-  it('maps distance to the three tiers', () => {
-    expect(dpadInterval(20)).toBe(DPAD_TIERS[0].interval);
-    expect(dpadInterval(DPAD_TIERS[0].dist)).toBe(DPAD_TIERS[1].interval);
-    expect(dpadInterval(DPAD_TIERS[1].dist + 100)).toBe(DPAD_TIERS[2].interval);
+describe('dpadZone', () => {
+  it('uses half-open distance boundaries', () => {
+    expect(dpadZone(DPAD_DEAD_ZONE_PX)).toBe(1);
+    expect(dpadZone(63)).toBe(1);
+    expect(dpadZone(64)).toBe(2);
+    expect(dpadZone(113)).toBe(2);
+    expect(dpadZone(114)).toBe(3);
+    expect(dpadZone(163)).toBe(3);
+    expect(dpadZone(164)).toBe(4);
+    expect(dpadZone(10_000)).toBe(4);
+  });
+});
+
+describe('dpadBadgeText', () => {
+  it('repeats ASCII direction glyphs once per zone', () => {
+    const cases: Array<[ArrowKey, string]> = [
+      ['left', '<'],
+      ['right', '>'],
+      ['up', '^'],
+      ['down', 'v'],
+    ];
+
+    for (const [dir, glyph] of cases) {
+      for (let zone = 1; zone <= 4; zone += 1) {
+        expect(dpadBadgeText(dir, zone)).toBe(glyph.repeat(zone));
+      }
+    }
+  });
+
+  it('shows a plus in the dead zone regardless of the distance zone', () => {
+    for (let zone = 1; zone <= 4; zone += 1) {
+      expect(dpadBadgeText(null, zone)).toBe('+');
+    }
   });
 });
 
@@ -78,43 +107,106 @@ describe('long-press D-pad', () => {
     expect(dpad).toEqual([{ active: true, dir: null }]);
   });
 
-  it('sends an arrow immediately on engaging a direction, then repeats', () => {
-    const { ctrl, arrows } = harness();
-    ctrl.onTouchStart(p(100, 100), 0);
-    runTimersUntil(ctrl, LONG_PRESS_MS);
-    // Drag down past the dead zone → immediate arrow.
-    ctrl.onTouchMove(
-      p(100, 100 + DPAD_DEAD_ZONE_PX + 5, 1),
-      LONG_PRESS_MS + 10
-    );
-    expect(arrows).toEqual(['down']);
-    // Repeats fire on the timer at tier-1 cadence.
-    runTimersUntil(ctrl, LONG_PRESS_MS + 10 + 2 * DPAD_TIERS[0].interval);
-    expect(arrows).toEqual(['down', 'down', 'down']);
-  });
-
-  it('speeds up in higher tiers and pauses in the dead zone', () => {
+  it('fires exactly once on zone-1 entry and never repeats', () => {
     const { ctrl, arrows } = harness();
     ctrl.onTouchStart(p(100, 100), 0);
     runTimersUntil(ctrl, LONG_PRESS_MS);
     const t0 = LONG_PRESS_MS + 10;
-    ctrl.onTouchMove(p(100, 100 + DPAD_TIERS[1].dist + 20), t0);
+    ctrl.onTouchMove(p(100, 100 + DPAD_DEAD_ZONE_PX + 5), t0);
     expect(arrows).toEqual(['down']);
-    // Fastest tier cadence.
-    runTimersUntil(ctrl, t0 + DPAD_TIERS[2].interval);
-    expect(arrows).toEqual(['down', 'down']);
-    // Back inside the dead zone → repeats stop.
-    ctrl.onTouchMove(p(100, 102), t0 + DPAD_TIERS[2].interval + 1);
+    expect(ctrl.nextTimerAt()).toBeNull();
+    ctrl.onTimer(t0 + 10_000);
+    expect(arrows).toEqual(['down']);
     expect(ctrl.nextTimerAt()).toBeNull();
   });
 
-  it('fires immediately again on direction change', () => {
+  it('pumps one arrow per dead-zone to zone-1 re-engagement', () => {
     const { ctrl, arrows } = harness();
     ctrl.onTouchStart(p(100, 100), 0);
     runTimersUntil(ctrl, LONG_PRESS_MS);
-    ctrl.onTouchMove(p(100, 140), LONG_PRESS_MS + 5);
-    ctrl.onTouchMove(p(160, 100), LONG_PRESS_MS + 20);
+    const t0 = LONG_PRESS_MS + 10;
+    ctrl.onTouchMove(p(100, 120), t0);
+    ctrl.onTouchMove(p(100, 102), t0 + 10);
+    ctrl.onTouchMove(p(100, 120), t0 + 20);
+    ctrl.onTouchMove(p(100, 102), t0 + 30);
+    ctrl.onTouchMove(p(100, 120), t0 + 40);
+    expect(arrows).toEqual(['down', 'down', 'down']);
+    expect(ctrl.nextTimerAt()).toBeNull();
+  });
+
+  it('repeats zone 2 every 1000ms', () => {
+    const { ctrl, arrows } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    runTimersUntil(ctrl, LONG_PRESS_MS);
+    const t0 = LONG_PRESS_MS + 10;
+    ctrl.onTouchMove(p(100, 164), t0);
+    expect(DPAD_ZONES[1].repeatMs).toBe(1_000);
+    expect(arrows).toEqual(['down']);
+    expect(ctrl.nextTimerAt()).toBe(t0 + 1_000);
+    ctrl.onTimer(t0 + 999);
+    expect(arrows).toEqual(['down']);
+    runTimersUntil(ctrl, t0 + 2_000);
+    expect(arrows).toEqual(['down', 'down', 'down']);
+  });
+
+  it('fires immediately on an outward jump to zone 4, then every 250ms', () => {
+    const { ctrl, arrows } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    runTimersUntil(ctrl, LONG_PRESS_MS);
+    const t0 = LONG_PRESS_MS + 10;
+    ctrl.onTouchMove(p(100, 120), t0);
+    const outwardAt = t0 + 50;
+    ctrl.onTouchMove(p(100, 264), outwardAt);
+    expect(DPAD_ZONES[3].repeatMs).toBe(250);
+    expect(arrows).toEqual(['down', 'down']);
+    expect(ctrl.nextTimerAt()).toBe(outwardAt + 250);
+    runTimersUntil(ctrl, outwardAt + 500);
+    expect(arrows).toEqual(['down', 'down', 'down', 'down']);
+  });
+
+  it('retreats from zone 4 to zone 2 without an immediate arrow', () => {
+    const { ctrl, arrows } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    runTimersUntil(ctrl, LONG_PRESS_MS);
+    const t0 = LONG_PRESS_MS + 10;
+    ctrl.onTouchMove(p(100, 264), t0);
+    expect(ctrl.nextTimerAt()).toBe(t0 + 250);
+
+    ctrl.onTouchMove(p(100, 164), t0 + 100);
+    expect(arrows).toEqual(['down']);
+    // Keep the sooner zone-4 deadline, then adopt zone 2's slower cadence.
+    expect(ctrl.nextTimerAt()).toBe(t0 + 250);
+    ctrl.onTimer(t0 + 250);
+    expect(arrows).toEqual(['down', 'down']);
+    expect(ctrl.nextTimerAt()).toBe(t0 + 1_250);
+  });
+
+  it('stops repeats when retreating to zone 1', () => {
+    const { ctrl, arrows } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    runTimersUntil(ctrl, LONG_PRESS_MS);
+    const t0 = LONG_PRESS_MS + 10;
+    ctrl.onTouchMove(p(100, 164), t0);
+    ctrl.onTouchMove(p(100, 120), t0 + 100);
+    expect(arrows).toEqual(['down']);
+    expect(ctrl.nextTimerAt()).toBeNull();
+    ctrl.onTimer(t0 + 10_000);
+    expect(arrows).toEqual(['down']);
+  });
+
+  it('fires on a direction change and restarts the current zone cadence', () => {
+    const { ctrl, arrows } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    runTimersUntil(ctrl, LONG_PRESS_MS);
+    const t0 = LONG_PRESS_MS + 10;
+    ctrl.onTouchMove(p(100, 170), t0);
+    ctrl.onTouchMove(p(170, 100), t0 + 400);
     expect(arrows).toEqual(['down', 'right']);
+    expect(ctrl.nextTimerAt()).toBe(t0 + 1_400);
+    ctrl.onTimer(t0 + 1_000);
+    expect(arrows).toEqual(['down', 'right']);
+    ctrl.onTimer(t0 + 1_400);
+    expect(arrows).toEqual(['down', 'right', 'right']);
   });
 
   it('prevents default while in D-pad mode', () => {
