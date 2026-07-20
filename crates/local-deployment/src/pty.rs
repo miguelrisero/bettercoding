@@ -302,6 +302,26 @@ fn cli_prompt_file_content(prompt_arg: &CliPromptArg, prompt: &str) -> Option<St
     })
 }
 
+fn stageable_cli_prompt_content(
+    resume_session_id: Option<&str>,
+    initial_prompt: Option<&str>,
+    prompt_arg: &CliPromptArg,
+) -> Option<String> {
+    if active_resume_id(resume_session_id).is_some() {
+        None
+    } else {
+        initial_prompt.and_then(|prompt| cli_prompt_file_content(prompt_arg, prompt))
+    }
+}
+
+fn legacy_attach_requires_prompt_staging(
+    resume_session_id: Option<&str>,
+    initial_prompt: Option<&str>,
+    prompt_arg: &CliPromptArg,
+) -> bool {
+    stageable_cli_prompt_content(resume_session_id, initial_prompt, prompt_arg).is_some()
+}
+
 /// Path of a workspace's transient CLI initial-prompt file. Kept next to the
 /// other backend assets (same trust domain as the SQLite DB) under a dedicated
 /// `cli-prompts/` subdir; named by the workspace id so racing first-attaches
@@ -1967,6 +1987,25 @@ impl PtyService {
                 (tmux_workspace, &tmux_spec)
             {
                 let home = tmux_home.unwrap_or(CliTmuxHome::Current);
+                if home == CliTmuxHome::Legacy
+                    && legacy_attach_requires_prompt_staging(
+                        tmux_resume_id.as_deref(),
+                        tmux_initial_prompt.as_deref(),
+                        &spec.prompt_arg,
+                    )
+                {
+                    // The route-time existence probe and this create-time
+                    // locator are independent. If the route probe flakes, it
+                    // can supply a baked prompt even though locate resolves a
+                    // live legacy session. That attach-only arm cannot stage
+                    // the file, so fail closed and leave the DB prompt parked
+                    // for the next attach's follow-up paste delivery.
+                    tracing::warn!(
+                        "Refusing legacy CLI attach for workspace {workspace_id}: \
+                         initial prompt requires staging; leaving prompt parked"
+                    );
+                    return Err(PtyError::PromptStageFailed);
+                }
                 let (socket, session_name) = cli_tmux_target(home, workspace_id);
                 // Bring an already-running server in line with our config
                 // (options are server-wide; `-f` below only affects a fresh
@@ -2008,27 +2047,22 @@ impl PtyService {
 
                         // Materialize the initial prompt to a private file so
                         // the bootstrap reads it instead of carrying it inline.
-                        let resume_active =
-                            active_resume_id(tmux_resume_id.as_deref()).is_some();
-                        let prompt_file: Option<PathBuf> = if resume_active {
-                            None
-                        } else {
-                            match tmux_initial_prompt
-                                .as_deref()
-                                .and_then(|p| cli_prompt_file_content(&spec.prompt_arg, p))
-                            {
-                                Some(content) => Some(
-                                    write_cli_prompt_file(workspace_id, &content).map_err(|e| {
-                                        tracing::error!(
-                                            "Failed to write CLI prompt file for {session_name}: \
-                                             {e}; leaving prompt parked"
-                                        );
-                                        remove_cli_prompt_file(workspace_id);
-                                        PtyError::PromptStageFailed
-                                    })?,
-                                ),
-                                None => None,
-                            }
+                        let prompt_file: Option<PathBuf> = match stageable_cli_prompt_content(
+                            tmux_resume_id.as_deref(),
+                            tmux_initial_prompt.as_deref(),
+                            &spec.prompt_arg,
+                        ) {
+                            Some(content) => Some(
+                                write_cli_prompt_file(workspace_id, &content).map_err(|e| {
+                                    tracing::error!(
+                                        "Failed to write CLI prompt file for {session_name}: \
+                                         {e}; leaving prompt parked"
+                                    );
+                                    remove_cli_prompt_file(workspace_id);
+                                    PtyError::PromptStageFailed
+                                })?,
+                            ),
+                            None => None,
                         };
                         cmd.arg(cli_bootstrap(
                             spec,
@@ -2779,6 +2813,42 @@ mod tests {
             cli_prompt_file_content(&CliPromptArg::Unsupported, "hi"),
             None
         );
+    }
+
+    #[test]
+    fn legacy_attach_prompt_guard_matches_current_staging_condition() {
+        let resume_id = "bccad5cc-3bd4-4f80-b75d-35db5f087ac0";
+
+        assert!(legacy_attach_requires_prompt_staging(
+            None,
+            Some("ship it"),
+            &CliPromptArg::Positional,
+        ));
+        assert!(!legacy_attach_requires_prompt_staging(
+            Some(resume_id),
+            Some("ship it"),
+            &CliPromptArg::Positional,
+        ));
+        assert!(legacy_attach_requires_prompt_staging(
+            Some("not-an-active-resume-id"),
+            Some("ship it"),
+            &CliPromptArg::Positional,
+        ));
+        assert!(!legacy_attach_requires_prompt_staging(
+            None,
+            None,
+            &CliPromptArg::Positional,
+        ));
+        assert!(!legacy_attach_requires_prompt_staging(
+            None,
+            Some("  \n\t"),
+            &CliPromptArg::Positional,
+        ));
+        assert!(!legacy_attach_requires_prompt_staging(
+            None,
+            Some("ship it"),
+            &CliPromptArg::Unsupported,
+        ));
     }
 
     #[test]
