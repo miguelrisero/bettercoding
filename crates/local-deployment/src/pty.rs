@@ -857,10 +857,10 @@ fn cli_tmux_conf_path() -> Option<PathBuf> {
 /// first so the append-style options aren't re-applied on every attach.
 /// Best-effort: no server running is the common case and simply a no-op.
 fn ensure_cli_tmux_server_options() {
-    ensure_cli_tmux_server_options_on(CLI_TMUX_SOCKET);
+    ensure_cli_tmux_server_options_on(CLI_TMUX_SOCKET, tmux_client_flags_supported());
 }
 
-fn ensure_cli_tmux_server_options_on(socket: &str) {
+fn ensure_cli_tmux_server_options_on(socket: &str, client_flags_supported: bool) {
     let tmux = |args: &[&str]| {
         std::process::Command::new("tmux")
             .args(["-L", socket])
@@ -874,7 +874,7 @@ fn ensure_cli_tmux_server_options_on(socket: &str) {
     // launch bootstrap) is parsed; apply unconditionally (idempotent, no-op
     // without a running server) so servers started before this option joined
     // the conf don't hand the bootstrap to a fish/csh login shell.
-    if tmux_client_flags_supported() {
+    if client_flags_supported {
         // This migration MUST stay above the clipboard probe: a production
         // server commonly already has `set-clipboard on`, which makes the
         // probe return early, but may have started before window-size joined
@@ -891,7 +891,18 @@ fn ensure_cli_tmux_server_options_on(socket: &str) {
             "smallest",
         ]);
     } else {
-        let _ = tmux(&["set-option", "-g", "default-shell", "/bin/sh"]);
+        // A server can outlive this backend process. Actively release a
+        // `smallest` clamp left by an earlier supported build/probe result.
+        let _ = tmux(&[
+            "set-option",
+            "-g",
+            "default-shell",
+            "/bin/sh",
+            ";",
+            "set-option",
+            "-gu",
+            "window-size",
+        ]);
     }
 
     let Ok(probe) = tmux(&["show-options", "-s", "set-clipboard"]) else {
@@ -2748,7 +2759,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_sets_shell_and_smallest_before_current_clipboard_probe_returns() {
+    fn ensure_reconciles_window_size_in_both_capability_directions() {
         if !tmux_client_flags_supported() {
             return;
         }
@@ -2781,7 +2792,7 @@ mod tests {
             String::from_utf8_lossy(&started.stderr)
         );
 
-        ensure_cli_tmux_server_options_on(&socket);
+        ensure_cli_tmux_server_options_on(&socket, true);
 
         let shown = std::process::Command::new("tmux")
             .args(["-L", &socket, "show-options", "-gv", "window-size"])
@@ -2796,6 +2807,15 @@ mod tests {
             .expect("show scratch default-shell");
         assert!(shown.status.success(), "show default-shell must succeed");
         assert_eq!(String::from_utf8_lossy(&shown.stdout).trim(), "/bin/sh");
+
+        ensure_cli_tmux_server_options_on(&socket, false);
+
+        let shown = std::process::Command::new("tmux")
+            .args(["-L", &socket, "show-options", "-gv", "window-size"])
+            .output()
+            .expect("show downgraded scratch window-size");
+        assert!(shown.status.success(), "show window-size must succeed");
+        assert_eq!(String::from_utf8_lossy(&shown.stdout).trim(), "latest");
 
         drop(server);
     }
