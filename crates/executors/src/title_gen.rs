@@ -8,6 +8,7 @@
 //! background, so workspace creation is not blocked by a slow/absent model.
 
 use std::{
+    future::Future,
     io,
     process::{Output, Stdio},
     time::Duration,
@@ -286,6 +287,23 @@ async fn generate_workspace_names_with_command(
     prompt: &str,
     timeout: Duration,
 ) -> Option<WorkspaceNames> {
+    generate_workspace_names_with_command_timeout_signal(program, args, prompt, timeout, || {
+        tokio::time::sleep(timeout)
+    })
+    .await
+}
+
+async fn generate_workspace_names_with_command_timeout_signal<F, Fut>(
+    program: &str,
+    args: &[String],
+    prompt: &str,
+    timeout: Duration,
+    timeout_signal: F,
+) -> Option<WorkspaceNames>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ()>,
+{
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .current_dir(std::env::temp_dir())
@@ -296,20 +314,21 @@ async fn generate_workspace_names_with_command(
 
     // Each branch logs WHY it fell back — the original silent `?` chain made a
     // timed-out/erroring call indistinguishable from "model produced no title".
-    let output = match command_output_with_timeout(&mut cmd, prompt.as_bytes(), timeout).await {
-        Ok(None) => {
-            tracing::warn!(
-                "workspace title generation timed out after {}s; using heuristic naming",
-                timeout.as_secs()
-            );
-            return None;
-        }
-        Err(e) => {
-            tracing::warn!("workspace title generation command failed: {e}");
-            return None;
-        }
-        Ok(Some(output)) => output,
-    };
+    let output =
+        match command_output_with_timeout(&mut cmd, prompt.as_bytes(), timeout_signal).await {
+            Ok(None) => {
+                tracing::warn!(
+                    "workspace title generation timed out after {}s; using heuristic naming",
+                    timeout.as_secs()
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!("workspace title generation command failed: {e}");
+                return None;
+            }
+            Ok(Some(output)) => output,
+        };
     if !output.status.success() {
         tracing::warn!(
             status = %output.status,
@@ -352,11 +371,15 @@ fn escaped_log_snippet(bytes: &[u8]) -> String {
     escaped
 }
 
-async fn command_output_with_timeout(
+async fn command_output_with_timeout<F, Fut>(
     cmd: &mut tokio::process::Command,
     prompt: &[u8],
-    timeout: Duration,
-) -> io::Result<Option<Output>> {
+    timeout_signal: F,
+) -> io::Result<Option<Output>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ()>,
+{
     // command-group maps this to a POSIX process group on Unix and a Job Object
     // on Windows. The guard remains the sole owner until cleanup is complete;
     // its Drop path synchronously requests a whole-group kill if this future is
@@ -382,7 +405,7 @@ async fn command_output_with_timeout(
                 stdin.shutdown().await
             };
             let wait_for_exit = wait_for_leader_exit(child.child_mut());
-            let call_timeout = tokio::time::sleep(timeout);
+            let call_timeout = timeout_signal();
             tokio::pin!(write_prompt, wait_for_exit, call_timeout);
 
             let mut prompt_written = false;
@@ -745,12 +768,17 @@ mod tests {
     use std::time::Duration;
 
     #[cfg(unix)]
-    use super::GROUP_POLL_INTERVAL;
+    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+
     use super::{
         CAPTURE_MAX_BYTES, DISALLOWED_TOOLS, LOG_SNIPPET_MAX_BYTES, TITLE_MAX_CHARS,
         build_title_request, escaped_log_snippet, first_line_title_hint,
-        generate_workspace_names_with_command, parse_workspace_names, read_bounded_chunk, slugify,
+        generate_workspace_names_with_command,
+        generate_workspace_names_with_command_timeout_signal, parse_workspace_names,
+        read_bounded_chunk, slugify,
     };
+    #[cfg(unix)]
+    use super::{GROUP_EXIT_BARRIER, GROUP_POLL_INTERVAL};
 
     #[cfg(unix)]
     const GRANDCHILD_LOOP_SCRIPT: &str = r#"
@@ -761,6 +789,7 @@ mod tests {
                 sleep 0.02
             done
         ) &
+        printf '%s\n' "$!" > "$3"
         wait
     "#;
 
@@ -768,18 +797,20 @@ mod tests {
     fn grandchild_fixture(
         script: &str,
         test_name: &str,
-    ) -> (tempfile::TempDir, PathBuf, PathBuf, Vec<String>) {
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, Vec<String>) {
         let temp_dir = tempfile::tempdir().unwrap();
         let ready_path = temp_dir.path().join("grandchild-ready");
         let progress_path = temp_dir.path().join("grandchild-progress");
+        let pid_path = temp_dir.path().join("grandchild-pid");
         let args = vec![
             "-c".to_string(),
             script.to_string(),
             test_name.to_string(),
             ready_path.to_string_lossy().into_owned(),
             progress_path.to_string_lossy().into_owned(),
+            pid_path.to_string_lossy().into_owned(),
         ];
-        (temp_dir, ready_path, progress_path, args)
+        (temp_dir, ready_path, progress_path, pid_path, args)
     }
 
     #[tokio::test]
@@ -808,55 +839,86 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn assert_writes_quiesce(path: &Path) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        let mut last_size = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
-        let mut stable_since = tokio::time::Instant::now();
+    fn read_descendant_pid(path: &Path) -> Pid {
+        let raw = std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let pid = raw
+            .trim()
+            .parse::<i32>()
+            .unwrap_or_else(|error| panic!("invalid PID in {}: {error}", path.display()));
+        assert!(pid > 0, "invalid descendant PID {pid}");
+        Pid::from_raw(pid)
+    }
 
+    #[cfg(unix)]
+    fn assert_process_exists(pid: Pid) {
+        assert_eq!(
+            kill(pid, None),
+            Ok(()),
+            "descendant PID {} was not alive before cleanup",
+            pid.as_raw()
+        );
+    }
+
+    #[cfg(unix)]
+    async fn assert_process_is_gone(pid: Pid) {
+        let deadline = tokio::time::Instant::now() + GROUP_EXIT_BARRIER + Duration::from_secs(3);
         loop {
-            tokio::time::sleep(GROUP_POLL_INTERVAL).await;
-            let size = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
-            if size == last_size {
-                if stable_since.elapsed() >= Duration::from_millis(200) {
-                    return;
-                }
-            } else {
-                last_size = size;
-                stable_since = tokio::time::Instant::now();
+            match kill(pid, None) {
+                Err(Errno::ESRCH) => return,
+                Ok(()) => {}
+                Err(error) => panic!(
+                    "failed to probe descendant PID {} after cleanup: {error}",
+                    pid.as_raw()
+                ),
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "{} kept growing after title generation returned or was cancelled",
-                path.display()
+                "descendant PID {} still existed after title generation cleanup",
+                pid.as_raw()
             );
+            tokio::time::sleep(GROUP_POLL_INTERVAL).await;
         }
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn timeout_kills_background_grandchild() {
-        let (_temp_dir, ready_path, progress_path, args) =
+        let (_temp_dir, ready_path, progress_path, pid_path, args) =
             grandchild_fixture(GRANDCHILD_LOOP_SCRIPT, "title-gen-timeout-test");
+        let (timeout_tx, timeout_rx) = tokio::sync::oneshot::channel();
 
         let call = tokio::spawn(async move {
-            generate_workspace_names_with_command(
+            generate_workspace_names_with_command_timeout_signal(
                 "/bin/sh",
                 &args,
                 "test task",
                 Duration::from_millis(500),
+                move || async move {
+                    timeout_rx.await.expect("timeout trigger was dropped");
+                },
             )
             .await
         });
 
-        wait_for_nonempty_file(&ready_path, Duration::from_secs(1)).await;
-        wait_for_nonempty_file(&progress_path, Duration::from_secs(1)).await;
-        let names = tokio::time::timeout(Duration::from_secs(2), call)
+        wait_for_nonempty_file(&ready_path, Duration::from_secs(10)).await;
+        wait_for_nonempty_file(&progress_path, Duration::from_secs(10)).await;
+        wait_for_nonempty_file(&pid_path, Duration::from_secs(10)).await;
+        let descendant_pid = read_descendant_pid(&pid_path);
+        assert_process_exists(descendant_pid);
+
+        // Runner scheduling before readiness is outside the measured window:
+        // fire the injected timeout only after the descendant is demonstrably live.
+        timeout_tx
+            .send(())
+            .expect("title command exited before timeout");
+        let names = tokio::time::timeout(Duration::from_secs(10), call)
             .await
-            .expect("title command did not return after its timeout")
+            .expect("title command cleanup did not finish after its timeout")
             .unwrap();
 
         assert!(names.is_none());
-        assert_writes_quiesce(&progress_path).await;
+        assert_process_is_gone(descendant_pid).await;
     }
 
     #[cfg(unix)]
@@ -870,19 +932,20 @@ mod tests {
                     sleep 0.02
                 done
             ) </dev/null >/dev/null 2>&1 &
+            printf '%s\n' "$!" > "$3"
             while [ ! -s "$1" ] || [ ! -s "$2" ]; do
                 sleep 0.01
             done
             exit 0
         "#;
-        let (_temp_dir, ready_path, progress_path, args) =
+        let (_temp_dir, ready_path, progress_path, pid_path, args) =
             grandchild_fixture(script, "title-gen-leader-exit-test");
 
         let names = generate_workspace_names_with_command(
             "/bin/sh",
             &args,
             "test task",
-            Duration::from_secs(2),
+            Duration::from_secs(10),
         )
         .await;
 
@@ -892,7 +955,7 @@ mod tests {
             std::fs::metadata(&progress_path).is_ok_and(|metadata| metadata.len() > 0),
             "grandchild never wrote progress"
         );
-        assert_writes_quiesce(&progress_path).await;
+        assert_process_is_gone(read_descendant_pid(&pid_path)).await;
     }
 
     #[cfg(unix)]
@@ -906,6 +969,7 @@ mod tests {
                         sleep 0.02
                     done
                 ) &
+                printf '%s\n' "$!" > "$3"
                 while [ ! -s "$1" ] || [ ! -s "$2" ]; do
                     sleep 0.01
                 done
@@ -921,14 +985,15 @@ mod tests {
         test_name: &str,
         expected: super::WorkspaceNames,
     ) {
-        let (_temp_dir, ready_path, progress_path, args) = grandchild_fixture(script, test_name);
+        let (_temp_dir, ready_path, progress_path, pid_path, args) =
+            grandchild_fixture(script, test_name);
         let names = tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(15),
             generate_workspace_names_with_command(
                 "/bin/sh",
                 &args,
                 "test task",
-                Duration::from_secs(2),
+                Duration::from_secs(10),
             ),
         )
         .await
@@ -940,7 +1005,7 @@ mod tests {
             std::fs::metadata(&progress_path).is_ok_and(|metadata| metadata.len() > 0),
             "grandchild never wrote progress"
         );
-        assert_writes_quiesce(&progress_path).await;
+        assert_process_is_gone(read_descendant_pid(&pid_path)).await;
     }
 
     #[cfg(unix)]
@@ -983,7 +1048,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_kills_background_grandchild() {
-        let (_temp_dir, ready_path, progress_path, args) =
+        let (_temp_dir, ready_path, progress_path, pid_path, args) =
             grandchild_fixture(GRANDCHILD_LOOP_SCRIPT, "title-gen-cancellation-test");
         let mut call = Box::pin(generate_workspace_names_with_command(
             "/bin/sh",
@@ -993,16 +1058,22 @@ mod tests {
         ));
 
         tokio::select! {
-            _ = wait_for_nonempty_file(&ready_path, Duration::from_secs(1)) => {}
+            _ = wait_for_nonempty_file(&ready_path, Duration::from_secs(10)) => {}
             result = &mut call => panic!("title command returned before cancellation: {result:?}"),
         }
         tokio::select! {
-            _ = wait_for_nonempty_file(&progress_path, Duration::from_secs(1)) => {}
+            _ = wait_for_nonempty_file(&progress_path, Duration::from_secs(10)) => {}
             result = &mut call => panic!("title command returned before cancellation: {result:?}"),
         }
+        tokio::select! {
+            _ = wait_for_nonempty_file(&pid_path, Duration::from_secs(10)) => {}
+            result = &mut call => panic!("title command returned before cancellation: {result:?}"),
+        }
+        let descendant_pid = read_descendant_pid(&pid_path);
+        assert_process_exists(descendant_pid);
         drop(call);
 
-        assert_writes_quiesce(&progress_path).await;
+        assert_process_is_gone(descendant_pid).await;
     }
 
     #[cfg(unix)]
