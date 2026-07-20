@@ -79,6 +79,10 @@ impl MsgStore {
         self.push(LogMsg::MessageId(id));
     }
 
+    pub fn push_native_uuid(&self, uuid: String) {
+        self.push(LogMsg::NativeUuid(uuid));
+    }
+
     pub fn push_finished(&self) {
         self.push(LogMsg::Finished);
     }

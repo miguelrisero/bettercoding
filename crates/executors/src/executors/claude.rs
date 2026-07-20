@@ -1205,6 +1205,7 @@ impl ClaudeLogProcessor {
                     LogMsg::JsonPatch(_)
                     | LogMsg::SessionId(_)
                     | LogMsg::MessageId(_)
+                    | LogMsg::NativeUuid(_)
                     | LogMsg::Stderr(_)
                     | LogMsg::Ready => continue,
                     LogMsg::Finished => break,
@@ -1249,11 +1250,20 @@ impl ClaudeLogProcessor {
                                 ClaudeJson::User { uuid, .. } => {
                                     pending_assistant_uuid = None;
                                     if let Some(uuid) = uuid {
+                                        msg_store.push_native_uuid(uuid.clone());
                                         msg_store.push_message_id(uuid.clone());
                                     }
                                 }
                                 ClaudeJson::Assistant { uuid, .. } => {
+                                    if let Some(uuid) = uuid {
+                                        msg_store.push_native_uuid(uuid.clone());
+                                    }
                                     pending_assistant_uuid = uuid.clone();
+                                }
+                                ClaudeJson::StreamEvent {
+                                    uuid: Some(uuid), ..
+                                } => {
+                                    msg_store.push_native_uuid(uuid.clone());
                                 }
                                 ClaudeJson::Result { .. } => {
                                     if let Some(uuid) = pending_assistant_uuid.take() {
@@ -3587,6 +3597,43 @@ mod tests {
         assert!(
             patch_count > 0,
             "Expected JsonPatch messages to be generated from streaming processing"
+        );
+    }
+
+    #[tokio::test]
+    async fn emits_every_observed_stream_uuid_for_native_linking() {
+        let msg_store = Arc::new(MsgStore::new());
+        let processor = ClaudeLogProcessor::process_logs(
+            msg_store.clone(),
+            Path::new("/tmp/test-worktree"),
+            EntryIndexProvider::default(),
+            HistoryStrategy::Default,
+        );
+        msg_store.push_stdout(
+            concat!(
+                "{\"type\":\"user\",\"uuid\":\"user-uuid\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+                "{\"type\":\"assistant\",\"uuid\":\"assistant-uuid\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
+                "{\"type\":\"stream_event\",\"uuid\":\"event-uuid\",\"event\":{\"type\":\"message_stop\"}}\n"
+            )
+            .to_string(),
+        );
+        msg_store.push_finished();
+        processor.await.unwrap();
+
+        let native_uuids = msg_store
+            .get_history()
+            .into_iter()
+            .filter_map(|msg| match msg {
+                LogMsg::NativeUuid(uuid) => Some(uuid),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            native_uuids,
+            ["user-uuid", "assistant-uuid", "event-uuid"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
         );
     }
 

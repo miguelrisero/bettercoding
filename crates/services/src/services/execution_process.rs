@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use db::{
     DBService,
     models::{
-        coding_agent_turn::CodingAgentTurn, execution_process::ExecutionProcess,
-        execution_process_logs::ExecutionProcessLogs,
+        coding_agent_turn::CodingAgentTurn, execution_native_link::ExecutionNativeLink,
+        execution_process::ExecutionProcess, execution_process_logs::ExecutionProcessLogs,
     },
 };
 use futures::{StreamExt, TryStreamExt};
@@ -333,6 +333,18 @@ pub fn spawn_stream_raw_logs_to_storage(
                             tracing::error!(
                                 "Failed to update agent_message_id {} for execution process {}: {}",
                                 agent_message_id,
+                                execution_id,
+                                e
+                            );
+                        }
+                    }
+                    LogMsg::NativeUuid(native_uuid) => {
+                        if let Err(e) =
+                            ExecutionNativeLink::insert(&db.pool, execution_id, native_uuid).await
+                        {
+                            tracing::error!(
+                                "Failed to persist native uuid {} for execution process {}: {}",
+                                native_uuid,
                                 execution_id,
                                 e
                             );
