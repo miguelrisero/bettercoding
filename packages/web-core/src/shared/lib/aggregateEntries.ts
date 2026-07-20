@@ -1,6 +1,6 @@
 import type {
   PatchTypeWithKey,
-  DisplayEntry,
+  BaseDisplayEntry,
   AggregatedPatchGroup,
   AggregatedDiffGroup,
   AggregatedThinkingGroup,
@@ -177,14 +177,14 @@ function aggregateThinkingInPreviousTurns(
  */
 export function aggregateConsecutiveEntries(
   entries: PatchTypeWithKey[]
-): DisplayEntry[] {
+): BaseDisplayEntry[] {
   if (entries.length === 0) return [];
 
   // First pass: aggregate thinking entries in previous turns
   const entriesWithThinkingAggregated =
     aggregateThinkingInPreviousTurns(entries);
 
-  const result: DisplayEntry[] = [];
+  const result: BaseDisplayEntry[] = [];
 
   // State for tool aggregation (file_read, search, web_fetch, command_run_*)
   let currentToolGroup: PatchTypeWithKey[] = [];
@@ -248,7 +248,7 @@ export function aggregateConsecutiveEntries(
     ) {
       flushToolGroup();
       flushDiffGroup();
-      result.push(entry as unknown as DisplayEntry);
+      result.push(entry as unknown as BaseDisplayEntry);
       continue;
     }
 

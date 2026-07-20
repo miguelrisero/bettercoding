@@ -3,6 +3,7 @@ import {
   ExecutorAction,
   NativeFeedEntry,
   NativeFeedFork,
+  NativeBranchMetadata,
   PatchType,
 } from 'shared/types';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
@@ -11,6 +12,10 @@ export type PatchTypeWithKey = PatchType & {
   patchKey: string;
   executionProcessId: string;
   nativeEntry?: NativeFeedEntry;
+  nativeFork?: {
+    claudeSessionId: string;
+    branch: NativeBranchMetadata;
+  };
 };
 
 /**
@@ -68,11 +73,27 @@ export type AggregatedThinkingGroup = {
   executionProcessId: string;
 };
 
-export type DisplayEntry =
+export type BaseDisplayEntry =
   | PatchTypeWithKey
   | AggregatedPatchGroup
   | AggregatedDiffGroup
   | AggregatedThinkingGroup;
+
+export interface NativeForkDisplayBranch {
+  label: string;
+  isDefault: boolean;
+  entries: BaseDisplayEntry[];
+}
+
+export interface NativeForkDisplayGroup {
+  type: 'NATIVE_FORK_GROUP';
+  patchKey: string;
+  executionProcessId: string;
+  forkParentUuid: string;
+  branches: NativeForkDisplayBranch[];
+}
+
+export type DisplayEntry = BaseDisplayEntry | NativeForkDisplayGroup;
 
 export function isAggregatedGroup(
   entry: DisplayEntry
@@ -90,6 +111,12 @@ export function isAggregatedThinkingGroup(
   entry: DisplayEntry
 ): entry is AggregatedThinkingGroup {
   return entry.type === 'AGGREGATED_THINKING_GROUP';
+}
+
+export function isNativeForkDisplayGroup(
+  entry: DisplayEntry
+): entry is NativeForkDisplayGroup {
+  return entry.type === 'NATIVE_FORK_GROUP';
 }
 
 export type AddEntryType = 'initial' | 'running' | 'historic' | 'plan';

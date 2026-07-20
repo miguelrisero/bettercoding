@@ -91,6 +91,12 @@
     "subagent": {
       "defaultType": "Subagente"
     },
+    "fork": {
+      "explanation": "Algunos mensajes siguieron un camino que el agente ya no está siguiendo.",
+      "branchLabel": "Rama {{index}}",
+      "resumeHint": "Claude continúa aquí",
+      "emptyBranch": "No hay mensajes visibles en esta rama"
+    },
     "loadingEarlierMessages": "Cargando mensajes anteriores",
     "cliEmptyTitle": "Este workspace normalmente se ejecuta en la terminal",
     "cliEmptyDescription": "Los nuevos workspaces empiezan en la CLI. Abre la terminal para ver y continuar la conversación, o envía un mensaje aquí para usar el chat.",

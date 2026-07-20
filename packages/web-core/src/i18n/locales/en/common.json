@@ -83,6 +83,12 @@
     "subagent": {
       "defaultType": "Subagent"
     },
+    "fork": {
+      "explanation": "Some messages went down a path the agent is no longer following.",
+      "branchLabel": "Branch {{index}}",
+      "resumeHint": "Claude resumes here",
+      "emptyBranch": "No visible messages in this branch"
+    },
     "loadingEarlierMessages": "Loading earlier messages",
     "cliEmptyTitle": "This workspace usually runs in the terminal",
     "cliEmptyDescription": "New workspaces start in the CLI. Open the terminal to see and continue the conversation — or send a message here to use chat instead.",

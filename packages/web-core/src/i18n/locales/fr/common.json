@@ -78,6 +78,12 @@
     "subagent": {
       "defaultType": "Sous-agent"
     },
+    "fork": {
+      "explanation": "Certains messages ont suivi un chemin que l'agent ne suit plus.",
+      "branchLabel": "Branche {{index}}",
+      "resumeHint": "Claude reprend ici",
+      "emptyBranch": "Aucun message visible dans cette branche"
+    },
     "loadingEarlierMessages": "Chargement des messages précédents",
     "cliEmptyTitle": "Cet espace de travail s'exécute généralement dans le terminal",
     "cliEmptyDescription": "Les nouveaux espaces de travail démarrent dans la CLI. Ouvrez le terminal pour voir et poursuivre la conversation, ou envoyez un message ici pour utiliser le chat.",

@@ -91,6 +91,12 @@
     "subagent": {
       "defaultType": "サブエージェント"
     },
+    "fork": {
+      "explanation": "一部のメッセージは、エージェントが現在たどっていない経路に進みました。",
+      "branchLabel": "ブランチ {{index}}",
+      "resumeHint": "Claude はここから再開",
+      "emptyBranch": "このブランチに表示できるメッセージはありません"
+    },
     "loadingEarlierMessages": "以前のメッセージを読み込み中",
     "cliEmptyTitle": "このワークスペースは通常ターミナルで実行されます",
     "cliEmptyDescription": "新しいワークスペースは CLI で開始します。ターミナルを開いて会話を確認・継続するか、ここにメッセージを送信してチャットを使用してください。",

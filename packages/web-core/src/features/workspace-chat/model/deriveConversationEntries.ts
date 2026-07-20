@@ -12,6 +12,7 @@ import {
   type ConversationScriptTurn,
   type ConversationTurn,
 } from './deriveConversationTurns';
+import { annotateExecutorEntriesWithNativeForks } from './deriveNativeForkGroups';
 
 export interface DerivedConversationEntriesResult {
   readonly entries: PatchTypeWithKey[];
@@ -245,8 +246,12 @@ export function deriveConversationEntries({
     );
   }
 
+  const forkAwareEntries = source.nativeFeed
+    ? annotateExecutorEntriesWithNativeForks(entries, source.nativeFeed.entries)
+    : entries;
+
   return {
-    entries,
+    entries: forkAwareEntries,
     hasRunningProcess,
     hasSetupScriptRun,
     hasCleanupScriptRun,

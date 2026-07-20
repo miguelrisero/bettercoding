@@ -32,11 +32,13 @@ import type {
   AddEntryType,
   ConversationTimelineSource,
   DisplayEntry,
+  NativeForkDisplayGroup,
 } from '@/shared/hooks/useConversationHistory/types';
 import {
   isAggregatedGroup,
   isAggregatedDiffGroup,
   isAggregatedThinkingGroup,
+  isNativeForkDisplayGroup,
 } from '@/shared/hooks/useConversationHistory/types';
 import { useConversationHistory } from '../model/hooks/useConversationHistory';
 import { useSetTokenUsageInfo } from '../model/contexts/EntriesContext';
@@ -46,6 +48,7 @@ import { ChatEmptyState } from '@vibe/ui/components/ChatEmptyState';
 import { useUiPreferencesStore } from '@/shared/stores/useUiPreferencesStore';
 import { ChatScriptPlaceholder } from '@vibe/ui/components/ChatScriptPlaceholder';
 import { ScriptFixerDialog } from '@/shared/dialogs/scripts/ScriptFixerDialog';
+import { ChatForkBranches } from '@vibe/ui/components/ChatForkBranches';
 
 interface ConversationListProps {
   attempt: WorkspaceWithSession;
@@ -81,6 +84,17 @@ function renderRowContent(
   resetAction: UseResetProcessResult,
   repos: RepoWithTargetBranch[]
 ): React.ReactNode {
+  if (isNativeForkDisplayGroup(entry)) {
+    return (
+      <NativeForkGroupEntry
+        group={entry}
+        attempt={attempt}
+        resetAction={resetAction}
+        repos={repos}
+      />
+    );
+  }
+
   if (isAggregatedGroup(entry)) {
     return (
       <DisplayConversationEntry
@@ -153,6 +167,48 @@ function renderRowContent(
   }
 
   return null;
+}
+
+function NativeForkGroupEntry({
+  group,
+  attempt,
+  resetAction,
+  repos,
+}: {
+  group: NativeForkDisplayGroup;
+  attempt: WorkspaceWithSession;
+  resetAction: UseResetProcessResult;
+  repos: RepoWithTargetBranch[];
+}) {
+  const { t } = useTranslation('common');
+
+  return (
+    <div className="px-double py-base">
+      <ChatForkBranches
+        explanation={t('conversation.fork.explanation')}
+        resumeHint={t('conversation.fork.resumeHint')}
+        emptyBranchLabel={t('conversation.fork.emptyBranch')}
+        branches={group.branches.map((branch, index) => ({
+          id: `${group.patchKey}:${index}:${branch.isDefault ? 'default' : 'alternate'}`,
+          label: t('conversation.fork.branchLabel', {
+            index: index + 1,
+            defaultValue: branch.label,
+          }),
+          isDefault: branch.isDefault,
+          content:
+            branch.entries.length > 0 ? (
+              <>
+                {branch.entries.map((entry) => (
+                  <div key={entry.patchKey}>
+                    {renderRowContent(entry, attempt, resetAction, repos)}
+                  </div>
+                ))}
+              </>
+            ) : null,
+        }))}
+      />
+    </div>
+  );
 }
 
 export const ConversationList = forwardRef<
@@ -376,7 +432,8 @@ export const ConversationList = forwardRef<
     const derivedTimeline = deriveConversationTimeline(
       derivedEntries.entries,
       prevEntriesRef.current,
-      prevRowsRef.current
+      prevRowsRef.current,
+      pending.source.nativeFeed?.forks
     );
 
     prevEntriesRef.current = derivedTimeline.displayEntries;
