@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex, Weak},
     time::{Duration, Instant},
 };
 
@@ -51,21 +51,33 @@ const MAX_GITIGNORE_BACKUP_ATTEMPTS: usize = 32;
 
 type WorkspaceFilesystemLock = Arc<RwLock<()>>;
 
-/// Serializes upload-directory migration against every in-process Files request.
-/// Keys are canonical worktree roots so aliases of the same workspace share a lock.
-// TODO: Entries are never evicted (bounded by distinct workspace count, not
-// requests); eviction belongs in the workspace-deletion path.
-static WORKSPACE_FILESYSTEM_LOCKS: LazyLock<Mutex<HashMap<PathBuf, WorkspaceFilesystemLock>>> =
+/// Serializes upload-directory migration against Files requests within one
+/// server process. Keys are canonical worktree roots so aliases of the same
+/// workspace share a lock. The deployment model runs one local server per data
+/// directory; cross-process concurrency is not fully serialized and is
+/// mitigated by atomic rename, rename-failure re-probing, and default-upload
+/// publish retry.
+///
+/// TODO: Add an OS-level lockfile if the deployment model ever permits multiple
+/// local servers for one data directory.
+static WORKSPACE_FILESYSTEM_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn workspace_filesystem_lock(canonical_base: &Path) -> WorkspaceFilesystemLock {
     let mut locks = WORKSPACE_FILESYSTEM_LOCKS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    locks
-        .entry(canonical_base.to_path_buf())
-        .or_insert_with(|| Arc::new(RwLock::new(())))
-        .clone()
+    locks.retain(|_, filesystem_lock| filesystem_lock.strong_count() > 0);
+    if let Some(filesystem_lock) = locks.get(canonical_base).and_then(Weak::upgrade) {
+        return filesystem_lock;
+    }
+
+    let filesystem_lock = Arc::new(RwLock::new(()));
+    locks.insert(
+        canonical_base.to_path_buf(),
+        Arc::downgrade(&filesystem_lock),
+    );
+    filesystem_lock
 }
 
 /// Stream a file while retaining the workspace read guard until the response
@@ -466,8 +478,10 @@ async fn ensure_uploads_gitignore(uploads_dir: &Path) -> Result<(), ApiError> {
     loop {
         match tokio::fs::symlink_metadata(&gitignore).await {
             Ok(metadata) if metadata.file_type().is_file() => {
-                // A regular .gitignore may contain deliberate user-owned rules;
-                // presence is sufficient, so never overwrite its contents.
+                // Deliberately do not parse, validate, or rewrite an existing
+                // regular .gitignore: it is user-owned data. The app guarantees
+                // only that one exists (app-seeded files contain "*"); users own
+                // any edits they make.
                 return Ok(());
             }
             Ok(_) => {
@@ -722,6 +736,113 @@ async fn resolve_uploads_dir(canonical_base: &Path) -> Result<PathBuf, ApiError>
     resolve_uploads_dir_impl(canonical_base, |_, _| {}, || {}).await
 }
 
+async fn publish_upload_once(
+    tmp_path: &Path,
+    final_path: &Path,
+    overwrite: bool,
+) -> std::io::Result<()> {
+    if overwrite {
+        tokio::fs::rename(tmp_path, final_path).await
+    } else {
+        tokio::fs::hard_link(tmp_path, final_path).await
+    }
+}
+
+async fn cleanup_upload_temp(path: &Path) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "Failed to clean up temporary upload file"
+            );
+        }
+    }
+}
+
+async fn cleanup_upload_temp_paths(original: &Path, relocated: Option<&Path>) {
+    cleanup_upload_temp(original).await;
+    if let Some(relocated) = relocated.filter(|path| *path != original) {
+        cleanup_upload_temp(relocated).await;
+    }
+}
+
+async fn upload_target_is_missing(target_dir: &Path) -> bool {
+    matches!(
+        tokio::fs::symlink_metadata(target_dir).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn map_upload_publish_error(error: std::io::Error, name: &str, overwrite: bool) -> ApiError {
+    if !overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
+        ApiError::Conflict(format!("File '{name}' already exists"))
+    } else {
+        error.into()
+    }
+}
+
+async fn publish_streamed_upload(
+    canonical_base: &Path,
+    target_dir: &Path,
+    tmp_name: &str,
+    name: &str,
+    overwrite: bool,
+    retry_default_publish: bool,
+) -> Result<(PathBuf, PathBuf), ApiError> {
+    let original_tmp_path = target_dir.join(tmp_name);
+    let original_final_path = target_dir.join(name);
+    let initial_error =
+        match publish_upload_once(&original_tmp_path, &original_final_path, overwrite).await {
+            Ok(()) => {
+                cleanup_upload_temp_paths(&original_tmp_path, None).await;
+                return Ok((target_dir.to_path_buf(), original_final_path));
+            }
+            Err(error) => error,
+        };
+
+    let retry_after_move = retry_default_publish
+        && initial_error.kind() == std::io::ErrorKind::NotFound
+        && upload_target_is_missing(target_dir).await;
+    if !retry_after_move {
+        cleanup_upload_temp_paths(&original_tmp_path, None).await;
+        return Err(map_upload_publish_error(initial_error, name, overwrite));
+    }
+
+    tracing::warn!(
+        original_target_dir = %target_dir.display(),
+        error = %initial_error,
+        "Default uploads directory moved during publish; re-resolving and retrying once"
+    );
+
+    let retry_target_dir = match resolve_uploads_dir(canonical_base).await {
+        Ok(directory) => directory,
+        Err(error) => {
+            // If resolution itself fails, the atomic migration can only have
+            // moved this UUID-named temp file between the two default dirs.
+            let current_tmp = canonical_base.join(UPLOADS_DIR).join(tmp_name);
+            let legacy_tmp = canonical_base.join(LEGACY_UPLOADS_DIR).join(tmp_name);
+            cleanup_upload_temp_paths(&original_tmp_path, Some(&current_tmp)).await;
+            cleanup_upload_temp_paths(&original_tmp_path, Some(&legacy_tmp)).await;
+            return Err(error);
+        }
+    };
+    let retry_tmp_path = retry_target_dir.join(tmp_name);
+    let retry_final_path = retry_target_dir.join(name);
+    let retry_result = publish_upload_once(&retry_tmp_path, &retry_final_path, overwrite).await;
+
+    // Whether the retry succeeds or fails, the hard-link publication path and
+    // every error path get best-effort cleanup at both possible locations.
+    cleanup_upload_temp_paths(&original_tmp_path, Some(&retry_tmp_path)).await;
+
+    match retry_result {
+        Ok(()) => Ok((retry_target_dir, retry_final_path)),
+        Err(error) => Err(map_upload_publish_error(error, name, overwrite)),
+    }
+}
+
 pub async fn upload_files(
     Extension(workspace): Extension<Workspace>,
     State(deployment): State<DeploymentImpl>,
@@ -747,7 +868,7 @@ pub async fn upload_files(
     }
     let _read_guard = filesystem_lock.read_owned().await;
 
-    let target_dir = match custom_path {
+    let mut target_dir = match custom_path {
         Some(path) => file_policy::resolve_existing_dir(&base, path)?,
         None => resolve_uploads_dir(&canonical_base).await?,
     };
@@ -763,14 +884,19 @@ pub async fn upload_files(
             )));
         }
         let name = file_policy::safe_basename(&raw_name)?;
-        let final_path = target_dir.join(&name);
+        let prospective_final_path = target_dir.join(&name);
 
-        if !query.overwrite && tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
+        if !query.overwrite
+            && tokio::fs::try_exists(&prospective_final_path)
+                .await
+                .unwrap_or(false)
+        {
             return Err(ApiError::Conflict(format!("File '{name}' already exists")));
         }
 
         // Stream to a temp file in the target dir (same filesystem → atomic rename).
-        let tmp_path = target_dir.join(format!(".bc-upload-{}.tmp", Uuid::new_v4()));
+        let tmp_name = format!(".bc-upload-{}.tmp", Uuid::new_v4());
+        let tmp_path = target_dir.join(&tmp_name);
         let mut out = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -808,27 +934,19 @@ pub async fn upload_files(
         drop(out);
 
         // Publish atomically. For no-overwrite, hard_link fails if the target
-        // already exists, closing the try_exists -> rename race (TOCTOU).
-        if query.overwrite {
-            if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err(e.into());
-            }
-        } else {
-            match tokio::fs::hard_link(&tmp_path, &final_path).await {
-                Ok(()) => {
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
-                    return Err(ApiError::Conflict(format!("File '{name}' already exists")));
-                }
-                Err(e) => {
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
-                    return Err(e.into());
-                }
-            }
-        }
+        // already exists, closing the try_exists -> rename race (TOCTOU). A
+        // default-folder publish gets one recovery attempt if another process
+        // atomically migrates the directory after streaming began.
+        let (published_target_dir, final_path) = publish_streamed_upload(
+            &canonical_base,
+            &target_dir,
+            &tmp_name,
+            &name,
+            query.overwrite,
+            custom_path.is_none(),
+        )
+        .await?;
+        target_dir = published_target_dir;
 
         let meta = tokio::fs::symlink_metadata(&final_path).await.ok();
         uploaded.push(WorkspaceFileEntry {
@@ -1355,6 +1473,72 @@ mod tests {
         assert_eq!(fs::read(blocked_new_path).unwrap(), b"not a directory");
         // When both paths are directories, new-dir precedence is covered by
         // uploads_dir_resolver_prefers_new_dir_when_both_exist.
+    }
+
+    #[tokio::test]
+    async fn default_upload_publish_retries_after_external_migration() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
+        let expected = base.join(UPLOADS_DIR);
+        let tmp_name = ".bc-upload-retry.tmp";
+        fs::write(legacy.join(tmp_name), b"streamed upload").unwrap();
+        fs::rename(&legacy, &expected).unwrap();
+
+        let (published_dir, final_path) =
+            publish_streamed_upload(&base, &legacy, tmp_name, "report.txt", false, true)
+                .await
+                .unwrap();
+
+        assert_eq!(published_dir, expected);
+        assert_eq!(final_path, expected.join("report.txt"));
+        assert_eq!(fs::read(final_path).unwrap(), b"streamed upload");
+        assert!(!legacy.join(tmp_name).exists());
+        assert!(!expected.join(tmp_name).exists());
+    }
+
+    #[tokio::test]
+    async fn default_upload_publish_retry_failure_cleans_both_temp_paths() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
+        let expected = base.join(UPLOADS_DIR);
+        let tmp_name = ".bc-upload-conflict.tmp";
+        fs::write(legacy.join(tmp_name), b"streamed upload").unwrap();
+        fs::write(legacy.join("report.txt"), b"existing report").unwrap();
+        fs::rename(&legacy, &expected).unwrap();
+
+        let error = publish_streamed_upload(&base, &legacy, tmp_name, "report.txt", false, true)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ApiError::Conflict(_)));
+        assert_eq!(
+            fs::read(expected.join("report.txt")).unwrap(),
+            b"existing report"
+        );
+        assert!(!legacy.join(tmp_name).exists());
+        assert!(!expected.join(tmp_name).exists());
+    }
+
+    #[test]
+    fn workspace_filesystem_lock_prunes_dead_entries() {
+        let first_tempdir = tempfile::tempdir().unwrap();
+        let first_base = fs::canonicalize(first_tempdir.path()).unwrap();
+        let first_lock = workspace_filesystem_lock(&first_base);
+        drop(first_lock);
+
+        let second_tempdir = tempfile::tempdir().unwrap();
+        let second_base = fs::canonicalize(second_tempdir.path()).unwrap();
+        let second_lock = workspace_filesystem_lock(&second_base);
+
+        let locks = WORKSPACE_FILESYSTEM_LOCKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!locks.contains_key(&first_base));
+        assert!(locks.get(&second_base).and_then(Weak::upgrade).is_some());
+        drop(locks);
+        drop(second_lock);
     }
 
     #[test]

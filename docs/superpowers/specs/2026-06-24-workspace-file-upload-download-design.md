@@ -155,6 +155,10 @@ migrates `.vibe-uploads` with a guarded, non-blocking rename:
 - **Both present:** prefer `.bettercoding-uploads`, keep both directories without
   merging or deleting either, and assert the inner `.gitignore` on both.
 
+An existing regular `.gitignore` is user-owned: the server does not parse,
+validate, or rewrite its contents; it only guarantees that an ignore file exists
+(app-seeded files contain `*`).
+
 Both-present is intentionally reachable after rollback and re-upgrade. Rolling
 back an older binary after migration hides `.bettercoding-uploads` from its Files
 panel because that binary exempts only `.vibe-uploads` from hidden-file filtering.
