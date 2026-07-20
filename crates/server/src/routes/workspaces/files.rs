@@ -45,9 +45,6 @@ use crate::{DeploymentImpl, error::ApiError, middleware::load_workspace_middlewa
 
 /// Wall-clock budget for generating a zip archive.
 const ZIP_WALL_TIME: Duration = Duration::from_secs(120);
-/// Maximum number of sibling names tried when preserving a non-regular
-/// `.gitignore` before creating the app-managed replacement.
-const MAX_GITIGNORE_BACKUP_ATTEMPTS: usize = 32;
 
 type WorkspaceFilesystemLock = Arc<RwLock<()>>;
 
@@ -440,37 +437,14 @@ async fn move_aside_non_regular_gitignore(
     uploads_dir: &Path,
     gitignore: &Path,
 ) -> Result<(), ApiError> {
-    for attempt in 0..MAX_GITIGNORE_BACKUP_ATTEMPTS {
-        let backup_name = if attempt == 0 {
-            ".gitignore.bak".to_string()
-        } else {
-            format!(".gitignore.bak.{attempt}")
-        };
-        let backup = uploads_dir.join(backup_name);
-
-        match tokio::fs::symlink_metadata(&backup).await {
-            Ok(_) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-
-        tokio::fs::rename(gitignore, &backup).await?;
-        tracing::warn!(
-            original_path = %gitignore.display(),
-            backup_path = %backup.display(),
-            "Moved non-regular uploads .gitignore aside before repair"
-        );
-        return Ok(());
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        format!(
-            "No available backup name for non-regular {} after {MAX_GITIGNORE_BACKUP_ATTEMPTS} attempts",
-            gitignore.display()
-        ),
-    )
-    .into())
+    let backup = uploads_dir.join(format!(".gitignore.bak.{}", Uuid::new_v4()));
+    tokio::fs::rename(gitignore, &backup).await?;
+    tracing::warn!(
+        original_path = %gitignore.display(),
+        backup_path = %backup.display(),
+        "Moved non-regular uploads .gitignore aside before repair"
+    );
+    Ok(())
 }
 
 async fn ensure_uploads_gitignore(uploads_dir: &Path) -> Result<(), ApiError> {
@@ -1028,6 +1002,21 @@ mod tests {
         );
     }
 
+    fn gitignore_backups(path: &Path) -> Vec<PathBuf> {
+        let mut backups = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".gitignore.bak."))
+            })
+            .collect::<Vec<_>>();
+        backups.sort();
+        backups
+    }
+
     #[tokio::test]
     async fn uploads_dir_resolver_creates_new_dir_when_neither_exists() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -1280,15 +1269,17 @@ mod tests {
         let resolved = resolve_uploads_dir(&base).await.unwrap();
 
         assert_eq!(resolved, expected);
+        let backups = gitignore_backups(&expected);
+        assert_eq!(backups.len(), 1);
         assert_eq!(
-            fs::read(expected.join(".gitignore.bak/nested")).unwrap(),
+            fs::read(backups[0].join("nested")).unwrap(),
             b"not an ignore file"
         );
         assert_gitignored(&expected);
     }
 
     #[tokio::test]
-    async fn uploads_dir_resolver_uses_numbered_gitignore_backup_without_clobbering() {
+    async fn uploads_dir_resolver_preserves_existing_gitignore_backup_without_clobbering() {
         let tempdir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(tempdir.path()).unwrap();
         let expected = seed_upload_dir(&base, UPLOADS_DIR);
@@ -1296,19 +1287,24 @@ mod tests {
         fs::remove_file(&gitignore).unwrap();
         fs::create_dir(&gitignore).unwrap();
         fs::write(gitignore.join("nested"), b"preserve me").unwrap();
-        fs::write(expected.join(".gitignore.bak"), b"existing backup").unwrap();
+        let existing_backup = expected.join(".gitignore.bak.00000000-0000-0000-0000-000000000000");
+        fs::create_dir(&existing_backup).unwrap();
+        fs::write(existing_backup.join("nested"), b"existing backup").unwrap();
 
         let resolved = resolve_uploads_dir(&base).await.unwrap();
 
         assert_eq!(resolved, expected);
+        let backups = gitignore_backups(&expected);
+        assert_eq!(backups.len(), 2);
         assert_eq!(
-            fs::read(expected.join(".gitignore.bak")).unwrap(),
+            fs::read(existing_backup.join("nested")).unwrap(),
             b"existing backup"
         );
-        assert_eq!(
-            fs::read(expected.join(".gitignore.bak.1/nested")).unwrap(),
-            b"preserve me"
-        );
+        let new_backup = backups
+            .iter()
+            .find(|backup| **backup != existing_backup)
+            .unwrap();
+        assert_eq!(fs::read(new_backup.join("nested")).unwrap(), b"preserve me");
         assert_gitignored(&expected);
     }
 
@@ -1331,9 +1327,11 @@ mod tests {
 
         assert_eq!(resolved, expected);
         assert_gitignored(&expected);
-        let backup = expected.join(".gitignore.bak");
+        let backups = gitignore_backups(&expected);
+        assert_eq!(backups.len(), 1);
+        let backup = &backups[0];
         assert!(
-            fs::symlink_metadata(&backup)
+            fs::symlink_metadata(backup)
                 .unwrap()
                 .file_type()
                 .is_symlink()
