@@ -67,6 +67,8 @@
     "deniedByUser": "用户拒绝了 {{toolName}}",
     "tool": "工具",
     "thinking": "思考中",
+    "assistant": "Claude",
+    "viaCli": "通过 CLI",
     "toolSummary": {
       "read": "读取 {{path}}",
       "searched": "搜索 \"{{query}}\"",

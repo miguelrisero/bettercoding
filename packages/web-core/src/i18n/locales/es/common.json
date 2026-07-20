@@ -80,6 +80,8 @@
     "plan": "Plan",
     "tool": "Herramienta",
     "thinking": "Pensando",
+    "assistant": "Claude",
+    "viaCli": "vía CLI",
     "toolSummary": {
       "read": "Leyó {{path}}",
       "searched": "Buscó \"{{query}}\"",

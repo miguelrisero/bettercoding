@@ -72,6 +72,8 @@
     "deniedByUser": "{{toolName}} denied by user",
     "tool": "Tool",
     "thinking": "Thinking",
+    "assistant": "Claude",
+    "viaCli": "via CLI",
     "toolSummary": {
       "read": "Read {{path}}",
       "searched": "Searched for \"{{query}}\"",

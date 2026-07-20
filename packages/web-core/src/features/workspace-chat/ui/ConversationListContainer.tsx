@@ -43,7 +43,7 @@ import {
 import { useConversationHistory } from '../model/hooks/useConversationHistory';
 import { useSetTokenUsageInfo } from '../model/contexts/EntriesContext';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
-import type { RepoWithTargetBranch } from 'shared/types';
+import type { NativeFeedOrigin, RepoWithTargetBranch } from 'shared/types';
 import { ChatEmptyState } from '@vibe/ui/components/ChatEmptyState';
 import { useUiPreferencesStore } from '@/shared/stores/useUiPreferencesStore';
 import { ChatScriptPlaceholder } from '@vibe/ui/components/ChatScriptPlaceholder';
@@ -78,6 +78,23 @@ export interface ConversationListHandle {
 const ALWAYS_UNVIRTUALIZED_TAIL_ROWS = 8;
 const STREAMING_UNVIRTUALIZED_BUFFER_ROWS = 24;
 
+function getDisplayEntryOrigin(
+  entry: DisplayEntry
+): NativeFeedOrigin | undefined {
+  if (
+    isAggregatedGroup(entry) ||
+    isAggregatedDiffGroup(entry) ||
+    isAggregatedThinkingGroup(entry)
+  ) {
+    return entry.entries.find((nestedEntry) => nestedEntry.nativeEntry)
+      ?.nativeEntry?.origin;
+  }
+
+  return entry.type === 'NORMALIZED_ENTRY'
+    ? entry.nativeEntry?.origin
+    : undefined;
+}
+
 function renderRowContent(
   entry: DisplayEntry,
   attempt: WorkspaceWithSession,
@@ -107,6 +124,7 @@ function renderRowContent(
         workspaceWithSession={attempt}
         resetAction={resetAction}
         repos={repos}
+        origin={getDisplayEntryOrigin(entry)}
       />
     );
   }
@@ -123,6 +141,7 @@ function renderRowContent(
         workspaceWithSession={attempt}
         resetAction={resetAction}
         repos={repos}
+        origin={getDisplayEntryOrigin(entry)}
       />
     );
   }
@@ -139,6 +158,7 @@ function renderRowContent(
         workspaceWithSession={attempt}
         resetAction={resetAction}
         repos={repos}
+        origin={getDisplayEntryOrigin(entry)}
       />
     );
   }
@@ -162,6 +182,7 @@ function renderRowContent(
         workspaceWithSession={attempt}
         resetAction={resetAction}
         repos={repos}
+        origin={getDisplayEntryOrigin(entry)}
       />
     );
   }

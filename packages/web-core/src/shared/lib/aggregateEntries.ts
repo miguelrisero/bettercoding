@@ -23,6 +23,24 @@ function isThinkingEntry(entry: PatchTypeWithKey): boolean {
   return entry.content.entry_type.type === 'thinking';
 }
 
+function sharesNativeBoundary(
+  left: PatchTypeWithKey,
+  right: PatchTypeWithKey
+): boolean {
+  const leftNative = left.nativeEntry;
+  const rightNative = right.nativeEntry;
+  if (!leftNative && !rightNative) return true;
+  if (!leftNative || !rightNative) return false;
+
+  return (
+    leftNative.origin === rightNative.origin &&
+    leftNative.claude_session_id === rightNative.claude_session_id &&
+    leftNative.branch?.fork_parent_uuid ===
+      rightNative.branch?.fork_parent_uuid &&
+    leftNative.branch?.branch_index === rightNative.branch?.branch_index
+  );
+}
+
 /**
  * Extracts the file path from a file_edit entry, or null if not a file_edit entry.
  */
@@ -146,6 +164,13 @@ function aggregateThinkingInPreviousTurns(
 
     // Only aggregate thinking entries in previous turns
     if (isInPreviousTurn && isThinkingEntry(entry)) {
+      const previousThinkingEntry = currentThinkingGroup.at(-1);
+      if (
+        previousThinkingEntry &&
+        !sharesNativeBoundary(previousThinkingEntry, entry)
+      ) {
+        flushThinkingGroup();
+      }
       currentThinkingGroup.push(entry);
     } else {
       // Flush any pending thinking group
@@ -264,7 +289,10 @@ export function aggregateConsecutiveEntries(
         // Start a new diff group
         currentDiffPath = fileEditPath;
         currentDiffGroup.push(entry);
-      } else if (fileEditPath === currentDiffPath) {
+      } else if (
+        fileEditPath === currentDiffPath &&
+        sharesNativeBoundary(currentDiffGroup[0], entry)
+      ) {
         // Same file - add to current diff group
         currentDiffGroup.push(entry);
       } else {
@@ -283,7 +311,10 @@ export function aggregateConsecutiveEntries(
         // Start a new tool group
         currentAggregationType = aggregationType;
         currentToolGroup.push(entry);
-      } else if (aggregationType === currentAggregationType) {
+      } else if (
+        aggregationType === currentAggregationType &&
+        sharesNativeBoundary(currentToolGroup[0], entry)
+      ) {
         // Same type - add to current group
         currentToolGroup.push(entry);
       } else {

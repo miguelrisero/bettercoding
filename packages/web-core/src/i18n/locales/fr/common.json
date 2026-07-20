@@ -67,6 +67,8 @@
     "deniedByUser": "{{toolName}} refusé par l'utilisateur",
     "tool": "Outil",
     "thinking": "Réflexion",
+    "assistant": "Claude",
+    "viaCli": "via la CLI",
     "toolSummary": {
       "read": "Lu {{path}}",
       "searched": "Recherché \"{{query}}\"",

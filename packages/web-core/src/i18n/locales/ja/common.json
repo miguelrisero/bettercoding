@@ -80,6 +80,8 @@
     "plan": "計画",
     "tool": "ツール",
     "thinking": "思考中",
+    "assistant": "Claude",
+    "viaCli": "CLI 経由",
     "toolSummary": {
       "read": "{{path}} を読み込み",
       "searched": "「{{query}}」を検索",

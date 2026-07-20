@@ -80,6 +80,8 @@
     "plan": "계획",
     "tool": "도구",
     "thinking": "생각 중",
+    "assistant": "Claude",
+    "viaCli": "CLI를 통해",
     "toolSummary": {
       "read": "{{path}} 읽기",
       "searched": "\"{{query}}\" 검색",

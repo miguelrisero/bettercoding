@@ -8,6 +8,7 @@ import {
   ToolStatus,
   ToolResult,
   TodoItem,
+  type NativeFeedOrigin,
   type RepoWithTargetBranch,
 } from 'shared/types';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
@@ -48,6 +49,7 @@ import { ChatAggregatedToolEntries } from '@vibe/ui/components/ChatAggregatedToo
 import { ChatAggregatedDiffEntries } from '@vibe/ui/components/ChatAggregatedDiffEntries';
 import { ChatCollapsedThinking } from '@vibe/ui/components/ChatCollapsedThinking';
 import { ChatMarkdown } from '@vibe/ui/components/ChatMarkdown';
+import { Badge } from '@vibe/ui/components/Badge';
 import {
   DiffViewBody,
   useDiffData,
@@ -77,6 +79,7 @@ type Props = {
   aggregatedGroup: AggregatedPatchGroup | null;
   aggregatedDiffGroup: AggregatedDiffGroup | null;
   aggregatedThinkingGroup: AggregatedThinkingGroup | null;
+  origin?: NativeFeedOrigin;
 };
 
 type FileEditAction = Extract<ActionType, { action: 'file_edit' }>;
@@ -308,6 +311,7 @@ function DisplayConversationEntry(props: Props) {
     executionProcessId,
     workspaceWithSession,
     resetAction,
+    origin,
   } = props;
   const sessionId = workspaceWithSession?.session?.id;
   const executorCanFork = !!(
@@ -316,6 +320,7 @@ function DisplayConversationEntry(props: Props) {
       BaseAgentCapability.SESSION_FORK
     )
   );
+  const attribution = origin === 'cli' ? <ViaCliBadge /> : undefined;
 
   // Handle aggregated groups (consecutive file_read or search entries)
   if (aggregatedGroup) {
@@ -359,6 +364,7 @@ function DisplayConversationEntry(props: Props) {
           executionProcessId={executionProcessId}
           executorCanFork={executorCanFork}
           resetAction={resetAction}
+          attribution={attribution}
         />
       );
 
@@ -368,6 +374,7 @@ function DisplayConversationEntry(props: Props) {
           content={entry.content}
           workspaceId={workspaceWithSession?.id}
           sessionId={sessionId}
+          attribution={attribution}
         />
       );
 
@@ -711,6 +718,7 @@ function UserMessageEntry({
   executionProcessId,
   executorCanFork,
   resetAction,
+  attribution,
 }: {
   content: string;
   expansionKey: string;
@@ -719,6 +727,7 @@ function UserMessageEntry({
   executionProcessId: string | undefined;
   executorCanFork: boolean;
   resetAction: UseResetProcessResult;
+  attribution: React.ReactNode;
 }) {
   const [expanded, toggle] = usePersistedExpanded(`user:${expansionKey}`, true);
   const { startEdit, isEntryGreyed, isInEditMode } = useMessageEditContext();
@@ -755,6 +764,7 @@ function UserMessageEntry({
       onEdit={canEdit ? handleEdit : undefined}
       onReset={canReset ? handleReset : undefined}
       isGreyed={isGreyed}
+      attribution={attribution}
       renderMarkdown={({ content, workspaceId }) => (
         <AppChatMarkdown
           content={content}
@@ -876,15 +886,21 @@ function AssistantMessageEntry({
   content,
   workspaceId,
   sessionId,
+  attribution,
 }: {
   content: string;
   workspaceId: string | undefined;
   sessionId: string | undefined;
+  attribution: React.ReactNode;
 }) {
+  const { t } = useTranslation('common');
+
   return (
     <ChatAssistantMessage
       content={content}
       workspaceId={workspaceId}
+      title={t('conversation.assistant')}
+      attribution={attribution}
       renderMarkdown={({ content, workspaceId }) => (
         <AppChatMarkdown
           content={content}
@@ -895,6 +911,19 @@ function AssistantMessageEntry({
         />
       )}
     />
+  );
+}
+
+function ViaCliBadge() {
+  const { t } = useTranslation('common');
+
+  return (
+    <Badge
+      variant="outline"
+      className="border-border bg-secondary/60 px-base py-half font-normal text-low"
+    >
+      {t('conversation.viaCli')}
+    </Badge>
   );
 }
 
@@ -1388,6 +1417,10 @@ function AggregatedDiffGroupEntry({ group }: { group: AggregatedDiffGroup }) {
 const DisplayConversationEntrySpaced = (props: Props) => {
   const { isEntryGreyed } = useMessageEditContext();
   const isGreyed = isEntryGreyed(props.expansionKey);
+  const entryType = props.entry?.entry_type.type;
+  const usesContainerHeader =
+    entryType === 'user_message' || entryType === 'assistant_message';
+  const showInlineAttribution = props.origin === 'cli' && !usesContainerHeader;
 
   return (
     <div
@@ -1396,6 +1429,11 @@ const DisplayConversationEntrySpaced = (props: Props) => {
         isGreyed && 'opacity-50 pointer-events-none'
       )}
     >
+      {showInlineAttribution && (
+        <div className="mb-half flex justify-end">
+          <ViaCliBadge />
+        </div>
+      )}
       <DisplayConversationEntry {...props} />
     </div>
   );
