@@ -22,10 +22,9 @@ use executors::{
 };
 use local_deployment::pty::{
     CLI_PROMPT_PARKED_NOTICE, CliPromptDelivery, CliPromptRouting, PtyCommand,
-    cli_pane_agent_running, cli_pane_agent_running_at, cli_prompt_file_exists, cli_tmux_available,
-    cli_tmux_session_exists, cli_tmux_target_exists, locate_cli_tmux_target,
-    remove_cli_prompt_file, resolved_cli_tmux_session_name, route_followup_prompt,
-    route_initial_prompt, send_cli_keys_to,
+    cli_pane_agent_running_at, cli_prompt_file_exists, cli_tmux_available, cli_tmux_session_exists,
+    cli_tmux_target_exists, locate_cli_tmux_target, remove_cli_prompt_file,
+    resolved_cli_tmux_session_name, route_followup_prompt, route_initial_prompt, send_cli_keys_to,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -708,6 +707,8 @@ async fn wait_for_cli_session(workspace_id: Uuid) -> bool {
 /// would clear a prompt no agent ever received. An unconfirmed launch leaves
 /// the parked DB prompt for the next attach's paste/fresh-launch retry — and
 /// drops the never-consumed file so a later launch can't half-consume it.
+/// The tmux target is pinned before polling so a double-home change cannot
+/// satisfy the process check from a different session than the recipient.
 ///
 /// Note: a prompt stranded by a losing racing first-attach that won
 /// `new-session -A` with a promptless bootstrap is deliberately NOT recovered
@@ -717,9 +718,13 @@ async fn wait_for_cli_session(workspace_id: Uuid) -> bool {
 /// prompt. Leaving it parked means the next attach delivers it as a follow-up
 /// paste into the live agent: slower in that rare race, but never lost.
 async fn confirm_baked_prompt_consumed(workspace_id: Uuid, program: &str) -> bool {
+    let Some(target) = locate_cli_tmux_target(workspace_id).await else {
+        remove_cli_prompt_file(workspace_id);
+        return false;
+    };
     for _ in 0..30 {
         if !cli_prompt_file_exists(workspace_id)
-            && cli_pane_agent_running(workspace_id, program).await == Some(true)
+            && cli_pane_agent_running_at(&target, program).await == Some(true)
         {
             return true;
         }
