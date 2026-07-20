@@ -1199,16 +1199,18 @@ fn cli_tmux_argv_on(input: CliTmuxArgv<'_>) -> Vec<std::ffi::OsString> {
     args
 }
 
-fn partition_cli_tmux_session_probe(command_status: Option<bool>) -> CliTmuxSessionProbe {
-    match command_status {
-        Some(true) => CliTmuxSessionProbe::Present,
-        Some(false) => CliTmuxSessionProbe::Absent,
-        None => CliTmuxSessionProbe::Unknown,
+fn classify_cli_tmux_session_probe(success: bool, stderr: &str) -> CliTmuxSessionProbe {
+    if success {
+        CliTmuxSessionProbe::Present
+    } else if stderr.contains("can't find session") || stderr.contains("no server running on") {
+        CliTmuxSessionProbe::Absent
+    } else {
+        CliTmuxSessionProbe::Unknown
     }
 }
 
 async fn probe_tmux_session_on(socket: &str, session_name: &str) -> CliTmuxSessionProbe {
-    let command_status = match run_cli_tmux_output(&[
+    match run_cli_tmux_output(&[
         "-L",
         socket,
         "has-session",
@@ -1217,7 +1219,20 @@ async fn probe_tmux_session_on(socket: &str, session_name: &str) -> CliTmuxSessi
     ])
     .await
     {
-        Ok(output) => Some(output.status.success()),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let probe = classify_cli_tmux_session_probe(output.status.success(), &stderr);
+            if probe == CliTmuxSessionProbe::Unknown {
+                tracing::warn!(
+                    socket,
+                    session_name,
+                    status = %output.status,
+                    stderr = %stderr,
+                    "CLI tmux session probe returned an unrecognized error; session state is unknown"
+                );
+            }
+            probe
+        }
         Err(error) => {
             tracing::warn!(
                 socket,
@@ -1225,10 +1240,9 @@ async fn probe_tmux_session_on(socket: &str, session_name: &str) -> CliTmuxSessi
                 error,
                 "CLI tmux session probe failed; session state is unknown"
             );
-            None
+            CliTmuxSessionProbe::Unknown
         }
-    };
-    partition_cli_tmux_session_probe(command_status)
+    }
 }
 
 fn resolve_cli_tmux_session_probes(
@@ -3726,17 +3740,32 @@ mod tests {
     }
 
     #[test]
-    fn session_probe_partitions_command_outcomes() {
+    fn session_probe_classifies_command_outcomes() {
         assert_eq!(
-            partition_cli_tmux_session_probe(Some(true)),
+            classify_cli_tmux_session_probe(true, ""),
             CliTmuxSessionProbe::Present
         );
         assert_eq!(
-            partition_cli_tmux_session_probe(Some(false)),
+            classify_cli_tmux_session_probe(false, "can't find session: foo"),
             CliTmuxSessionProbe::Absent
         );
         assert_eq!(
-            partition_cli_tmux_session_probe(None),
+            classify_cli_tmux_session_probe(false, "no server running on /tmp/x"),
+            CliTmuxSessionProbe::Absent
+        );
+        assert_eq!(
+            classify_cli_tmux_session_probe(
+                false,
+                "error connecting to /tmp/x (Permission denied)"
+            ),
+            CliTmuxSessionProbe::Unknown
+        );
+        assert_eq!(
+            classify_cli_tmux_session_probe(false, ""),
+            CliTmuxSessionProbe::Unknown
+        );
+        assert_eq!(
+            classify_cli_tmux_session_probe(false, "some unrecognized message"),
             CliTmuxSessionProbe::Unknown
         );
     }
@@ -3770,14 +3799,20 @@ mod tests {
         static SOCKET_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SOCKET_SEQ.fetch_add(1, Ordering::Relaxed);
         let base = format!("bc-b2-test-{}-{seq}", std::process::id());
-        ScratchTmuxPair {
+        let pair = ScratchTmuxPair {
             current: ScratchTmuxServer {
                 socket: format!("{base}-current"),
             },
             legacy: ScratchTmuxServer {
                 socket: format!("{base}-legacy"),
             },
-        }
+        };
+        // Keep both fixture servers alive with an out-of-namespace session so
+        // an absent target exercises tmux's definitive "can't find session"
+        // response rather than a version-specific missing-socket diagnostic.
+        pair.current.start_session("scratch-fixture-sentinel");
+        pair.legacy.start_session("scratch-fixture-sentinel");
+        pair
     }
 
     impl Drop for ScratchTmuxServer {
@@ -3916,6 +3951,9 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_probe_makes_create_fail_without_starting_a_scratch_session() {
+        if !tmux_available() {
+            return;
+        }
         let pair = scratch_tmux_pair();
         let workspace_id = Uuid::new_v4();
         let probe_result = resolve_cli_tmux_session_probes(
