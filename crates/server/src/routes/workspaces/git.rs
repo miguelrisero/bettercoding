@@ -809,10 +809,20 @@ where
     let rebase_result = rebase(new_base_branch, old_base_branch);
 
     if rebase_result.is_ok() {
-        // If a target-changing rebase conflicts and is later continued, the database
-        // deliberately keeps the old target until the next successful rebase or an
-        // explicit target change. That stale value is non-destructive: it never claims
-        // Git reached a base that the rebase did not complete.
+        // A target-changing rebase that conflicts and is later completed by
+        // continue_workspace_rebase deliberately leaves WorkspaceRepo::target_branch
+        // at the old target. That value remains the direct-merge destination in
+        // merge_workspace, create_pr's default PR base (workspaces/pr.rs), the
+        // ahead/behind base in get_workspace_branch_status, and start_review's
+        // fork-point base (sessions/review.rs). It also becomes the next rebase's
+        // default old_base_branch in rebase_workspace and RebaseDialog's initial
+        // target/upstream selection
+        // (packages/web-core/src/shared/dialogs/command-bar/RebaseDialog.tsx).
+        //
+        // This divergence is direction-safe: the database never claims a base Git did
+        // not reach. It self-heals on the next successful rebase or an explicit target
+        // change. A filed follow-up tracks the durable fix: persist the intended target
+        // when continue_workspace_rebase completes.
         WorkspaceRepo::update_target_branch(pool, workspace_id, repo_id, new_base_branch).await?;
     }
 
@@ -964,6 +974,9 @@ pub async fn continue_workspace_rebase(
     let workspace_path = Path::new(&container_ref);
     let worktree_path = workspace_path.join(&repo.name);
 
+    // This handler intentionally does not persist any target branch. See the comment
+    // in rebase_workspace_core for the rationale and filed persist-on-continue
+    // follow-up.
     deployment.git().continue_rebase(&worktree_path)?;
 
     Ok(ResponseJson(ApiResponse::success(())))
