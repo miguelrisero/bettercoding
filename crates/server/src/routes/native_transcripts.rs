@@ -27,11 +27,12 @@ pub struct AssignNativeCliSessionRequest {
     pub session_id: Uuid,
 }
 
-fn service(deployment: &DeploymentImpl) -> Result<Arc<ClaudeTranscriptIngest>, ApiError> {
-    deployment
-        .claude_transcript_ingest()
-        .cloned()
-        .ok_or_else(|| ApiError::BadRequest("CLI transcript ingest is disabled".to_string()))
+fn service(deployment: &DeploymentImpl) -> Option<Arc<ClaudeTranscriptIngest>> {
+    deployment.claude_transcript_ingest().cloned()
+}
+
+fn disabled_error() -> ApiError {
+    ApiError::BadRequest("CLI transcript ingest is disabled".to_string())
 }
 
 fn map_ingest_error(error: ClaudeTranscriptIngestError) -> ApiError {
@@ -58,11 +59,11 @@ async fn stream_native_feed_ws(
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| async move {
         let ingest = match service(&deployment) {
-            Ok(ingest) => ingest,
-            Err(error) => {
+            Some(ingest) => ingest,
+            None => {
                 let mut socket = socket;
                 let _ = socket
-                    .send(LogMsg::Stderr(error.to_string()).to_ws_message_unchecked())
+                    .send(LogMsg::Stderr(disabled_error().to_string()).to_ws_message_unchecked())
                     .await;
                 let _ = socket.close().await;
                 return;
@@ -163,7 +164,8 @@ async fn get_unassigned(
     State(deployment): State<DeploymentImpl>,
     Path(workspace_id): Path<Uuid>,
 ) -> Result<ResponseJson<ApiResponse<Vec<UnassignedCliSession>>>, ApiError> {
-    let sessions = service(&deployment)?
+    let sessions = service(&deployment)
+        .ok_or_else(disabled_error)?
         .list_unassigned(workspace_id)
         .await
         .map_err(map_ingest_error)?;
@@ -174,7 +176,8 @@ async fn assign_unassigned(
     State(deployment): State<DeploymentImpl>,
     Json(payload): Json<AssignNativeCliSessionRequest>,
 ) -> Result<ResponseJson<ApiResponse<()>>, ApiError> {
-    service(&deployment)?
+    service(&deployment)
+        .ok_or_else(disabled_error)?
         .assign_manual(&payload.claude_session_id, payload.session_id)
         .await
         .map_err(map_ingest_error)?;
