@@ -252,6 +252,59 @@ async fn read_only_fixture_backfill_is_complete_and_idempotent() {
 }
 
 #[tokio::test]
+async fn large_backfill_imports_across_bounded_line_batches() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, &workspace_root).await;
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    let sid = "10101010-1010-4010-8010-101010101010";
+    let content = (0..300)
+        .map(|index| {
+            native_user_record(
+                sid,
+                &format!("batched-{index}"),
+                &format!("line {index}"),
+                "2026-07-20T20:00:00Z",
+            )
+        })
+        .collect::<String>();
+    fs::write(native_dir.join(format!("{sid}.jsonl")), content).unwrap();
+    ClaudeSessionLink::assign_manual(&db.pool, sid, session.id, &cwd.to_string_lossy())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), projects_dir));
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let file = CliNativeFile::list_latest_by_sid(&db.pool, sid)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        CliNativeRecord::count_for_file(&db.pool, file.id)
+            .await
+            .unwrap(),
+        300
+    );
+    assert_eq!(
+        CliIngestOutbox::latest_seq(&db.pool, session.id)
+            .await
+            .unwrap(),
+        300
+    );
+}
+
+#[tokio::test]
 async fn unmatched_sid_is_imported_raw_before_manual_assignment() {
     let temp = TempDir::new().unwrap();
     let workspace_root = temp.path().join("worktree");
@@ -920,7 +973,7 @@ async fn ordinary_outbox_constraint_failure_rolls_back_for_scan_retry() {
 }
 
 #[tokio::test]
-async fn truncation_without_complete_line_invalidates_connected_subscriber() {
+async fn staged_truncation_keeps_old_generation_until_replacement_batch_commits() {
     let temp = TempDir::new().unwrap();
     let workspace_root = temp.path().join("worktree");
     let projects_dir = temp.path().join("projects");
@@ -949,6 +1002,11 @@ async fn truncation_without_complete_line_invalidates_connected_subscriber() {
         .unwrap();
     let before = service.snapshot(session.id).await.unwrap();
     assert_eq!(before.entries.len(), 1);
+    let old_file = CliNativeFile::list_latest_by_sid(&db.pool, sid)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
 
     let mut updates = service.subscribe();
     fs::write(&native_file, br#"{"type":"user"#).unwrap();
@@ -957,9 +1015,34 @@ async fn truncation_without_complete_line_invalidates_connected_subscriber() {
         .await
         .unwrap();
 
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), updates.recv())
+            .await
+            .is_err(),
+        "an uncommitted replacement must not invalidate the feed"
+    );
+    let staged = service.snapshot(session.id).await.unwrap();
+    assert_eq!(staged.revision, before.revision);
+    assert_eq!(staged.entries.len(), 1);
+    assert_eq!(staged.entries[0].uuid.as_deref(), Some("before-truncate"));
+    let staged_files = CliNativeFile::list_latest_by_sid(&db.pool, sid)
+        .await
+        .unwrap();
+    assert_eq!(staged_files.len(), 1);
+    assert_eq!(staged_files[0].generation, 0);
+
+    fs::write(
+        &native_file,
+        native_user_record(sid, "after-truncate", "replacement", "2026-07-20T20:01:00Z"),
+    )
+    .unwrap();
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
     let update = tokio::time::timeout(Duration::from_secs(5), updates.recv())
         .await
-        .expect("connected subscriber was not invalidated")
+        .expect("committed replacement did not invalidate the feed")
         .unwrap();
     let invalidated_revision = match update {
         NativeFeedUpdate::RevisionInvalidated {
@@ -970,20 +1053,110 @@ async fn truncation_without_complete_line_invalidates_connected_subscriber() {
             revision
         }
         NativeFeedUpdate::RecordsAppended { .. } => {
-            panic!("truncation without a complete line must not require an outbox row")
+            panic!("publisher is not running in this test")
         }
     };
 
     let resnapshot = service.snapshot(session.id).await.unwrap();
     assert_eq!(resnapshot.revision, invalidated_revision);
     assert!(resnapshot.revision > before.revision);
-    assert_eq!(resnapshot.seq, before.seq);
-    assert!(resnapshot.entries.is_empty());
+    assert!(resnapshot.seq > before.seq);
+    assert_eq!(resnapshot.entries.len(), 1);
+    assert_eq!(
+        resnapshot.entries[0].uuid.as_deref(),
+        Some("after-truncate")
+    );
     let files = CliNativeFile::list_latest_by_sid(&db.pool, sid)
         .await
         .unwrap();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].generation, 1);
+    assert!(
+        CliNativeFile::find_by_id(&db.pool, old_file.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        CliNativeRecord::count_for_file(&db.pool, old_file.id)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn rescan_purge_frees_prompt_binding_for_rewritten_record() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, &workspace_root).await;
+    let sid = "34343434-3434-4434-8434-343434343434";
+    let process_id = create_coding_turn(&db, session.id, "rewrite prompt").await;
+    CodingAgentTurn::update_agent_session_id(&db.pool, process_id, sid)
+        .await
+        .unwrap();
+    let turn = CodingAgentTurn::find_by_execution_process_id(&db.pool, process_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    let native_file = native_dir.join(format!("{sid}.jsonl"));
+    let recorded_at =
+        (Utc::now() + ChronoDuration::seconds(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    fs::write(
+        &native_file,
+        native_user_record(sid, "before-rewrite", "rewrite prompt", &recorded_at),
+    )
+    .unwrap();
+
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), projects_dir));
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+    let old_file = CliNativeFile::list_latest_by_sid(&db.pool, sid)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let old_row = CliNativeRecord::list_for_session(&db.pool, session.id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(old_row.bound_coding_agent_turn_id, Some(turn.id));
+
+    fs::write(
+        &native_file,
+        native_user_record(sid, "after-rewrite", "rewrite prompt", &recorded_at),
+    )
+    .unwrap();
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(
+        CliNativeFile::find_by_id(&db.pool, old_file.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let rows = CliNativeRecord::list_for_session(&db.pool, session.id)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].uuid.as_deref(), Some("after-rewrite"));
+    assert_eq!(rows[0].bound_coding_agent_turn_id, Some(turn.id));
+    assert_eq!(
+        service.snapshot(session.id).await.unwrap().entries[0].origin,
+        NativeFeedOrigin::App
+    );
 }
 
 #[tokio::test]

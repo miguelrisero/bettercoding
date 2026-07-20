@@ -53,13 +53,16 @@ use uuid::Uuid;
 
 use self::{
     projection::build_projection,
-    tail::{ObservedFileState, StoredTailState, hash_bytes, rescan_reason, split_complete_lines},
+    tail::{
+        ObservedFileState, StoredTailState, hash_bytes, read_complete_line_batch, rescan_reason,
+    },
 };
 use crate::services::filesystem_watcher;
 
 const REGISTRY_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const OUTBOX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_PROJECT_DIR_SCAN: usize = 512;
+const IMPORT_BATCH_LINE_LIMIT: usize = 256;
 
 #[derive(Debug, Clone)]
 pub(crate) struct NativeLinkPersisted {
@@ -592,83 +595,119 @@ impl ClaudeTranscriptIngest {
             },
             force_rescan,
         );
-        if let Some(reason) = reason {
-            native_file = CliNativeFile::bump_generation(&self.db.pool, &registration).await?;
-            self.rescans.fetch_add(1, Ordering::Relaxed);
-            if let Some(link) = &link {
-                self.invalidate_revision(link.link.session_id).await;
-            }
-            tracing::info!(?reason, path = %path.display(), generation = native_file.generation, "rescanning native transcript generation");
+        let mut activate_replacement = reason.is_some();
+        let (mut cursor_offset, mut next_line_seq, mut last_line_offset, mut last_line_hash) =
+            if activate_replacement {
+                (0, 0, 0, None)
+            } else {
+                (
+                    native_file.cursor_offset,
+                    native_file.next_line_seq,
+                    native_file.last_line_offset,
+                    native_file.last_line_hash.clone(),
+                )
+            };
+        if activate_replacement {
             file.seek(SeekFrom::Start(0))?;
         } else {
             file.seek(SeekFrom::Start(native_file.cursor_offset as u64))?;
         }
+        let mut reader = BufReader::new(file);
 
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        let tail =
-            split_complete_lines(&bytes, native_file.cursor_offset, native_file.next_line_seq);
-        if tail.lines.is_empty() {
-            return Ok(());
-        }
+        loop {
+            let tail = read_complete_line_batch(
+                &mut reader,
+                cursor_offset,
+                next_line_seq,
+                IMPORT_BATCH_LINE_LIMIT,
+            )?;
+            if tail.lines.is_empty() {
+                break;
+            }
 
-        let mut records = Vec::new();
-        for complete in &tail.lines {
-            match adapt_native_claude_line(&complete.raw, claude_session_id) {
-                Ok(line) if line.is_sidechain() => continue,
-                Ok(line) => {
-                    if line.is_unknown() {
-                        self.unknown_kinds.fetch_add(1, Ordering::Relaxed);
+            let mut records = Vec::new();
+            for complete in &tail.lines {
+                match adapt_native_claude_line(&complete.raw, claude_session_id) {
+                    Ok(line) if line.is_sidechain() => continue,
+                    Ok(line) => {
+                        if line.is_unknown() {
+                            self.unknown_kinds.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let envelope = line.metadata();
+                        records.push(NewCliNativeRecord {
+                            line_seq: complete.line_seq,
+                            claude_session_id: claude_session_id.to_string(),
+                            uuid: envelope.uuid.clone(),
+                            parent_uuid: envelope.parent_uuid.clone(),
+                            kind: envelope.kind.clone(),
+                            ts: envelope.timestamp.clone(),
+                            raw: complete.raw.clone(),
+                            user_prompt: line.plain_user_text(),
+                            recorded_at: envelope
+                                .timestamp
+                                .as_deref()
+                                .and_then(parse_native_timestamp),
+                        });
                     }
-                    let envelope = line.metadata();
-                    records.push(NewCliNativeRecord {
-                        line_seq: complete.line_seq,
-                        claude_session_id: claude_session_id.to_string(),
-                        uuid: envelope.uuid.clone(),
-                        parent_uuid: envelope.parent_uuid.clone(),
-                        kind: envelope.kind.clone(),
-                        ts: envelope.timestamp.clone(),
-                        raw: complete.raw.clone(),
-                        user_prompt: line.plain_user_text(),
-                        recorded_at: envelope
-                            .timestamp
-                            .as_deref()
-                            .and_then(parse_native_timestamp),
-                    });
-                }
-                Err(_) => {
-                    self.unknown_kinds.fetch_add(1, Ordering::Relaxed);
-                    records.push(NewCliNativeRecord {
-                        line_seq: complete.line_seq,
-                        claude_session_id: claude_session_id.to_string(),
-                        uuid: None,
-                        parent_uuid: None,
-                        kind: "unknown".to_string(),
-                        ts: None,
-                        raw: complete.raw.clone(),
-                        user_prompt: None,
-                        recorded_at: None,
-                    });
+                    Err(_) => {
+                        self.unknown_kinds.fetch_add(1, Ordering::Relaxed);
+                        records.push(NewCliNativeRecord {
+                            line_seq: complete.line_seq,
+                            claude_session_id: claude_session_id.to_string(),
+                            uuid: None,
+                            parent_uuid: None,
+                            kind: "unknown".to_string(),
+                            ts: None,
+                            raw: complete.raw.clone(),
+                            user_prompt: None,
+                            recorded_at: None,
+                        });
+                    }
                 }
             }
-        }
-        let cursor = ImportedCursor {
-            cursor_offset: tail.cursor_offset,
-            next_line_seq: tail.next_line_seq,
-            last_line_offset: tail
-                .last_line_offset
-                .unwrap_or(native_file.last_line_offset),
-            last_line_hash: tail
-                .last_line_hash
-                .as_deref()
-                .or(native_file.last_line_hash.as_deref()),
-            observed_size,
-            observed_mtime_ms,
-        };
-        let imported =
-            CliNativeRecord::import_batch(&self.db.pool, native_file.id, &records, &cursor).await?;
-        if imported.appended_outbox > 0 {
-            self.publisher_notify.notify_one();
+            let batch_last_line_offset = tail.last_line_offset.unwrap_or(last_line_offset);
+            let batch_last_line_hash = tail.last_line_hash.as_deref().or(last_line_hash.as_deref());
+            let cursor = ImportedCursor {
+                cursor_offset: tail.cursor_offset,
+                next_line_seq: tail.next_line_seq,
+                last_line_offset: batch_last_line_offset,
+                last_line_hash: batch_last_line_hash,
+                observed_size,
+                observed_mtime_ms,
+            };
+            let imported = if activate_replacement {
+                let replacement = CliNativeRecord::replace_generation_and_import_batch(
+                    &self.db.pool,
+                    &registration,
+                    &records,
+                    &cursor,
+                )
+                .await?;
+                native_file = replacement.file;
+                activate_replacement = false;
+                self.rescans.fetch_add(1, Ordering::Relaxed);
+                if let Some(link) = &link {
+                    // The replacement is committed and visible before its
+                    // revision can prompt a connected feed to resnapshot.
+                    self.invalidate_revision(link.link.session_id).await;
+                }
+                tracing::info!(?reason, path = %path.display(), generation = native_file.generation, "rescanned native transcript generation");
+                replacement.imported
+            } else {
+                CliNativeRecord::import_batch(&self.db.pool, native_file.id, &records, &cursor)
+                    .await?
+            };
+            if imported.appended_outbox > 0 {
+                self.publisher_notify.notify_one();
+            }
+
+            cursor_offset = tail.cursor_offset;
+            next_line_seq = tail.next_line_seq;
+            last_line_offset = batch_last_line_offset;
+            last_line_hash = tail.last_line_hash.or(last_line_hash);
+            if tail.trailing_bytes > 0 {
+                break;
+            }
         }
         Ok(())
     }

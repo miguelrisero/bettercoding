@@ -1,7 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
+
+use super::cli_native_file::{CliNativeFile, RegisterCliNativeFile};
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct CliNativeRecord {
@@ -45,6 +47,12 @@ pub struct ImportBatchResult {
     pub inserted_records: u64,
     pub appended_outbox: u64,
     pub last_seq: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplacedGenerationImport {
+    pub file: CliNativeFile,
+    pub imported: ImportBatchResult,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -93,6 +101,107 @@ impl CliNativeRecord {
         cursor: &ImportedCursor<'_>,
     ) -> Result<ImportBatchResult, sqlx::Error> {
         let mut tx = pool.begin().await?;
+        let result =
+            Self::import_batch_in_transaction(&mut tx, file_id, records, cursor, None).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// Activate a rewritten file only once its first complete-line batch is
+    /// ready. New generation insertion, old generation removal (including
+    /// cascading records/outbox), first-batch import, and cursor advancement
+    /// are one transaction, so readers see either the old generation or a
+    /// populated new one.
+    pub async fn replace_generation_and_import_batch(
+        pool: &SqlitePool,
+        registration: &RegisterCliNativeFile<'_>,
+        records: &[NewCliNativeRecord],
+        cursor: &ImportedCursor<'_>,
+    ) -> Result<ReplacedGenerationImport, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+        let next_generation = sqlx::query_scalar!(
+            r#"SELECT COALESCE(MAX(generation), -1) + 1 AS "generation!: i64"
+               FROM cli_native_files
+               WHERE dir_path = $1 AND file_name = $2"#,
+            registration.dir_path,
+            registration.file_name
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // Capture the pre-purge watermark so replacement rows never reuse a
+        // sequence already observed by a connected publisher.
+        let session_id = sqlx::query_scalar!(
+            r#"SELECT session_id AS "session_id!: Uuid"
+               FROM claude_session_links
+               WHERE claude_session_id = $1"#,
+            registration.claude_session_id
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let next_outbox_seq = if let Some(session_id) = session_id {
+            Some(
+                sqlx::query_scalar!(
+                    r#"SELECT COALESCE(MAX(seq), 0) + 1 AS "seq!: i64"
+                       FROM cli_ingest_outbox WHERE session_id = $1"#,
+                    session_id
+                )
+                .fetch_one(&mut *tx)
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        let file_id = Uuid::new_v4();
+        sqlx::query!(
+            r#"INSERT INTO cli_native_files
+                   (id, claude_session_id, dir_path, file_name,
+                    discovered_workspace_id, dev, inode, generation,
+                    observed_size, observed_mtime_ms)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
+            file_id,
+            registration.claude_session_id,
+            registration.dir_path,
+            registration.file_name,
+            registration.discovered_workspace_id,
+            registration.dev,
+            registration.inode,
+            next_generation,
+            registration.observed_size,
+            registration.observed_mtime_ms
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query!(
+            r#"DELETE FROM cli_native_files
+               WHERE dir_path = $1 AND file_name = $2 AND id != $3"#,
+            registration.dir_path,
+            registration.file_name,
+            file_id
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        let imported =
+            Self::import_batch_in_transaction(&mut tx, file_id, records, cursor, next_outbox_seq)
+                .await?;
+        tx.commit().await?;
+
+        let file = CliNativeFile::find_by_id(pool, file_id)
+            .await?
+            .expect("activated native generation exists");
+        Ok(ReplacedGenerationImport { file, imported })
+    }
+
+    async fn import_batch_in_transaction(
+        tx: &mut Transaction<'_, Sqlite>,
+        file_id: Uuid,
+        records: &[NewCliNativeRecord],
+        cursor: &ImportedCursor<'_>,
+        minimum_next_outbox_seq: Option<i64>,
+    ) -> Result<ImportBatchResult, sqlx::Error> {
         let imported_at = Utc::now();
 
         let session_id = sqlx::query_scalar!(
@@ -103,7 +212,7 @@ impl CliNativeRecord {
                WHERE f.id = $1"#,
             file_id
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
 
         let mut next_outbox_seq = if let Some(session_id) = session_id {
@@ -112,8 +221,9 @@ impl CliNativeRecord {
                    FROM cli_ingest_outbox WHERE session_id = $1"#,
                 session_id
             )
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?
+            .max(minimum_next_outbox_seq.unwrap_or(1))
         } else {
             0
         };
@@ -129,7 +239,7 @@ impl CliNativeRecord {
                        ) AS "linked!: bool""#,
                     native_uuid
                 )
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **tx)
                 .await?
             } else {
                 false
@@ -173,7 +283,7 @@ impl CliNativeRecord {
                             window_start,
                             reference_time
                         )
-                        .fetch_optional(&mut *tx)
+                        .fetch_optional(&mut **tx)
                         .await?
                     }
                     _ => None,
@@ -198,7 +308,7 @@ impl CliNativeRecord {
                 record.raw,
                 bound_turn_id
             )
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
             if inserted.rows_affected() == 0 {
@@ -218,7 +328,7 @@ impl CliNativeRecord {
                 file_id,
                 record.line_seq
             )
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
             if outbox_inserted.rows_affected() > 0 {
@@ -247,10 +357,8 @@ impl CliNativeRecord {
             cursor.observed_mtime_ms,
             file_id
         )
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-
-        tx.commit().await?;
         Ok(result)
     }
 
