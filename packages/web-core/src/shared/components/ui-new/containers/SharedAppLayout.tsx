@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 import { Outlet } from '@tanstack/react-router';
 import { SyncErrorProvider } from '@/shared/providers/SyncErrorProvider';
 import { useIsMobile } from '@/shared/hooks/useIsMobile';
-import { useVisualViewportGeometry } from '@/shared/hooks/useVisualViewportHeight';
+import { useVisualViewportGeometry } from '@/shared/hooks/useVisualViewportGeometry';
 import { useUiPreferencesStore } from '@/shared/stores/useUiPreferencesStore';
 import { cn } from '@/shared/lib/utils';
 

@@ -9,8 +9,10 @@ import { isTouchDevice } from './useIsMobile';
  * `fixed inset-0` app keeps its full height and the keyboard just covers the
  * bottom half (including the terminal's input line). The only reliable signal
  * is `window.visualViewport`, so this store mirrors its height and vertical
- * offset. It still pins window scroll back to 0 when possible, but retaining
- * any residual iOS focus pan lets the app shell follow the visible viewport.
+ * offset. The offset is authoritative: this read path deliberately does not
+ * call `window.scrollTo()`. Layout scroll may already be zero during an iOS
+ * visual pan, and mutating it here both outlives mounted consumers and can make
+ * the geometry read in the same tick capture a stale `offsetTop`.
  *
  * Android Chrome resizes the layout viewport itself when the viewport meta
  * carries `interactive-widget=resizes-content`; there the visual height equals
@@ -49,6 +51,8 @@ let snapshot = FALLBACK_GEOMETRY;
 let initialized = false;
 let attached = false;
 let notifyFrame: number | null = null;
+let earlySettleTimer: ReturnType<typeof setTimeout> | null = null;
+let lateSettleTimer: ReturnType<typeof setTimeout> | null = null;
 
 function readGeometry(): VisualViewportGeometry {
   const vv = window.visualViewport;
@@ -77,25 +81,33 @@ function updateSnapshot(next: VisualViewportGeometry) {
   if (notifyFrame !== null) return;
   notifyFrame = requestAnimationFrame(() => {
     notifyFrame = null;
-    for (const l of [...listeners]) l();
+    for (const listener of [...listeners]) {
+      try {
+        listener();
+      } catch {
+        // External-store subscribers are independent. One broken consumer
+        // must not starve the rest of this frame's notifications.
+      }
+    }
   });
 }
 
 function onViewportChange() {
-  const vv = window.visualViewport;
-  // iOS pans the visual viewport to reveal a focused input near the bottom.
-  // Undo layout scrolling when possible, then retain any residual visual pan
-  // so the fixed app shell can follow what the user can actually see. Never
-  // fight an offset while zoomed, which belongs to the user's pinch gesture.
-  if (vv && vv.offsetTop > 0 && vv.scale <= ZOOM_SCALE_EPSILON) {
-    window.scrollTo(0, 0);
-  }
   updateSnapshot(readGeometry());
 }
 
 function scheduleViewportSettleResync() {
-  setTimeout(onViewportChange, EARLY_VIEWPORT_SETTLE_MS);
-  setTimeout(onViewportChange, LATE_VIEWPORT_SETTLE_MS);
+  if (earlySettleTimer !== null) clearTimeout(earlySettleTimer);
+  if (lateSettleTimer !== null) clearTimeout(lateSettleTimer);
+
+  earlySettleTimer = setTimeout(() => {
+    earlySettleTimer = null;
+    onViewportChange();
+  }, EARLY_VIEWPORT_SETTLE_MS);
+  lateSettleTimer = setTimeout(() => {
+    lateSettleTimer = null;
+    onViewportChange();
+  }, LATE_VIEWPORT_SETTLE_MS);
 }
 
 function subscribe(listener: Listener) {
@@ -137,9 +149,12 @@ function getSnapshot(): VisualViewportGeometry {
  * (layout-viewport) sizing on `null`.
  */
 export function useVisualViewportGeometry(): VisualViewportGeometry {
-  return useSyncExternalStore(subscribe, getSnapshot, () => FALLBACK_GEOMETRY);
+  return useSyncExternalStore(
+    visualViewportStore.subscribe,
+    visualViewportStore.getSnapshot,
+    () => FALLBACK_GEOMETRY
+  );
 }
 
-// Test-only escape hatch for exercising the attach-once module store without a
-// DOM renderer. Production consumers should use useVisualViewportGeometry.
-export const __vvStoreForTests = { subscribe, getSnapshot };
+/** Shared geometry source used by both the React hook and non-React consumers. */
+export const visualViewportStore = { subscribe, getSnapshot };

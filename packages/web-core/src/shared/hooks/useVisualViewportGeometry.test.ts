@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 type CapturedListener = EventListenerOrEventListenerObject;
 
+const subscriptions: Array<() => void> = [];
+
 function createEventTargetStub() {
   const listeners = new Map<string, Set<CapturedListener>>();
 
@@ -24,7 +26,10 @@ function createEventTargetStub() {
   };
 }
 
-async function createViewportHarness() {
+async function createViewportHarness({
+  touch = true,
+  autoSubscribe = true,
+} = {}) {
   const viewportEvents = createEventTargetStub();
   const windowEvents = createEventTargetStub();
   const documentEvents = createEventTargetStub();
@@ -47,23 +52,33 @@ async function createViewportHarness() {
 
   vi.stubGlobal('window', fakeWindow);
   vi.stubGlobal('document', fakeDocument);
-  vi.stubGlobal('navigator', { maxTouchPoints: 1 });
+  vi.stubGlobal('navigator', { maxTouchPoints: touch ? 1 : 0 });
   vi.stubGlobal(
     'requestAnimationFrame',
     (callback: FrameRequestCallback): number =>
       setTimeout(() => callback(0), 0) as unknown as number
   );
 
-  const { __vvStoreForTests: store } = await import(
-    './useVisualViewportHeight'
+  const { visualViewportStore: store } = await import(
+    './useVisualViewportGeometry'
   );
-  const unsubscribe = store.subscribe(vi.fn());
+  const listener = vi.fn();
+
+  const subscribe = (nextListener: () => void) => {
+    const unsubscribe = store.subscribe(nextListener);
+    subscriptions.push(unsubscribe);
+    return unsubscribe;
+  };
+
+  if (autoSubscribe) subscribe(listener);
 
   return {
     visualViewport,
     scrollTo,
     store,
-    unsubscribe,
+    listener,
+    subscribe,
+    viewportAddEventListener: viewportEvents.addEventListener,
     dispatchViewport(type: string) {
       viewportEvents.dispatchEvent(new Event(type));
     },
@@ -77,27 +92,28 @@ describe('visual viewport geometry store', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.resetModules();
+    subscriptions.length = 0;
   });
 
   afterEach(() => {
+    for (const unsubscribe of subscriptions.splice(0)) unsubscribe();
     vi.clearAllTimers();
     vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
-  it('stores residual iOS visual viewport pan after scroll reset', async () => {
+  it('stores residual iOS visual viewport pan without mutating scroll', async () => {
     const harness = await createViewportHarness();
     harness.visualViewport.height = 498.9;
     harness.visualViewport.offsetTop = 150.9;
 
     harness.dispatchViewport('scroll');
 
-    expect(harness.scrollTo).toHaveBeenCalledWith(0, 0);
+    expect(harness.scrollTo).not.toHaveBeenCalled();
     expect(harness.store.getSnapshot()).toEqual({
       height: 498,
       offsetTop: 150,
     });
-    harness.unsubscribe();
   });
 
   it('recovers a silently restored height after focus settles', async () => {
@@ -111,23 +127,41 @@ describe('visual viewport geometry store', () => {
     await vi.advanceTimersByTimeAsync(700);
 
     expect(harness.store.getSnapshot().height).toBe(844);
-    harness.unsubscribe();
   });
 
-  it('falls back to layout geometry during pinch zoom', async () => {
+  it('replaces pending settle checks instead of accumulating timeouts', async () => {
+    const harness = await createViewportHarness();
+    await vi.advanceTimersByTimeAsync(0);
+
+    harness.dispatchWindow('focusout');
+    harness.dispatchWindow('focusout');
+    harness.dispatchWindow('focusout');
+
+    expect(vi.getTimerCount()).toBe(2);
+  });
+
+  it('keeps fallback snapshot identity stable through pinch zoom', async () => {
     const harness = await createViewportHarness();
     harness.visualViewport.height = 422;
     harness.visualViewport.offsetTop = 90;
     harness.visualViewport.scale = 2;
 
     harness.dispatchViewport('resize');
+    const pinchSnapshot = harness.store.getSnapshot();
+    harness.dispatchViewport('scroll');
 
-    expect(harness.store.getSnapshot()).toEqual({
-      height: null,
-      offsetTop: 0,
-    });
+    expect(pinchSnapshot).toEqual({ height: null, offsetTop: 0 });
+    expect(harness.store.getSnapshot()).toBe(pinchSnapshot);
     expect(harness.scrollTo).not.toHaveBeenCalled();
-    harness.unsubscribe();
+  });
+
+  it('keeps fallback snapshot identity stable on non-touch devices', async () => {
+    const harness = await createViewportHarness({ touch: false });
+    const firstSnapshot = harness.store.getSnapshot();
+
+    expect(firstSnapshot).toEqual({ height: null, offsetTop: 0 });
+    expect(harness.store.getSnapshot()).toBe(firstSnapshot);
+    expect(harness.viewportAddEventListener).not.toHaveBeenCalled();
   });
 
   it('keeps snapshot identity stable across no-op events', async () => {
@@ -137,6 +171,20 @@ describe('visual viewport geometry store', () => {
     harness.dispatchViewport('resize');
 
     expect(harness.store.getSnapshot()).toBe(before);
-    harness.unsubscribe();
+  });
+
+  it('notifies every subscriber when an earlier subscriber throws', async () => {
+    const harness = await createViewportHarness({ autoSubscribe: false });
+    const throwingListener = vi.fn(() => {
+      throw new Error('subscriber failed');
+    });
+    const healthyListener = vi.fn();
+    harness.subscribe(throwingListener);
+    harness.subscribe(healthyListener);
+
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(throwingListener).toHaveBeenCalledOnce();
+    expect(healthyListener).toHaveBeenCalledOnce();
   });
 });
