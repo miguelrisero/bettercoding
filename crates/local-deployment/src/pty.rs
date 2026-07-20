@@ -972,12 +972,19 @@ const DEFAULT_CLI_TMUX_SOCKET: &str = "bettercoding";
 // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
 const DEFAULT_LEGACY_CLI_TMUX_SOCKET: &str = "vibe-kanban";
 
+#[derive(Debug, PartialEq, Eq)]
+struct CliTmuxSockets {
+    current: String,
+    legacy: String,
+    legacy_home_enabled: bool,
+}
+
 fn resolve_cli_tmux_sockets(
     current_override: Option<String>,
     legacy_override: Option<String>,
     current_default: &str,
     legacy_default: &str,
-) -> (String, String) {
+) -> CliTmuxSockets {
     let current = current_override.unwrap_or_else(|| current_default.to_string());
     let legacy = legacy_override.unwrap_or_else(|| {
         if current == current_default {
@@ -986,7 +993,12 @@ fn resolve_cli_tmux_sockets(
             format!("{current}-legacy")
         }
     });
-    (current, legacy)
+    let legacy_home_enabled = current != legacy;
+    CliTmuxSockets {
+        current,
+        legacy,
+        legacy_home_enabled,
+    }
 }
 
 /// Dedicated socket for newly-created CLI sessions. A value that differs from
@@ -1013,18 +1025,31 @@ pub(crate) fn cli_tmux_socket() -> &'static str {
 /// cache.
 // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
 pub(crate) fn legacy_cli_tmux_socket() -> &'static str {
-    static SOCKET: OnceLock<String> = OnceLock::new();
-    SOCKET
-        .get_or_init(|| {
-            resolve_cli_tmux_sockets(
-                Some(cli_tmux_socket().to_string()),
-                std::env::var("BC_CLI_TMUX_LEGACY_SOCKET").ok(),
-                DEFAULT_CLI_TMUX_SOCKET,
-                DEFAULT_LEGACY_CLI_TMUX_SOCKET,
-            )
-            .1
-        })
-        .as_str()
+    resolved_cli_tmux_sockets().legacy.as_str()
+}
+
+fn resolved_cli_tmux_sockets() -> &'static CliTmuxSockets {
+    static SOCKETS: OnceLock<CliTmuxSockets> = OnceLock::new();
+    SOCKETS.get_or_init(|| {
+        let sockets = resolve_cli_tmux_sockets(
+            Some(cli_tmux_socket().to_string()),
+            std::env::var("BC_CLI_TMUX_LEGACY_SOCKET").ok(),
+            DEFAULT_CLI_TMUX_SOCKET,
+            DEFAULT_LEGACY_CLI_TMUX_SOCKET,
+        );
+        if !sockets.legacy_home_enabled {
+            tracing::error!(
+                current_socket = sockets.current,
+                legacy_socket = sockets.legacy,
+                "Resolved current and legacy CLI tmux sockets are equal; disabling the legacy home"
+            );
+        }
+        sockets
+    })
+}
+
+fn is_legacy_home_enabled() -> bool {
+    resolved_cli_tmux_sockets().legacy_home_enabled
 }
 
 /// Bound CLI tmux control commands so a wedged current or legacy server cannot
@@ -1236,6 +1261,7 @@ async fn locate_cli_tmux_session_on(
     workspace_id: Uuid,
     current_socket: &str,
     legacy_socket: &str,
+    legacy_home_enabled: bool,
 ) -> Result<CliTmuxLocation, PtyError> {
     // Probe in stable current-then-legacy order. Both results are required:
     // an unreadable home must never be mistaken for an empty one.
@@ -1244,7 +1270,11 @@ async fn locate_cli_tmux_session_on(
 
     // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
     let legacy_name = legacy_cli_tmux_session_name(workspace_id);
-    let legacy = probe_tmux_session_on(legacy_socket, &legacy_name).await;
+    let legacy = if legacy_home_enabled {
+        probe_tmux_session_on(legacy_socket, &legacy_name).await
+    } else {
+        CliTmuxSessionProbe::Absent
+    };
     if current == CliTmuxSessionProbe::Present && legacy == CliTmuxSessionProbe::Present {
         tracing::info!(
             workspace_id = %workspace_id,
@@ -1263,7 +1293,13 @@ async fn locate_cli_tmux_session(workspace_id: Uuid) -> Result<CliTmuxLocation, 
             present: false,
         });
     }
-    locate_cli_tmux_session_on(workspace_id, cli_tmux_socket(), legacy_cli_tmux_socket()).await
+    locate_cli_tmux_session_on(
+        workspace_id,
+        cli_tmux_socket(),
+        legacy_cli_tmux_socket(),
+        is_legacy_home_enabled(),
+    )
+    .await
 }
 
 /// Locate and pin a workspace's tmux target for a multi-step operation. `None`
@@ -1303,13 +1339,19 @@ async fn cli_tmux_session_exists_on(
     workspace_id: Uuid,
     current_socket: &str,
     legacy_socket: &str,
+    legacy_home_enabled: bool,
 ) -> bool {
-    locate_cli_tmux_session_on(workspace_id, current_socket, legacy_socket)
-        .await
-        .map(|location| location.present)
-        // This bool only gates prompt parking. The create-time locator repeats
-        // the probes and fails closed instead of creating on an unknown home.
-        .unwrap_or(false)
+    locate_cli_tmux_session_on(
+        workspace_id,
+        current_socket,
+        legacy_socket,
+        legacy_home_enabled,
+    )
+    .await
+    .map(|location| location.present)
+    // This bool only gates prompt parking. The create-time locator repeats
+    // the probes and fails closed instead of creating on an unknown home.
+    .unwrap_or(false)
 }
 
 /// Whether a workspace's CLI tmux session already exists. Lets the terminal
@@ -1321,7 +1363,13 @@ pub async fn cli_tmux_session_exists(workspace_id: Uuid) -> bool {
     if !tmux_available() {
         return false;
     }
-    cli_tmux_session_exists_on(workspace_id, cli_tmux_socket(), legacy_cli_tmux_socket()).await
+    cli_tmux_session_exists_on(
+        workspace_id,
+        cli_tmux_socket(),
+        legacy_cli_tmux_socket(),
+        is_legacy_home_enabled(),
+    )
+    .await
 }
 
 /// Whether CLI mode can actually run claude in a tmux session (vs. degrading
@@ -1480,12 +1528,20 @@ pub(crate) fn workspace_id_from_cli_session_name(name: &str) -> Option<Uuid> {
     Uuid::parse_str(hex).ok()
 }
 
-async fn kill_cli_tmux_sessions_on(workspace_id: Uuid, current_socket: &str, legacy_socket: &str) {
+async fn kill_cli_tmux_sessions_on(
+    workspace_id: Uuid,
+    current_socket: &str,
+    legacy_socket: &str,
+    legacy_home_enabled: bool,
+) {
     for home in [
         CliTmuxHome::Current,
         // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
         CliTmuxHome::Legacy,
     ] {
+        if home == CliTmuxHome::Legacy && !legacy_home_enabled {
+            continue;
+        }
         let (socket, session_name) =
             cli_tmux_target_on(home, workspace_id, current_socket, legacy_socket);
         match tokio::process::Command::new("tmux")
@@ -1513,7 +1569,13 @@ async fn kill_cli_tmux_sessions_on(workspace_id: Uuid, current_socket: &str, leg
 /// matching; tmux `-t` is otherwise a prefix match.
 pub async fn kill_cli_tmux_session(workspace_id: Uuid) {
     if tmux_available() {
-        kill_cli_tmux_sessions_on(workspace_id, cli_tmux_socket(), legacy_cli_tmux_socket()).await;
+        kill_cli_tmux_sessions_on(
+            workspace_id,
+            cli_tmux_socket(),
+            legacy_cli_tmux_socket(),
+            is_legacy_home_enabled(),
+        )
+        .await;
     }
     // Drop any transient prompt file AFTER the session is dead (covers the
     // never-attached case where the bootstrap never ran to self-delete it).
@@ -1751,12 +1813,12 @@ pub async fn list_cli_tmux_sessions() -> Result<Vec<(Uuid, bool, i64)>, String> 
     if !tmux_available() {
         return Ok(Vec::new());
     }
-    list_cli_tmux_sessions_on(&[
-        cli_tmux_socket(),
+    let mut sockets = vec![cli_tmux_socket()];
+    if is_legacy_home_enabled() {
         // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
-        legacy_cli_tmux_socket(),
-    ])
-    .await
+        sockets.push(legacy_cli_tmux_socket());
+    }
+    list_cli_tmux_sessions_on(&sockets).await
 }
 
 async fn list_cli_tmux_sessions_on(sockets: &[&str]) -> Result<Vec<(Uuid, bool, i64)>, String> {
@@ -1923,13 +1985,21 @@ async fn cli_tmux_session_liveness_on(
     workspace_id: Uuid,
     current_socket: &str,
     legacy_socket: &str,
+    legacy_home_enabled: bool,
 ) -> CliTmuxSessionLiveness {
     let now = now_unix_secs();
     let current = list_cli_tmux_socket_on(current_socket, now).await;
-    let legacy = list_cli_tmux_socket_on(legacy_socket, now).await;
+    let legacy = if legacy_home_enabled {
+        cli_tmux_home_liveness(
+            list_cli_tmux_socket_on(legacy_socket, now).await,
+            &legacy_cli_tmux_session_name(workspace_id),
+        )
+    } else {
+        CliTmuxHomeLiveness::Absent
+    };
     CliTmuxSessionLiveness {
         current: cli_tmux_home_liveness(current, &cli_tmux_session_name(workspace_id)),
-        legacy: cli_tmux_home_liveness(legacy, &legacy_cli_tmux_session_name(workspace_id)),
+        legacy,
     }
 }
 
@@ -1940,7 +2010,13 @@ pub(crate) async fn cli_tmux_session_liveness(workspace_id: Uuid) -> CliTmuxSess
             legacy: CliTmuxHomeLiveness::Absent,
         };
     }
-    cli_tmux_session_liveness_on(workspace_id, cli_tmux_socket(), legacy_cli_tmux_socket()).await
+    cli_tmux_session_liveness_on(
+        workspace_id,
+        cli_tmux_socket(),
+        legacy_cli_tmux_socket(),
+        is_legacy_home_enabled(),
+    )
+    .await
 }
 
 async fn kill_cli_tmux_home_on(
@@ -1967,6 +2043,7 @@ async fn reap_cli_tmux_session_with_liveness_on(
     minimum_idle_secs: i64,
     current_socket: &str,
     legacy_socket: &str,
+    legacy_home_enabled: bool,
     liveness: CliTmuxSessionLiveness,
 ) -> usize {
     let mut killed = 0;
@@ -1974,6 +2051,9 @@ async fn reap_cli_tmux_session_with_liveness_on(
         (CliTmuxHome::Current, liveness.current),
         (CliTmuxHome::Legacy, liveness.legacy),
     ] {
+        if home == CliTmuxHome::Legacy && !legacy_home_enabled {
+            continue;
+        }
         match state {
             CliTmuxHomeLiveness::Present {
                 attached: false,
@@ -2010,6 +2090,7 @@ pub(crate) async fn reap_cli_tmux_session_if_inactive(
         minimum_idle_secs,
         cli_tmux_socket(),
         legacy_cli_tmux_socket(),
+        is_legacy_home_enabled(),
         liveness,
     )
     .await
@@ -2294,7 +2375,13 @@ impl PtyService {
         );
         let tmux_probe_result = match &command {
             PtyCommand::TmuxCli { workspace_id, .. } if tmux_available() => Some(
-                locate_cli_tmux_session_on(*workspace_id, &tmux_sockets.0, &tmux_sockets.1).await,
+                locate_cli_tmux_session_on(
+                    *workspace_id,
+                    &tmux_sockets.0,
+                    &tmux_sockets.1,
+                    is_legacy_home_enabled(),
+                )
+                .await,
             ),
             _ => None,
         };
@@ -2819,13 +2906,13 @@ async fn cli_tmux_client_name_on(socket: &str, client_pid: u32) -> Result<Option
 pub(crate) async fn cli_tmux_client_name(
     client_pid: u32,
 ) -> Result<Option<(&'static str, String)>, String> {
-    let sockets = [
-        cli_tmux_socket(),
+    let mut sockets = vec![cli_tmux_socket()];
+    if is_legacy_home_enabled() {
         // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
-        legacy_cli_tmux_socket(),
-    ];
+        sockets.push(legacy_cli_tmux_socket());
+    }
     let mut errors = Vec::new();
-    for socket in sockets {
+    for &socket in &sockets {
         match cli_tmux_client_name_on(socket, client_pid).await {
             Ok(Some(client_name)) => return Ok(Some((socket, client_name))),
             Ok(None) => {}
@@ -2914,7 +3001,11 @@ mod tests {
                 DEFAULT_CLI_TMUX_SOCKET,
                 DEFAULT_LEGACY_CLI_TMUX_SOCKET,
             ),
-            ("bettercoding".to_string(), "vibe-kanban".to_string())
+            CliTmuxSockets {
+                current: "bettercoding".to_string(),
+                legacy: "vibe-kanban".to_string(),
+                legacy_home_enabled: true,
+            }
         );
     }
 
@@ -2927,7 +3018,11 @@ mod tests {
                 DEFAULT_CLI_TMUX_SOCKET,
                 DEFAULT_LEGACY_CLI_TMUX_SOCKET,
             ),
-            ("dev-stack".to_string(), "dev-stack-legacy".to_string())
+            CliTmuxSockets {
+                current: "dev-stack".to_string(),
+                legacy: "dev-stack-legacy".to_string(),
+                legacy_home_enabled: true,
+            }
         );
     }
 
@@ -2940,7 +3035,11 @@ mod tests {
                 DEFAULT_CLI_TMUX_SOCKET,
                 DEFAULT_LEGACY_CLI_TMUX_SOCKET,
             ),
-            ("dev-stack".to_string(), "old-dev-stack".to_string())
+            CliTmuxSockets {
+                current: "dev-stack".to_string(),
+                legacy: "old-dev-stack".to_string(),
+                legacy_home_enabled: true,
+            }
         );
     }
 
@@ -2953,7 +3052,28 @@ mod tests {
                 DEFAULT_CLI_TMUX_SOCKET,
                 DEFAULT_LEGACY_CLI_TMUX_SOCKET,
             ),
-            ("bettercoding".to_string(), "legacy-override".to_string())
+            CliTmuxSockets {
+                current: "bettercoding".to_string(),
+                legacy: "legacy-override".to_string(),
+                legacy_home_enabled: true,
+            }
+        );
+    }
+
+    #[test]
+    fn cli_tmux_socket_pair_disables_equal_overrides() {
+        assert_eq!(
+            resolve_cli_tmux_sockets(
+                Some("shared-socket".to_string()),
+                Some("shared-socket".to_string()),
+                DEFAULT_CLI_TMUX_SOCKET,
+                DEFAULT_LEGACY_CLI_TMUX_SOCKET,
+            ),
+            CliTmuxSockets {
+                current: "shared-socket".to_string(),
+                legacy: "shared-socket".to_string(),
+                legacy_home_enabled: false,
+            }
         );
     }
 
@@ -3681,9 +3801,14 @@ mod tests {
             .start_session(&legacy_cli_tmux_session_name(workspace_id));
 
         assert_eq!(
-            locate_cli_tmux_session_on(workspace_id, &pair.current.socket, &pair.legacy.socket)
-                .await
-                .expect("scratch probes should be definitive"),
+            locate_cli_tmux_session_on(
+                workspace_id,
+                &pair.current.socket,
+                &pair.legacy.socket,
+                true,
+            )
+            .await
+            .expect("scratch probes should be definitive"),
             CliTmuxLocation {
                 home: CliTmuxHome::Legacy,
                 present: true,
@@ -3701,10 +3826,14 @@ mod tests {
         pair.legacy
             .start_session(&legacy_cli_tmux_session_name(workspace_id));
 
-        let location =
-            locate_cli_tmux_session_on(workspace_id, &pair.current.socket, &pair.legacy.socket)
-                .await
-                .expect("scratch probes should be definitive");
+        let location = locate_cli_tmux_session_on(
+            workspace_id,
+            &pair.current.socket,
+            &pair.legacy.socket,
+            true,
+        )
+        .await
+        .expect("scratch probes should be definitive");
         assert_eq!(location.home, CliTmuxHome::Legacy);
         let target = owned_cli_tmux_target_on(
             location.home,
@@ -3716,10 +3845,15 @@ mod tests {
         pair.current
             .start_session(&cli_tmux_session_name(workspace_id));
         assert_eq!(
-            locate_cli_tmux_session_on(workspace_id, &pair.current.socket, &pair.legacy.socket)
-                .await
-                .expect("scratch probes should be definitive")
-                .home,
+            locate_cli_tmux_session_on(
+                workspace_id,
+                &pair.current.socket,
+                &pair.legacy.socket,
+                true,
+            )
+            .await
+            .expect("scratch probes should be definitive")
+            .home,
             CliTmuxHome::Current,
         );
         assert_eq!(target.socket, pair.legacy.socket);
@@ -3737,9 +3871,14 @@ mod tests {
         }
         let pair = scratch_tmux_pair();
         assert_eq!(
-            locate_cli_tmux_session_on(Uuid::new_v4(), &pair.current.socket, &pair.legacy.socket)
-                .await
-                .expect("empty scratch probes should be definitive"),
+            locate_cli_tmux_session_on(
+                Uuid::new_v4(),
+                &pair.current.socket,
+                &pair.legacy.socket,
+                true,
+            )
+            .await
+            .expect("empty scratch probes should be definitive"),
             CliTmuxLocation {
                 home: CliTmuxHome::Current,
                 present: false,
@@ -3760,9 +3899,14 @@ mod tests {
             .start_session(&legacy_cli_tmux_session_name(workspace_id));
 
         assert_eq!(
-            locate_cli_tmux_session_on(workspace_id, &pair.current.socket, &pair.legacy.socket)
-                .await
-                .expect("scratch probes should be definitive"),
+            locate_cli_tmux_session_on(
+                workspace_id,
+                &pair.current.socket,
+                &pair.legacy.socket,
+                true,
+            )
+            .await
+            .expect("scratch probes should be definitive"),
             CliTmuxLocation {
                 home: CliTmuxHome::Current,
                 present: true,
@@ -3827,8 +3971,13 @@ mod tests {
             .start_session(&legacy_cli_tmux_session_name(workspace_id));
 
         assert!(
-            cli_tmux_session_exists_on(workspace_id, &pair.current.socket, &pair.legacy.socket)
-                .await
+            cli_tmux_session_exists_on(
+                workspace_id,
+                &pair.current.socket,
+                &pair.legacy.socket,
+                true,
+            )
+            .await
         );
     }
 
@@ -3905,6 +4054,7 @@ mod tests {
             60,
             &pair.current.socket,
             &pair.legacy.socket,
+            true,
             CliTmuxSessionLiveness {
                 current: CliTmuxHomeLiveness::Present {
                     attached: false,
@@ -3944,6 +4094,7 @@ mod tests {
             0,
             &pair.current.socket,
             &pair.legacy.socket,
+            true,
             CliTmuxSessionLiveness {
                 current: CliTmuxHomeLiveness::Unknown,
                 legacy: CliTmuxHomeLiveness::Absent,
@@ -3982,7 +4133,13 @@ mod tests {
             CliTmuxSessionProbe::Present
         );
 
-        kill_cli_tmux_sessions_on(workspace_id, &pair.current.socket, &pair.legacy.socket).await;
+        kill_cli_tmux_sessions_on(
+            workspace_id,
+            &pair.current.socket,
+            &pair.legacy.socket,
+            true,
+        )
+        .await;
 
         assert_eq!(
             probe_tmux_session_on(&pair.legacy.socket, &legacy_name).await,
