@@ -14,6 +14,22 @@ export interface SendPresenceOptions {
   resendVisibleSize?: boolean;
 }
 
+/**
+ * Keep the pane-fit path's resize and effective-presence publication coupled.
+ * A null size means the pane is unmeasurable: publish its demotion without
+ * ever forwarding FitAddon's clamped placeholder grid.
+ */
+export function syncTerminalFitState(
+  connection: Pick<TerminalPresenceConnection, 'resize'>,
+  size: TerminalSize | null,
+  publishPresence: () => void
+): void {
+  if (size) {
+    connection.resize(size.cols, size.rows);
+  }
+  publishPresence();
+}
+
 export function getEffectiveTerminalPresence(
   visibilityState: DocumentVisibilityState,
   size: TerminalSize | null

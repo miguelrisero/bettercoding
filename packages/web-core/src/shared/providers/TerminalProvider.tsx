@@ -415,23 +415,10 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
         terminalConnectionsRef.current.get(tabId)?.send(data);
       },
       resize: (cols: number, rows: number) => {
-        const connection = terminalConnectionsRef.current.get(tabId);
-        if (!connection) return;
-        connection.resize(cols, rows);
-        // A resize callback comes from a measurable mounted pane. If it was
-        // gated off, rejoin sizing immediately after sending the fresh grid.
-        if (
-          connection.generation.closed ||
-          reconnectStateRef.current.get(tabId) !== connection.generation ||
-          connection.ws.readyState !== WebSocket.OPEN
-        ) {
-          return;
-        }
-        const visible = document.visibilityState === 'visible';
-        if (connection.lastSentPresence === visible) {
-          return;
-        }
-        sendPresence(connection, { cols, rows }, document.visibilityState);
+        // Pane-driven presence is deliberately published in XTermInstance's
+        // fit path, where measurability is known. Its per-tab broadcaster is
+        // the single publisher for both hidden and visible pane transitions.
+        terminalConnectionsRef.current.get(tabId)?.resize(cols, rows);
       },
     }),
     []

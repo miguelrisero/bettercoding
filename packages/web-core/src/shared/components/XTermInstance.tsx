@@ -14,6 +14,7 @@ import {
   TERMINAL_BACKGROUND,
   getTerminalTheme,
 } from '@/shared/lib/terminalTheme';
+import { syncTerminalFitState } from '@/shared/lib/terminalPresence';
 import { resolveTerminalEndpoint } from '@/shared/lib/terminalWsUrl';
 import { cancelActiveTerminalGesture } from '@/shared/lib/terminalTouchGestures';
 import { installTerminalTouchLayers } from '@/shared/lib/terminalTouchLayers';
@@ -199,19 +200,20 @@ export function XTermInstance({
     const instance = fitInstance();
     if (!instance) return;
     const conn = getTerminalConnection(tabId);
-    if (conn) {
-      if (!isTerminalMeasurable(instance.terminal)) {
-        // FitAddon clamps a zero-box pane to a tiny positive grid. Never send
-        // that grid: exclude this tab from shared tmux sizing instead.
-        broadcastTerminalPresence(tabId);
-        return;
-      }
-      conn.resize(instance.terminal.cols, instance.terminal.rows);
-    } else {
+    if (!conn) {
       // The initial connect was deferred because the pane was unmeasured at
       // mount; now that the ResizeObserver reports a real size, open it.
       ensureConnection();
+      return;
     }
+
+    // FitAddon clamps a zero-box pane to a tiny positive grid. Publish the
+    // effective-presence transition in either direction, but only forward a
+    // grid when the pane is genuinely measurable.
+    const size = isTerminalMeasurable(instance.terminal)
+      ? { cols: instance.terminal.cols, rows: instance.terminal.rows }
+      : null;
+    syncTerminalFitState(conn, size, () => broadcastTerminalPresence(tabId));
   }, [
     tabId,
     fitInstance,
