@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
@@ -37,6 +39,26 @@ pub struct CreateSession {
 }
 
 impl Session {
+    /// Resolve the directory used by the coding agent within a local
+    /// workspace. A missing configured subdirectory falls back to the
+    /// workspace root, matching CLI handover behavior.
+    pub fn effective_working_dir(&self, container_ref: &Path) -> Option<PathBuf> {
+        if container_ref.as_os_str().is_empty() {
+            return None;
+        }
+        if let Some(relative) = self
+            .agent_working_dir
+            .as_deref()
+            .filter(|dir| !dir.is_empty())
+        {
+            let joined = container_ref.join(relative);
+            if joined.exists() {
+                return Some(joined);
+            }
+        }
+        Some(container_ref.to_path_buf())
+    }
+
     pub async fn find_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<Self>, sqlx::Error> {
         sqlx::query_as!(
             Session,
@@ -379,5 +401,46 @@ impl Session {
         .execute(pool)
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(agent_working_dir: Option<&str>) -> Session {
+        Session {
+            id: Uuid::nil(),
+            workspace_id: Uuid::nil(),
+            name: None,
+            executor: None,
+            agent_working_dir: agent_working_dir.map(str::to_string),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn effective_working_dir_uses_existing_relative_path() {
+        let base = std::env::temp_dir();
+        assert_eq!(
+            session(Some(".")).effective_working_dir(&base),
+            Some(base.join("."))
+        );
+    }
+
+    #[test]
+    fn effective_working_dir_falls_back_for_missing_relative_path() {
+        let base = std::env::temp_dir();
+        let missing = format!("missing-session-dir-{}", Uuid::new_v4());
+        assert_eq!(
+            session(Some(&missing)).effective_working_dir(&base),
+            Some(base)
+        );
+    }
+
+    #[test]
+    fn effective_working_dir_rejects_empty_container_path() {
+        assert_eq!(session(None).effective_working_dir(Path::new("")), None);
     }
 }

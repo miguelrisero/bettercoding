@@ -9,8 +9,7 @@ use axum::{
 use deployment::Deployment;
 use serde::Deserialize;
 use services::services::claude_transcript_ingest::{
-    ClaudeTranscriptIngest, ClaudeTranscriptIngestError, NativeFeedSnapshot, NativeFeedUpdate,
-    UnassignedCliSession,
+    ClaudeTranscriptIngest, NativeFeedSnapshot, NativeFeedUpdate, UnassignedCliSession,
 };
 use ts_rs::TS;
 use utils::{log_msg::LogMsg, response::ApiResponse};
@@ -33,24 +32,7 @@ fn service(deployment: &DeploymentImpl) -> Option<Arc<ClaudeTranscriptIngest>> {
 }
 
 fn disabled_error() -> ApiError {
-    ApiError::BadRequest("CLI transcript ingest is disabled".to_string())
-}
-
-fn map_ingest_error(error: ClaudeTranscriptIngestError) -> ApiError {
-    match error {
-        ClaudeTranscriptIngestError::Database(error) => ApiError::Database(error),
-        ClaudeTranscriptIngestError::Io(error) => ApiError::Io(error),
-        ClaudeTranscriptIngestError::Workspace(error) => ApiError::Workspace(error),
-        ClaudeTranscriptIngestError::SessionNotFound(_) => {
-            ApiError::Session(db::models::session::SessionError::NotFound)
-        }
-        ClaudeTranscriptIngestError::WorkspacePathMissing(workspace_id) => ApiError::BadRequest(
-            format!("workspace {workspace_id} has no local path to map to Claude"),
-        ),
-        ClaudeTranscriptIngestError::NotQuarantined(claude_session_id) => ApiError::Conflict(
-            format!("Claude session {claude_session_id} is not unassigned in this workspace"),
-        ),
-    }
+    ApiError::FeatureDisabled("CLI transcript ingest is disabled".to_string())
 }
 
 async fn stream_native_feed_ws(
@@ -272,11 +254,10 @@ async fn get_unassigned(
     State(deployment): State<DeploymentImpl>,
     Path(workspace_id): Path<Uuid>,
 ) -> Result<ResponseJson<ApiResponse<Vec<UnassignedCliSession>>>, ApiError> {
-    let sessions = service(&deployment)
-        .ok_or_else(disabled_error)?
-        .list_unassigned(workspace_id)
-        .await
-        .map_err(map_ingest_error)?;
+    let Some(ingest) = service(&deployment) else {
+        return Ok(ResponseJson(ApiResponse::success(Vec::new())));
+    };
+    let sessions = ingest.list_unassigned(workspace_id).await?;
     Ok(ResponseJson(ApiResponse::success(sessions)))
 }
 
@@ -287,8 +268,7 @@ async fn assign_unassigned(
     service(&deployment)
         .ok_or_else(disabled_error)?
         .assign_manual(&payload.claude_session_id, payload.session_id)
-        .await
-        .map_err(map_ingest_error)?;
+        .await?;
     Ok(ResponseJson(ApiResponse::success(())))
 }
 

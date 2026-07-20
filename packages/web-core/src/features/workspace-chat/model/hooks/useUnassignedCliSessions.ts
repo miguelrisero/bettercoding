@@ -1,10 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type {
-  ApiResponse,
   AssignNativeCliSessionRequest,
   UnassignedCliSession,
 } from 'shared/types';
 
+import { handleApiResponse } from '@/shared/lib/api';
 import { makeLocalApiRequest } from '@/shared/lib/localApiTransport';
 import { useHostId } from '@/shared/providers/HostIdProvider';
 
@@ -19,19 +19,7 @@ async function fetchUnassignedCliSessions(
   const response = await makeLocalApiRequest(
     `/api/workspaces/${workspaceId}/native-cli-sessions/unassigned`
   );
-
-  // The local ingest service is feature-flagged. Its disabled response should
-  // make this optional surface disappear rather than turn chat into an error.
-  if (response.status === 400) return [];
-  if (!response.ok) {
-    throw new Error(`Failed to load CLI conversations (${response.status})`);
-  }
-
-  const payload: ApiResponse<UnassignedCliSession[]> = await response.json();
-  if (!payload.success || !payload.data) {
-    throw new Error(payload.message ?? 'Failed to load CLI conversations');
-  }
-  return payload.data;
+  return handleApiResponse<UnassignedCliSession[]>(response);
 }
 
 async function assignCliSession(
@@ -45,14 +33,7 @@ async function assignCliSession(
       body: JSON.stringify(request),
     }
   );
-  if (!response.ok) {
-    throw new Error(`Failed to assign CLI conversation (${response.status})`);
-  }
-
-  const payload: ApiResponse<null> = await response.json();
-  if (!payload.success) {
-    throw new Error(payload.message ?? 'Failed to assign CLI conversation');
-  }
+  await handleApiResponse<void>(response);
 }
 
 export function useUnassignedCliSessions(

@@ -28,9 +28,16 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    ClaudeTranscriptIngest, DirectoryContext, NativeFeedOrigin, NativeFeedUpdate,
-    claude_project_slug, effective_cwd,
+    ClaudeTranscriptIngest, ClaudeTranscriptIngestError, DirectoryContext, NativeFeedOrigin,
+    NativeFeedUpdate, claude_project_slug,
 };
+
+fn effective_cwd(workspace: &Workspace, session: &Session) -> Option<std::path::PathBuf> {
+    workspace
+        .container_ref
+        .as_deref()
+        .and_then(|container_ref| session.effective_working_dir(Path::new(container_ref)))
+}
 
 const FIXTURE_SID: &str = "06a7eacd-664b-4d9c-83f3-d4774a6216a8";
 
@@ -42,6 +49,19 @@ async fn test_db() -> DBService {
         .unwrap();
     db::run_migrations_for_tests(&pool).await.unwrap();
     DBService { pool }
+}
+
+#[tokio::test]
+async fn nonexistent_workspace_is_not_reported_as_a_missing_path() {
+    let db = test_db().await;
+    let service = ClaudeTranscriptIngest::new(db, std::env::temp_dir());
+
+    assert!(matches!(
+        service.list_unassigned(Uuid::new_v4()).await,
+        Err(ClaudeTranscriptIngestError::Workspace(
+            db::models::workspace::WorkspaceError::WorkspaceNotFound
+        ))
+    ));
 }
 
 async fn create_workspace_and_session(

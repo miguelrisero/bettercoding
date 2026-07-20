@@ -31,7 +31,7 @@ use db::{
         cli_native_file::{CliNativeFile, RegisterCliNativeFile},
         cli_native_record::{CliNativeRecord, ImportedCursor, NewCliNativeRecord},
         session::Session,
-        workspace::Workspace,
+        workspace::{Workspace, WorkspaceError},
     },
 };
 use executors::executors::claude::native::adapt_native_claude_line;
@@ -266,14 +266,25 @@ impl ClaudeTranscriptIngest {
     ) -> Result<Vec<UnassignedCliSession>, ClaudeTranscriptIngestError> {
         let workspace = Workspace::find_by_id(&self.db.pool, workspace_id)
             .await?
-            .ok_or(ClaudeTranscriptIngestError::WorkspacePathMissing(
-                workspace_id,
-            ))?;
+            .ok_or(WorkspaceError::WorkspaceNotFound)?;
         let session = Session::find_latest_by_workspace_id(&self.db.pool, workspace_id).await?;
         let cwd = session
             .as_ref()
-            .and_then(|session| effective_cwd(&workspace, session))
-            .or_else(|| workspace.container_ref.as_ref().map(PathBuf::from))
+            .and_then(|session| {
+                workspace
+                    .container_ref
+                    .as_deref()
+                    .and_then(|container_ref| {
+                        session.effective_working_dir(Path::new(container_ref))
+                    })
+            })
+            .or_else(|| {
+                workspace
+                    .container_ref
+                    .as_deref()
+                    .filter(|container_ref| !container_ref.is_empty())
+                    .map(PathBuf::from)
+            })
             .ok_or(ClaudeTranscriptIngestError::WorkspacePathMissing(
                 workspace_id,
             ))?;
@@ -306,12 +317,14 @@ impl ClaudeTranscriptIngest {
             .ok_or(ClaudeTranscriptIngestError::SessionNotFound(session_id))?;
         let workspace = Workspace::find_by_id(&self.db.pool, session.workspace_id)
             .await?
+            .ok_or(WorkspaceError::WorkspaceNotFound)?;
+        let cwd = workspace
+            .container_ref
+            .as_deref()
+            .and_then(|container_ref| session.effective_working_dir(Path::new(container_ref)))
             .ok_or(ClaudeTranscriptIngestError::WorkspacePathMissing(
                 session.workspace_id,
             ))?;
-        let cwd = effective_cwd(&workspace, &session).ok_or(
-            ClaudeTranscriptIngestError::WorkspacePathMissing(session.workspace_id),
-        )?;
         let files = CliNativeFile::list_latest_by_sid(&self.db.pool, claude_session_id).await?;
         if files.is_empty()
             || !files
@@ -394,7 +407,13 @@ impl ClaudeTranscriptIngest {
                 else {
                     continue;
                 };
-                let Some(cwd) = effective_cwd(&workspace, &session) else {
+                let Some(cwd) = workspace
+                    .container_ref
+                    .as_deref()
+                    .and_then(|container_ref| {
+                        session.effective_working_dir(Path::new(container_ref))
+                    })
+                else {
                     continue;
                 };
                 let context = DirectoryContext {
@@ -944,19 +963,6 @@ impl ClaudeTranscriptIngest {
             }
         }
     }
-}
-
-/// Replicates the terminal route's effective-cwd rule without coupling the
-/// read-only service to that write/attach route.
-fn effective_cwd(workspace: &Workspace, session: &Session) -> Option<PathBuf> {
-    let base = PathBuf::from(workspace.container_ref.as_ref()?);
-    if let Some(relative) = session.agent_working_dir.as_deref() {
-        let joined = base.join(relative);
-        if joined.exists() {
-            return Some(joined);
-        }
-    }
-    Some(base)
 }
 
 /// Best-effort Claude project key. It is never trusted as an ownership signal;

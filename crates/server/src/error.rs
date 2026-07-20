@@ -18,6 +18,7 @@ use relay_hosts::{
 };
 use relay_webrtc::WebRtcError;
 use services::services::{
+    claude_transcript_ingest::ClaudeTranscriptIngestError,
     config::{ConfigError, EditorOpenError},
     container::ContainerError,
     file::FileError,
@@ -73,6 +74,8 @@ pub enum ApiError {
     Unauthorized,
     #[error("Bad request: {0}")]
     BadRequest(String),
+    #[error("Feature disabled: {0}")]
+    FeatureDisabled(String),
     #[error("Conflict: {0}")]
     Conflict(String),
     #[error("Forbidden: {0}")]
@@ -156,6 +159,27 @@ impl From<ContainerError> for ApiError {
             ContainerError::ExecutorError(e) => ApiError::Executor(e),
             ContainerError::Worktree(e) => e.into(),
             other => ApiError::Container(other),
+        }
+    }
+}
+
+impl From<ClaudeTranscriptIngestError> for ApiError {
+    fn from(err: ClaudeTranscriptIngestError) -> Self {
+        match err {
+            ClaudeTranscriptIngestError::Database(err) => ApiError::Database(err),
+            ClaudeTranscriptIngestError::Io(err) => ApiError::Io(err),
+            ClaudeTranscriptIngestError::Workspace(err) => ApiError::Workspace(err),
+            ClaudeTranscriptIngestError::SessionNotFound(_) => {
+                ApiError::Session(SessionError::NotFound)
+            }
+            ClaudeTranscriptIngestError::WorkspacePathMissing(workspace_id) => {
+                ApiError::BadRequest(format!(
+                    "workspace {workspace_id} has no local path to map to Claude"
+                ))
+            }
+            ClaudeTranscriptIngestError::NotQuarantined(claude_session_id) => ApiError::Conflict(
+                format!("Claude session {claude_session_id} is not unassigned in this workspace"),
+            ),
         }
     }
 }
@@ -460,6 +484,11 @@ impl IntoResponse for ApiError {
                 "Unauthorized. Please sign in again.",
             ),
             ApiError::BadRequest(msg) => ErrorInfo::bad_request("BadRequest", msg.clone()),
+            ApiError::FeatureDisabled(msg) => ErrorInfo::with_status(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "FeatureDisabled",
+                msg.clone(),
+            ),
             ApiError::Conflict(msg) => ErrorInfo::conflict("ConflictError", msg.clone()),
             ApiError::Forbidden(msg) => {
                 ErrorInfo::with_status(StatusCode::FORBIDDEN, "ForbiddenError", msg.clone())
@@ -616,5 +645,26 @@ impl From<RelayPairingClientError> for ApiError {
                 ApiError::BadGateway(err.to_string())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feature_disabled_has_a_distinct_service_unavailable_status() {
+        let response =
+            ApiError::FeatureDisabled("test feature is disabled".to_string()).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn transcript_workspace_not_found_maps_to_not_found() {
+        let error = ClaudeTranscriptIngestError::Workspace(WorkspaceError::WorkspaceNotFound);
+        assert_eq!(
+            ApiError::from(error).into_response().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 }
