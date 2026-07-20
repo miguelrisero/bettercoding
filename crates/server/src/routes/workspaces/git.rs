@@ -823,7 +823,18 @@ where
         // not reach. It self-heals on the next successful rebase or an explicit target
         // change. A filed follow-up tracks the durable fix: persist the intended target
         // when continue_workspace_rebase completes.
-        WorkspaceRepo::update_target_branch(pool, workspace_id, repo_id, new_base_branch).await?;
+        let target_update =
+            WorkspaceRepo::update_target_branch(pool, workspace_id, repo_id, new_base_branch).await;
+        if let Err(error) = &target_update {
+            tracing::warn!(
+                workspace_id = %workspace_id,
+                repo_id = %repo_id,
+                intended_target_branch = %new_base_branch,
+                %error,
+                "Git rebase succeeded but target branch persistence failed"
+            );
+        }
+        target_update?;
     }
 
     Ok(rebase_result)
