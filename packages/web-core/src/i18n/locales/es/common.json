@@ -82,6 +82,7 @@
     "thinking": "Pensando",
     "assistant": "Claude",
     "viaCli": "vía CLI",
+    "cliSessionActive": "Sesión CLI activa",
     "toolSummary": {
       "read": "Leyó {{path}}",
       "searched": "Buscó \"{{query}}\"",

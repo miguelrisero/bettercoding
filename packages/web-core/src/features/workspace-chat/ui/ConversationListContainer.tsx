@@ -8,7 +8,11 @@ import {
   useState,
   type MouseEvent,
 } from 'react';
-import { SpinnerIcon, TerminalWindowIcon } from '@phosphor-icons/react';
+import {
+  CircleIcon,
+  SpinnerIcon,
+  TerminalWindowIcon,
+} from '@phosphor-icons/react';
 import { useTranslation } from 'react-i18next';
 
 import {
@@ -49,6 +53,7 @@ import { useUiPreferencesStore } from '@/shared/stores/useUiPreferencesStore';
 import { ChatScriptPlaceholder } from '@vibe/ui/components/ChatScriptPlaceholder';
 import { ScriptFixerDialog } from '@/shared/dialogs/scripts/ScriptFixerDialog';
 import { ChatForkBranches } from '@vibe/ui/components/ChatForkBranches';
+import { Badge } from '@vibe/ui/components/Badge';
 
 interface ConversationListProps {
   attempt: WorkspaceWithSession;
@@ -64,6 +69,8 @@ interface ConversationListProps {
    * no-op there.
    */
   cliAvailable?: boolean;
+  /** Coarse workspace status hint from the existing CLI activity stream. */
+  cliSessionActive?: boolean;
 }
 
 export interface ConversationListHandle {
@@ -242,6 +249,7 @@ export const ConversationList = forwardRef<
     onAtBottomChange,
     sessionScopeId,
     cliAvailable = false,
+    cliSessionActive = false,
   },
   ref
 ) {
@@ -861,6 +869,22 @@ export const ConversationList = forwardRef<
   return (
     <ApprovalFormProvider>
       <div className="relative h-full overflow-hidden">
+        {cliSessionActive && (
+          <div className="pointer-events-none absolute right-double top-base z-20">
+            <Badge
+              role="status"
+              variant="outline"
+              className="gap-half border-border bg-primary/90 font-normal text-normal shadow-sm backdrop-blur-sm"
+            >
+              <CircleIcon
+                className="size-2 text-brand"
+                weight="fill"
+                aria-hidden="true"
+              />
+              {t('conversation.cliSessionActive')}
+            </Badge>
+          </div>
+        )}
         {showLoader && (
           <div className="absolute inset-0 flex items-center justify-center z-10">
             <SpinnerIcon className="size-6 animate-spin text-low" />

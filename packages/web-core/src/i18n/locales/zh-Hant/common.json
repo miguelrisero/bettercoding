@@ -69,6 +69,7 @@
     "thinking": "思考中",
     "assistant": "Claude",
     "viaCli": "透過 CLI",
+    "cliSessionActive": "CLI 工作階段使用中",
     "toolSummary": {
       "read": "讀取 {{path}}",
       "searched": "搜尋 \"{{query}}\"",

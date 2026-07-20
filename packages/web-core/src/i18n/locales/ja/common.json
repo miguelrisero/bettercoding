@@ -82,6 +82,7 @@
     "thinking": "思考中",
     "assistant": "Claude",
     "viaCli": "CLI 経由",
+    "cliSessionActive": "CLI セッションがアクティブ",
     "toolSummary": {
       "read": "{{path}} を読み込み",
       "searched": "「{{query}}」を検索",

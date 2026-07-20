@@ -74,6 +74,7 @@
     "thinking": "Thinking",
     "assistant": "Claude",
     "viaCli": "via CLI",
+    "cliSessionActive": "CLI session active",
     "toolSummary": {
       "read": "Read {{path}}",
       "searched": "Searched for \"{{query}}\"",

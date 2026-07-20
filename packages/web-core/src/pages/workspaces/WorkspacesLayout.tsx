@@ -64,6 +64,13 @@ export function WorkspacesLayout() {
     isNewSessionMode,
     startNewSession,
   } = useWorkspaceContext();
+  const selectedWorkspaceStatus = activeWorkspaces.find(
+    (workspace) => workspace.id === selectedWorkspace?.id
+  );
+  const cliSessionActive = Boolean(
+    selectedWorkspaceStatus?.isRunning &&
+      !selectedWorkspaceStatus.isExecutorRunning
+  );
 
   const { t } = useTranslation('common');
   usePageTitle(
@@ -288,6 +295,7 @@ export function WorkspacesLayout() {
                   isSessionsLoading={isSessionsLoading}
                   isNewSessionMode={isNewSessionMode}
                   onStartNewSession={startNewSession}
+                  cliSessionActive={cliSessionActive}
                 />
               )}
             </div>
@@ -432,6 +440,7 @@ export function WorkspacesLayout() {
                     isSessionsLoading={isSessionsLoading}
                     isNewSessionMode={isNewSessionMode}
                     onStartNewSession={startNewSession}
+                    cliSessionActive={cliSessionActive}
                   />
                 )}
               </Panel>

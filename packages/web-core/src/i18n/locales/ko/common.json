@@ -82,6 +82,7 @@
     "thinking": "생각 중",
     "assistant": "Claude",
     "viaCli": "CLI를 통해",
+    "cliSessionActive": "CLI 세션 활성",
     "toolSummary": {
       "read": "{{path}} 읽기",
       "searched": "\"{{query}}\" 검색",
