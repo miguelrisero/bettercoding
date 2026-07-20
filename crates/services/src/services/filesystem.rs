@@ -213,7 +213,8 @@ impl FilesystemService {
             None => return Ok(vec![]),
         };
         let skip_dirs = Self::get_directories_to_skip();
-        let vibe_kanban_temp_dir = utils::path::get_vibe_kanban_temp_dir();
+        let vibe_kanban_temp_dir =
+            utils::path::normalize_macos_private_alias(utils::path::get_vibe_kanban_temp_dir());
         let mut walker_builder = WalkBuilder::new(base_dir);
         walker_builder
             .follow_links(false)

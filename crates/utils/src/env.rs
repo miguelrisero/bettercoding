@@ -1,3 +1,5 @@
+use std::{ffi::OsString, path::PathBuf};
+
 /// Read an environment variable, preferring its current name over its legacy
 /// compatibility alias.
 /// A current variable set to an empty string deliberately wins: `std::env::var`
@@ -5,6 +7,59 @@
 // TODO(bc-legacy-cleanup): drop legacy VK_ fallback.
 pub fn env_var_with_legacy(new_name: &str, legacy_name: &str) -> Option<String> {
     select_env_var_with_legacy(|name| std::env::var(name).ok(), new_name, legacy_name)
+}
+
+/// Read and normalise a filesystem path override from the environment.
+///
+/// This deliberately differs from [`env_var_with_legacy`], where an empty
+/// current string variable wins over its legacy alias. An empty or non-UTF-8
+/// path can never be a valid persisted target, so path overrides treat either
+/// value as unset and emit a warning instead.
+pub fn env_path_override(name: &str) -> Option<PathBuf> {
+    normalize_path_override(name, std::env::var_os(name))
+}
+
+/// Normalise an explicit path override value without reading or mutating the
+/// named environment variable.
+pub(crate) fn normalize_path_override(name: &str, value: Option<OsString>) -> Option<PathBuf> {
+    let value = value?;
+    if value.is_empty() {
+        tracing::warn!(
+            variable = name,
+            "Ignoring empty path override; treating it as unset"
+        );
+        return None;
+    }
+
+    let Some(value) = value.to_str() else {
+        tracing::warn!(
+            variable = name,
+            "Ignoring non-UTF-8 path override; treating it as unset"
+        );
+        return None;
+    };
+
+    let path = if value.starts_with('~') {
+        crate::path::expand_tilde(value)
+    } else {
+        PathBuf::from(value)
+    };
+    if path.is_absolute() {
+        return Some(path);
+    }
+
+    match std::path::absolute(&path) {
+        Ok(absolute_path) => Some(absolute_path),
+        Err(error) => {
+            tracing::warn!(
+                variable = name,
+                path = %path.display(),
+                error = %error,
+                "Failed to make relative path override absolute; using it as-is"
+            );
+            Some(path)
+        }
+    }
 }
 
 fn select_env_var_with_legacy<F>(lookup: F, new_name: &str, legacy_name: &str) -> Option<String>
@@ -17,6 +72,8 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
 
     use super::*;
 
@@ -72,5 +129,47 @@ mod tests {
     #[test]
     fn returns_none_when_neither_is_set() {
         assert_eq!(select(&[], "NEW_NAME", "OLD_NAME"), None);
+    }
+
+    #[test]
+    fn empty_path_override_is_treated_as_unset() {
+        assert_eq!(
+            normalize_path_override("BC_TEST_PATH", Some(OsString::new())),
+            None
+        );
+    }
+
+    #[test]
+    fn relative_path_override_is_made_absolute() {
+        let relative = PathBuf::from("relative-worktree-base");
+        let normalized =
+            normalize_path_override("BC_TEST_PATH", Some(relative.clone().into_os_string()))
+                .expect("normalise relative override");
+
+        assert!(normalized.is_absolute());
+        assert_eq!(
+            normalized,
+            std::path::absolute(relative).expect("make expected path absolute")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_path_override_is_treated_as_unset() {
+        let value = OsString::from_vec(vec![0xff]);
+
+        assert_eq!(normalize_path_override("BC_TEST_PATH", Some(value)), None);
+    }
+
+    #[test]
+    fn leading_tilde_in_path_override_is_expanded() {
+        let raw = "~/bettercoding-test-override";
+        let expected = crate::path::expand_tilde(raw);
+        assert_ne!(expected, PathBuf::from(raw));
+
+        assert_eq!(
+            normalize_path_override("BC_TEST_PATH", Some(OsString::from(raw))),
+            Some(expected)
+        );
     }
 }

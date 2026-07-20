@@ -17,7 +17,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use sqlx::SqlitePool;
 use tokio::{io::AsyncWriteExt, sync::RwLock, task::JoinHandle};
 use utils::{
-    assets::prod_asset_dir_path,
+    assets::try_prod_asset_dir_path,
     execution_logs::{
         ExecutionLogWriter, process_log_file_path, process_log_file_path_in_root,
         read_execution_log_file,
@@ -367,18 +367,20 @@ async fn read_execution_logs_for_execution(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if cfg!(debug_assertions) {
                 // Convenience for local development with a clone of a prod db. Read only access to prod logs.
-                let prod_path =
-                    process_log_file_path_in_root(&prod_asset_dir_path(), session_id, execution_id);
-                match read_execution_log_file(&prod_path).await {
-                    Ok(contents) => return Ok(Some(contents)),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => {
-                        return Err(err).with_context(|| {
-                            format!(
-                                "read execution log file for execution {execution_id} from {}",
-                                prod_path.display()
-                            )
-                        });
+                if let Ok(prod_asset_dir) = try_prod_asset_dir_path() {
+                    let prod_path =
+                        process_log_file_path_in_root(&prod_asset_dir, session_id, execution_id);
+                    match read_execution_log_file(&prod_path).await {
+                        Ok(contents) => return Ok(Some(contents)),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            return Err(err).with_context(|| {
+                                format!(
+                                    "read execution log file for execution {execution_id} from {}",
+                                    prod_path.display()
+                                )
+                            });
+                        }
                     }
                 }
             }

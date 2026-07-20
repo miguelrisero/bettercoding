@@ -507,8 +507,16 @@ impl WorktreeManager {
         .map_err(|e| WorktreeError::TaskJoin(format!("{e}")))?
     }
 
-    /// Get the base directory for vibe-kanban worktrees
+    /// Get the base directory for worktrees.
+    ///
+    /// `BC_WORKTREE_BASE` is a hard test/development seam and takes precedence
+    /// over the persisted workspace-directory setting. Its path is used as-given,
+    /// without adding an app-owned subdirectory.
     pub fn get_worktree_base_dir() -> std::path::PathBuf {
+        if let Some(override_path) = utils::path::worktree_base_env_override() {
+            return override_path.to_path_buf();
+        }
+
         if let Some(override_path) = WORKSPACE_DIR_OVERRIDE.get() {
             // Always use app-owned subdirectory within custom path for safety.
             // This ensures orphan cleanup never touches user's existing folders.
