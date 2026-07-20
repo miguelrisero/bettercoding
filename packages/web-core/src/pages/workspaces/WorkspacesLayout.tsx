@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   useSyncExternalStore,
@@ -114,9 +115,12 @@ export function WorkspacesLayout() {
   const [mobileTab] = useMobileActiveTab();
   const mainContainerRef = useRef<WorkspacesMainContainerHandle>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     // Mobile panes stay mounted under `hidden`; release xterm focus when its
     // pane is hidden so the iOS keyboard and visual-viewport pan can settle.
+    // This must stay layout-phase: `display:none` style recalculation can reset
+    // activeElement to <body> before a passive effect gets a chance to blur the
+    // textarea, leaving the iOS keyboard open.
     if (isMobile && mobileTab !== 'chat') {
       blurActiveTerminalTextarea();
     }

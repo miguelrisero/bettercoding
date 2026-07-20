@@ -61,25 +61,24 @@ export function SharedAppLayout() {
             : 'grid grid-rows-[auto_1fr] h-screen'
         )}
         style={
-          // Track the VISUAL viewport so the app ends above the on-screen
-          // keyboard and follows any residual iOS focus pan. That keeps the
-          // terminal input and mobile tab strip inside the visible rect even
-          // though iOS does not shrink or necessarily scroll the layout
-          // viewport (see useVisualViewportGeometry). Applied on BOTH layout
-          // branches: the hook is non-null only on touch devices, including
-          // tablets wide enough for the desktop layout. The explicit height
-          // wins over `bottom: 0` / `h-screen`; when the hook has no value (no
-          // touch / no visualViewport / pinch-zoomed) the classes alone keep
-          // the pre-existing behavior.
+          // Both touch layouts use the visual height so the app ends above the
+          // keyboard. The fixed mobile branch also follows residual iOS focus
+          // pan via `top`; the statically positioned desktop/tablet branch gets
+          // height only because `top` cannot move it. Residual pan on a wide
+          // iPad is therefore a known limitation. When geometry is unavailable
+          // (non-touch, no visualViewport, or pinch zoom), classes retain the
+          // pre-existing layout.
           visualViewportHeight !== null
-            ? {
-                height: visualViewportHeight,
-                bottom: 'auto',
-                top:
-                  visualViewportOffsetTop > 0
-                    ? visualViewportOffsetTop
-                    : undefined,
-              }
+            ? isMobile
+              ? {
+                  height: visualViewportHeight,
+                  bottom: 'auto',
+                  top:
+                    visualViewportOffsetTop > 0
+                      ? visualViewportOffsetTop
+                      : undefined,
+                }
+              : { height: visualViewportHeight }
             : undefined
         }
       >
