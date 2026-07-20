@@ -18,7 +18,7 @@ use utils::{
 };
 
 #[derive(Debug, Error)]
-pub enum VibeKanbanError {
+pub enum BetterCodingError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -30,7 +30,7 @@ pub enum VibeKanbanError {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), VibeKanbanError> {
+async fn main() -> Result<(), BetterCodingError> {
     // Install rustls crypto provider before any TLS operations
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()

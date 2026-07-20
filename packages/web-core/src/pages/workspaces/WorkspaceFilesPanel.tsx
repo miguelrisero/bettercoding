@@ -27,7 +27,7 @@ interface WorkspaceFilesPanelProps {
 type UploadTarget = 'drop' | 'current';
 
 // Where uploads land when the "Drop folder" target is selected.
-const DROP_FOLDER = '.vibe-uploads';
+const DROP_FOLDER = '.bettercoding-uploads';
 
 function joinPath(base: string, name: string): string {
   return base ? `${base}/${name}` : name;
@@ -79,7 +79,7 @@ export function WorkspaceFilesPanel({ workspaceId }: WorkspaceFilesPanelProps) {
       setIsUploading(true);
       setUploadError(null);
       try {
-        // Empty targetPath => server drops into the .vibe-uploads folder.
+        // Empty targetPath => server drops into the .bettercoding-uploads folder.
         await workspaceFilesApi.upload(workspaceId, files, {
           path: targetPath,
           overwrite,

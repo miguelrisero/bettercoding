@@ -4,6 +4,7 @@ version = "0.1.44"
 edition = "2024"
 autobins = false
 
+# TODO(bc-legacy-cleanup): vibe-kanban-mcp is a tooling identity; rename requires compatibility.
 [[bin]]
 name = "vibe-kanban-mcp"
 path = "src/bin/vibe_kanban_mcp.rs"

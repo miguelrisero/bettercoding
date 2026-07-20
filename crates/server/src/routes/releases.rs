@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 use crate::DeploymentImpl;
 
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+// TODO(bc-legacy-cleanup): release feed URL is a published compatibility identity; keep stable.
 const GITHUB_API_URL: &str = "https://api.github.com/repos/BloopAI/vibe-kanban/releases";
 
 type ReleasesCache = RwLock<Option<(Vec<GitHubRelease>, Instant)>>;

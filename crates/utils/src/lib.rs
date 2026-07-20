@@ -1,4 +1,4 @@
-use std::{env, sync::OnceLock};
+use std::sync::OnceLock;
 
 use directories::ProjectDirs;
 
@@ -7,6 +7,7 @@ pub mod assets;
 pub mod browser;
 pub mod command_ext;
 pub mod diff;
+pub mod env;
 pub mod execution_logs;
 pub mod http_headers;
 pub mod jwt;
@@ -50,9 +51,11 @@ pub fn is_wsl2() -> bool {
 
 pub fn cache_dir() -> std::path::PathBuf {
     let proj = if cfg!(debug_assertions) {
+        // TODO(bc-legacy-cleanup): ProjectDirs identity is persisted on disk; rename requires migration.
         ProjectDirs::from("ai", "bloop-dev", env!("CARGO_PKG_NAME"))
             .expect("OS didn't give us a home directory")
     } else {
+        // TODO(bc-legacy-cleanup): ProjectDirs identity is persisted on disk; rename requires migration.
         ProjectDirs::from("ai", "bloop", env!("CARGO_PKG_NAME"))
             .expect("OS didn't give us a home directory")
     };

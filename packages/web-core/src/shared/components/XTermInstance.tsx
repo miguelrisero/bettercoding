@@ -47,7 +47,7 @@ interface XTermInstanceProps {
    */
   mode?: 'shell' | 'cli';
   /**
-   * In 'cli' mode, the VibeKanban session whose claude conversation to resume
+   * In 'cli' mode, the BetterCoding session whose claude conversation to resume
    * (handover from the chat UI). Forwarded to the terminal WS as `session_id`.
    */
   sessionId?: string;

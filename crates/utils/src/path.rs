@@ -1,6 +1,10 @@
 use std::path::{Path, PathBuf};
 
 /// Directory name for storing attachments in worktrees
+// TODO(bc-legacy-cleanup): rename deferred - stored free-text prompts and messages embed
+// .vibe-attachments/... links (scratch messages, session history), and the prefix is also
+// synthesized in the workspace create flow which is out of scope for this change; renaming
+// would break historical references.
 pub const VIBE_ATTACHMENTS_DIR: &str = ".vibe-attachments";
 
 /// Directories that should always be skipped regardless of gitignore.
@@ -105,6 +109,7 @@ pub fn normalize_macos_private_alias<P: AsRef<Path>>(p: P) -> PathBuf {
     p.to_path_buf()
 }
 
+// TODO(bc-legacy-cleanup): function and temp-dir names are persisted identities; rename needs migration.
 pub fn get_vibe_kanban_temp_dir() -> std::path::PathBuf {
     let dir_name = if cfg!(debug_assertions) {
         "vibe-kanban-dev"

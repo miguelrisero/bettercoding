@@ -21,6 +21,7 @@ fn main() {
     if let Ok(api_endpoint) = std::env::var("POSTHOG_API_ENDPOINT") {
         println!("cargo:rustc-env=POSTHOG_API_ENDPOINT={}", api_endpoint);
     }
+    // TODO(bc-legacy-cleanup): migrate VK_ rustc-env baking with the coupled CI secrets.
     if let Ok(vk_shared_api_base) = std::env::var("VK_SHARED_API_BASE") {
         println!("cargo:rustc-env=VK_SHARED_API_BASE={}", vk_shared_api_base);
     }

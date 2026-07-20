@@ -19,7 +19,18 @@ use utils::path::ALWAYS_SKIP_DIRS;
 use crate::error::ApiError;
 
 /// Git-ignored directory that uploads land in by default.
-pub const VIBE_UPLOADS_DIR: &str = ".vibe-uploads";
+pub const UPLOADS_DIR: &str = ".bettercoding-uploads";
+/// Legacy default upload directory retained for migrate-on-access compatibility.
+///
+/// Both directories may intentionally coexist after rollback and re-upgrade;
+/// when both are present, neither is merged or deleted. An older binary rolled
+/// back after migration hides `.bettercoding-uploads` in its Files panel because
+/// its `is_hidden` exempts only `.vibe-uploads`. The files are not lost and become
+/// visible again after re-upgrading. Older binaries also ignore `BC_`-prefixed
+/// environment configuration, so keep matching `VK_` variables set throughout
+/// a rollback window.
+// TODO(bc-legacy-cleanup): remove legacy uploads-dir support when no .vibe-uploads dirs remain in the wild.
+pub const LEGACY_UPLOADS_DIR: &str = ".vibe-uploads";
 
 // --- Caps (tunable). Concrete limits, never `DefaultBodyLimit::disable()`. ---
 
@@ -50,9 +61,10 @@ pub fn is_denied_component(name: &str) -> bool {
 }
 
 /// True for dotfiles/dot-dirs, which are hidden from listings by default. The
-/// default upload drop folder is exempt so users can browse what they uploaded.
+/// current and legacy upload drop folders are exempt so users can browse what
+/// they uploaded during the migration.
 pub fn is_hidden(name: &str) -> bool {
-    name.starts_with('.') && name != VIBE_UPLOADS_DIR
+    name.starts_with('.') && name != UPLOADS_DIR && name != LEGACY_UPLOADS_DIR
 }
 
 /// Validate a caller-supplied relative path string. Rejects absolute paths,
@@ -183,6 +195,15 @@ mod tests {
     }
     fn is_not_found(err: &ApiError) -> bool {
         matches!(err, ApiError::File(FileError::NotFound))
+    }
+
+    #[test]
+    fn upload_dirs_are_not_hidden_during_migration() {
+        assert!(!is_hidden(UPLOADS_DIR));
+        assert!(!is_hidden(LEGACY_UPLOADS_DIR));
+        assert!(is_hidden(".gitignore"));
+        assert!(is_hidden(".other-dotfile"));
+        assert!(!is_hidden("visible.txt"));
     }
 
     #[test]

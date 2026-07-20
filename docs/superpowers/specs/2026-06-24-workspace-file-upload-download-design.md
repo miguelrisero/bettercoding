@@ -140,3 +140,28 @@ download headers (no attacker filename); bounded uploads + zip (DoS); no silent 
 - **P1 frontend visibility** → gate on `selectedWorkspace` + local capability.
 - **Maintainability** → single `WorkspaceFilePolicy` helper + tests.
 - **Deferred (noted non-goals):** app-wide CSRF-token/secret scheme (match existing local posture instead), resumable uploads, remote support.
+
+---
+
+## Amendment — 2026-07-19: default upload directory migration
+
+The default drop folder is now `.bettercoding-uploads`. On access, the server
+migrates `.vibe-uploads` with a guarded, non-blocking rename:
+
+- **Neither present:** create `.bettercoding-uploads`.
+- **Legacy only:** rename it when the workspace is idle; otherwise use it for
+  this request and retry migration on a later access.
+- **Current only:** use `.bettercoding-uploads`.
+- **Both present:** prefer `.bettercoding-uploads`, keep both directories without
+  merging or deleting either, and assert the inner `.gitignore` on both.
+
+An existing regular `.gitignore` is user-owned: the server does not parse,
+validate, or rewrite its contents; it only guarantees that an ignore file exists
+(app-seeded files contain `*`).
+
+Both-present is intentionally reachable after rollback and re-upgrade. Rolling
+back an older binary after migration hides `.bettercoding-uploads` from its Files
+panel because that binary exempts only `.vibe-uploads` from hidden-file filtering.
+The files are not lost; re-upgrading shows them again. Older binaries also ignore
+`BC_`-prefixed environment configuration, so keep matching `VK_` variables set
+during a rollback window.

@@ -52,13 +52,11 @@ impl PreviewProxyService {
     }
 }
 
-fn env_flag_enabled(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        value == "1"
-            || value.eq_ignore_ascii_case("true")
-            || value.eq_ignore_ascii_case("yes")
-            || value.eq_ignore_ascii_case("on")
-    })
+fn env_flag_enabled(value: &str) -> bool {
+    value == "1"
+        || value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("yes")
+        || value.eq_ignore_ascii_case("on")
 }
 #[derive(Clone, Copy, Debug)]
 struct PreviewTarget {
@@ -602,7 +600,11 @@ async fn http_proxy_handler(
 
                 // Inject Eruda CDN, init, devtools and click-to-component scripts before </body>
                 if let Some(pos) = html.to_lowercase().rfind("</body>") {
-                    let nav_script_disabled = env_flag_enabled("VK_PREVIEW_DISABLE_NAV_SCRIPT");
+                    let nav_script_disabled = utils::env::env_var_with_legacy(
+                        "BC_PREVIEW_DISABLE_NAV_SCRIPT",
+                        "VK_PREVIEW_DISABLE_NAV_SCRIPT",
+                    )
+                    .is_some_and(|value| env_flag_enabled(&value));
                     let scripts = if nav_script_disabled {
                         format!(
                             "<script src=\"https://cdn.jsdelivr.net/npm/eruda@3.4.3/eruda.js\"></script><script>{}</script><script>{}</script>",

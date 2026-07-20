@@ -864,7 +864,7 @@ export const workspaceFilesApi = {
 
   /**
    * Upload one or more files into the workspace. When `opts.path` is empty the
-   * server drops the files into a `.vibe-uploads/` folder. Throws an
+   * server drops the files into a `.bettercoding-uploads/` folder. Throws an
    * {@link ApiError} with `status === 409` when a file already exists and
    * `overwrite` is not set, letting the caller offer to replace it.
    */

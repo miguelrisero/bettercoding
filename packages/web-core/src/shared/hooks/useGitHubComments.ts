@@ -73,7 +73,7 @@ export function useGitHubComments({
 
   // Helper to match paths - handles repo prefix in diff paths
   // GitHub paths: "packages/web-core/src/file.ts"
-  // Diff paths: "vibe-kanban/packages/web-core/src/file.ts" (repo name prefixed)
+  // Diff paths: "<repo>/packages/web-core/src/file.ts" (repo name prefixed)
   const pathMatches = useCallback(
     (diffPath: string, githubPath: string): boolean => {
       return diffPath === githubPath || diffPath.endsWith('/' + githubPath);

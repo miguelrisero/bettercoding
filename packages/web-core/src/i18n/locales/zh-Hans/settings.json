@@ -221,7 +221,7 @@
       },
       "privacy": {
         "title": "隐私",
-        "description": "通过共享匿名使用数据帮助改进 Vibe-Kanban。",
+        "description": "通过共享匿名使用数据帮助改进 BetterCoding。",
         "telemetry": {
           "label": "启用遥测",
           "helper": "启用匿名使用事件跟踪以帮助改进应用程序。不会收集提示或项目信息。"

@@ -13,6 +13,7 @@ fn main() {
     }
 
     // Pass VK_SHARED_API_BASE to the compiler so option_env!() sees it
+    // TODO(bc-legacy-cleanup): migrate VK_ rustc-env baking with the coupled CI secrets.
     if let Ok(val) = std::env::var("VK_SHARED_API_BASE") {
         println!("cargo:rustc-env=VK_SHARED_API_BASE={}", val);
     }
