@@ -387,7 +387,7 @@ where
     let mut child = ChildGroupGuard::new(cmd.group_spawn_no_window()?);
 
     let result = async {
-        let (mut stdin, mut stdout, mut stderr) = take_child_stdio(child.child_mut())?;
+        let (stdin, mut stdout, mut stderr) = take_child_stdio(child.child_mut())?;
         // Keep capture ownership outside the cancellable chunk reads so grace
         // expiry cannot discard bytes collected by earlier chunks.
         let mut stdout_bytes = Vec::new();
@@ -400,9 +400,19 @@ where
                 Stderr(io::Result<bool>),
             }
 
-            let write_prompt = async {
-                stdin.write_all(prompt).await?;
-                stdin.shutdown().await
+            // Own stdin inside the concurrent write future so completing it
+            // closes the pipe immediately instead of leaving the handle alive
+            // while the child waits for EOF. Preserve any write/flush error,
+            // but drop the handle before returning it on every completion path.
+            let write_prompt = async move {
+                let mut stdin = stdin;
+                let result = async {
+                    stdin.write_all(prompt).await?;
+                    stdin.flush().await
+                }
+                .await;
+                drop(stdin);
+                result
             };
             let wait_for_exit = wait_for_leader_exit(child.child_mut());
             let call_timeout = timeout_signal();
@@ -1088,6 +1098,46 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn closes_stdin_after_writing_prompt() {
+        const NONCE: u64 = 0x0123_4567_89ab_cdef;
+        let request = build_title_request("Generate an EOF-gated workspace title", NONCE).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let fake_claude = temp_dir.path().join("fake-claude");
+        std::fs::write(
+            &fake_claude,
+            r#"#!/bin/sh
+prompt=$(cat)
+case "$prompt" in
+    *"TASK_0123456789abcdef_BEGIN"*"Generate an EOF-gated workspace title"*"TASK_0123456789abcdef_END"*) ;;
+    *) exit 91 ;;
+esac
+printf '%s\n' '{"title":"bp -> stdin eof","branch":"bp-stdin-eof"}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_claude).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fake_claude, permissions).unwrap();
+
+        let names = generate_workspace_names_with_command(
+            fake_claude.to_str().unwrap(),
+            &request.args,
+            &request.prompt,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(
+            names,
+            Some(super::WorkspaceNames {
+                title: "bp -> stdin eof".to_string(),
+                branch_slug: "bp-stdin-eof".to_string(),
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn task_answering_prose_output_returns_none() {
         const NONCE: u64 = 0x0123_4567_89ab_cdef;
         let request = build_title_request(
@@ -1113,13 +1163,17 @@ printf 'I would implement the requested task by editing the handler.\n'
         permissions.set_mode(0o700);
         std::fs::set_permissions(&fake_claude, permissions).unwrap();
 
-        let names = generate_workspace_names_with_command(
-            fake_claude.to_str().unwrap(),
-            &request.args,
-            &request.prompt,
-            Duration::from_secs(1),
+        let names = tokio::time::timeout(
+            Duration::from_secs(2),
+            generate_workspace_names_with_command(
+                fake_claude.to_str().unwrap(),
+                &request.args,
+                &request.prompt,
+                Duration::from_secs(5),
+            ),
         )
-        .await;
+        .await
+        .expect("prose command blocked waiting for stdin EOF");
 
         assert!(names.is_none());
     }
