@@ -67,6 +67,22 @@ pub struct SessionNativeRecord {
 }
 
 impl CliNativeRecord {
+    pub async fn session_ids_for_uuid(
+        pool: &SqlitePool,
+        native_uuid: &str,
+    ) -> Result<Vec<Uuid>, sqlx::Error> {
+        sqlx::query_scalar!(
+            r#"SELECT DISTINCT l.session_id AS "session_id!: Uuid"
+               FROM cli_native_records r
+               JOIN claude_session_links l
+                 ON l.claude_session_id = r.claude_session_id
+               WHERE r.uuid = $1"#,
+            native_uuid
+        )
+        .fetch_all(pool)
+        .await
+    }
+
     /// Insert raw records, append per-session outbox rows, and advance the
     /// newline-aligned cursor atomically. A replay of an existing line is a
     /// no-op for both the raw table and outbox.

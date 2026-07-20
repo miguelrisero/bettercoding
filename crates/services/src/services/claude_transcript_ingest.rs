@@ -16,7 +16,7 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
@@ -60,6 +60,22 @@ use crate::services::filesystem_watcher;
 const REGISTRY_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const OUTBOX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_PROJECT_DIR_SCAN: usize = 512;
+
+#[derive(Debug, Clone)]
+pub(crate) struct NativeLinkPersisted {
+    pub execution_process_id: Uuid,
+    pub native_uuid: String,
+}
+
+static NATIVE_LINK_EVENTS: OnceLock<broadcast::Sender<NativeLinkPersisted>> = OnceLock::new();
+
+fn native_link_events() -> &'static broadcast::Sender<NativeLinkPersisted> {
+    NATIVE_LINK_EVENTS.get_or_init(|| broadcast::channel(4096).0)
+}
+
+pub(crate) fn notify_native_link_persisted(event: NativeLinkPersisted) {
+    let _ = native_link_events().send(event);
+}
 
 #[derive(Debug, Error)]
 pub enum ClaudeTranscriptIngestError {
@@ -136,6 +152,12 @@ impl ClaudeTranscriptIngest {
         let service = Arc::new(Self::new(db, projects_dir));
 
         tokio::spawn(service.clone().run_publisher(shutdown.child_token()));
+        let native_link_updates = native_link_events().subscribe();
+        tokio::spawn(
+            service
+                .clone()
+                .run_native_link_invalidation(native_link_updates, shutdown.child_token()),
+        );
         tokio::spawn(service.clone().run_registry(shutdown.child_token(), true));
         Some(service)
     }
@@ -709,6 +731,41 @@ impl ClaudeTranscriptIngest {
                 session_id,
                 revision,
             });
+    }
+
+    async fn run_native_link_invalidation(
+        self: Arc<Self>,
+        mut updates: broadcast::Receiver<NativeLinkPersisted>,
+        shutdown: CancellationToken,
+    ) {
+        loop {
+            let event = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                event = updates.recv() => match event {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "native-link invalidation listener lagged");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            };
+            match CliNativeRecord::session_ids_for_uuid(&self.db.pool, &event.native_uuid).await {
+                Ok(session_ids) => {
+                    for session_id in session_ids {
+                        self.invalidate_revision(session_id).await;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        execution_process_id = %event.execution_process_id,
+                        native_uuid = %event.native_uuid,
+                        "failed to invalidate feed after native UUID persistence"
+                    );
+                }
+            }
+        }
     }
 
     async fn run_publisher(self: Arc<Self>, shutdown: CancellationToken) {

@@ -47,7 +47,6 @@ impl MsgStore {
     }
 
     pub fn push(&self, msg: LogMsg) {
-        let _ = self.sender.send(msg.clone()); // live listeners
         let bytes = msg.approx_bytes();
 
         let mut inner = self.inner.write().unwrap();
@@ -60,6 +59,13 @@ impl MsgStore {
         }
         inner.history.push_back(StoredMsg { msg, bytes });
         inner.total_bytes = inner.total_bytes.saturating_add(bytes);
+        let message = inner
+            .history
+            .back()
+            .expect("message was just stored")
+            .msg
+            .clone();
+        let _ = self.sender.send(message); // live listeners
     }
 
     // Convenience
@@ -105,7 +111,17 @@ impl MsgStore {
     pub fn history_plus_stream(
         &self,
     ) -> futures::stream::BoxStream<'static, Result<LogMsg, std::io::Error>> {
-        let (history, rx) = (self.get_history(), self.get_receiver());
+        // `push` records history and broadcasts while holding the write lock.
+        // Subscribe and copy history under the matching read lock so an event
+        // cannot fall into the gap between those two sources.
+        let inner = self.inner.read().unwrap();
+        let rx = self.sender.subscribe();
+        let history = inner
+            .history
+            .iter()
+            .map(|s| s.msg.clone())
+            .collect::<Vec<_>>();
+        drop(inner);
 
         let hist = futures::stream::iter(history.into_iter().map(Ok::<_, std::io::Error>));
         let live = BroadcastStream::new(rx).filter_map(|res| async move {

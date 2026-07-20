@@ -27,6 +27,13 @@ use utils::{
 };
 use uuid::Uuid;
 
+use crate::services::claude_transcript_ingest::{
+    NativeLinkPersisted, notify_native_link_persisted,
+};
+
+const NATIVE_LINK_INSERT_ATTEMPTS: usize = 5;
+const NATIVE_LINK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
 pub async fn migrate_execution_logs_to_files() -> Result<()> {
     let pool = DBService::new_migration_pool()
         .await
@@ -279,85 +286,240 @@ pub fn spawn_stream_raw_logs_to_storage(
         };
 
         if let Some(store) = store {
-            let mut stream = store.history_plus_stream();
+            let output_store = store.clone();
+            let persist_metadata = persist_execution_metadata(store, db, execution_id);
+            let persist_output = async move {
+                let mut stream = output_store.history_plus_stream();
+                drop(output_store);
+                while let Some(Ok(msg)) = stream.next().await {
+                    match &msg {
+                        LogMsg::Stdout(_) | LogMsg::Stderr(_) => {
+                            match serde_json::to_string(&msg) {
+                                Ok(jsonl_line) => {
+                                    let mut jsonl_line_with_newline = jsonl_line;
+                                    jsonl_line_with_newline.push('\n');
 
-            while let Some(Ok(msg)) = stream.next().await {
-                match &msg {
-                    LogMsg::Stdout(_) | LogMsg::Stderr(_) => match serde_json::to_string(&msg) {
-                        Ok(jsonl_line) => {
-                            let mut jsonl_line_with_newline = jsonl_line;
-                            jsonl_line_with_newline.push('\n');
-
-                            if let Err(e) =
-                                log_writer.append_jsonl_line(&jsonl_line_with_newline).await
-                            {
-                                tracing::error!(
-                                    "Failed to append log line for execution {}: {}",
-                                    execution_id,
-                                    e
-                                );
+                                    if let Err(e) =
+                                        log_writer.append_jsonl_line(&jsonl_line_with_newline).await
+                                    {
+                                        tracing::error!(
+                                            "Failed to append log line for execution {}: {}",
+                                            execution_id,
+                                            e
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Failed to serialize log message for execution {}: {}",
+                                        execution_id,
+                                        e
+                                    );
+                                }
                             }
                         }
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to serialize log message for execution {}: {}",
-                                execution_id,
-                                e
-                            );
+                        LogMsg::Finished => {
+                            break;
                         }
-                    },
-                    LogMsg::SessionId(agent_session_id) => {
-                        if let Err(e) = CodingAgentTurn::update_agent_session_id(
-                            &db.pool,
-                            execution_id,
-                            agent_session_id,
-                        )
-                        .await
-                        {
-                            tracing::error!(
-                                "Failed to update agent_session_id {} for execution process {}: {}",
-                                agent_session_id,
-                                execution_id,
-                                e
-                            );
-                        }
+                        LogMsg::SessionId(_)
+                        | LogMsg::MessageId(_)
+                        | LogMsg::NativeUuid(_)
+                        | LogMsg::JsonPatch(_)
+                        | LogMsg::Ready => continue,
                     }
-                    LogMsg::MessageId(agent_message_id) => {
-                        if let Err(e) = CodingAgentTurn::update_agent_message_id(
-                            &db.pool,
-                            execution_id,
-                            agent_message_id,
-                        )
-                        .await
-                        {
-                            tracing::error!(
-                                "Failed to update agent_message_id {} for execution process {}: {}",
-                                agent_message_id,
-                                execution_id,
-                                e
-                            );
-                        }
-                    }
-                    LogMsg::NativeUuid(native_uuid) => {
-                        if let Err(e) =
-                            ExecutionNativeLink::insert(&db.pool, execution_id, native_uuid).await
-                        {
-                            tracing::error!(
-                                "Failed to persist native uuid {} for execution process {}: {}",
-                                native_uuid,
-                                execution_id,
-                                e
-                            );
-                        }
-                    }
-                    LogMsg::Finished => {
-                        break;
-                    }
-                    LogMsg::JsonPatch(_) | LogMsg::Ready => continue,
                 }
-            }
+            };
+            tokio::join!(persist_output, persist_metadata);
         }
     })
+}
+
+async fn persist_execution_metadata(store: Arc<MsgStore>, db: DBService, execution_id: Uuid) {
+    let mut stream = store.history_plus_stream();
+    // The stream's receiver is sufficient. Releasing this Arc lets the
+    // channel close once normalizers and the MsgStore registry are done, at
+    // which point every event after Finished has been drained.
+    drop(store);
+    while let Some(Ok(msg)) = stream.next().await {
+        match msg {
+            LogMsg::SessionId(agent_session_id) => {
+                if let Err(error) = CodingAgentTurn::update_agent_session_id(
+                    &db.pool,
+                    execution_id,
+                    &agent_session_id,
+                )
+                .await
+                {
+                    tracing::error!(
+                        %error,
+                        %agent_session_id,
+                        %execution_id,
+                        "failed to persist native session id"
+                    );
+                }
+            }
+            LogMsg::MessageId(agent_message_id) => {
+                if let Err(error) = CodingAgentTurn::update_agent_message_id(
+                    &db.pool,
+                    execution_id,
+                    &agent_message_id,
+                )
+                .await
+                {
+                    tracing::error!(
+                        %error,
+                        %agent_message_id,
+                        %execution_id,
+                        "failed to persist native message id"
+                    );
+                }
+            }
+            LogMsg::NativeUuid(native_uuid) => {
+                persist_native_link_with_retry(&db, execution_id, &native_uuid).await;
+            }
+            LogMsg::Finished
+            | LogMsg::Stdout(_)
+            | LogMsg::Stderr(_)
+            | LogMsg::JsonPatch(_)
+            | LogMsg::Ready => {}
+        }
+    }
+}
+
+pub(crate) async fn persist_native_link_with_retry(
+    db: &DBService,
+    execution_id: Uuid,
+    native_uuid: &str,
+) -> bool {
+    for attempt in 1..=NATIVE_LINK_INSERT_ATTEMPTS {
+        match ExecutionNativeLink::insert(&db.pool, execution_id, native_uuid).await {
+            Ok(_) => {
+                notify_native_link_persisted(NativeLinkPersisted {
+                    execution_process_id: execution_id,
+                    native_uuid: native_uuid.to_string(),
+                });
+                return true;
+            }
+            Err(error) if attempt < NATIVE_LINK_INSERT_ATTEMPTS => {
+                tracing::warn!(
+                    %error,
+                    %execution_id,
+                    %native_uuid,
+                    attempt,
+                    "retrying native UUID persistence"
+                );
+                tokio::time::sleep(NATIVE_LINK_RETRY_DELAY).await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    %execution_id,
+                    %native_uuid,
+                    attempts = attempt,
+                    "failed to persist native UUID after retries"
+                );
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use db::models::{
+        session::{CreateSession, Session},
+        workspace::{CreateWorkspace, Workspace},
+    };
+    use executors::{
+        actions::{
+            ExecutorAction, ExecutorActionType, coding_agent_initial::CodingAgentInitialRequest,
+        },
+        executors::BaseCodingAgent,
+        profile::ExecutorConfig,
+    };
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+
+    async fn execution_fixture() -> (DBService, Uuid) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations_for_tests(&pool).await.unwrap();
+        let db = DBService { pool };
+        let workspace_id = Uuid::new_v4();
+        Workspace::create(
+            &db.pool,
+            &CreateWorkspace {
+                branch: "main".to_string(),
+                name: None,
+            },
+            workspace_id,
+        )
+        .await
+        .unwrap();
+        let session = Session::create(
+            &db.pool,
+            &CreateSession {
+                executor: Some("CLAUDE_CODE".to_string()),
+                name: None,
+            },
+            Uuid::new_v4(),
+            workspace_id,
+        )
+        .await
+        .unwrap();
+        let execution_id = Uuid::new_v4();
+        ExecutionProcess::create(
+            &db.pool,
+            &db::models::execution_process::CreateExecutionProcess {
+                session_id: session.id,
+                executor_action: ExecutorAction::new(
+                    ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
+                        prompt: "late uuid".to_string(),
+                        executor_config: ExecutorConfig::new(BaseCodingAgent::ClaudeCode),
+                        working_dir: None,
+                    }),
+                    None,
+                ),
+                run_reason: db::models::execution_process::ExecutionProcessRunReason::CodingAgent,
+            },
+            execution_id,
+            &[],
+        )
+        .await
+        .unwrap();
+        (db, execution_id)
+    }
+
+    #[tokio::test]
+    async fn metadata_drain_persists_uuid_emitted_after_finished() {
+        let (db, execution_id) = execution_fixture().await;
+        let store = Arc::new(MsgStore::new());
+        let task = tokio::spawn(persist_execution_metadata(
+            store.clone(),
+            db.clone(),
+            execution_id,
+        ));
+        tokio::task::yield_now().await;
+
+        store.push_finished();
+        store.push_native_uuid("late-after-finished".to_string());
+        drop(store);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("metadata consumer did not drain to store closure")
+            .unwrap();
+
+        assert_eq!(
+            ExecutionNativeLink::find_execution_id(&db.pool, "late-after-finished")
+                .await
+                .unwrap(),
+            Some(execution_id)
+        );
+    }
 }
 
 async fn read_execution_logs_for_execution(

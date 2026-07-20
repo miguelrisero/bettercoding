@@ -646,6 +646,86 @@ async fn same_prompt_hours_after_dispatch_remains_cli_origin() {
 }
 
 #[tokio::test]
+async fn native_link_after_import_reclassifies_origin_and_invalidates_feed() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, &workspace_root).await;
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    let sid = "28282828-2828-4828-8828-282828282828";
+    let assistant = serde_json::json!({
+        "type": "assistant",
+        "sessionId": sid,
+        "uuid": "linked-after-import",
+        "timestamp": "2026-07-20T20:00:00Z",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "late identity"}]
+        }
+    });
+    fs::write(
+        native_dir.join(format!("{sid}.jsonl")),
+        format!("{assistant}\n"),
+    )
+    .unwrap();
+    ClaudeSessionLink::assign_manual(&db.pool, sid, session.id, &cwd.to_string_lossy())
+        .await
+        .unwrap()
+        .unwrap();
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), projects_dir));
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        service.snapshot(session.id).await.unwrap().entries[0].origin,
+        NativeFeedOrigin::Cli
+    );
+
+    let native_link_updates = super::native_link_events().subscribe();
+    let shutdown = CancellationToken::new();
+    let listener = tokio::spawn(
+        service
+            .clone()
+            .run_native_link_invalidation(native_link_updates, shutdown.child_token()),
+    );
+    let mut feed_updates = service.subscribe();
+    let process_id = create_coding_turn(&db, session.id, "executor output").await;
+    assert!(
+        crate::services::execution_process::persist_native_link_with_retry(
+            &db,
+            process_id,
+            "linked-after-import",
+        )
+        .await
+    );
+
+    match tokio::time::timeout(Duration::from_secs(5), feed_updates.recv())
+        .await
+        .expect("late link did not invalidate the feed")
+        .unwrap()
+    {
+        NativeFeedUpdate::RevisionInvalidated { session_id, .. } => {
+            assert_eq!(session_id, session.id);
+        }
+        NativeFeedUpdate::RecordsAppended { .. } => panic!("publisher is not running"),
+    }
+    let snapshot = service.snapshot(session.id).await.unwrap();
+    assert_eq!(snapshot.entries[0].origin, NativeFeedOrigin::Executor);
+    assert_eq!(
+        snapshot.entries[0].linked_execution_process_id,
+        Some(process_id)
+    );
+
+    shutdown.cancel();
+    listener.await.unwrap();
+}
+
+#[tokio::test]
 async fn recent_app_dispatch_prefers_the_newest_matching_turn() {
     let temp = TempDir::new().unwrap();
     let workspace_root = temp.path().join("worktree");
