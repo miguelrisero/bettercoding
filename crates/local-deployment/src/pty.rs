@@ -1199,10 +1199,23 @@ fn cli_tmux_argv_on(input: CliTmuxArgv<'_>) -> Vec<std::ffi::OsString> {
     args
 }
 
+/// Classify `tmux has-session` without mistaking arbitrary client failures for absence.
+///
+/// Live testing against a real tmux 3.4 binary exposed wording that unit-only
+/// coverage had missed: a socket that has never had a server reports `No such
+/// file or directory`. For an existence check, that is semantically equivalent
+/// to `no server running`: a never-created socket behaves like one whose server
+/// exited cleanly, and neither can contain a session. Other connection errors
+/// remain unknown so callers fail closed.
 fn classify_cli_tmux_session_probe(success: bool, stderr: &str) -> CliTmuxSessionProbe {
     if success {
         CliTmuxSessionProbe::Present
-    } else if stderr.contains("can't find session") || stderr.contains("no server running on") {
+    } else if stderr.contains("can't find session")
+        || stderr.contains("no server running on")
+        || stderr
+            .to_ascii_lowercase()
+            .contains("no such file or directory")
+    {
         CliTmuxSessionProbe::Absent
     } else {
         CliTmuxSessionProbe::Unknown
@@ -3756,6 +3769,17 @@ mod tests {
         assert_eq!(
             classify_cli_tmux_session_probe(
                 false,
+                "error connecting to /tmp/tmux-1000/foo (No such file or directory)"
+            ),
+            CliTmuxSessionProbe::Absent
+        );
+        assert_eq!(
+            classify_cli_tmux_session_probe(false, "No Such File Or Directory"),
+            CliTmuxSessionProbe::Absent
+        );
+        assert_eq!(
+            classify_cli_tmux_session_probe(
+                false,
                 "error connecting to /tmp/x (Permission denied)"
             ),
             CliTmuxSessionProbe::Unknown
@@ -3767,6 +3791,19 @@ mod tests {
         assert_eq!(
             classify_cli_tmux_session_probe(false, "some unrecognized message"),
             CliTmuxSessionProbe::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn session_probe_reports_absent_for_never_started_scratch_socket() {
+        if !tmux_available() {
+            return;
+        }
+        let socket = format!("bc-b2-never-started-{}", Uuid::new_v4().simple());
+
+        assert_eq!(
+            probe_tmux_session_on(&socket, "definitely-absent-session").await,
+            CliTmuxSessionProbe::Absent
         );
     }
 
