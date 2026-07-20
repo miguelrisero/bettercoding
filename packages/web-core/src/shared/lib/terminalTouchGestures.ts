@@ -18,41 +18,59 @@ import {
  * 1/2/4 arrows per second, and the badge repeats an ASCII direction by zone.
  *
  * Coexists with the touch→wheel scroll bridge (terminalTouchScroll): a finger
- * that moves beyond slop before the long-press delay is a scroll; only an
- * in-slop event at/after the deadline proves a moving finger dwelled. Timer
+ * that moves beyond slop before the long-press delay is a scroll; any move
+ * timestamped at/after the deadline proves a moving finger dwelled. Timer
  * promotion keeps perfectly still presses working, but a queued pre-deadline
  * swipe demotes it before an arrow can fire. A proven dwell enters D-pad mode,
  * sets `dpadActive`, and makes the scroll bridge stand down. Select mode
  * disables the whole layer.
  *
- * `createTouchGestureController` is pure and time-injected (every method takes
- * `now`; scheduling is pull-based via `nextTimerAt`) — the unit-tested seam.
- * `installTerminalTouchGestures` binds real events and one timer to it, using
- * event timestamps (not handler-delivery time) so a busy main thread can't
- * misclassify a fast swipe as a dwell, and the monotonic clock so NTP steps
- * can't stall repeats mid-gesture.
+ * `createTouchGestureController` is pure and time-injected; scheduling is
+ * pull-based via `nextTimerAt`. Event timestamps classify dwell, slop, demotion,
+ * and taps so a busy main thread cannot rewrite what the user did. Repeat
+ * cadence and the dispatch rate floor use handler-delivery time instead, so a
+ * stale queued event cannot create an already-overdue repeat. The DOM adapter
+ * supplies `e.timeStamp` for the former and `performance.now()` for the latter.
  */
 
 export const LONG_PRESS_MS = 350;
 export const TAP_SLOP_PX = 12;
 export const DOUBLE_TAP_MS = 300;
+/**
+ * A deliberate drag that starts when a long press feels ready (~320–345ms)
+ * can carry a coalesced timestamp just below the deadline; demoting it would
+ * silently drop the gesture with no feedback. Genuine fast swipes cross slop
+ * within roughly 30–50ms of touchstart, far outside this guard band.
+ */
+export const DEMOTE_GUARD_MS = 60;
 /** Drag distance (px) from the press origin before arrows start firing. */
 export const DPAD_DEAD_ZONE_PX = 14;
+/** Distance retained around every D-pad boundary to absorb thumb tremor. */
+export const ZONE_HYSTERESIS_PX = 8;
+/**
+ * Dispatch floor shared by every arrow path; boundary jitter is harmless even
+ * if it crosses more quickly than the repeat cadence.
+ */
+export const MIN_ARROW_INTERVAL_MS = 120;
 /** Max age (ms) of a touch sequence still counting as a three-finger tap. */
 export const MULTI_TAP_MS = 500;
 
 /**
  * D-pad distance/rate tuning. Rows are ordered by inclusive minimum distance.
- * Zone 1: [dead zone, 64px) — one arrow per outward entry, no auto-repeat.
- * Zone 2: [64px, 114px) — slow auto-repeat, about one arrow per second.
- * Zone 3: [114px, 164px) — medium auto-repeat, about two arrows per second.
- * Zone 4: [164px, ∞) — fast auto-repeat, about four arrows per second.
+ * Zone 1: [dead zone, 48px) — one arrow per outward entry, no auto-repeat.
+ * Zone 2: [48px, 88px) — slow auto-repeat, about one arrow per second.
+ * Zone 3: [88px, 128px) — medium auto-repeat, about two arrows per second.
+ * Zone 4: [128px, ∞) — fast auto-repeat, about four arrows per second.
+ * Pulling the thresholds inward keeps zone 4 reachable from natural left- and
+ * right-thumb origins on a 390px viewport, rather than only near its center.
+ * Keep the owner's specified repeat rates exactly at 1000 / 500 / 250ms; they
+ * are intentional product behavior, not values to "fix" during tuning.
  */
 export const DPAD_ZONES = [
   { minDistance: DPAD_DEAD_ZONE_PX, repeatMs: null },
-  { minDistance: 64, repeatMs: 1_000 },
-  { minDistance: 114, repeatMs: 500 },
-  { minDistance: 164, repeatMs: 250 },
+  { minDistance: 48, repeatMs: 1_000 },
+  { minDistance: 88, repeatMs: 500 },
+  { minDistance: 128, repeatMs: 250 },
 ] as const;
 
 export type DpadZone = 1 | 2 | 3 | 4;
@@ -78,6 +96,62 @@ export function dpadZone(distance: number): DpadZone {
     }
   }
   return 1;
+}
+
+/**
+ * Stateful zone selection with symmetric hysteresis. Moving outward enters a
+ * zone at `minDistance + 8`; retreating leaves it below `minDistance - 8`.
+ * Zone 0 is the dead zone/no-direction state.
+ */
+export function dpadZoneWithHysteresis(
+  distance: number,
+  currentZone: DpadZone | 0
+): DpadZone | 0 {
+  let nextZone = currentZone;
+
+  while (
+    nextZone < DPAD_ZONES.length &&
+    distance >=
+      DPAD_ZONES[nextZone as 0 | 1 | 2 | 3].minDistance + ZONE_HYSTERESIS_PX
+  ) {
+    nextZone = (nextZone + 1) as DpadZone;
+  }
+
+  while (
+    nextZone > 0 &&
+    distance < DPAD_ZONES[nextZone - 1].minDistance - ZONE_HYSTERESIS_PX
+  ) {
+    nextZone = (nextZone - 1) as DpadZone | 0;
+  }
+
+  return nextZone;
+}
+
+function dpadDirectionWithHysteresis(
+  dx: number,
+  dy: number,
+  currentDirection: ArrowKey
+): ArrowKey {
+  const candidate = dpadDirection(dx, dy, 0) ?? currentDirection;
+  const incumbentIsHorizontal =
+    currentDirection === 'left' || currentDirection === 'right';
+  const candidateIsHorizontal = candidate === 'left' || candidate === 'right';
+
+  if (incumbentIsHorizontal === candidateIsHorizontal) return candidate;
+
+  const incumbentMagnitude = incumbentIsHorizontal
+    ? Math.abs(dx)
+    : Math.abs(dy);
+  const candidateMagnitude = candidateIsHorizontal
+    ? Math.abs(dx)
+    : Math.abs(dy);
+  if (
+    candidateMagnitude >= incumbentMagnitude * 1.3 ||
+    candidateMagnitude >= incumbentMagnitude + 10
+  ) {
+    return candidate;
+  }
+  return currentDirection;
 }
 
 const DPAD_BADGE_GLYPH: Record<ArrowKey, string> = {
@@ -125,48 +199,62 @@ export function createTouchGestureController(deps: GestureDeps) {
   let startY = 0;
   let pressAt = 0;
   let maxTouches = 0;
-  /** A multi-touch gesture travelled beyond slop — it's a swipe, not a tap. */
-  let multiMoved = false;
-  /** An in-slop move at/after the deadline proves this sequence really dwelled. */
+  /** Promotion or any past-slop travel permanently rules out multi-tap paste. */
+  let multiTapDisqualified = false;
+  /** Any move timestamped at/after the deadline proves this sequence dwelled. */
   let dwellProven = false;
-  /** The first move after timer promotion may expose a queued earlier swipe. */
-  let timerPromotionAwaitingMove = false;
   // D-pad repeat state.
   let dir: ArrowKey | null = null;
-  let zone: DpadZone = 1;
+  let zone: DpadZone | 0 = 0;
   let nextRepeatAt: number | null = null;
+  let lastArrowAt: number | null = null;
   // Double-tap tracking.
   let lastTap: { at: number; x: number; y: number } | null = null;
 
   const dpadOrigin = () => ({ clientX: startX, clientY: startY });
 
-  const scheduleRepeatFrom = (now: number) => {
-    const repeatMs = DPAD_ZONES[zone - 1].repeatMs;
-    nextRepeatAt = repeatMs === null ? null : now + repeatMs;
+  const scheduleRepeatFrom = (nowForScheduling: number) => {
+    const repeatMs = zone === 0 ? null : DPAD_ZONES[zone - 1].repeatMs;
+    nextRepeatAt = repeatMs === null ? null : nowForScheduling + repeatMs;
+  };
+
+  const dispatchArrow = (
+    direction: ArrowKey,
+    nowForScheduling: number
+  ): boolean => {
+    if (
+      lastArrowAt !== null &&
+      nowForScheduling - lastArrowAt < MIN_ARROW_INTERVAL_MS
+    ) {
+      return false;
+    }
+    deps.sendArrow(direction);
+    lastArrowAt = nowForScheduling;
+    return true;
   };
 
   const exitDpad = () => {
     if (phase === 'dpad') deps.setDpad(false, null, 1, dpadOrigin());
     dir = null;
-    zone = 1;
+    zone = 0;
     nextRepeatAt = null;
-    timerPromotionAwaitingMove = false;
   };
 
-  const promoteToDpad = (fromTimer = false) => {
+  const promoteToDpad = () => {
     phase = 'dpad';
+    multiTapDisqualified = true;
     dir = null;
-    zone = 1;
+    zone = 0;
     nextRepeatAt = null;
-    timerPromotionAwaitingMove = fromTimer;
-    deps.setDpad(true, null, zone, dpadOrigin());
+    deps.setDpad(true, null, 1, dpadOrigin());
   };
 
   return {
     onTouchStart(p: GesturePoint, now: number): void {
-      dwellProven = false;
-      timerPromotionAwaitingMove = false;
       if (p.touches === 1) {
+        dwellProven = false;
+        multiTapDisqualified = false;
+        maxTouches = 1;
         if (!deps.isEnabled()) {
           phase = 'ignored';
           return;
@@ -175,8 +263,6 @@ export function createTouchGestureController(deps: GestureDeps) {
         startX = p.clientX;
         startY = p.clientY;
         pressAt = now;
-        maxTouches = 1;
-        multiMoved = false;
         return;
       }
       if (phase === 'idle') {
@@ -184,6 +270,9 @@ export function createTouchGestureController(deps: GestureDeps) {
         // landing within the same frame — the normal case for a deliberate
         // three-finger tap). Initialize here or `pressAt` would be stale
         // from the previous gesture and the select-mode gate skipped.
+        dwellProven = false;
+        multiTapDisqualified = false;
+        maxTouches = p.touches;
         if (!deps.isEnabled()) {
           phase = 'ignored';
           return;
@@ -192,8 +281,6 @@ export function createTouchGestureController(deps: GestureDeps) {
         startX = p.clientX;
         startY = p.clientY;
         pressAt = now;
-        maxTouches = p.touches;
-        multiMoved = false;
         return;
       }
       // Additional finger landed mid-gesture. A D-pad in progress is
@@ -203,15 +290,28 @@ export function createTouchGestureController(deps: GestureDeps) {
       phase = phase === 'ignored' ? 'ignored' : 'multi';
     },
 
-    onTouchMove(p: GesturePoint, now: number): GestureMoveResult {
+    onTouchMove(
+      p: GesturePoint,
+      eventAt: number,
+      nowForScheduling = eventAt
+    ): GestureMoveResult {
       const movedPastSlop =
         Math.abs(p.clientX - startX) > TAP_SLOP_PX ||
         Math.abs(p.clientY - startY) > TAP_SLOP_PX;
+      const pressDeadline = pressAt + LONG_PRESS_MS;
+
+      if (phase !== 'idle' && movedPastSlop) {
+        multiTapDisqualified = true;
+      }
+      if (
+        (phase === 'pressed' || phase === 'dpad') &&
+        !dwellProven &&
+        eventAt >= pressDeadline
+      ) {
+        dwellProven = true;
+      }
 
       if (phase === 'multi') {
-        // A travelling multi-touch is a swipe/pinch (e.g. iPadOS three-finger
-        // system gestures) — it must never count as a three-finger TAP.
-        if (movedPastSlop) multiMoved = true;
         return { prevent: false };
       }
 
@@ -225,10 +325,9 @@ export function createTouchGestureController(deps: GestureDeps) {
           }
           promoteToDpad();
           // fall through to D-pad handling of this same move
-        } else if (now - pressAt >= LONG_PRESS_MS) {
+        } else if (dwellProven) {
           // Event time, rather than handler-delivery time, proves the finger
           // remained within slop through the long-press deadline.
-          dwellProven = true;
           promoteToDpad();
           // fall through to D-pad handling of this same move
         } else {
@@ -237,23 +336,29 @@ export function createTouchGestureController(deps: GestureDeps) {
       }
       if (phase !== 'dpad') return { prevent: false };
 
-      if (timerPromotionAwaitingMove) {
-        timerPromotionAwaitingMove = false;
-        if (now < pressAt + LONG_PRESS_MS && movedPastSlop) {
-          // This move happened before the deadline but sat queued behind the
-          // timer. Demote synchronously: our listener runs before the scroll
-          // bridge, so this same event reaches it with suppression cleared.
-          exitDpad();
-          phase = 'ignored';
-          return { prevent: false };
-        }
+      if (
+        !dwellProven &&
+        movedPastSlop &&
+        eventAt < pressDeadline - DEMOTE_GUARD_MS
+      ) {
+        // This move happened well before the deadline but sat queued behind
+        // timer promotion. Keep checking until dwell is actually proven: an
+        // innocent in-slop event must not consume the demotion protection.
+        exitDpad();
+        phase = 'ignored';
+        return { prevent: false };
       }
 
       const dx = p.clientX - startX;
       const dy = p.clientY - startY;
-      const nextDir = dpadDirection(dx, dy);
       const distance = Math.max(Math.abs(dx), Math.abs(dy));
-      const nextZone = dpadZone(distance);
+      const nextZone = dpadZoneWithHysteresis(distance, zone);
+      const nextDir =
+        nextZone === 0
+          ? null
+          : dir === null
+            ? dpadDirection(dx, dy)
+            : dpadDirectionWithHysteresis(dx, dy, dir);
       if (nextDir !== dir) {
         dir = nextDir;
         zone = nextZone;
@@ -261,23 +366,23 @@ export function createTouchGestureController(deps: GestureDeps) {
         if (dir) {
           // Engage and direction changes are always responsive; zone 1 then
           // stays discrete until the finger returns to the dead zone.
-          deps.sendArrow(dir);
-          scheduleRepeatFrom(now);
+          dispatchArrow(dir, nowForScheduling);
+          scheduleRepeatFrom(nowForScheduling);
         }
-        deps.setDpad(true, dir, zone, dpadOrigin());
+        deps.setDpad(true, dir, zone || 1, dpadOrigin());
       } else if (dir && nextZone !== zone) {
         const previousZone = zone;
-        zone = nextZone;
+        zone = nextZone as DpadZone;
         const repeatMs = DPAD_ZONES[zone - 1].repeatMs;
         if (zone > previousZone) {
-          deps.sendArrow(dir);
-          scheduleRepeatFrom(now);
+          dispatchArrow(dir, nowForScheduling);
+          scheduleRepeatFrom(nowForScheduling);
         } else if (repeatMs === null) {
           nextRepeatAt = null;
         } else {
           // On retreat, preserve an already-promised sooner tick; the slower
           // cadence takes over after it fires instead of adding an arrow now.
-          const slowerDeadline = now + repeatMs;
+          const slowerDeadline = nowForScheduling + repeatMs;
           nextRepeatAt =
             nextRepeatAt === null
               ? slowerDeadline
@@ -291,15 +396,17 @@ export function createTouchGestureController(deps: GestureDeps) {
 
     onTouchEnd(remainingTouches: number, now: number): void {
       if (remainingTouches > 0) return; // wait for the last finger
-      const wasPhase = phase;
+      const wasPhase =
+        phase === 'dpad' && !dwellProven && now < pressAt + LONG_PRESS_MS
+          ? 'pressed'
+          : phase;
       const touchCount = maxTouches;
-      const wasMultiMoved = multiMoved;
+      const wasMultiTapDisqualified = multiTapDisqualified;
       exitDpad();
       phase = 'idle';
       maxTouches = 0;
-      multiMoved = false;
+      multiTapDisqualified = false;
       dwellProven = false;
-      timerPromotionAwaitingMove = false;
 
       if (wasPhase === 'ignored' || wasPhase === 'dpad') {
         lastTap = null;
@@ -308,7 +415,7 @@ export function createTouchGestureController(deps: GestureDeps) {
       if (touchCount > 1) {
         if (
           touchCount === 3 &&
-          !wasMultiMoved &&
+          !wasMultiTapDisqualified &&
           now - pressAt <= MULTI_TAP_MS
         ) {
           deps.paste();
@@ -335,19 +442,19 @@ export function createTouchGestureController(deps: GestureDeps) {
     },
 
     /** Run due work: long-press promotion and D-pad key repeats. */
-    onTimer(now: number): void {
-      if (phase === 'pressed' && now - pressAt >= LONG_PRESS_MS) {
-        promoteToDpad(true);
+    onTimer(nowForScheduling: number): void {
+      if (phase === 'pressed' && nowForScheduling >= pressAt + LONG_PRESS_MS) {
+        promoteToDpad();
         return;
       }
       if (
         phase === 'dpad' &&
         dir &&
         nextRepeatAt !== null &&
-        now >= nextRepeatAt
+        nowForScheduling >= nextRepeatAt
       ) {
-        deps.sendArrow(dir);
-        scheduleRepeatFrom(now);
+        dispatchArrow(dir, nowForScheduling);
+        scheduleRepeatFrom(nowForScheduling);
       }
     },
 
@@ -369,9 +476,8 @@ export function createTouchGestureController(deps: GestureDeps) {
       exitDpad();
       phase = 'idle';
       maxTouches = 0;
-      multiMoved = false;
+      multiTapDisqualified = false;
       dwellProven = false;
-      timerPromotionAwaitingMove = false;
       lastTap = null;
     },
   };
@@ -496,7 +602,8 @@ export function installTerminalTouchGestures(
   };
   const onMove = (e: TouchEvent) => {
     if (
-      controller.onTouchMove(toPoint(e), e.timeStamp).prevent &&
+      controller.onTouchMove(toPoint(e), e.timeStamp, performance.now())
+        .prevent &&
       e.cancelable
     ) {
       e.preventDefault();

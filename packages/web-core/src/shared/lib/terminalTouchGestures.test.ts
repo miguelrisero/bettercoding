@@ -3,14 +3,18 @@ import { describe, it, expect } from 'vitest';
 import type { ArrowKey } from './terminalKeySequences';
 import {
   createTouchGestureController,
+  DEMOTE_GUARD_MS,
   dpadBadgeText,
   dpadDirection,
   dpadZone,
+  dpadZoneWithHysteresis,
   DOUBLE_TAP_MS,
   DPAD_DEAD_ZONE_PX,
   DPAD_ZONES,
   LONG_PRESS_MS,
+  MIN_ARROW_INTERVAL_MS,
   TAP_SLOP_PX,
+  ZONE_HYSTERESIS_PX,
 } from './terminalTouchGestures';
 
 function harness({ enabled = true } = {}) {
@@ -65,13 +69,52 @@ describe('dpadDirection', () => {
 describe('dpadZone', () => {
   it('uses half-open distance boundaries', () => {
     expect(dpadZone(DPAD_DEAD_ZONE_PX)).toBe(1);
-    expect(dpadZone(63)).toBe(1);
-    expect(dpadZone(64)).toBe(2);
-    expect(dpadZone(113)).toBe(2);
-    expect(dpadZone(114)).toBe(3);
-    expect(dpadZone(163)).toBe(3);
-    expect(dpadZone(164)).toBe(4);
+    expect(dpadZone(47)).toBe(1);
+    expect(dpadZone(48)).toBe(2);
+    expect(dpadZone(87)).toBe(2);
+    expect(dpadZone(88)).toBe(3);
+    expect(dpadZone(127)).toBe(3);
+    expect(dpadZone(128)).toBe(4);
     expect(dpadZone(10_000)).toBe(4);
+  });
+});
+
+describe('dpadZoneWithHysteresis', () => {
+  it('enters zones above and leaves zones below their hysteresis bands', () => {
+    expect(
+      dpadZoneWithHysteresis(DPAD_DEAD_ZONE_PX + ZONE_HYSTERESIS_PX - 1, 0)
+    ).toBe(0);
+    expect(
+      dpadZoneWithHysteresis(DPAD_DEAD_ZONE_PX + ZONE_HYSTERESIS_PX, 0)
+    ).toBe(1);
+
+    for (const zone of [2, 3, 4] as const) {
+      const boundary = DPAD_ZONES[zone - 1].minDistance;
+      expect(
+        dpadZoneWithHysteresis(boundary + ZONE_HYSTERESIS_PX - 1, zone - 1)
+      ).toBe(zone - 1);
+      expect(
+        dpadZoneWithHysteresis(boundary + ZONE_HYSTERESIS_PX, zone - 1)
+      ).toBe(zone);
+      expect(dpadZoneWithHysteresis(boundary - ZONE_HYSTERESIS_PX, zone)).toBe(
+        zone
+      );
+      expect(
+        dpadZoneWithHysteresis(boundary - ZONE_HYSTERESIS_PX - 1, zone)
+      ).toBe(zone - 1);
+    }
+
+    expect(
+      dpadZoneWithHysteresis(DPAD_DEAD_ZONE_PX - ZONE_HYSTERESIS_PX, 1)
+    ).toBe(1);
+    expect(
+      dpadZoneWithHysteresis(DPAD_DEAD_ZONE_PX - ZONE_HYSTERESIS_PX - 1, 1)
+    ).toBe(0);
+  });
+
+  it('can cross multiple zones in one sample', () => {
+    expect(dpadZoneWithHysteresis(10_000, 0)).toBe(4);
+    expect(dpadZoneWithHysteresis(0, 4)).toBe(0);
   });
 });
 
@@ -112,7 +155,10 @@ describe('long-press D-pad', () => {
     ctrl.onTouchStart(p(100, 100), 0);
     runTimersUntil(ctrl, LONG_PRESS_MS);
     const t0 = LONG_PRESS_MS + 10;
-    ctrl.onTouchMove(p(100, 100 + DPAD_DEAD_ZONE_PX + 5), t0);
+    ctrl.onTouchMove(
+      p(100, 100 + DPAD_DEAD_ZONE_PX + ZONE_HYSTERESIS_PX + 1),
+      t0
+    );
     expect(arrows).toEqual(['down']);
     expect(ctrl.nextTimerAt()).toBeNull();
     ctrl.onTimer(t0 + 10_000);
@@ -125,11 +171,13 @@ describe('long-press D-pad', () => {
     ctrl.onTouchStart(p(100, 100), 0);
     runTimersUntil(ctrl, LONG_PRESS_MS);
     const t0 = LONG_PRESS_MS + 10;
-    ctrl.onTouchMove(p(100, 120), t0);
-    ctrl.onTouchMove(p(100, 102), t0 + 10);
-    ctrl.onTouchMove(p(100, 120), t0 + 20);
-    ctrl.onTouchMove(p(100, 102), t0 + 30);
-    ctrl.onTouchMove(p(100, 120), t0 + 40);
+    const engagedY = 100 + DPAD_DEAD_ZONE_PX + ZONE_HYSTERESIS_PX + 1;
+    const deadY = 100 + DPAD_DEAD_ZONE_PX - ZONE_HYSTERESIS_PX - 1;
+    ctrl.onTouchMove(p(100, engagedY), t0);
+    ctrl.onTouchMove(p(100, deadY), t0 + MIN_ARROW_INTERVAL_MS / 2);
+    ctrl.onTouchMove(p(100, engagedY), t0 + MIN_ARROW_INTERVAL_MS);
+    ctrl.onTouchMove(p(100, deadY), t0 + MIN_ARROW_INTERVAL_MS * 1.5);
+    ctrl.onTouchMove(p(100, engagedY), t0 + MIN_ARROW_INTERVAL_MS * 2);
     expect(arrows).toEqual(['down', 'down', 'down']);
     expect(ctrl.nextTimerAt()).toBeNull();
   });
@@ -154,8 +202,11 @@ describe('long-press D-pad', () => {
     ctrl.onTouchStart(p(100, 100), 0);
     runTimersUntil(ctrl, LONG_PRESS_MS);
     const t0 = LONG_PRESS_MS + 10;
-    ctrl.onTouchMove(p(100, 120), t0);
-    const outwardAt = t0 + 50;
+    ctrl.onTouchMove(
+      p(100, 100 + DPAD_DEAD_ZONE_PX + ZONE_HYSTERESIS_PX + 1),
+      t0
+    );
+    const outwardAt = t0 + MIN_ARROW_INTERVAL_MS;
     ctrl.onTouchMove(p(100, 264), outwardAt);
     expect(DPAD_ZONES[3].repeatMs).toBe(250);
     expect(arrows).toEqual(['down', 'down']);
@@ -186,7 +237,12 @@ describe('long-press D-pad', () => {
     ctrl.onTouchStart(p(100, 100), 0);
     runTimersUntil(ctrl, LONG_PRESS_MS);
     const t0 = LONG_PRESS_MS + 10;
-    ctrl.onTouchMove(p(100, 164), t0);
+    ctrl.onTouchMove(
+      p(100, 100 + DPAD_ZONES[2].minDistance + ZONE_HYSTERESIS_PX + 1),
+      t0
+    );
+    expect(ctrl.nextTimerAt()).not.toBeNull();
+
     ctrl.onTouchMove(p(100, 120), t0 + 100);
     expect(arrows).toEqual(['down']);
     expect(ctrl.nextTimerAt()).toBeNull();
@@ -234,14 +290,90 @@ describe('long-press D-pad', () => {
   });
 });
 
-describe('scroll handoff', () => {
-  it('rejects a coalesced fast swipe delivered after the deadline', () => {
+describe('D-pad hysteresis and dispatch floor', () => {
+  it('absorbs 20 jitter moves around every zone boundary', () => {
+    const { ctrl, arrows } = harness();
+
+    for (const [index, zone] of ([2, 3, 4] as const).entries()) {
+      const startedAt = index * 5_000;
+      const boundary = DPAD_ZONES[zone - 1].minDistance;
+      ctrl.onTouchStart(p(100, 100), startedAt);
+      runTimersUntil(ctrl, startedAt + LONG_PRESS_MS);
+      const engagedAt = startedAt + LONG_PRESS_MS + 10;
+      ctrl.onTouchMove(
+        p(100, 100 + boundary + ZONE_HYSTERESIS_PX + 1),
+        engagedAt
+      );
+
+      for (let move = 0; move < 20; move += 1) {
+        const distance = boundary + (move % 2 === 0 ? -5 : 5);
+        ctrl.onTouchMove(p(100, 100 + distance), engagedAt + (move + 1) * 5);
+      }
+
+      expect(arrows).toHaveLength(index + 1);
+      ctrl.onTouchEnd(0, engagedAt + 110);
+    }
+  });
+
+  it('does not re-arm on dead-zone-edge thumb jitter', () => {
+    const { ctrl, arrows } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    runTimersUntil(ctrl, LONG_PRESS_MS);
+    const engagedAt = LONG_PRESS_MS + 10;
+    ctrl.onTouchMove(
+      p(100, 100 + DPAD_DEAD_ZONE_PX + ZONE_HYSTERESIS_PX + 1),
+      engagedAt
+    );
+
+    for (let move = 0; move < 20; move += 1) {
+      const distance = DPAD_DEAD_ZONE_PX + (move % 2 === 0 ? -5 : 5);
+      ctrl.onTouchMove(p(100, 100 + distance), engagedAt + (move + 1) * 10);
+    }
+
+    expect(arrows).toEqual(['down']);
+  });
+
+  it('holds the incumbent axis through a near-45-degree drag', () => {
+    const { ctrl, arrows } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    runTimersUntil(ctrl, LONG_PRESS_MS);
+    const engagedAt = LONG_PRESS_MS + 10;
+    ctrl.onTouchMove(p(130, 128), engagedAt);
+
+    for (let move = 0; move < 10; move += 1) {
+      const [dx, dy] = move % 2 === 0 ? [28, 30] : [30, 28];
+      ctrl.onTouchMove(p(100 + dx, 100 + dy), engagedAt + (move + 1) * 150);
+    }
+
+    expect(arrows).toEqual(['right']);
+    ctrl.onTouchMove(p(120, 131), engagedAt + 1_650);
+    expect(arrows).toEqual(['right', 'down']);
+  });
+
+  it('drops an arrow dispatched inside the global rate floor', () => {
     const { ctrl, arrows, dpad } = harness();
     ctrl.onTouchStart(p(100, 100), 0);
-    const r = ctrl.onTouchMove(p(100, 100 + TAP_SLOP_PX + 5), 400);
-    expect(r.prevent).toBe(false);
-    expect(dpad).toEqual([]);
-    expect(arrows).toEqual([]);
+    runTimersUntil(ctrl, LONG_PRESS_MS);
+    const engagedAt = LONG_PRESS_MS + 10;
+    ctrl.onTouchMove(p(100, 130), engagedAt);
+    ctrl.onTouchMove(p(140, 100), engagedAt + MIN_ARROW_INTERVAL_MS - 1);
+
+    expect(arrows).toEqual(['down']);
+    expect(dpad.at(-1)).toEqual({ active: true, dir: 'right' });
+
+    ctrl.onTouchMove(p(60, 100), engagedAt + MIN_ARROW_INTERVAL_MS);
+    expect(arrows).toEqual(['down', 'left']);
+  });
+});
+
+describe('scroll handoff', () => {
+  it('accepts a drag whose event timestamp proves the dwell', () => {
+    const { ctrl, arrows, dpad } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    const r = ctrl.onTouchMove(p(100, 130), 400);
+    expect(r.prevent).toBe(true);
+    expect(dpad[0]).toEqual({ active: true, dir: null });
+    expect(arrows).toEqual(['down']);
   });
 
   it('stands down when the finger moves before the long-press delay', () => {
@@ -342,6 +474,21 @@ describe('three-finger tap = paste', () => {
     ctrl.onTouchEnd(0, 2_000);
     expect(events).toEqual([]);
   });
+
+  it('does not paste after the sequence promoted and fired D-pad arrows', () => {
+    const { ctrl, arrows, events } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    runTimersUntil(ctrl, LONG_PRESS_MS);
+    ctrl.onTouchMove(p(100, 140), LONG_PRESS_MS + 10);
+    ctrl.onTouchStart(p(120, 100, 2), LONG_PRESS_MS + 20);
+    ctrl.onTouchStart(p(140, 100, 3), LONG_PRESS_MS + 30);
+    ctrl.onTouchEnd(2, LONG_PRESS_MS + 80);
+    ctrl.onTouchEnd(1, LONG_PRESS_MS + 90);
+    ctrl.onTouchEnd(0, LONG_PRESS_MS + 100);
+
+    expect(arrows).toEqual(['down']);
+    expect(events).not.toContain('paste');
+  });
 });
 
 describe('select mode (disabled layer)', () => {
@@ -385,6 +532,35 @@ describe('timer starvation + cancellation (council round 1)', () => {
     expect(arrows).toEqual([]);
   });
 
+  it('keeps demotion armed across an innocent queued in-slop move', () => {
+    const { ctrl, arrows, dpad } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    ctrl.onTimer(400);
+
+    expect(ctrl.onTouchMove(p(100, 105), 100, 400)).toEqual({
+      prevent: true,
+    });
+    const result = ctrl.onTouchMove(p(100, 180), 200, 400);
+
+    expect(result).toEqual({ prevent: false });
+    expect(arrows).toEqual([]);
+    expect(dpad.at(-1)).toEqual({ active: false, dir: null });
+    expect(ctrl.nextTimerAt()).toBeNull();
+  });
+
+  it('keeps a near-deadline drag in D-pad mode inside the guard band', () => {
+    const { ctrl, arrows, dpad } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    ctrl.onTimer(400);
+    const dragAt = LONG_PRESS_MS - Math.floor(DEMOTE_GUARD_MS / 3);
+
+    const result = ctrl.onTouchMove(p(100, 180), dragAt, 400);
+
+    expect(result).toEqual({ prevent: true });
+    expect(arrows).toEqual(['down']);
+    expect(dpad.at(-1)).toEqual({ active: true, dir: 'down' });
+  });
+
   it('keeps timer promotion after an in-slop post-deadline move', () => {
     const { ctrl, arrows, dpad } = harness();
     ctrl.onTouchStart(p(100, 100), 0);
@@ -404,14 +580,42 @@ describe('timer starvation + cancellation (council round 1)', () => {
     expect(dpad).toEqual([]);
   });
 
+  it('recovers queued pre-deadline touchends as double-tap input', () => {
+    const { ctrl, events } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    ctrl.onTimer(400);
+    ctrl.onTouchEnd(0, 120);
+
+    ctrl.onTouchStart(p(100, 100), 200);
+    ctrl.onTimer(600);
+    ctrl.onTouchEnd(0, 320);
+
+    expect(events).toEqual(['tab']);
+  });
+
+  it('schedules repeats from delivery time, not a stale move timestamp', () => {
+    const { ctrl, arrows } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    ctrl.onTimer(1_000);
+    ctrl.onTouchMove(p(100, 240), 400, 1_000);
+
+    expect(arrows).toEqual(['down']);
+    expect(ctrl.nextTimerAt()).toBe(1_250);
+    ctrl.onTimer(1_000);
+    expect(arrows).toEqual(['down']);
+  });
+
   it('cancel() releases an active D-pad and stops repeats', () => {
-    const { ctrl, dpad } = harness();
+    const { ctrl, arrows, dpad } = harness();
     ctrl.onTouchStart(p(100, 100), 0);
     runTimersUntil(ctrl, LONG_PRESS_MS);
-    ctrl.onTouchMove(p(100, 150), LONG_PRESS_MS + 10);
+    ctrl.onTouchMove(p(100, 170), LONG_PRESS_MS + 10);
+    expect(ctrl.nextTimerAt()).not.toBeNull();
     ctrl.cancel();
     expect(dpad.at(-1)).toEqual({ active: false, dir: null });
     expect(ctrl.nextTimerAt()).toBeNull();
+    ctrl.onTimer(10_000);
+    expect(arrows).toEqual(['down']);
     // A stray touchend after cancel is a no-op.
     ctrl.onTouchEnd(0, LONG_PRESS_MS + 100);
     expect(dpad.at(-1)).toEqual({ active: false, dir: null });
