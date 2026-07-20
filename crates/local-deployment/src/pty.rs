@@ -952,10 +952,29 @@ const DEFAULT_CLI_TMUX_SOCKET: &str = "bettercoding";
 // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
 const DEFAULT_LEGACY_CLI_TMUX_SOCKET: &str = "vibe-kanban";
 
-/// Dedicated socket for newly-created CLI sessions. The override is a test/dev
-/// seam for scratch verification and parallel dev stacks that must not touch
-/// the production socket; unit tests pass explicit sockets to `_on` helpers
-/// instead of mutating process-global environment variables.
+fn resolve_cli_tmux_sockets(
+    current_override: Option<String>,
+    legacy_override: Option<String>,
+    current_default: &str,
+    legacy_default: &str,
+) -> (String, String) {
+    let current = current_override.unwrap_or_else(|| current_default.to_string());
+    let legacy = legacy_override.unwrap_or_else(|| {
+        if current == current_default {
+            legacy_default.to_string()
+        } else {
+            format!("{current}-legacy")
+        }
+    });
+    (current, legacy)
+}
+
+/// Dedicated socket for newly-created CLI sessions. A value that differs from
+/// the compiled default also moves an otherwise-unset legacy socket to
+/// `<current>-legacy`, keeping test/dev stacks away from production. Both
+/// environment overrides are cached on their first respective lookup; unit
+/// tests exercise [`resolve_cli_tmux_sockets`] without mutating process-global
+/// environment variables.
 pub(crate) fn cli_tmux_socket() -> &'static str {
     static SOCKET: OnceLock<String> = OnceLock::new();
     SOCKET
@@ -967,15 +986,23 @@ pub(crate) fn cli_tmux_socket() -> &'static str {
 }
 
 /// Legacy socket lookup seam for live sessions created before the identity
-/// migration. Like the current override, this is intended for test/dev stacks;
-/// unit tests use explicit scratch sockets and never set it.
+/// migration. An explicit `BC_CLI_TMUX_LEGACY_SOCKET` always wins; otherwise a
+/// non-default current socket derives `<current>-legacy`, while the compiled
+/// current socket keeps the production legacy default. The legacy override is
+/// read once, and the current value comes from [`cli_tmux_socket`]'s read-once
+/// cache.
 // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
 pub(crate) fn legacy_cli_tmux_socket() -> &'static str {
     static SOCKET: OnceLock<String> = OnceLock::new();
     SOCKET
         .get_or_init(|| {
-            std::env::var("BC_CLI_TMUX_LEGACY_SOCKET")
-                .unwrap_or_else(|_| DEFAULT_LEGACY_CLI_TMUX_SOCKET.to_string())
+            resolve_cli_tmux_sockets(
+                Some(cli_tmux_socket().to_string()),
+                std::env::var("BC_CLI_TMUX_LEGACY_SOCKET").ok(),
+                DEFAULT_CLI_TMUX_SOCKET,
+                DEFAULT_LEGACY_CLI_TMUX_SOCKET,
+            )
+            .1
         })
         .as_str()
 }
@@ -2427,6 +2454,58 @@ impl Default for PtyService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_tmux_socket_pair_uses_both_compiled_defaults() {
+        assert_eq!(
+            resolve_cli_tmux_sockets(
+                None,
+                None,
+                DEFAULT_CLI_TMUX_SOCKET,
+                DEFAULT_LEGACY_CLI_TMUX_SOCKET,
+            ),
+            ("bettercoding".to_string(), "vibe-kanban".to_string())
+        );
+    }
+
+    #[test]
+    fn cli_tmux_socket_pair_derives_legacy_from_current_override() {
+        assert_eq!(
+            resolve_cli_tmux_sockets(
+                Some("dev-stack".to_string()),
+                None,
+                DEFAULT_CLI_TMUX_SOCKET,
+                DEFAULT_LEGACY_CLI_TMUX_SOCKET,
+            ),
+            ("dev-stack".to_string(), "dev-stack-legacy".to_string())
+        );
+    }
+
+    #[test]
+    fn cli_tmux_socket_pair_respects_both_explicit_overrides() {
+        assert_eq!(
+            resolve_cli_tmux_sockets(
+                Some("dev-stack".to_string()),
+                Some("old-dev-stack".to_string()),
+                DEFAULT_CLI_TMUX_SOCKET,
+                DEFAULT_LEGACY_CLI_TMUX_SOCKET,
+            ),
+            ("dev-stack".to_string(), "old-dev-stack".to_string())
+        );
+    }
+
+    #[test]
+    fn cli_tmux_socket_pair_respects_explicit_legacy_with_default_current() {
+        assert_eq!(
+            resolve_cli_tmux_sockets(
+                None,
+                Some("legacy-override".to_string()),
+                DEFAULT_CLI_TMUX_SOCKET,
+                DEFAULT_LEGACY_CLI_TMUX_SOCKET,
+            ),
+            ("bettercoding".to_string(), "legacy-override".to_string())
+        );
+    }
 
     #[test]
     fn cli_session_names_are_namespaced_and_tmux_safe() {
