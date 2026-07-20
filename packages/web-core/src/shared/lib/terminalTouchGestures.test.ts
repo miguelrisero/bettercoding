@@ -302,6 +302,8 @@ describe('D-pad hysteresis and dispatch floor', () => {
   it('absorbs 20 jitter moves around every zone boundary', () => {
     const { ctrl, arrows } = harness();
 
+    // Give every pass its own event-time window: this isolates hysteresis from
+    // the independent, sequence-scoped dispatch floor.
     for (const [index, zone] of ([2, 3, 4] as const).entries()) {
       const startedAt = index * 5_000;
       const boundary = DPAD_ZONES[zone - 1].minDistance;
@@ -371,6 +373,39 @@ describe('D-pad hysteresis and dispatch floor', () => {
 
     ctrl.onTouchMove(p(60, 100), engagedAt + MIN_ARROW_INTERVAL_MS);
     expect(arrows).toEqual(['down', 'left']);
+  });
+
+  it('keeps the existing repeat deadline after a throttled direction change', () => {
+    const { ctrl, arrows } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    runTimersUntil(ctrl, LONG_PRESS_MS);
+    const engagedAt = LONG_PRESS_MS + 10;
+    ctrl.onTouchMove(p(100, 164), engagedAt);
+    const promisedRepeatAt = engagedAt + DPAD_REPEAT_SLOW_MS;
+    expect(ctrl.nextTimerAt()).toBe(promisedRepeatAt);
+
+    ctrl.onTouchMove(p(164, 100), engagedAt + MIN_ARROW_INTERVAL_MS - 1);
+
+    expect(arrows).toEqual(['down']);
+    expect(ctrl.nextTimerAt()).toBe(promisedRepeatAt);
+    ctrl.onTimer(promisedRepeatAt);
+    expect(arrows).toEqual(['down', 'right']);
+  });
+
+  it('resets the dispatch floor between touch sequences', () => {
+    const { ctrl, arrows } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    ctrl.onTimer(1_000);
+    ctrl.onTouchMove(p(100, 180), 400, 1_000);
+    ctrl.onTouchEnd(0, 450);
+
+    // Compress delivery time to expose a leaked floor independently of the
+    // long-press delay that normally makes the coupling unreachable.
+    ctrl.onTouchStart(p(100, 100), 500);
+    ctrl.onTimer(1_001);
+    ctrl.onTouchMove(p(100, 180), 900, 1_001);
+
+    expect(arrows).toEqual(['down', 'down']);
   });
 });
 
@@ -567,6 +602,28 @@ describe('timer starvation + cancellation (council round 1)', () => {
     expect(result).toEqual({ prevent: true });
     expect(arrows).toEqual(['down']);
     expect(dpad.at(-1)).toEqual({ active: true, dir: 'down' });
+  });
+
+  it('does not recover guard-band arrows as double-tap input', () => {
+    const { ctrl, arrows, events } = harness();
+    const guardBandDragAt = LONG_PRESS_MS - Math.floor(DEMOTE_GUARD_MS / 3);
+
+    for (const startedAt of [0, 500]) {
+      const deliveredAt = startedAt + LONG_PRESS_MS + 50;
+      ctrl.onTouchStart(p(100, 100), startedAt);
+      ctrl.onTimer(deliveredAt);
+      ctrl.onTouchMove(p(100, 180), startedAt + guardBandDragAt, deliveredAt);
+      ctrl.onTouchEnd(0, startedAt + LONG_PRESS_MS - 1);
+    }
+
+    expect(arrows).toEqual(['down', 'down']);
+    expect(events).not.toContain('tab');
+
+    ctrl.onTouchStart(p(100, 100), 1_000);
+    ctrl.onTouchEnd(0, 1_030);
+    ctrl.onTouchStart(p(100, 100), 1_100);
+    ctrl.onTouchEnd(0, 1_130);
+    expect(events.filter((event) => event === 'tab')).toEqual(['tab']);
   });
 
   it('keeps timer promotion after an in-slop post-deadline move', () => {

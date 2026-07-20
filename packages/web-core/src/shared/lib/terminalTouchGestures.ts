@@ -31,6 +31,10 @@ import {
  * cadence and the dispatch rate floor use handler-delivery time instead, so a
  * stale queued event cannot create an already-overdue repeat. The DOM adapter
  * supplies `e.timeStamp` for the former and `performance.now()` for the latter.
+ * This split has one load-bearing premise: `TouchEvent.timeStamp` shares
+ * `performance.now()`'s time origin, as it does in current browsers.
+ * `onTimer`/`nextTimerAt` compare `pressAt + LONG_PRESS_MS` against that
+ * delivery clock, so re-validate the premise when supporting a new platform.
  */
 
 export const LONG_PRESS_MS = 350;
@@ -41,6 +45,11 @@ export const DOUBLE_TAP_MS = 300;
  * can carry a coalesced timestamp just below the deadline; demoting it would
  * silently drop the gesture with no feedback. Genuine fast swipes cross slop
  * within roughly 30–50ms of touchstart, far outside this guard band.
+ *
+ * The tradeoff is real: someone who holds still for 290–350ms and then flicks
+ * to scroll can be read as a D-pad if delivery trails the timer by even ~5–10ms;
+ * without the band, that gesture would scroll. Keep the band narrow and do not
+ * widen it without weighing that cost.
  */
 export const DEMOTE_GUARD_MS = 60;
 /** Drag distance (px) from the press origin before arrows start firing. */
@@ -211,6 +220,8 @@ export function createTouchGestureController(deps: GestureDeps) {
   let multiTapDisqualified = false;
   /** Any move timestamped at/after the deadline proves this sequence dwelled. */
   let dwellProven = false;
+  /** At least one arrow was actually sent during the current touch sequence. */
+  let arrowDispatched = false;
   // D-pad repeat state.
   let dir: ArrowKey | null = null;
   let zone: DpadZone | 0 = 0;
@@ -237,6 +248,7 @@ export function createTouchGestureController(deps: GestureDeps) {
       return false;
     }
     deps.sendArrow(direction);
+    arrowDispatched = true;
     lastArrowAt = nowForScheduling;
     return true;
   };
@@ -261,6 +273,8 @@ export function createTouchGestureController(deps: GestureDeps) {
     onTouchStart(p: GesturePoint, now: number): void {
       if (p.touches === 1) {
         dwellProven = false;
+        arrowDispatched = false;
+        lastArrowAt = null;
         multiTapDisqualified = false;
         maxTouches = 1;
         if (!deps.isEnabled()) {
@@ -279,6 +293,8 @@ export function createTouchGestureController(deps: GestureDeps) {
         // three-finger tap). Initialize here or `pressAt` would be stale
         // from the previous gesture and the select-mode gate skipped.
         dwellProven = false;
+        arrowDispatched = false;
+        lastArrowAt = null;
         multiTapDisqualified = false;
         maxTouches = p.touches;
         if (!deps.isEnabled()) {
@@ -370,12 +386,14 @@ export function createTouchGestureController(deps: GestureDeps) {
       if (nextDir !== dir) {
         dir = nextDir;
         zone = nextZone;
-        nextRepeatAt = null;
         if (dir) {
           // Engage and direction changes are always responsive; zone 1 then
           // stays discrete until the finger returns to the dead zone.
-          dispatchArrow(dir, nowForScheduling);
-          scheduleRepeatFrom(nowForScheduling);
+          if (dispatchArrow(dir, nowForScheduling)) {
+            scheduleRepeatFrom(nowForScheduling);
+          }
+        } else {
+          nextRepeatAt = null;
         }
         deps.setDpad(true, dir, zone || 1, dpadOrigin());
       } else if (dir && nextZone !== zone) {
@@ -383,8 +401,9 @@ export function createTouchGestureController(deps: GestureDeps) {
         zone = nextZone as DpadZone;
         const repeatMs = DPAD_ZONES[zone - 1].repeatMs;
         if (zone > previousZone) {
-          dispatchArrow(dir, nowForScheduling);
-          scheduleRepeatFrom(nowForScheduling);
+          if (dispatchArrow(dir, nowForScheduling)) {
+            scheduleRepeatFrom(nowForScheduling);
+          }
         } else if (repeatMs === null) {
           nextRepeatAt = null;
         } else {
@@ -405,7 +424,10 @@ export function createTouchGestureController(deps: GestureDeps) {
     onTouchEnd(remainingTouches: number, now: number): void {
       if (remainingTouches > 0) return; // wait for the last finger
       const wasPhase =
-        phase === 'dpad' && !dwellProven && now < pressAt + LONG_PRESS_MS
+        phase === 'dpad' &&
+        !dwellProven &&
+        !arrowDispatched &&
+        now < pressAt + LONG_PRESS_MS
           ? 'pressed'
           : phase;
       const touchCount = maxTouches;
@@ -415,6 +437,8 @@ export function createTouchGestureController(deps: GestureDeps) {
       maxTouches = 0;
       multiTapDisqualified = false;
       dwellProven = false;
+      arrowDispatched = false;
+      lastArrowAt = null;
 
       if (wasPhase === 'ignored' || wasPhase === 'dpad') {
         lastTap = null;
@@ -486,6 +510,8 @@ export function createTouchGestureController(deps: GestureDeps) {
       maxTouches = 0;
       multiTapDisqualified = false;
       dwellProven = false;
+      arrowDispatched = false;
+      lastArrowAt = null;
       lastTap = null;
     },
   };
