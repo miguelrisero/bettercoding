@@ -1603,14 +1603,31 @@ pub(crate) fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliTmuxSessionRow {
+    session_name: String,
+    workspace_id: Uuid,
+    attached: bool,
+    idle_secs: i64,
+}
+
+/// One socket's bounded `list-sessions` outcome. A normal no-server exit is
+/// definitively empty; inability to obtain a trustworthy answer is failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CliTmuxSocketSnapshot {
+    Rows(Vec<CliTmuxSessionRow>),
+    Empty,
+    Failed(String),
+}
+
 /// List our CLI tmux sessions for the reaper: `(workspace_id, attached,
 /// idle_secs)` for every current `bc_*` and legacy `vk_*` session across both
-/// sockets, merged per workspace with the safest liveness values. Returns empty
-/// when tmux is unavailable or neither server is running. Other namespaces are
-/// ignored, so a user-created session is never reaped.
-pub async fn list_cli_tmux_sessions() -> Vec<(Uuid, bool, i64)> {
+/// sockets, merged per workspace with the safest liveness values. An unreadable
+/// socket fails the entire snapshot so the reaper cannot act on a partial view.
+/// Other namespaces are ignored, so a user-created session is never reaped.
+pub async fn list_cli_tmux_sessions() -> Result<Vec<(Uuid, bool, i64)>, String> {
     if !tmux_available() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     list_cli_tmux_sessions_on(&[
         cli_tmux_socket(),
@@ -1620,35 +1637,84 @@ pub async fn list_cli_tmux_sessions() -> Vec<(Uuid, bool, i64)> {
     .await
 }
 
-async fn list_cli_tmux_sessions_on(sockets: &[&str]) -> Vec<(Uuid, bool, i64)> {
+async fn list_cli_tmux_sessions_on(sockets: &[&str]) -> Result<Vec<(Uuid, bool, i64)>, String> {
     let now = now_unix_secs();
-    let mut sessions = Vec::new();
+    let mut snapshots = Vec::with_capacity(sockets.len());
     for socket in sockets {
-        let output = tokio::process::Command::new("tmux")
-            .args([
-                "-L",
-                socket,
-                "list-sessions",
-                "-F",
-                "#{session_name}\t#{session_attached}\t#{session_activity}",
-            ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .await;
-        let stdout = match output {
-            Ok(output) if output.status.success() => output.stdout,
-            // No server / no sessions on one socket must not hide the other.
-            _ => continue,
-        };
-        for session in String::from_utf8_lossy(&stdout)
-            .lines()
-            .filter_map(|line| parse_cli_session_line(line, now))
-        {
-            merge_cli_tmux_session_liveness(&mut sessions, session);
+        snapshots.push(list_cli_tmux_socket_on(socket, now).await);
+    }
+    merge_cli_tmux_socket_snapshots(snapshots)
+}
+
+async fn list_cli_tmux_socket_on(socket: &str, now: i64) -> CliTmuxSocketSnapshot {
+    let output = match run_cli_tmux_output(&[
+        "-L",
+        socket,
+        "list-sessions",
+        "-F",
+        "#{session_name}\t#{session_attached}\t#{session_activity}",
+    ])
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return CliTmuxSocketSnapshot::Failed(format!("socket {socket}: {error}"));
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if cli_tmux_list_exit_is_definitively_empty(&stderr) {
+            return CliTmuxSocketSnapshot::Empty;
+        }
+        return CliTmuxSocketSnapshot::Failed(format!(
+            "socket {socket}: tmux list-sessions exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+
+    let rows: Vec<_> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| parse_cli_session_row(line, now))
+        .collect();
+    if rows.is_empty() {
+        CliTmuxSocketSnapshot::Empty
+    } else {
+        CliTmuxSocketSnapshot::Rows(rows)
+    }
+}
+
+fn cli_tmux_list_exit_is_definitively_empty(stderr: &str) -> bool {
+    stderr.contains("no server running")
+        || stderr.contains("No such file or directory")
+        || stderr.contains("Connection refused")
+}
+
+fn merge_cli_tmux_socket_snapshots(
+    snapshots: impl IntoIterator<Item = CliTmuxSocketSnapshot>,
+) -> Result<Vec<(Uuid, bool, i64)>, String> {
+    let mut sessions = Vec::new();
+    let mut failures = Vec::new();
+    for snapshot in snapshots {
+        match snapshot {
+            CliTmuxSocketSnapshot::Rows(rows) => {
+                for row in rows {
+                    merge_cli_tmux_session_liveness(
+                        &mut sessions,
+                        (row.workspace_id, row.attached, row.idle_secs),
+                    );
+                }
+            }
+            CliTmuxSocketSnapshot::Empty => {}
+            CliTmuxSocketSnapshot::Failed(error) => failures.push(error),
         }
     }
-    sessions
+    if failures.is_empty() {
+        Ok(sessions)
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 fn merge_cli_tmux_session_liveness(
@@ -1671,31 +1737,160 @@ fn merge_cli_tmux_session_liveness(
 
 /// Parse one `name\tattached\tactivity` tmux row into `(workspace_id, attached,
 /// idle_secs)`, accepting current `bc_` and legacy `vk_` names only.
+#[cfg(test)]
 fn parse_cli_session_line(line: &str, now: i64) -> Option<(Uuid, bool, i64)> {
-    let mut parts = line.split('\t');
-    let workspace_id = workspace_id_from_cli_session_name(parts.next()?)?;
-    let attached = parts.next()?.trim() != "0";
-    let activity: i64 = parts.next()?.trim().parse().ok()?;
-    Some((workspace_id, attached, (now - activity).max(0)))
+    let row = parse_cli_session_row(line, now)?;
+    Some((row.workspace_id, row.attached, row.idle_secs))
 }
 
-/// Fresh `(attached, idle_secs)` for one CLI session, or `None` if it no longer
-/// exists. The reaper calls this immediately before killing as a TOCTOU recheck,
-/// so a session that was attached or became active since the list snapshot is
-/// spared.
+fn parse_cli_session_row(line: &str, now: i64) -> Option<CliTmuxSessionRow> {
+    let mut parts = line.split('\t');
+    let session_name = parts.next()?.to_string();
+    let workspace_id = workspace_id_from_cli_session_name(&session_name)?;
+    let attached = parts.next()?.trim() != "0";
+    let activity: i64 = parts.next()?.trim().parse().ok()?;
+    Some(CliTmuxSessionRow {
+        session_name,
+        workspace_id,
+        attached,
+        idle_secs: (now - activity).max(0),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CliTmuxHomeLiveness {
+    Present { attached: bool, idle_secs: i64 },
+    Absent,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CliTmuxSessionLiveness {
+    current: CliTmuxHomeLiveness,
+    legacy: CliTmuxHomeLiveness,
+}
+
+fn cli_tmux_home_liveness(
+    snapshot: CliTmuxSocketSnapshot,
+    session_name: &str,
+) -> CliTmuxHomeLiveness {
+    match snapshot {
+        CliTmuxSocketSnapshot::Rows(rows) => rows
+            .into_iter()
+            .find(|row| row.session_name == session_name)
+            .map(|row| CliTmuxHomeLiveness::Present {
+                attached: row.attached,
+                idle_secs: row.idle_secs,
+            })
+            .unwrap_or(CliTmuxHomeLiveness::Absent),
+        CliTmuxSocketSnapshot::Empty => CliTmuxHomeLiveness::Absent,
+        CliTmuxSocketSnapshot::Failed(_) => CliTmuxHomeLiveness::Unknown,
+    }
+}
+
+/// Fresh per-home liveness for one workspace. The reaper calls this immediately
+/// before killing as a TOCTOU recheck. A failed home is `Unknown`, never absent,
+/// and is therefore ineligible for a guarded kill.
 ///
 /// Implemented by re-listing rather than `tmux display-message`: display-message
 /// resolves formats in a client/pane context and returns EMPTY for the
 /// session-scoped `#{session_attached}` / `#{session_activity}` there, which made
 /// this recheck always parse to `None` and silently disabled the whole reaper.
-/// `list-sessions` (used here) populates those fields correctly, and already
-/// no-ops cleanly when tmux is unavailable.
-pub async fn cli_tmux_session_liveness(workspace_id: Uuid) -> Option<(bool, i64)> {
-    list_cli_tmux_sessions()
-        .await
-        .into_iter()
-        .find(|(id, _, _)| *id == workspace_id)
-        .map(|(_, attached, idle)| (attached, idle))
+/// `list-sessions` (used here) populates those fields correctly.
+async fn cli_tmux_session_liveness_on(
+    workspace_id: Uuid,
+    current_socket: &str,
+    legacy_socket: &str,
+) -> CliTmuxSessionLiveness {
+    let now = now_unix_secs();
+    let current = list_cli_tmux_socket_on(current_socket, now).await;
+    let legacy = list_cli_tmux_socket_on(legacy_socket, now).await;
+    CliTmuxSessionLiveness {
+        current: cli_tmux_home_liveness(current, &cli_tmux_session_name(workspace_id)),
+        legacy: cli_tmux_home_liveness(legacy, &legacy_cli_tmux_session_name(workspace_id)),
+    }
+}
+
+pub(crate) async fn cli_tmux_session_liveness(workspace_id: Uuid) -> CliTmuxSessionLiveness {
+    if !tmux_available() {
+        return CliTmuxSessionLiveness {
+            current: CliTmuxHomeLiveness::Absent,
+            legacy: CliTmuxHomeLiveness::Absent,
+        };
+    }
+    cli_tmux_session_liveness_on(workspace_id, cli_tmux_socket(), legacy_cli_tmux_socket()).await
+}
+
+async fn kill_cli_tmux_home_on(
+    home: CliTmuxHome,
+    workspace_id: Uuid,
+    current_socket: &str,
+    legacy_socket: &str,
+) -> bool {
+    let (socket, session_name) =
+        cli_tmux_target_on(home, workspace_id, current_socket, legacy_socket);
+    run_cli_tmux(&[
+        "-L",
+        socket,
+        "kill-session",
+        "-t",
+        &format!("={session_name}"),
+    ])
+    .await
+    .is_ok()
+}
+
+async fn reap_cli_tmux_session_with_liveness_on(
+    workspace_id: Uuid,
+    minimum_idle_secs: i64,
+    current_socket: &str,
+    legacy_socket: &str,
+    liveness: CliTmuxSessionLiveness,
+) -> usize {
+    let mut killed = 0;
+    for (home, state) in [
+        (CliTmuxHome::Current, liveness.current),
+        (CliTmuxHome::Legacy, liveness.legacy),
+    ] {
+        match state {
+            CliTmuxHomeLiveness::Present {
+                attached: false,
+                idle_secs,
+            } if idle_secs >= minimum_idle_secs => {
+                if kill_cli_tmux_home_on(home, workspace_id, current_socket, legacy_socket).await {
+                    killed += 1;
+                }
+            }
+            CliTmuxHomeLiveness::Unknown => tracing::warn!(
+                workspace_id = %workspace_id,
+                home = ?home,
+                "Reaper: CLI tmux home liveness is unknown; leaving it untouched"
+            ),
+            _ => {}
+        }
+    }
+    killed
+}
+
+/// Guarded periodic-reaper kill. Unlike explicit workspace cleanup, this makes
+/// an independent fresh decision for each home and never kills an attached,
+/// fresh, or unknown home.
+pub(crate) async fn reap_cli_tmux_session_if_inactive(
+    workspace_id: Uuid,
+    minimum_idle_secs: i64,
+) -> usize {
+    if !tmux_available() {
+        return 0;
+    }
+    let liveness = cli_tmux_session_liveness(workspace_id).await;
+    reap_cli_tmux_session_with_liveness_on(
+        workspace_id,
+        minimum_idle_secs,
+        cli_tmux_socket(),
+        legacy_cli_tmux_socket(),
+        liveness,
+    )
+    .await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3434,10 +3629,117 @@ mod tests {
         pair.legacy
             .start_session(&legacy_cli_tmux_session_name(legacy_id));
 
-        let sessions =
-            list_cli_tmux_sessions_on(&[&pair.current.socket, &pair.legacy.socket]).await;
+        let sessions = list_cli_tmux_sessions_on(&[&pair.current.socket, &pair.legacy.socket])
+            .await
+            .expect("both scratch socket snapshots should succeed");
         assert!(sessions.iter().any(|(id, _, _)| *id == current_id));
         assert!(sessions.iter().any(|(id, _, _)| *id == legacy_id));
+    }
+
+    #[tokio::test]
+    async fn failed_socket_snapshot_aborts_reaper_round_before_any_kill() {
+        if !tmux_available() {
+            return;
+        }
+        let pair = scratch_tmux_pair();
+        let workspace_id = Uuid::new_v4();
+        let current_name = cli_tmux_session_name(workspace_id);
+        let legacy_name = legacy_cli_tmux_session_name(workspace_id);
+        pair.current.start_session(&current_name);
+        pair.legacy.start_session(&legacy_name);
+
+        // The failed current-socket snapshot may be hiding an attached copy.
+        // Even though the visible legacy row looks reapable, the periodic
+        // round gets no candidates and therefore cannot kill either home.
+        let round = merge_cli_tmux_socket_snapshots([
+            CliTmuxSocketSnapshot::Failed("injected current query failure".to_string()),
+            CliTmuxSocketSnapshot::Rows(vec![CliTmuxSessionRow {
+                session_name: legacy_name.clone(),
+                workspace_id,
+                attached: false,
+                idle_secs: 10_000,
+            }]),
+        ]);
+        assert!(round.is_err(), "a partial snapshot must abort the round");
+
+        assert_eq!(
+            probe_tmux_session_on(&pair.current.socket, &current_name).await,
+            CliTmuxSessionProbe::Present
+        );
+        assert_eq!(
+            probe_tmux_session_on(&pair.legacy.socket, &legacy_name).await,
+            CliTmuxSessionProbe::Present
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_reaper_kills_idle_legacy_but_keeps_fresh_current_home() {
+        if !tmux_available() {
+            return;
+        }
+        let pair = scratch_tmux_pair();
+        let workspace_id = Uuid::new_v4();
+        let current_name = cli_tmux_session_name(workspace_id);
+        let legacy_name = legacy_cli_tmux_session_name(workspace_id);
+        pair.current.start_session(&current_name);
+        pair.legacy.start_session(&legacy_name);
+
+        let killed = reap_cli_tmux_session_with_liveness_on(
+            workspace_id,
+            60,
+            &pair.current.socket,
+            &pair.legacy.socket,
+            CliTmuxSessionLiveness {
+                current: CliTmuxHomeLiveness::Present {
+                    attached: false,
+                    idle_secs: 5,
+                },
+                legacy: CliTmuxHomeLiveness::Present {
+                    attached: false,
+                    idle_secs: 120,
+                },
+            },
+        )
+        .await;
+
+        assert_eq!(killed, 1);
+        assert_eq!(
+            probe_tmux_session_on(&pair.current.socket, &current_name).await,
+            CliTmuxSessionProbe::Present
+        );
+        assert_eq!(
+            probe_tmux_session_on(&pair.legacy.socket, &legacy_name).await,
+            CliTmuxSessionProbe::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_reaper_never_kills_an_unknown_home() {
+        if !tmux_available() {
+            return;
+        }
+        let pair = scratch_tmux_pair();
+        let workspace_id = Uuid::new_v4();
+        let current_name = cli_tmux_session_name(workspace_id);
+        pair.current.start_session(&current_name);
+
+        let killed = reap_cli_tmux_session_with_liveness_on(
+            workspace_id,
+            0,
+            &pair.current.socket,
+            &pair.legacy.socket,
+            CliTmuxSessionLiveness {
+                current: CliTmuxHomeLiveness::Unknown,
+                legacy: CliTmuxHomeLiveness::Absent,
+            },
+        )
+        .await;
+
+        assert_eq!(killed, 0);
+        assert_eq!(
+            probe_tmux_session_on(&pair.current.socket, &current_name).await,
+            CliTmuxSessionProbe::Present
+        );
     }
 
     #[test]
