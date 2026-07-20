@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::pty::{
-    CliClientPresence, PtyService, cli_tmux_socket, now_unix_secs,
+    CliClientPresence, PtyService, cli_tmux_socket, legacy_cli_tmux_socket, now_unix_secs,
     refresh_cli_tmux_client_ignore_size, run_cli_tmux, tmux_available, tmux_client_flags_supported,
     workspace_id_from_cli_session_name,
 };
@@ -131,6 +131,11 @@ struct TmuxClientRow {
     client_name: String,
     client_activity: i64,
     ignore_size: bool,
+}
+
+struct SocketTmuxClientRow {
+    socket: &'static str,
+    client: TmuxClientRow,
 }
 
 /// Parse one tab-delimited `list-clients` row and discard clients outside our
@@ -237,8 +242,8 @@ pub struct CliActivityMonitor;
 
 #[derive(Default)]
 struct ClientSizeSweepState {
-    refresh_failures: HashMap<u32, ClientSizeRefreshFailure>,
-    seen_client_pids: HashSet<u32>,
+    refresh_failures: HashMap<(&'static str, u32), ClientSizeRefreshFailure>,
+    seen_clients: HashSet<(&'static str, u32)>,
 }
 
 struct ClientSizeRefreshFailure {
@@ -380,32 +385,69 @@ impl CliActivityMonitor {
     }
 }
 
-/// Reconcile tmux's per-client flag with web presence. One list command gives
-/// every field needed for every workspace. Steady state stops there; a batch
-/// with transitions takes one fresh PID/name snapshot before any mutation.
+async fn list_cli_tmux_clients_on(socket: &str) -> Result<Vec<TmuxClientRow>, String> {
+    let output = run_cli_tmux(&[
+        "-L",
+        socket,
+        "list-clients",
+        "-F",
+        "#{client_pid}\t#{client_name}\t#{client_activity}\t#{client_flags}\t#{session_name}",
+    ])
+    .await?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_cli_client_line)
+        .collect())
+}
+
+async fn fresh_cli_tmux_client_map_on(socket: &str) -> Result<HashMap<u32, String>, String> {
+    let output = run_cli_tmux(&[
+        "-L",
+        socket,
+        "list-clients",
+        "-F",
+        "#{client_pid}\t#{client_name}",
+    ])
+    .await?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, name) = line.split_once('\t')?;
+            let pid = pid.trim().parse().ok()?;
+            (!name.is_empty()).then(|| (pid, name.to_string()))
+        })
+        .collect())
+}
+
+/// Reconcile tmux's per-client flag with web presence. One list command per
+/// socket gives every field needed for every workspace. Steady state stops
+/// there; sockets with transitions take one fresh PID/name snapshot before any
+/// mutation.
 async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepState) {
     if !tmux_client_flags_supported() {
         return;
     }
 
-    let output = match run_cli_tmux(&[
-        "-L",
+    let sockets = [
         cli_tmux_socket(),
-        "list-clients",
-        "-F",
-        "#{client_pid}\t#{client_name}\t#{client_activity}\t#{client_flags}\t#{session_name}",
-    ])
-    .await
-    {
-        Ok(output) => output,
-        Err(e) => {
-            tracing::debug!("Failed to list tmux clients for size sweep: {e}");
-            return;
+        // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+        legacy_cli_tmux_socket(),
+    ];
+    let mut clients = Vec::new();
+    for socket in sockets {
+        match list_cli_tmux_clients_on(socket).await {
+            Ok(rows) => clients.extend(
+                rows.into_iter()
+                    .map(|client| SocketTmuxClientRow { socket, client }),
+            ),
+            Err(e) => {
+                tracing::debug!(socket, "Failed to list tmux clients for size sweep: {e}");
+            }
         }
-    };
+    }
 
     // LOAD-BEARING ORDERING — do not harmlessly swap these snapshots. The
-    // sweep reads tmux flags above BEFORE snapshotting presence here, while
+    // sweep reads both servers' tmux flags above BEFORE snapshotting presence, while
     // the event path writes the presence registry BEFORE refreshing tmux.
     // A race can therefore only make this sweep re-issue an event decision;
     // it cannot observe the new tmux flag with the old registry state and
@@ -414,22 +456,23 @@ async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepSt
     let now_instant = std::time::Instant::now();
     let now_unix = now_unix_secs();
 
-    let clients: Vec<_> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(parse_cli_client_line)
-        .collect();
-    let previous_client_pids = std::mem::replace(
-        &mut state.seen_client_pids,
-        clients.iter().map(|client| client.client_pid).collect(),
+    let previous_clients = std::mem::replace(
+        &mut state.seen_clients,
+        clients
+            .iter()
+            .map(|located| (located.socket, located.client.client_pid))
+            .collect(),
     );
-    state.refresh_failures.retain(|client_pid, failure| {
-        clients.iter().any(|client| {
-            client.client_pid == *client_pid && client.client_name == failure.client_name
+    state.refresh_failures.retain(|key, failure| {
+        clients.iter().any(|located| {
+            (located.socket, located.client.client_pid) == *key
+                && located.client.client_name == failure.client_name
         })
     });
 
-    let mut transitions = Vec::new();
-    for client in clients {
+    let mut transitions: HashMap<&'static str, Vec<(TmuxClientRow, bool)>> = HashMap::new();
+    for SocketTmuxClientRow { socket, client } in clients {
+        let key = (socket, client.client_pid);
         let input_idle_secs = now_unix.saturating_sub(client.client_activity).max(0) as u64;
         let sizing_presence = presence
             .get(&client.client_pid)
@@ -437,109 +480,102 @@ async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepSt
         let Some(desired_ignore) = desired_ignore_client_size(
             input_idle_secs,
             sizing_presence,
-            previous_client_pids.contains(&client.client_pid),
+            previous_clients.contains(&key),
         ) else {
             continue;
         };
         if desired_ignore == client.ignore_size {
-            state.refresh_failures.remove(&client.client_pid);
+            state.refresh_failures.remove(&key);
             continue;
         }
-        transitions.push((client, desired_ignore));
+        transitions
+            .entry(socket)
+            .or_default()
+            .push((client, desired_ignore));
     }
 
-    if transitions.is_empty() {
-        return;
-    }
-
-    let output = match run_cli_tmux(&[
-        "-L",
-        cli_tmux_socket(),
-        "list-clients",
-        "-F",
-        "#{client_pid}\t#{client_name}",
-    ])
-    .await
-    {
-        Ok(output) => output,
-        Err(e) => {
-            tracing::debug!("Failed to refresh tmux client map for size transitions: {e}");
-            return;
-        }
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let fresh_clients: HashMap<u32, &str> = stdout
-        .lines()
-        .filter_map(|line| {
-            let (pid, name) = line.split_once('\t')?;
-            let pid = pid.trim().parse().ok()?;
-            (!name.is_empty()).then_some((pid, name))
-        })
-        .collect();
-
-    for (client, desired_ignore) in transitions {
-        // `client_name` is a /dev/pts/N path and can be recycled after the
-        // sweep snapshot. The fresh batch rejects mappings already stale when
-        // it was taken; it cannot lock tmux across the async refresh loop, so
-        // any later detach/name reuse remains repair work for the next sweep.
-        match fresh_clients.get(&client.client_pid).copied() {
-            Some(fresh_name) if fresh_name == client.client_name => {}
-            Some(fresh_name) => {
-                state.refresh_failures.remove(&client.client_pid);
-                tracing::debug!(
-                    client_name = %client.client_name,
-                    client_pid = client.client_pid,
-                    resolved_name = %fresh_name,
-                    "Skipping stale tmux client size transition"
-                );
-                continue;
-            }
-            None => {
-                state.refresh_failures.remove(&client.client_pid);
-                tracing::debug!(
-                    client_name = %client.client_name,
-                    client_pid = client.client_pid,
-                    "Skipping vanished tmux client size transition"
-                );
-                continue;
-            }
-        }
-
-        match refresh_cli_tmux_client_ignore_size(&client.client_name, desired_ignore).await {
-            Ok(()) => {
-                state.refresh_failures.remove(&client.client_pid);
-            }
+    for socket in sockets {
+        let Some(socket_transitions) = transitions.remove(socket) else {
+            continue;
+        };
+        let fresh_clients = match fresh_cli_tmux_client_map_on(socket).await {
+            Ok(clients) => clients,
             Err(e) => {
-                let failure = state
-                    .refresh_failures
-                    .entry(client.client_pid)
-                    .or_insert_with(|| ClientSizeRefreshFailure {
-                        client_name: client.client_name.clone(),
-                        count: 0,
-                    });
-                if failure.client_name != client.client_name {
-                    failure.client_name.clone_from(&client.client_name);
-                    failure.count = 0;
-                }
-                failure.count = failure.count.saturating_add(1);
-                if failure.count == 2 {
-                    tracing::warn!(
+                tracing::debug!(
+                    socket,
+                    "Failed to refresh tmux client map for size transitions: {e}"
+                );
+                continue;
+            }
+        };
+
+        for (client, desired_ignore) in socket_transitions {
+            let key = (socket, client.client_pid);
+            // `client_name` is a /dev/pts/N path and can be recycled after the
+            // sweep snapshot. The fresh batch rejects mappings already stale
+            // when it was taken; later reuse is repaired by the next sweep.
+            match fresh_clients.get(&client.client_pid).map(String::as_str) {
+                Some(fresh_name) if fresh_name == client.client_name => {}
+                Some(fresh_name) => {
+                    state.refresh_failures.remove(&key);
+                    tracing::debug!(
+                        socket,
                         client_name = %client.client_name,
                         client_pid = client.client_pid,
-                        error = %e,
-                        "Failed to reconcile tmux client size twice consecutively"
+                        resolved_name = %fresh_name,
+                        "Skipping stale tmux client size transition"
                     );
                     continue;
                 }
-                // First and later failures stay at debug; the second failure
-                // above is the single operator signal until success resets it.
-                tracing::debug!(
-                    client_name = %client.client_name,
-                    client_pid = client.client_pid,
-                    error = %e,
-                    consecutive_failures = failure.count,
-                    "Failed to reconcile tmux client size"
-                );
+                None => {
+                    state.refresh_failures.remove(&key);
+                    tracing::debug!(
+                        socket,
+                        client_name = %client.client_name,
+                        client_pid = client.client_pid,
+                        "Skipping vanished tmux client size transition"
+                    );
+                    continue;
+                }
+            }
+
+            match refresh_cli_tmux_client_ignore_size(socket, &client.client_name, desired_ignore)
+                .await
+            {
+                Ok(()) => {
+                    state.refresh_failures.remove(&key);
+                }
+                Err(e) => {
+                    let failure = state.refresh_failures.entry(key).or_insert_with(|| {
+                        ClientSizeRefreshFailure {
+                            client_name: client.client_name.clone(),
+                            count: 0,
+                        }
+                    });
+                    if failure.client_name != client.client_name {
+                        failure.client_name.clone_from(&client.client_name);
+                        failure.count = 0;
+                    }
+                    failure.count = failure.count.saturating_add(1);
+                    if failure.count == 2 {
+                        tracing::warn!(
+                            socket,
+                            client_name = %client.client_name,
+                            client_pid = client.client_pid,
+                            error = %e,
+                            "Failed to reconcile tmux client size twice consecutively"
+                        );
+                        continue;
+                    }
+                    tracing::debug!(
+                        socket,
+                        client_name = %client.client_name,
+                        client_pid = client.client_pid,
+                        error = %e,
+                        consecutive_failures = failure.count,
+                        "Failed to reconcile tmux client size"
+                    );
+                }
             }
         }
     }
@@ -604,59 +640,76 @@ fn next_state(
 /// tmux server isn't running (which is indistinguishable from — and treated
 /// as — "no sessions").
 async fn observe_tmux() -> Option<HashMap<Uuid, Observation>> {
-    let output = tokio::process::Command::new("tmux")
-        .args([
-            "-L",
-            cli_tmux_socket(),
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}|#{pane_pid}|#{window_activity}|#{session_attached}",
-        ])
-        .output()
-        .await
-        .ok()?;
+    observe_tmux_on(&[
+        cli_tmux_socket(),
+        // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+        legacy_cli_tmux_socket(),
+    ])
+    .await
+}
 
-    if !output.status.success() {
+async fn observe_tmux_on(sockets: &[&str]) -> Option<HashMap<Uuid, Observation>> {
+    let mut outputs = Vec::new();
+    for socket in sockets {
+        let output = tokio::process::Command::new("tmux")
+            .args([
+                "-L",
+                socket,
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}|#{pane_pid}|#{window_activity}|#{session_attached}",
+            ])
+            .output()
+            .await;
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            outputs.push(output.stdout);
+        }
+    }
+    if outputs.is_empty() {
         return None;
     }
 
     let procs = snapshot_processes();
 
     let mut observations: HashMap<Uuid, Observation> = HashMap::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let mut fields = line.split('|');
-        let (Some(session_name), Some(pane_pid), Some(activity), Some(attached)) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        let Some(workspace_id) = workspace_id_from_cli_session_name(session_name) else {
-            continue;
-        };
+    for output in outputs {
+        for line in String::from_utf8_lossy(&output).lines() {
+            let mut fields = line.split('|');
+            let (Some(session_name), Some(pane_pid), Some(activity), Some(attached)) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let Some(workspace_id) = workspace_id_from_cli_session_name(session_name) else {
+                continue;
+            };
 
-        let last_activity: i64 = activity.trim().parse().unwrap_or(0);
-        let attached = attached.trim().parse::<i64>().unwrap_or(0) > 0;
-        let claude_like = pane_pid
-            .trim()
-            .parse::<u32>()
-            .map(|pid| subtree_has_claude(pid, &procs))
-            .unwrap_or(false);
+            let last_activity: i64 = activity.trim().parse().unwrap_or(0);
+            let attached = attached.trim().parse::<i64>().unwrap_or(0) > 0;
+            let claude_like = pane_pid
+                .trim()
+                .parse::<u32>()
+                .map(|pid| subtree_has_claude(pid, &procs))
+                .unwrap_or(false);
 
-        // A session can have several panes (manual splits); aggregate to the
-        // most "alive" view of it.
-        observations
-            .entry(workspace_id)
-            .and_modify(|o| {
-                o.claude_like |= claude_like;
-                o.last_activity = o.last_activity.max(last_activity);
-                o.attached |= attached;
-            })
-            .or_insert(Observation {
-                claude_like,
-                last_activity,
-                attached,
-            });
+            // A session can have several panes (manual splits), and a workspace
+            // can be double-homed during migration; aggregate the most alive view.
+            observations
+                .entry(workspace_id)
+                .and_modify(|o| {
+                    o.claude_like |= claude_like;
+                    o.last_activity = o.last_activity.max(last_activity);
+                    o.attached |= attached;
+                })
+                .or_insert(Observation {
+                    claude_like,
+                    last_activity,
+                    attached,
+                });
+        }
     }
 
     Some(observations)
@@ -768,10 +821,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_tabbed_cli_client_and_finds_ignore_size_between_flags() {
+    fn parses_current_and_legacy_cli_clients_and_finds_ignore_size() {
         let row = parse_cli_client_line(
             "4242\t/dev/pts/30\t999900\tattached,ignore-size,focused\t\
-             vk_00000000000000000000000000000001",
+             bc_00000000000000000000000000000001",
         )
         .expect("valid CLI client row");
         assert_eq!(
@@ -909,8 +962,11 @@ mod tests {
     #[test]
     fn session_names_round_trip() {
         let id = Uuid::new_v4();
-        let name = crate::pty::cli_tmux_session_name(id);
-        assert_eq!(workspace_id_from_cli_session_name(&name), Some(id));
+        let current = crate::pty::cli_tmux_session_name(id);
+        let legacy = format!("vk_{}", id.simple());
+        assert_eq!(workspace_id_from_cli_session_name(&current), Some(id));
+        assert_eq!(workspace_id_from_cli_session_name(&legacy), Some(id));
+        assert_eq!(workspace_id_from_cli_session_name("bc_short"), None);
         assert_eq!(workspace_id_from_cli_session_name("vk_short"), None);
         assert_eq!(workspace_id_from_cli_session_name("other_session"), None);
     }

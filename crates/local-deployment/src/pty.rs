@@ -1493,28 +1493,61 @@ pub async fn list_cli_tmux_sessions() -> Vec<(Uuid, bool, i64)> {
     if !tmux_available() {
         return Vec::new();
     }
-    let output = tokio::process::Command::new("tmux")
-        .args([
-            "-L",
-            cli_tmux_socket(),
-            "list-sessions",
-            "-F",
-            "#{session_name}\t#{session_attached}\t#{session_activity}",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await;
-    let stdout = match output {
-        Ok(o) if o.status.success() => o.stdout,
-        // Non-zero exit (no server / no sessions) or spawn error => nothing to reap.
-        _ => return Vec::new(),
-    };
+    list_cli_tmux_sessions_on(&[
+        cli_tmux_socket(),
+        // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+        legacy_cli_tmux_socket(),
+    ])
+    .await
+}
+
+async fn list_cli_tmux_sessions_on(sockets: &[&str]) -> Vec<(Uuid, bool, i64)> {
     let now = now_unix_secs();
-    String::from_utf8_lossy(&stdout)
-        .lines()
-        .filter_map(|line| parse_cli_session_line(line, now))
-        .collect()
+    let mut sessions = Vec::new();
+    for socket in sockets {
+        let output = tokio::process::Command::new("tmux")
+            .args([
+                "-L",
+                socket,
+                "list-sessions",
+                "-F",
+                "#{session_name}\t#{session_attached}\t#{session_activity}",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await;
+        let stdout = match output {
+            Ok(output) if output.status.success() => output.stdout,
+            // No server / no sessions on one socket must not hide the other.
+            _ => continue,
+        };
+        for session in String::from_utf8_lossy(&stdout)
+            .lines()
+            .filter_map(|line| parse_cli_session_line(line, now))
+        {
+            merge_cli_tmux_session_liveness(&mut sessions, session);
+        }
+    }
+    sessions
+}
+
+fn merge_cli_tmux_session_liveness(
+    sessions: &mut Vec<(Uuid, bool, i64)>,
+    candidate: (Uuid, bool, i64),
+) {
+    let (workspace_id, attached, idle_secs) = candidate;
+    if let Some((_, existing_attached, existing_idle)) = sessions
+        .iter_mut()
+        .find(|(existing_id, _, _)| *existing_id == workspace_id)
+    {
+        // Double-homed workspaces are only safe to reap when BOTH copies are
+        // detached and old enough; preserve the most protective combined view.
+        *existing_attached |= attached;
+        *existing_idle = (*existing_idle).min(idle_secs);
+    } else {
+        sessions.push((workspace_id, attached, idle_secs));
+    }
 }
 
 /// Parse one `name\tattached\tactivity` tmux row into `(workspace_id, attached,
@@ -2228,8 +2261,8 @@ impl PtyService {
         // Two rapid transitions can finish out of order; the periodic sweep
         // repairs any resulting divergence within one sweep period.
         tokio::spawn(async move {
-            let client_name = match cli_tmux_client_name(client_pid).await {
-                Ok(Some(client_name)) => client_name,
+            let (socket, client_name) = match cli_tmux_client_name(client_pid).await {
+                Ok(Some(location)) => location,
                 Ok(None) => {
                     tracing::debug!(
                         "tmux client pid {client_pid} not found for CLI presence update"
@@ -2241,9 +2274,11 @@ impl PtyService {
                     return;
                 }
             };
-            if let Err(e) = refresh_cli_tmux_client_ignore_size(&client_name, !visible).await {
+            if let Err(e) =
+                refresh_cli_tmux_client_ignore_size(socket, &client_name, !visible).await
+            {
                 tracing::debug!(
-                    "Failed to update ignore-size for tmux client {client_name} (pid {client_pid}): {e}"
+                    "Failed to update ignore-size for tmux client {client_name} on {socket} (pid {client_pid}): {e}"
                 );
             }
         });
@@ -2287,10 +2322,10 @@ impl PtyService {
     }
 }
 
-pub(crate) async fn cli_tmux_client_name(client_pid: u32) -> Result<Option<String>, String> {
+async fn cli_tmux_client_name_on(socket: &str, client_pid: u32) -> Result<Option<String>, String> {
     let output = run_cli_tmux(&[
         "-L",
-        cli_tmux_socket(),
+        socket,
         "list-clients",
         "-F",
         "#{client_pid}\t#{client_name}",
@@ -2305,7 +2340,31 @@ pub(crate) async fn cli_tmux_client_name(client_pid: u32) -> Result<Option<Strin
         }))
 }
 
+pub(crate) async fn cli_tmux_client_name(
+    client_pid: u32,
+) -> Result<Option<(&'static str, String)>, String> {
+    let sockets = [
+        cli_tmux_socket(),
+        // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+        legacy_cli_tmux_socket(),
+    ];
+    let mut errors = Vec::new();
+    for socket in sockets {
+        match cli_tmux_client_name_on(socket, client_pid).await {
+            Ok(Some(client_name)) => return Ok(Some((socket, client_name))),
+            Ok(None) => {}
+            Err(error) => errors.push(format!("{socket}: {error}")),
+        }
+    }
+    if errors.len() == sockets.len() {
+        Err(errors.join("; "))
+    } else {
+        Ok(None)
+    }
+}
+
 pub(crate) async fn refresh_cli_tmux_client_ignore_size(
+    socket: &str,
     client_name: &str,
     ignore_size: bool,
 ) -> Result<(), String> {
@@ -2316,7 +2375,7 @@ pub(crate) async fn refresh_cli_tmux_client_ignore_size(
     };
     run_cli_tmux(&[
         "-L",
-        cli_tmux_socket(),
+        socket,
         "refresh-client",
         "-t",
         client_name,
@@ -3010,6 +3069,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_list_sweeps_current_and_legacy_scratch_sockets() {
+        if !tmux_available() {
+            return;
+        }
+        let pair = scratch_tmux_pair();
+        let current_id = Uuid::new_v4();
+        let legacy_id = Uuid::new_v4();
+        pair.current
+            .start_session(&cli_tmux_session_name(current_id));
+        pair.legacy
+            .start_session(&legacy_cli_tmux_session_name(legacy_id));
+
+        let sessions =
+            list_cli_tmux_sessions_on(&[&pair.current.socket, &pair.legacy.socket]).await;
+        assert!(sessions.iter().any(|(id, _, _)| *id == current_id));
+        assert!(sessions.iter().any(|(id, _, _)| *id == legacy_id));
+    }
+
+    #[test]
+    fn double_homed_liveness_keeps_attached_and_most_recent_state() {
+        let workspace_id = Uuid::new_v4();
+        let mut sessions = Vec::new();
+        merge_cli_tmux_session_liveness(&mut sessions, (workspace_id, false, 900));
+        merge_cli_tmux_session_liveness(&mut sessions, (workspace_id, true, 30));
+
+        assert_eq!(sessions, vec![(workspace_id, true, 30)]);
+    }
+
+    #[tokio::test]
+    async fn kill_removes_legacy_session_on_scratch_socket() {
+        if !tmux_available() {
+            return;
+        }
+        let pair = scratch_tmux_pair();
+        let workspace_id = Uuid::new_v4();
+        let legacy_name = legacy_cli_tmux_session_name(workspace_id);
+        pair.legacy.start_session(&legacy_name);
+        assert!(tmux_session_exists_on(&pair.legacy.socket, &legacy_name).await);
+
+        kill_cli_tmux_sessions_on(workspace_id, &pair.current.socket, &pair.legacy.socket).await;
+
+        assert!(!tmux_session_exists_on(&pair.legacy.socket, &legacy_name).await);
+    }
+
     #[test]
     fn ensure_reconciles_window_size_in_both_capability_directions() {
         if !tmux_client_flags_supported() {
@@ -3074,25 +3178,33 @@ mod tests {
 
     #[test]
     fn parse_cli_session_line_reads_attached_and_idle() {
-        let id = "vk_00000000000000000000000000000001";
-        // activity 900, now 1000 -> idle 100; attached "0" -> false
-        let (_, attached, idle) =
-            parse_cli_session_line(&format!("{id}\t0\t900"), 1000).expect("valid line parses");
-        assert!(!attached);
-        assert_eq!(idle, 100);
-        // attached count > 0 -> true
-        let (_, attached, _) = parse_cli_session_line(&format!("{id}\t1\t900"), 1000).unwrap();
-        assert!(attached);
+        for id in [
+            "bc_00000000000000000000000000000001",
+            "vk_00000000000000000000000000000001",
+        ] {
+            // activity 900, now 1000 -> idle 100; attached "0" -> false
+            let (_, attached, idle) =
+                parse_cli_session_line(&format!("{id}\t0\t900"), 1000).expect("valid line parses");
+            assert!(!attached);
+            assert_eq!(idle, 100);
+            // attached count > 0 -> true
+            let (_, attached, _) = parse_cli_session_line(&format!("{id}\t1\t900"), 1000).unwrap();
+            assert!(attached);
+        }
     }
 
     #[test]
     fn parse_cli_session_line_rejects_malformed() {
-        let id = "vk_00000000000000000000000000000001";
-        // Empty fields — the `tmux display-message` failure mode that silently
-        // disabled the reaper — must NOT parse to a bogus liveness value.
-        assert!(parse_cli_session_line(&format!("{id}\t\t"), 1000).is_none());
-        // Missing columns.
-        assert!(parse_cli_session_line(id, 1000).is_none());
+        for id in [
+            "bc_00000000000000000000000000000001",
+            "vk_00000000000000000000000000000001",
+        ] {
+            // Empty fields — the `tmux display-message` failure mode that silently
+            // disabled the reaper — must NOT parse to a bogus liveness value.
+            assert!(parse_cli_session_line(&format!("{id}\t\t"), 1000).is_none());
+            // Missing columns.
+            assert!(parse_cli_session_line(id, 1000).is_none());
+        }
         // Non-vk session names are ignored entirely.
         assert!(parse_cli_session_line("misc\t0\t900", 1000).is_none());
     }
