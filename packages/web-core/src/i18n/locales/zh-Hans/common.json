@@ -70,6 +70,16 @@
     "assistant": "Claude",
     "viaCli": "通过 CLI",
     "cliSessionActive": "CLI 会话活跃",
+    "quarantine": {
+      "affordance": "未分配的 CLI",
+      "openLabel": "打开 {{count}} 个未分配的 CLI 对话",
+      "title": "未分配的 CLI 对话",
+      "description": "这些对话在此工作区中被发现，但尚未关联到应用对话。可将其中一个分配给当前打开的对话。",
+      "noPreview": "没有可用的提示预览",
+      "assign": "分配到此处",
+      "assigning": "正在分配…",
+      "error": "无法分配此对话，请重试。"
+    },
     "toolSummary": {
       "read": "读取 {{path}}",
       "searched": "搜索 \"{{query}}\"",

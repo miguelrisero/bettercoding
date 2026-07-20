@@ -70,6 +70,16 @@
     "assistant": "Claude",
     "viaCli": "via la CLI",
     "cliSessionActive": "Session CLI active",
+    "quarantine": {
+      "affordance": "CLI non attribuées",
+      "openLabel": "Ouvrir {{count}} conversations CLI non attribuées",
+      "title": "Conversations CLI non attribuées",
+      "description": "Ces conversations ont été trouvées dans cet espace de travail, mais ne sont liées à aucune conversation de l'application. Attribuez-en une à la conversation ouverte.",
+      "noPreview": "Aucun aperçu du message disponible",
+      "assign": "Attribuer ici",
+      "assigning": "Attribution…",
+      "error": "Cette conversation n'a pas pu être attribuée. Réessayez."
+    },
     "toolSummary": {
       "read": "Lu {{path}}",
       "searched": "Recherché \"{{query}}\"",

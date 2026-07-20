@@ -75,6 +75,16 @@
     "assistant": "Claude",
     "viaCli": "via CLI",
     "cliSessionActive": "CLI session active",
+    "quarantine": {
+      "affordance": "Unassigned CLI",
+      "openLabel": "Open {{count}} unassigned CLI conversations",
+      "title": "Unassigned CLI conversations",
+      "description": "These conversations were found in this workspace but are not linked to an app conversation. Assign one to the conversation currently open.",
+      "noPreview": "No prompt preview available",
+      "assign": "Assign here",
+      "assigning": "Assigning…",
+      "error": "This conversation could not be assigned. Try again."
+    },
     "toolSummary": {
       "read": "Read {{path}}",
       "searched": "Searched for \"{{query}}\"",

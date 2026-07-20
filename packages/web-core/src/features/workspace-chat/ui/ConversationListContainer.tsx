@@ -45,6 +45,7 @@ import {
   isNativeForkDisplayGroup,
 } from '@/shared/hooks/useConversationHistory/types';
 import { useConversationHistory } from '../model/hooks/useConversationHistory';
+import { useUnassignedCliSessions } from '../model/hooks/useUnassignedCliSessions';
 import { useSetTokenUsageInfo } from '../model/contexts/EntriesContext';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
 import type { NativeFeedOrigin, RepoWithTargetBranch } from 'shared/types';
@@ -54,6 +55,7 @@ import { ChatScriptPlaceholder } from '@vibe/ui/components/ChatScriptPlaceholder
 import { ScriptFixerDialog } from '@/shared/dialogs/scripts/ScriptFixerDialog';
 import { ChatForkBranches } from '@vibe/ui/components/ChatForkBranches';
 import { Badge } from '@vibe/ui/components/Badge';
+import { UnassignedCliSessions } from './UnassignedCliSessions';
 
 interface ConversationListProps {
   attempt: WorkspaceWithSession;
@@ -255,6 +257,10 @@ export const ConversationList = forwardRef<
 ) {
   const { t } = useTranslation('common');
   const repos = reposProp;
+  const unassignedCliSessions = useUnassignedCliSessions(
+    cliAvailable ? attempt.id : undefined,
+    cliAvailable ? attempt.session?.id : undefined
+  );
   const setWorkspacePanelState = useUiPreferencesStore(
     (s) => s.setWorkspacePanelState
   );
@@ -869,20 +875,28 @@ export const ConversationList = forwardRef<
   return (
     <ApprovalFormProvider>
       <div className="relative h-full overflow-hidden">
-        {cliSessionActive && (
-          <div className="pointer-events-none absolute right-double top-base z-20">
-            <Badge
-              role="status"
-              variant="outline"
-              className="gap-half border-border bg-primary/90 font-normal text-normal shadow-sm backdrop-blur-sm"
-            >
-              <CircleIcon
-                className="size-2 text-brand"
-                weight="fill"
-                aria-hidden="true"
-              />
-              {t('conversation.cliSessionActive')}
-            </Badge>
+        {(cliSessionActive || unassignedCliSessions.sessions.length > 0) && (
+          <div className="absolute right-double top-base z-20 flex max-w-[calc(100%_-_2rem)] flex-wrap justify-end gap-base">
+            <UnassignedCliSessions
+              sessions={unassignedCliSessions.sessions}
+              assigningSessionId={unassignedCliSessions.assigningSessionId}
+              error={unassignedCliSessions.error}
+              onAssign={unassignedCliSessions.assign}
+            />
+            {cliSessionActive && (
+              <Badge
+                role="status"
+                variant="outline"
+                className="pointer-events-none gap-half border-border bg-primary/90 font-normal text-normal shadow-sm backdrop-blur-sm"
+              >
+                <CircleIcon
+                  className="size-2 text-brand"
+                  weight="fill"
+                  aria-hidden="true"
+                />
+                {t('conversation.cliSessionActive')}
+              </Badge>
+            )}
           </div>
         )}
         {showLoader && (

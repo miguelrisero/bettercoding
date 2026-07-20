@@ -83,6 +83,16 @@
     "assistant": "Claude",
     "viaCli": "CLI 経由",
     "cliSessionActive": "CLI セッションがアクティブ",
+    "quarantine": {
+      "affordance": "未割り当ての CLI",
+      "openLabel": "未割り当ての CLI 会話 {{count}} 件を開く",
+      "title": "未割り当ての CLI 会話",
+      "description": "このワークスペースで見つかりましたが、アプリの会話にリンクされていません。現在開いている会話に割り当ててください。",
+      "noPreview": "プロンプトのプレビューはありません",
+      "assign": "ここに割り当て",
+      "assigning": "割り当て中…",
+      "error": "この会話を割り当てられませんでした。もう一度お試しください。"
+    },
     "toolSummary": {
       "read": "{{path}} を読み込み",
       "searched": "「{{query}}」を検索",

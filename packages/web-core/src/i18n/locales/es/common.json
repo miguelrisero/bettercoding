@@ -83,6 +83,16 @@
     "assistant": "Claude",
     "viaCli": "vía CLI",
     "cliSessionActive": "Sesión CLI activa",
+    "quarantine": {
+      "affordance": "CLI sin asignar",
+      "openLabel": "Abrir {{count}} conversaciones CLI sin asignar",
+      "title": "Conversaciones CLI sin asignar",
+      "description": "Estas conversaciones se encontraron en este workspace, pero no están vinculadas a una conversación de la aplicación. Asigna una a la conversación abierta.",
+      "noPreview": "No hay vista previa del mensaje",
+      "assign": "Asignar aquí",
+      "assigning": "Asignando…",
+      "error": "No se pudo asignar esta conversación. Inténtalo de nuevo."
+    },
     "toolSummary": {
       "read": "Leyó {{path}}",
       "searched": "Buscó \"{{query}}\"",
