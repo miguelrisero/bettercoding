@@ -46,6 +46,11 @@ const BRANCH_MAX_CHARS: usize = 40;
 const PROMPT_MAX_CHARS: usize = 2000;
 const CAPTURE_MAX_BYTES: usize = 64 * 1024;
 const LOG_SNIPPET_MAX_BYTES: usize = 256;
+// Bytes already written by a successful leader should normally arrive
+// immediately. A 400ms grace accommodates scheduling and pipe buffering while
+// preventing an inherited descriptor in a long-lived descendant from consuming
+// the remaining model-call budget.
+const PIPE_EOF_GRACE: Duration = Duration::from_millis(400);
 const GROUP_EXIT_BARRIER: Duration = Duration::from_secs(2);
 #[cfg(unix)]
 const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -343,30 +348,107 @@ async fn command_output_with_timeout(
     let mut child = ChildGroupGuard::new(cmd.group_spawn_no_window()?);
 
     let result = async {
-        let (mut stdin, stdout, stderr) = take_child_stdio(child.child_mut())?;
+        let (mut stdin, mut stdout, mut stderr) = take_child_stdio(child.child_mut())?;
+        // Keep capture ownership outside the cancellable chunk reads so grace
+        // expiry cannot discard bytes collected by earlier chunks.
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
 
-        let collect_output = async {
+        let (status, stdout_eof, stderr_eof, grace_expired) = {
+            enum CollectionEvent {
+                Prompt(io::Result<()>),
+                Stdout(io::Result<bool>),
+                Stderr(io::Result<bool>),
+            }
+
             let write_prompt = async {
                 stdin.write_all(prompt).await?;
                 stdin.shutdown().await
             };
-            let (status, (), stdout, stderr) = tokio::try_join!(
-                wait_for_leader_exit(child.child_mut()),
-                write_prompt,
-                read_bounded(stdout),
-                read_bounded(stderr),
-            )?;
-            Ok::<Output, io::Error>(Output {
-                status,
-                stdout,
-                stderr,
-            })
+            let wait_for_exit = wait_for_leader_exit(child.child_mut());
+            let call_timeout = tokio::time::sleep(timeout);
+            tokio::pin!(write_prompt, wait_for_exit, call_timeout);
+
+            let mut prompt_written = false;
+            let mut stdout_eof = false;
+            let mut stderr_eof = false;
+
+            let status = loop {
+                let io_event = async {
+                    tokio::select! {
+                        result = &mut write_prompt, if !prompt_written =>
+                            CollectionEvent::Prompt(result),
+                        result = read_bounded_chunk(&mut stdout, &mut stdout_bytes), if !stdout_eof =>
+                            CollectionEvent::Stdout(result),
+                        result = read_bounded_chunk(&mut stderr, &mut stderr_bytes), if !stderr_eof =>
+                            CollectionEvent::Stderr(result),
+                        _ = std::future::pending::<()>() => unreachable!(),
+                    }
+                };
+                let event = tokio::select! {
+                    // When the budget and leader exit become ready together,
+                    // preserve the full budget by observing the exit first.
+                    biased;
+                    status = &mut wait_for_exit => break status?,
+                    _ = &mut call_timeout => return Ok(None),
+                    event = io_event => event,
+                };
+                match event {
+                    CollectionEvent::Prompt(result) => {
+                        result?;
+                        prompt_written = true;
+                    }
+                    CollectionEvent::Stdout(result) => stdout_eof = result?,
+                    CollectionEvent::Stderr(result) => stderr_eof = result?,
+                }
+            };
+
+            let grace_timeout = tokio::time::sleep(PIPE_EOF_GRACE);
+            tokio::pin!(grace_timeout);
+            let grace_expired = loop {
+                if stdout_eof && stderr_eof {
+                    break false;
+                }
+                let pipe_event = async {
+                    tokio::select! {
+                        result = read_bounded_chunk(&mut stdout, &mut stdout_bytes), if !stdout_eof =>
+                            CollectionEvent::Stdout(result),
+                        result = read_bounded_chunk(&mut stderr, &mut stderr_bytes), if !stderr_eof =>
+                            CollectionEvent::Stderr(result),
+                        _ = std::future::pending::<()>() => unreachable!(),
+                    }
+                };
+                let event = tokio::select! {
+                    // Bound even a continuously readable inherited pipe.
+                    biased;
+                    _ = &mut grace_timeout => break true,
+                    event = pipe_event => event,
+                };
+                match event {
+                    CollectionEvent::Stdout(result) => stdout_eof = result?,
+                    CollectionEvent::Stderr(result) => stderr_eof = result?,
+                    CollectionEvent::Prompt(_) => unreachable!(),
+                }
+            };
+
+            (status, stdout_eof, stderr_eof, grace_expired)
         };
 
-        match tokio::time::timeout(timeout, collect_output).await {
-            Ok(output) => output.map(Some),
-            Err(_) => Ok(None),
+        if grace_expired {
+            tracing::debug!(
+                stdout_bytes = stdout_bytes.len(),
+                stderr_bytes = stderr_bytes.len(),
+                stdout_outlived_grace = !stdout_eof,
+                stderr_outlived_grace = !stderr_eof,
+                "workspace title generation pipes remained open after leader exit"
+            );
         }
+
+        Ok(Some(Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        }))
     }
     .await;
 
@@ -402,11 +484,21 @@ fn take_child_stdio(
     Ok((stdin, stdout, stderr))
 }
 
-async fn read_bounded(reader: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
-    let mut reader = reader.take(CAPTURE_MAX_BYTES as u64);
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).await?;
-    Ok(bytes)
+async fn read_bounded_chunk(
+    reader: &mut (impl AsyncRead + Unpin),
+    captured: &mut Vec<u8>,
+) -> io::Result<bool> {
+    let mut chunk = [0; 8 * 1024];
+    let read = reader.read(&mut chunk).await?;
+    if read == 0 {
+        return Ok(true);
+    }
+
+    // Continue draining after capture fills so a verbose leader cannot block
+    // forever on a full pipe while trying to exit.
+    let remaining = CAPTURE_MAX_BYTES.saturating_sub(captured.len());
+    captured.extend_from_slice(&chunk[..read.min(remaining)]);
+    Ok(false)
 }
 
 struct ChildGroupGuard {
@@ -641,7 +733,7 @@ mod tests {
     use super::{
         CAPTURE_MAX_BYTES, DISALLOWED_TOOLS, LOG_SNIPPET_MAX_BYTES, TITLE_MAX_CHARS,
         build_title_request, escaped_log_snippet, first_line_title_hint,
-        generate_workspace_names_with_command, parse_workspace_names, read_bounded, slugify,
+        generate_workspace_names_with_command, parse_workspace_names, read_bounded_chunk, slugify,
     };
 
     #[cfg(unix)]
@@ -676,7 +768,10 @@ mod tests {
 
     #[tokio::test]
     async fn capture_is_bounded() {
-        let captured = read_bounded(tokio::io::repeat(b'x')).await.unwrap();
+        let input = vec![b'x'; CAPTURE_MAX_BYTES + 1];
+        let mut input = input.as_slice();
+        let mut captured = Vec::new();
+        while !read_bounded_chunk(&mut input, &mut captured).await.unwrap() {}
         assert_eq!(captured.len(), CAPTURE_MAX_BYTES);
     }
 
@@ -782,6 +877,91 @@ mod tests {
             "grandchild never wrote progress"
         );
         assert_writes_quiesce(&progress_path).await;
+    }
+
+    #[cfg(unix)]
+    fn inherited_pipe_leader_script(output_command: &str) -> String {
+        format!(
+            r#"
+                (
+                    printf ready > "$1"
+                    while :; do
+                        printf x >> "$2"
+                        sleep 0.02
+                    done
+                ) &
+                while [ ! -s "$1" ] || [ ! -s "$2" ]; do
+                    sleep 0.01
+                done
+                {output_command}
+                exit 0
+            "#
+        )
+    }
+
+    #[cfg(unix)]
+    async fn assert_inherited_pipe_result(
+        script: &str,
+        test_name: &str,
+        expected: super::WorkspaceNames,
+    ) {
+        let (_temp_dir, ready_path, progress_path, args) = grandchild_fixture(script, test_name);
+        let names = tokio::time::timeout(
+            Duration::from_secs(3),
+            generate_workspace_names_with_command(
+                "/bin/sh",
+                &args,
+                "test task",
+                Duration::from_secs(2),
+            ),
+        )
+        .await
+        .expect("title command waited for inherited pipe EOF");
+
+        assert_eq!(names, Some(expected));
+        assert!(ready_path.exists(), "grandchild never signalled readiness");
+        assert!(
+            std::fs::metadata(&progress_path).is_ok_and(|metadata| metadata.len() > 0),
+            "grandchild never wrote progress"
+        );
+        assert_writes_quiesce(&progress_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn leader_exit_with_inherited_pipes_returns_buffered_names() {
+        let script = inherited_pipe_leader_script(
+            r#"printf '%s\n' '{"title":"bp -> pipe grace","branch":"bp-pipe-grace"}'"#,
+        );
+        assert_inherited_pipe_result(
+            &script,
+            "title-gen-inherited-pipes-test",
+            super::WorkspaceNames {
+                title: "bp -> pipe grace".to_string(),
+                branch_slug: "bp-pipe-grace".to_string(),
+            },
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn past_capture_cap_with_inherited_pipes_returns_initial_names() {
+        let script = inherited_pipe_leader_script(
+            r#"
+                printf '%s\n' '{"title":"bp -> capped capture","branch":"bp-capped-capture"}'
+                dd if=/dev/zero bs=1024 count=70 2>/dev/null
+            "#,
+        );
+        assert_inherited_pipe_result(
+            &script,
+            "title-gen-past-cap-test",
+            super::WorkspaceNames {
+                title: "bp -> capped capture".to_string(),
+                branch_slug: "bp-capped-capture".to_string(),
+            },
+        )
+        .await;
     }
 
     #[cfg(unix)]
