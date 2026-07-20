@@ -698,8 +698,18 @@ fn process_group_is_gone(pgid: u32) -> io::Result<bool> {
 
 #[cfg(windows)]
 async fn reap_process_job_after_kill(child: &mut AsyncGroupChild) {
-    // AsyncGroupChild::wait observes the Job Object's completion port, so this
-    // is a descendant barrier as well as a leader reap on Windows.
+    // Windows limitation: command-group's AsyncGroupChild::wait has
+    // leader/first-notification semantics. It returns on the first Job Object
+    // completion notification rather than proving that the job is empty, and
+    // its blocking fallback can outlive cancellation. This is therefore not a
+    // strict descendant barrier on Windows.
+    //
+    // A correct, cancel-safe barrier needs hand-rolled Job Object accounting.
+    // This fork deploys on Linux only, so the Unix path above is load-bearing
+    // and carries the real dual-condition barrier: leader reaped and process
+    // group gone. If Windows becomes a target, replace this wait with explicit
+    // Job Object completion accounting that separately reaps the leader and
+    // waits for the active-process count to reach zero within a cancel-safe bound.
     match tokio::time::timeout(GROUP_EXIT_BARRIER, child.wait()).await {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => tracing::warn!("failed to reap title process job: {error}"),
