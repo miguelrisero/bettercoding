@@ -7,7 +7,7 @@ use db::{
         claude_session_link::{ClaudeSessionBoundVia, ClaudeSessionLink},
         cli_ingest_outbox::CliIngestOutbox,
         cli_native_file::CliNativeFile,
-        cli_native_record::CliNativeRecord,
+        cli_native_record::{CliNativeRecord, CliNativeRecordDisposition},
         coding_agent_turn::{CodingAgentTurn, CreateCodingAgentTurn},
         execution_native_link::ExecutionNativeLink,
         execution_process::{CreateExecutionProcess, ExecutionProcess, ExecutionProcessRunReason},
@@ -531,6 +531,60 @@ async fn unmatched_sid_is_imported_raw_before_manual_assignment() {
         1
     );
     assert_eq!(service.snapshot(session.id).await.unwrap().entries.len(), 1);
+}
+
+#[tokio::test]
+async fn sidechain_line_in_tracked_file_is_persisted_but_not_rendered() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, &workspace_root).await;
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    let sid = "13131313-1313-4313-8313-131313131313";
+    let raw = format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "user",
+            "sessionId": sid,
+            "uuid": "sidechain-user",
+            "isSidechain": true,
+            "timestamp": "2026-07-20T20:00:00Z",
+            "message": { "role": "user", "content": "hidden agent work" }
+        })
+    );
+    fs::write(native_dir.join(format!("{sid}.jsonl")), &raw).unwrap();
+    ClaudeSessionLink::assign_manual(&db.pool, sid, session.id, &cwd.to_string_lossy())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), projects_dir));
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let rows = CliNativeRecord::list_for_session(&db.pool, session.id)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].disposition,
+        CliNativeRecordDisposition::Sidechain.as_str()
+    );
+    assert_eq!(rows[0].raw, raw.trim_end());
+    assert!(
+        service
+            .snapshot(session.id)
+            .await
+            .unwrap()
+            .entries
+            .is_empty()
+    );
 }
 
 #[tokio::test]

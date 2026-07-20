@@ -15,7 +15,27 @@ pub struct CliNativeRecord {
     pub kind: String,
     pub ts: Option<String>,
     pub raw: String,
+    pub disposition: String,
     pub bound_coding_agent_turn_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliNativeRecordDisposition {
+    Renderable,
+    Bookkeeping,
+    Sidechain,
+    Unknown,
+}
+
+impl CliNativeRecordDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Renderable => "renderable",
+            Self::Bookkeeping => "bookkeeping",
+            Self::Sidechain => "sidechain",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +47,7 @@ pub struct NewCliNativeRecord {
     pub kind: String,
     pub ts: Option<String>,
     pub raw: String,
+    pub disposition: CliNativeRecordDisposition,
     /// Plain user text used only for durable app-turn reconciliation.
     pub user_prompt: Option<String>,
     pub recorded_at: Option<DateTime<Utc>>,
@@ -65,6 +86,7 @@ pub struct SessionNativeRecord {
     pub kind: String,
     pub ts: Option<String>,
     pub raw: String,
+    pub disposition: String,
     pub linked_execution_process_id: Option<Uuid>,
     pub bound_turn_execution_process_id: Option<Uuid>,
     pub seq: i64,
@@ -291,12 +313,13 @@ impl CliNativeRecord {
                 None
             };
 
+            let disposition = record.disposition.as_str();
             let inserted = sqlx::query!(
                 r#"INSERT OR IGNORE INTO cli_native_records
                        (file_id, line_seq, claude_session_id, uuid,
                         parent_uuid, kind, ts, raw,
-                        bound_coding_agent_turn_id)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+                        disposition, bound_coding_agent_turn_id)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
                 file_id,
                 record.line_seq,
                 record.claude_session_id,
@@ -305,6 +328,7 @@ impl CliNativeRecord {
                 record.kind,
                 record.ts,
                 record.raw,
+                disposition,
                 bound_turn_id
             )
             .execute(&mut **tx)
@@ -375,6 +399,7 @@ impl CliNativeRecord {
                       r.kind,
                       r.ts,
                       r.raw,
+                      r.disposition,
                       (
                           SELECT enl.execution_process_id
                           FROM execution_native_links enl

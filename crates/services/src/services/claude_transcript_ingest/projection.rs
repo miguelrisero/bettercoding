@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use db::models::cli_native_record::SessionNativeRecord;
+use db::models::cli_native_record::{CliNativeRecordDisposition, SessionNativeRecord};
 use executors::{
     executors::claude::native::{NativeClaudeNormalizer, adapt_native_claude_line},
     logs::NormalizedEntry,
@@ -96,6 +96,9 @@ pub fn build_projection(
     let mut file_dag_positions = HashMap::<Uuid, usize>::new();
 
     for row in rows {
+        if row.disposition == CliNativeRecordDisposition::Sidechain.as_str() {
+            continue;
+        }
         let Ok(line) = adapt_native_claude_line(&row.raw, &row.claude_session_id) else {
             continue;
         };

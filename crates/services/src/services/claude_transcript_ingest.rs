@@ -29,12 +29,16 @@ use db::{
         claude_session_link::{ClaudeSessionLink, ClaudeSessionLinkMutation},
         cli_ingest_outbox::CliIngestOutbox,
         cli_native_file::{CliNativeFile, RegisterCliNativeFile},
-        cli_native_record::{CliNativeRecord, ImportedCursor, NewCliNativeRecord},
+        cli_native_record::{
+            CliNativeRecord, CliNativeRecordDisposition, ImportedCursor, NewCliNativeRecord,
+        },
         session::Session,
         workspace::{Workspace, WorkspaceError},
     },
 };
-use executors::executors::claude::native::adapt_native_claude_line;
+use executors::executors::claude::native::{
+    NativeClaudeDisposition, NativeClaudeSkipReason, adapt_native_claude_line,
+};
 pub use forks::{NativeForkBranch, NativeForkView};
 use futures::StreamExt;
 pub use projection::{
@@ -749,8 +753,19 @@ impl ClaudeTranscriptIngest {
             let mut records = Vec::new();
             for complete in &tail.lines {
                 match adapt_native_claude_line(&complete.raw, claude_session_id) {
-                    Ok(line) if line.is_sidechain() => continue,
                     Ok(line) => {
+                        let disposition = match line.disposition() {
+                            NativeClaudeDisposition::Renderable => {
+                                CliNativeRecordDisposition::Renderable
+                            }
+                            NativeClaudeDisposition::Skip(NativeClaudeSkipReason::Bookkeeping) => {
+                                CliNativeRecordDisposition::Bookkeeping
+                            }
+                            NativeClaudeDisposition::Skip(NativeClaudeSkipReason::Sidechain) => {
+                                CliNativeRecordDisposition::Sidechain
+                            }
+                            NativeClaudeDisposition::Unknown => CliNativeRecordDisposition::Unknown,
+                        };
                         if line.is_unknown() {
                             self.unknown_kinds.fetch_add(1, Ordering::Relaxed);
                         }
@@ -763,6 +778,7 @@ impl ClaudeTranscriptIngest {
                             kind: envelope.kind.clone(),
                             ts: envelope.timestamp.clone(),
                             raw: complete.raw.clone(),
+                            disposition,
                             user_prompt: line.plain_user_text(),
                             recorded_at: envelope
                                 .timestamp
@@ -780,6 +796,7 @@ impl ClaudeTranscriptIngest {
                             kind: "unknown".to_string(),
                             ts: None,
                             raw: complete.raw.clone(),
+                            disposition: CliNativeRecordDisposition::Unknown,
                             user_prompt: None,
                             recorded_at: None,
                         });
