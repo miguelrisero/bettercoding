@@ -14,10 +14,12 @@ import {
  *   - three-finger tap       → paste
  *
  * Coexists with the touch→wheel scroll bridge (terminalTouchScroll): a finger
- * that MOVES before the long-press delay is a scroll and this controller
- * stands down; a finger that DWELLS first enters D-pad mode, sets
- * `dpadActive` in the shared mobile state, and the scroll bridge stands down
- * (it checks `isSuppressed`). Select mode disables the whole layer.
+ * that moves beyond slop before the long-press delay is a scroll; only an
+ * in-slop event at/after the deadline proves a moving finger dwelled. Timer
+ * promotion keeps perfectly still presses working, but a queued pre-deadline
+ * swipe demotes it before an arrow can fire. A proven dwell enters D-pad mode,
+ * sets `dpadActive`, and makes the scroll bridge stand down. Select mode
+ * disables the whole layer.
  *
  * `createTouchGestureController` is pure and time-injected (every method takes
  * `now`; scheduling is pull-based via `nextTimerAt`) — the unit-tested seam.
@@ -89,6 +91,10 @@ export function createTouchGestureController(deps: GestureDeps) {
   let maxTouches = 0;
   /** A multi-touch gesture travelled beyond slop — it's a swipe, not a tap. */
   let multiMoved = false;
+  /** An in-slop move at/after the deadline proves this sequence really dwelled. */
+  let dwellProven = false;
+  /** The first move after timer promotion may expose a queued earlier swipe. */
+  let timerPromotionAwaitingMove = false;
   // D-pad repeat state.
   let dir: ArrowKey | null = null;
   let interval = DPAD_TIERS[0].interval;
@@ -99,16 +105,20 @@ export function createTouchGestureController(deps: GestureDeps) {
   const exitDpad = () => {
     if (phase === 'dpad') deps.setDpad(false, null);
     dir = null;
+    timerPromotionAwaitingMove = false;
   };
 
-  const promoteToDpad = () => {
+  const promoteToDpad = (fromTimer = false) => {
     phase = 'dpad';
     dir = null;
+    timerPromotionAwaitingMove = fromTimer;
     deps.setDpad(true, null);
   };
 
   return {
     onTouchStart(p: GesturePoint, now: number): void {
+      dwellProven = false;
+      timerPromotionAwaitingMove = false;
       if (p.touches === 1) {
         if (!deps.isEnabled()) {
           phase = 'ignored';
@@ -159,23 +169,38 @@ export function createTouchGestureController(deps: GestureDeps) {
       }
 
       if (phase === 'pressed') {
-        if (now - pressAt >= LONG_PRESS_MS) {
-          // The promotion timer can be starved by a busy main thread (TUI
-          // redraw, keyboard resize). The finger DID dwell long enough
-          // (`now` is the event's own timestamp, so a late-DELIVERED fast
-          // swipe doesn't land here) — promote before the slop check, or
-          // this move would hand a held press to the scroll bridge.
+        if (movedPastSlop) {
+          if (!dwellProven) {
+            // Ambiguous late delivery belongs to scrolling: injecting an
+            // arrow is worse than asking for another long press.
+            phase = 'ignored';
+            return { prevent: false };
+          }
+          promoteToDpad();
+          // fall through to D-pad handling of this same move
+        } else if (now - pressAt >= LONG_PRESS_MS) {
+          // Event time, rather than handler-delivery time, proves the finger
+          // remained within slop through the long-press deadline.
+          dwellProven = true;
           promoteToDpad();
           // fall through to D-pad handling of this same move
         } else {
-          if (movedPastSlop) {
-            // Moving before the long-press delay = scroll; the bridge owns it.
-            phase = 'ignored';
-          }
           return { prevent: false };
         }
       }
       if (phase !== 'dpad') return { prevent: false };
+
+      if (timerPromotionAwaitingMove) {
+        timerPromotionAwaitingMove = false;
+        if (now < pressAt + LONG_PRESS_MS && movedPastSlop) {
+          // This move happened before the deadline but sat queued behind the
+          // timer. Demote synchronously: our listener runs before the scroll
+          // bridge, so this same event reaches it with suppression cleared.
+          exitDpad();
+          phase = 'ignored';
+          return { prevent: false };
+        }
+      }
 
       const dx = p.clientX - startX;
       const dy = p.clientY - startY;
@@ -204,6 +229,8 @@ export function createTouchGestureController(deps: GestureDeps) {
       phase = 'idle';
       maxTouches = 0;
       multiMoved = false;
+      dwellProven = false;
+      timerPromotionAwaitingMove = false;
 
       if (wasPhase === 'ignored' || wasPhase === 'dpad') {
         lastTap = null;
@@ -241,7 +268,7 @@ export function createTouchGestureController(deps: GestureDeps) {
     /** Run due work: long-press promotion and D-pad key repeats. */
     onTimer(now: number): void {
       if (phase === 'pressed' && now - pressAt >= LONG_PRESS_MS) {
-        promoteToDpad();
+        promoteToDpad(true);
         return;
       }
       if (phase === 'dpad' && dir && now >= nextRepeatAt) {
@@ -269,6 +296,8 @@ export function createTouchGestureController(deps: GestureDeps) {
       phase = 'idle';
       maxTouches = 0;
       multiMoved = false;
+      dwellProven = false;
+      timerPromotionAwaitingMove = false;
       lastTap = null;
     },
   };

@@ -143,6 +143,15 @@ describe('long-press D-pad', () => {
 });
 
 describe('scroll handoff', () => {
+  it('rejects a coalesced fast swipe delivered after the deadline', () => {
+    const { ctrl, arrows, dpad } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    const r = ctrl.onTouchMove(p(100, 100 + TAP_SLOP_PX + 5), 400);
+    expect(r.prevent).toBe(false);
+    expect(dpad).toEqual([]);
+    expect(arrows).toEqual([]);
+  });
+
   it('stands down when the finger moves before the long-press delay', () => {
     const { ctrl, dpad, events } = harness();
     ctrl.onTouchStart(p(100, 100), 0);
@@ -153,6 +162,17 @@ describe('scroll handoff', () => {
     ctrl.onTouchEnd(0, 120);
     expect(dpad).toEqual([]);
     expect(events).toEqual([]);
+  });
+
+  it('stays ignored after an early swipe moves again past the deadline', () => {
+    const { ctrl, arrows, dpad } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    expect(ctrl.onTouchMove(p(100, 100 + TAP_SLOP_PX + 5), 100)).toEqual({
+      prevent: false,
+    });
+    expect(ctrl.onTouchMove(p(100, 160), 400)).toEqual({ prevent: false });
+    expect(dpad).toEqual([]);
+    expect(arrows).toEqual([]);
   });
 });
 
@@ -246,18 +266,42 @@ describe('select mode (disabled layer)', () => {
 });
 
 describe('timer starvation + cancellation (council round 1)', () => {
-  it('promotes to D-pad inside onTouchMove when the timer never fired', () => {
+  it('promotes from timestamped dwell evidence when the timer never fired', () => {
     const { ctrl, arrows, dpad } = harness();
     ctrl.onTouchStart(p(100, 100), 0);
-    // No onTimer call at all — simulates a starved main thread. First move
-    // arrives well past the long-press threshold.
-    const r = ctrl.onTouchMove(
-      p(100, 100 + DPAD_DEAD_ZONE_PX + 10),
-      LONG_PRESS_MS + 200
-    );
-    expect(r.prevent).toBe(true);
+    // No onTimer call at all — an in-slop sample proves the dwell, then an
+    // outward move can safely engage a direction.
+    expect(ctrl.onTouchMove(p(100, 100 + TAP_SLOP_PX), 380).prevent).toBe(true);
+    const outward = ctrl.onTouchMove(p(100, 140), 420);
+    expect(outward.prevent).toBe(true);
     expect(dpad[0]).toEqual({ active: true, dir: null });
     expect(arrows).toEqual(['down']);
+  });
+
+  it('demotes timer promotion when the next move predates the deadline', () => {
+    const { ctrl, arrows, dpad } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    ctrl.onTimer(400);
+    expect(dpad).toEqual([{ active: true, dir: null }]);
+
+    const r = ctrl.onTouchMove(p(100, 100 + TAP_SLOP_PX + 5), 140);
+    expect(r.prevent).toBe(false);
+    expect(dpad).toEqual([
+      { active: true, dir: null },
+      { active: false, dir: null },
+    ]);
+    expect(arrows).toEqual([]);
+  });
+
+  it('keeps timer promotion after an in-slop post-deadline move', () => {
+    const { ctrl, arrows, dpad } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    ctrl.onTimer(400);
+
+    const r = ctrl.onTouchMove(p(100, 100 + TAP_SLOP_PX), 400);
+    expect(r.prevent).toBe(true);
+    expect(dpad).toEqual([{ active: true, dir: null }]);
+    expect(arrows).toEqual([]);
   });
 
   it('still hands an early move to the scroll bridge', () => {
