@@ -117,6 +117,7 @@ pub fn build_projection(
             dag.records.push(NativeDagRecord {
                 uuid: uuid.clone(),
                 parent_uuid: metadata.parent_uuid.clone(),
+                kind: metadata.kind.clone(),
             });
         }
         if let Some(leaf_hint) = &metadata.leaf_uuid {
