@@ -874,12 +874,12 @@ fn ensure_cli_tmux_server_options_on(socket: &str, client_flags_supported: bool)
     // launch bootstrap) is parsed; apply unconditionally (idempotent, no-op
     // without a running server) so servers started before this option joined
     // the conf don't hand the bootstrap to a fish/csh login shell.
-    if client_flags_supported {
+    let migration = if client_flags_supported {
         // This migration MUST stay above the clipboard probe: a production
         // server commonly already has `set-clipboard on`, which makes the
         // probe return early, but may have started before window-size joined
         // the config.
-        let _ = tmux(&[
+        tmux(&[
             "set-option",
             "-g",
             "default-shell",
@@ -889,11 +889,11 @@ fn ensure_cli_tmux_server_options_on(socket: &str, client_flags_supported: bool)
             "-g",
             "window-size",
             "smallest",
-        ]);
+        ])
     } else {
         // A server can outlive this backend process. Actively release a
         // `smallest` clamp left by an earlier supported build/probe result.
-        let _ = tmux(&[
+        tmux(&[
             "set-option",
             "-g",
             "default-shell",
@@ -902,7 +902,20 @@ fn ensure_cli_tmux_server_options_on(socket: &str, client_flags_supported: bool)
             "set-option",
             "-gu",
             "window-size",
-        ]);
+        ])
+    };
+    match migration {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => tracing::debug!(
+            socket,
+            status = %output.status,
+            "CLI tmux server option migration exited unsuccessfully"
+        ),
+        Err(error) => tracing::debug!(
+            socket,
+            error = %error,
+            "Failed to spawn CLI tmux server option migration"
+        ),
     }
 
     let Ok(probe) = tmux(&["show-options", "-s", "set-clipboard"]) else {
@@ -2217,7 +2230,7 @@ pub(crate) async fn run_cli_tmux(args: &[&str]) -> Result<std::process::Output, 
     Err(if stderr.is_empty() {
         format!("tmux command exited with {}", output.status)
     } else {
-        stderr.to_string()
+        format!("tmux command exited with {}: {stderr}", output.status)
     })
 }
 

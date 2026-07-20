@@ -143,7 +143,10 @@ fn parse_cli_client_line(line: &str) -> Option<TmuxClientRow> {
     if client_name.is_empty() {
         return None;
     }
-    let client_activity = fields.next()?.trim().parse().ok()?;
+    let client_activity: i64 = fields.next()?.trim().parse().ok()?;
+    if client_activity < 0 {
+        return None;
+    }
     let flags = fields.next()?;
     workspace_id_from_cli_session_name(fields.next()?)?;
     if fields.next().is_some() {
