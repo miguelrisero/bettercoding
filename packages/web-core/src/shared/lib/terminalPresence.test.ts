@@ -46,23 +46,38 @@ describe('syncTerminalFitState', () => {
 });
 
 describe('sendPresence', () => {
-  it('publishes only effective-presence transitions unless forced', () => {
-    const frames: string[] = [];
-    const resizes: Array<[number, number]> = [];
+  it('orders a hidden-to-visible resize before the exact presence frame', () => {
+    const log: string[] = [];
     const connection: TerminalPresenceConnection = {
       ws: {
-        send: (data) => frames.push(String(data)),
+        send: (data) => log.push(String(data)),
       },
-      resize: (cols, rows) => resizes.push([cols, rows]),
-      lastSentPresence: null,
+      resize: (cols, rows) => log.push(`resize:${cols}x${rows}`),
+      lastSentPresence: false,
     };
 
     sendPresence(connection, SIZE, 'visible', {
       resendVisibleSize: true,
     });
-    sendPresence(connection, SIZE, 'visible', {
-      resendVisibleSize: true,
-    });
+
+    expect(log).toEqual([
+      'resize:120x40',
+      '{"type":"presence","visible":true}',
+    ]);
+  });
+
+  it('publishes only effective-presence transitions unless forced', () => {
+    const frames: string[] = [];
+    const connection: TerminalPresenceConnection = {
+      ws: {
+        send: (data) => frames.push(String(data)),
+      },
+      resize: () => {},
+      lastSentPresence: null,
+    };
+
+    sendPresence(connection, SIZE, 'visible');
+    sendPresence(connection, SIZE, 'visible');
     sendPresence(connection, null, 'visible');
     sendPresence(connection, SIZE, 'hidden');
     sendPresence(connection, SIZE, 'visible');
@@ -72,7 +87,6 @@ describe('sendPresence', () => {
       false,
       true,
     ]);
-    expect(resizes).toEqual([[120, 40]]);
     expect(connection.lastSentPresence).toBe(true);
 
     sendPresence(connection, SIZE, 'visible', { force: true });

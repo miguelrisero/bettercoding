@@ -806,6 +806,12 @@ mod tests {
             )
             .is_none()
         );
+        assert!(
+            parse_cli_client_line(
+                "1\t/dev/pts/1\t-1\tattached\tvk_00000000000000000000000000000001"
+            )
+            .is_none()
+        );
         assert!(parse_cli_client_line("1\t/dev/pts/1\t10\tattached").is_none());
         assert!(parse_cli_client_line("1\t/dev/pts/1\t10\tattached\twork").is_none());
         assert!(

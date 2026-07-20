@@ -78,6 +78,9 @@ describe('buildTerminalWsUrl', () => {
       'hidden='
     );
     expect(buildTerminalWsUrl(base)).not.toContain('hidden=');
+    expect(
+      buildTerminalWsUrl({ ...base, mode: 'shell', hidden: true })
+    ).not.toContain('hidden=');
   });
 });
 

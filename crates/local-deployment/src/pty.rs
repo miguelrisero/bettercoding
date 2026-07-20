@@ -2737,7 +2737,7 @@ mod tests {
         for conf in [cli_tmux_conf(false), cli_tmux_conf(true)] {
             assert!(conf.contains("set -g mouse on"));
             assert!(conf.contains("set -s set-clipboard on"));
-            assert!(conf.contains("clipboard"));
+            assert!(conf.contains("set -as terminal-features ',xterm*:clipboard'"));
             assert!(conf.contains("unbind-key -n MouseDown3Pane"));
             // Window command strings (the POSIX-sh launch bootstrap) are
             // parsed by default-shell; fish/csh would reject them outright.
