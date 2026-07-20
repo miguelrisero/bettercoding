@@ -28,6 +28,7 @@ use db::{
     DBService,
     models::workspace_cli_activity::{CliActivityState, WorkspaceCliActivity},
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::pty::{
@@ -251,7 +252,7 @@ impl Drop for ClientSizeSweepPermit {
 }
 
 impl CliActivityMonitor {
-    pub fn spawn(db: DBService, pty: PtyService) {
+    pub fn spawn(db: DBService, pty: PtyService, shutdown: CancellationToken) {
         tokio::spawn(async move {
             if !tmux_available() {
                 tracing::debug!("tmux unavailable; CLI activity monitor not started");
@@ -285,7 +286,10 @@ impl CliActivityMonitor {
                 Arc::new(tokio::sync::Mutex::new(ClientSizeSweepState::default()));
 
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
 
                 size_sweep_ticks += 1;
                 if size_sweep_ticks == SIZE_SWEEP_TICKS {
