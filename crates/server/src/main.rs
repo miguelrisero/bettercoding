@@ -45,7 +45,11 @@ async fn main() -> Result<(), BetterCodingError> {
     );
     let env_filter = EnvFilter::try_new(filter_string).expect("Failed to create tracing filter");
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(env_filter))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(env_filter),
+        )
         .with(sentry_layer())
         .init();
 

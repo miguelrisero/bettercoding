@@ -270,7 +270,7 @@ impl Deployment for LocalDeployment {
 
         // Surface CLI-mode tmux claude activity as workspace stage state
         // (Running / Needs Attention buckets in the sidebar).
-        cli_activity::CliActivityMonitor::spawn(db.clone());
+        cli_activity::CliActivityMonitor::spawn(db.clone(), pty.clone(), shutdown.child_token());
 
         // Keep opted-in CLI loops going across usage/rate limits: detect the
         // limit banner, schedule a wake-up, and re-prompt the agent.

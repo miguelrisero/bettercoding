@@ -63,6 +63,10 @@ struct TerminalQuery {
     /// so the terminal joins the exact chat the UI is showing (handover).
     #[serde(default)]
     session_id: Option<Uuid>,
+    /// Connect-time browser visibility. A hidden tmux client must be excluded
+    /// from shared sizing before its first WebSocket message can arrive.
+    #[serde(default)]
+    hidden: bool,
 }
 
 const DEFAULT_COLS: u16 = 80;
@@ -73,6 +77,7 @@ const DEFAULT_ROWS: u16 = 24;
 enum TerminalCommand {
     Input { data: String },
     Resize { cols: u16, rows: u16 },
+    Presence { visible: bool },
 }
 
 #[derive(Debug, Serialize)]
@@ -426,6 +431,7 @@ async fn terminal_ws(
                     resume_session_id,
                     initial_prompt: baked_prompt,
                     deferred_prompt_pending,
+                    connect_hidden: query.hidden,
                     spec,
                 },
             )
@@ -650,6 +656,9 @@ async fn handle_terminal_ws(
                                 }
                                 TerminalCommand::Resize { cols, rows } => {
                                     let _ = pty_service.resize(session_id_for_input, cols, rows).await;
+                                }
+                                TerminalCommand::Presence { visible } => {
+                                    pty_service.set_cli_presence(session_id_for_input, visible);
                                 }
                             }
                         }

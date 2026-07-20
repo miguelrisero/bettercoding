@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   useSyncExternalStore,
@@ -42,6 +43,7 @@ import {
   RIGHT_MAIN_PANEL_MODES,
 } from '@/shared/stores/useUiPreferencesStore';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
+import { blurActiveTerminalTextarea } from '@/shared/lib/blurActiveTerminalTextarea';
 
 const WORKSPACES_GUIDE_ID = 'workspaces-guide';
 
@@ -112,6 +114,17 @@ export function WorkspacesLayout() {
   const isMobile = useIsMobile();
   const [mobileTab] = useMobileActiveTab();
   const mainContainerRef = useRef<WorkspacesMainContainerHandle>(null);
+
+  useLayoutEffect(() => {
+    // Mobile panes stay mounted under `hidden`; release xterm focus when its
+    // pane is hidden so the iOS keyboard and visual-viewport pan can settle.
+    // This must stay layout-phase: `display:none` style recalculation can reset
+    // activeElement to <body> before a passive effect gets a chance to blur the
+    // textarea, leaving the iOS keyboard open.
+    if (isMobile && mobileTab !== 'chat') {
+      blurActiveTerminalTextarea();
+    }
+  }, [isMobile, mobileTab]);
 
   const handleScrollToBottom = useCallback(
     (behavior: 'auto' | 'smooth' = 'smooth') => {

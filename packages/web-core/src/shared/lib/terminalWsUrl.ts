@@ -23,6 +23,8 @@ export interface TerminalWsUrlParams {
   mode?: 'shell' | 'cli';
   /** CLI-mode handover: the uix session whose claude conversation to resume. */
   sessionId?: string;
+  /** Snapshot of document visibility for the initial tmux client attach. */
+  hidden?: boolean;
 }
 
 export function buildTerminalWsUrl({
@@ -33,12 +35,14 @@ export function buildTerminalWsUrl({
   host,
   mode = 'shell',
   sessionId,
+  hidden = false,
 }: TerminalWsUrlParams): string {
   const scheme = protocol === 'https:' ? 'https:' : 'http:';
   const modeParam = mode === 'cli' ? '&mode=cli' : '';
   const sessionParam =
     mode === 'cli' && sessionId ? `&session_id=${sessionId}` : '';
-  return `${scheme}//${host}/api/terminal/ws?workspace_id=${workspaceId}&cols=${cols}&rows=${rows}${modeParam}${sessionParam}`;
+  const hiddenParam = mode === 'cli' && hidden ? '&hidden=true' : '';
+  return `${scheme}//${host}/api/terminal/ws?workspace_id=${workspaceId}&cols=${cols}&rows=${rows}${modeParam}${sessionParam}${hiddenParam}`;
 }
 
 /**
@@ -80,21 +84,24 @@ export function resolveTerminalEndpoint(
 }
 
 /**
- * Compare two terminal WS endpoints ignoring the size params (`cols`/`rows`).
+ * Compare two terminal WS endpoints ignoring connect-time params that can be
+ * corrected immediately after open (`cols`/`rows` and `hidden`).
  *
  * Used to validate an in-flight connect attempt after its async open
  * resolves: size drift between "attempt started" and "attempt resolved" is
- * legitimate (the post-open resize corrects it), but a changed `session_id`,
- * `mode`, or `workspace_id` — e.g. a session switch while a slow relay
- * transport was opening — makes the attempt STALE: registering it would bind
- * the visible pane to the previous conversation's tmux session.
+ * legitimate (post-open sync corrects it), but a changed `session_id`, `mode`,
+ * or `workspace_id` — e.g. a session switch while a slow relay transport was
+ * opening — makes the attempt STALE: registering it would bind the visible
+ * pane to the previous conversation's tmux session. Ignoring `hidden` is
+ * load-bearing: a visibility flip during the handshake must converge through
+ * the presence sync, not discard and reconnect with another visibility race.
  */
 export function terminalEndpointsEquivalent(a: string, b: string): boolean {
   try {
     const ua = new URL(a);
     const ub = new URL(b);
     if (ua.origin !== ub.origin || ua.pathname !== ub.pathname) return false;
-    for (const key of ['cols', 'rows']) {
+    for (const key of ['cols', 'rows', 'hidden']) {
       ua.searchParams.delete(key);
       ub.searchParams.delete(key);
     }
@@ -115,8 +122,8 @@ export function terminalEndpointsEquivalent(a: string, b: string): boolean {
  * `epochChanged` is the caller's snapshot comparison (`endpointEpoch !==
  * attemptEpoch`): when `false` the source is untouched and the attempt is always
  * valid — no endpoint inspection needed. When `true`:
- * - size-only drift is NOT stale (`terminalEndpointsEquivalent` ignores
- *   cols/rows; the post-open resize corrects it);
+ * - size/visibility-only drift is NOT stale (`terminalEndpointsEquivalent`
+ *   ignores cols/rows/hidden; the post-open sync corrects it);
  * - a changed `session_id` / `mode` / `workspace_id` IS stale — letting the
  *   socket become live would bind the pane to the PREVIOUS conversation's tmux
  *   on a first-attach / post-reap create;
