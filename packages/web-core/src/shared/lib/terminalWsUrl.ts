@@ -41,7 +41,7 @@ export function buildTerminalWsUrl({
   const modeParam = mode === 'cli' ? '&mode=cli' : '';
   const sessionParam =
     mode === 'cli' && sessionId ? `&session_id=${sessionId}` : '';
-  const hiddenParam = hidden ? '&hidden=true' : '';
+  const hiddenParam = mode === 'cli' && hidden ? '&hidden=true' : '';
   return `${scheme}//${host}/api/terminal/ws?workspace_id=${workspaceId}&cols=${cols}&rows=${rows}${modeParam}${sessionParam}${hiddenParam}`;
 }
 

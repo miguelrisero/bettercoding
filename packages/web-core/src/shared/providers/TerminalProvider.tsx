@@ -671,23 +671,20 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
 
               const size =
                 connectionCallbacksRef.current.get(tabId)?.getSize?.() ?? null;
-              // Reconnects can complete while the document or pane is hidden.
-              // Correct connect-time presence before syncing size. This open
-              // path keeps its existing ordering; visibility transitions use
-              // resize-before-presence in `broadcastPresence` above.
+              // A visible client must publish its fresh grid before presence
+              // asynchronously clears ignore-size; reversing that order can
+              // reflow once at the stale connect grid and again at this one.
+              // Hidden clients publish presence first so they are excluded
+              // before any size synchronization.
               // Pass the connection directly so this also works for an
               // already-open transport, which synchronizes before map insert.
+              const documentVisible = document.visibilityState === 'visible';
               sendPresence(connection, size, document.visibilityState, {
                 force: true,
+                resendVisibleSize: documentVisible,
               });
-              if (size) {
-                ws.send(
-                  JSON.stringify({
-                    type: 'resize',
-                    cols: size.cols,
-                    rows: size.rows,
-                  })
-                );
+              if (!documentVisible && size) {
+                connection.resize(size.cols, size.rows);
               }
             };
             ws.onopen = syncOpenState;
