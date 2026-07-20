@@ -156,5 +156,8 @@ export function useVisualViewportGeometry(): VisualViewportGeometry {
   );
 }
 
-/** Shared geometry source used by both the React hook and non-React consumers. */
+/**
+ * Exposed so tests can drive the module-level store directly; application code
+ * otherwise consumes it through `useVisualViewportGeometry`.
+ */
 export const visualViewportStore = { subscribe, getSnapshot };
