@@ -87,16 +87,19 @@ impl CliNativeRecord {
             file_id
         )
         .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(sqlx::Error::RowNotFound)?;
-
-        let mut next_outbox_seq = sqlx::query_scalar!(
-            r#"SELECT COALESCE(MAX(seq), 0) + 1 AS "seq!: i64"
-               FROM cli_ingest_outbox WHERE session_id = $1"#,
-            session_id
-        )
-        .fetch_one(&mut *tx)
         .await?;
+
+        let mut next_outbox_seq = if let Some(session_id) = session_id {
+            sqlx::query_scalar!(
+                r#"SELECT COALESCE(MAX(seq), 0) + 1 AS "seq!: i64"
+                   FROM cli_ingest_outbox WHERE session_id = $1"#,
+                session_id
+            )
+            .fetch_one(&mut *tx)
+            .await?
+        } else {
+            0
+        };
 
         let mut result = ImportBatchResult::default();
 
@@ -117,7 +120,8 @@ impl CliNativeRecord {
 
             let bound_turn_id = if record.kind == "user" && !linked_to_execution {
                 match (record.user_prompt.as_deref(), record.recorded_at) {
-                    (Some(prompt), Some(recorded_at)) => {
+                    (Some(prompt), Some(recorded_at)) if session_id.is_some() => {
+                        let session_id = session_id.expect("checked above");
                         sqlx::query_scalar!(
                             r#"SELECT cat.id AS "id!: Uuid"
                                FROM coding_agent_turns cat
@@ -171,6 +175,9 @@ impl CliNativeRecord {
             }
 
             result.inserted_records += 1;
+            let Some(session_id) = session_id else {
+                continue;
+            };
             let outbox_inserted = sqlx::query!(
                 r#"INSERT OR IGNORE INTO cli_ingest_outbox
                        (session_id, seq, file_id, line_seq)

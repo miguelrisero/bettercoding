@@ -78,6 +78,55 @@ async fn create_workspace_and_session(
     (workspace, session)
 }
 
+async fn create_session(db: &DBService, workspace_id: Uuid) -> Session {
+    Session::create(
+        &db.pool,
+        &CreateSession {
+            executor: Some("CLAUDE_CODE".to_string()),
+            name: None,
+        },
+        Uuid::new_v4(),
+        workspace_id,
+    )
+    .await
+    .unwrap()
+}
+
+async fn create_coding_turn(db: &DBService, session_id: Uuid, prompt: &str) -> Uuid {
+    let process_id = Uuid::new_v4();
+    let action = ExecutorAction::new(
+        ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
+            prompt: prompt.to_string(),
+            executor_config: ExecutorConfig::new(BaseCodingAgent::ClaudeCode),
+            working_dir: None,
+        }),
+        None,
+    );
+    ExecutionProcess::create(
+        &db.pool,
+        &CreateExecutionProcess {
+            session_id,
+            executor_action: action,
+            run_reason: ExecutionProcessRunReason::CodingAgent,
+        },
+        process_id,
+        &[],
+    )
+    .await
+    .unwrap();
+    CodingAgentTurn::create(
+        &db.pool,
+        &CreateCodingAgentTurn {
+            execution_process_id: process_id,
+            prompt: Some(prompt.to_string()),
+        },
+        Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    process_id
+}
+
 fn fixture_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(
         "../../docs/superpowers/specs/evidence/2026-07-20-cli-ui-seam/evidence-transcript.redacted.jsonl",
@@ -202,7 +251,7 @@ async fn read_only_fixture_backfill_is_complete_and_idempotent() {
 }
 
 #[tokio::test]
-async fn unmatched_sid_is_quarantined_until_manual_assignment() {
+async fn unmatched_sid_is_imported_raw_before_manual_assignment() {
     let temp = TempDir::new().unwrap();
     let workspace_root = temp.path().join("worktree");
     let projects_dir = temp.path().join("projects");
@@ -241,7 +290,21 @@ async fn unmatched_sid_is_quarantined_until_manual_assignment() {
         CliNativeRecord::count_for_file(&db.pool, files[0].id)
             .await
             .unwrap(),
+        1
+    );
+    assert_eq!(
+        CliIngestOutbox::latest_seq(&db.pool, session.id)
+            .await
+            .unwrap(),
         0
+    );
+    assert!(
+        service
+            .snapshot(session.id)
+            .await
+            .unwrap()
+            .entries
+            .is_empty()
     );
     let unassigned = service.list_unassigned(workspace.id).await.unwrap();
     assert_eq!(unassigned.len(), 1);
@@ -263,6 +326,172 @@ async fn unmatched_sid_is_quarantined_until_manual_assignment() {
             .unwrap(),
         1
     );
+    assert_eq!(
+        CliIngestOutbox::latest_seq(&db.pool, session.id)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(service.snapshot(session.id).await.unwrap().entries.len(), 1);
+}
+
+#[tokio::test]
+async fn manual_assignment_republishes_raw_history_after_session_cascade() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, deleted_session) = create_workspace_and_session(&db, &workspace_root).await;
+    let cwd = effective_cwd(&workspace, &deleted_session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    let sid = "12121212-1212-4212-8212-121212121212";
+    let native_file = native_dir.join(format!("{sid}.jsonl"));
+    fs::write(
+        &native_file,
+        native_user_record(sid, "surviving-record", "survives", "2026-07-20T20:00:00Z"),
+    )
+    .unwrap();
+    ClaudeSessionLink::assign_manual(&db.pool, sid, deleted_session.id, &cwd.to_string_lossy())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), projects_dir));
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+    let file = CliNativeFile::list_latest_by_sid(&db.pool, sid)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        CliNativeRecord::count_for_file(&db.pool, file.id)
+            .await
+            .unwrap(),
+        1
+    );
+
+    sqlx::query("DELETE FROM sessions WHERE id = ?")
+        .bind(deleted_session.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        ClaudeSessionLink::find(&db.pool, sid)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        CliNativeRecord::count_for_file(&db.pool, file.id)
+            .await
+            .unwrap(),
+        1
+    );
+
+    let replacement_session = create_session(&db, workspace.id).await;
+    service
+        .assign_manual(sid, replacement_session.id)
+        .await
+        .unwrap();
+
+    let snapshot = service.snapshot(replacement_session.id).await.unwrap();
+    assert_eq!(snapshot.entries.len(), 1);
+    assert_eq!(
+        snapshot.entries[0].uuid.as_deref(),
+        Some("surviving-record")
+    );
+    assert_eq!(
+        CliIngestOutbox::latest_seq(&db.pool, replacement_session.id)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn executor_precedence_repoints_history_and_invalidates_both_feeds() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, original_session) = create_workspace_and_session(&db, &workspace_root).await;
+    let cwd = effective_cwd(&workspace, &original_session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    let sid = "13131313-1313-4313-8313-131313131313";
+    fs::write(
+        native_dir.join(format!("{sid}.jsonl")),
+        native_user_record(sid, "repointed-record", "move me", "2026-07-20T20:00:00Z"),
+    )
+    .unwrap();
+    ClaudeSessionLink::assign_manual(&db.pool, sid, original_session.id, &cwd.to_string_lossy())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), projects_dir));
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .snapshot(original_session.id)
+            .await
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
+
+    let executor_session = create_session(&db, workspace.id).await;
+    let process_id = create_coding_turn(&db, executor_session.id, "move me").await;
+    CodingAgentTurn::update_agent_session_id(&db.pool, process_id, sid)
+        .await
+        .unwrap();
+    let mut updates = service.subscribe();
+
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let mut invalidated = HashSet::new();
+    for _ in 0..2 {
+        match tokio::time::timeout(Duration::from_secs(5), updates.recv())
+            .await
+            .expect("both feeds should be invalidated")
+            .unwrap()
+        {
+            NativeFeedUpdate::RevisionInvalidated { session_id, .. } => {
+                invalidated.insert(session_id);
+            }
+            NativeFeedUpdate::RecordsAppended { .. } => {
+                panic!("publisher is not running in this test")
+            }
+        }
+    }
+    assert_eq!(
+        invalidated,
+        HashSet::from([original_session.id, executor_session.id])
+    );
+    assert!(
+        service
+            .snapshot(original_session.id)
+            .await
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    let moved = service.snapshot(executor_session.id).await.unwrap();
+    assert_eq!(moved.entries.len(), 1);
+    assert_eq!(moved.entries[0].uuid.as_deref(), Some("repointed-record"));
 }
 
 #[tokio::test]

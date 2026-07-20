@@ -26,7 +26,7 @@ use chrono::{DateTime, Utc};
 use db::{
     DBService,
     models::{
-        claude_session_link::ClaudeSessionLink,
+        claude_session_link::{ClaudeSessionLink, ClaudeSessionLinkMutation},
         cli_ingest_outbox::CliIngestOutbox,
         cli_native_file::{CliNativeFile, RegisterCliNativeFile},
         cli_native_record::{CliNativeRecord, ImportedCursor, NewCliNativeRecord},
@@ -288,7 +288,7 @@ impl ClaudeTranscriptIngest {
             ));
         }
 
-        ClaudeSessionLink::assign_manual(
+        let mutation = ClaudeSessionLink::assign_manual(
             &self.db.pool,
             claude_session_id,
             session_id,
@@ -296,6 +296,7 @@ impl ClaudeTranscriptIngest {
         )
         .await?
         .ok_or(ClaudeTranscriptIngestError::SessionNotFound(session_id))?;
+        self.apply_link_mutation(&mutation).await;
 
         for file in files {
             let path = Path::new(&file.dir_path).join(&file.file_name);
@@ -536,14 +537,17 @@ impl ClaudeTranscriptIngest {
             &context.cwd.to_string_lossy(),
         )
         .await?;
-        let Some(link) = link else {
+        if let Some(mutation) = &link {
+            self.apply_link_mutation(mutation).await;
+        } else {
             self.quarantined_paths
                 .lock()
                 .unwrap()
                 .insert(path.to_path_buf());
-            return Ok(());
-        };
-        self.quarantined_paths.lock().unwrap().remove(path);
+        }
+        if link.is_some() {
+            self.quarantined_paths.lock().unwrap().remove(path);
+        }
 
         let mut file = File::open(path)?;
         let verified_hash = if observed_size >= native_file.cursor_offset {
@@ -569,7 +573,9 @@ impl ClaudeTranscriptIngest {
         if let Some(reason) = reason {
             native_file = CliNativeFile::bump_generation(&self.db.pool, &registration).await?;
             self.rescans.fetch_add(1, Ordering::Relaxed);
-            self.invalidate_revision(link.session_id).await;
+            if let Some(link) = &link {
+                self.invalidate_revision(link.link.session_id).await;
+            }
             tracing::info!(?reason, path = %path.display(), generation = native_file.generation, "rescanning native transcript generation");
             file.seek(SeekFrom::Start(0))?;
         } else {
@@ -643,6 +649,19 @@ impl ClaudeTranscriptIngest {
             self.publisher_notify.notify_one();
         }
         Ok(())
+    }
+
+    async fn apply_link_mutation(&self, mutation: &ClaudeSessionLinkMutation) {
+        if mutation.republished_outbox > 0 {
+            self.publisher_notify.notify_one();
+        }
+        if !mutation.session_changed() {
+            return;
+        }
+        if let Some(previous_session_id) = mutation.previous_session_id {
+            self.invalidate_revision(previous_session_id).await;
+        }
+        self.invalidate_revision(mutation.link.session_id).await;
     }
 
     async fn locate_sid(&self, sid: &str) -> Result<Option<PathBuf>, std::io::Error> {

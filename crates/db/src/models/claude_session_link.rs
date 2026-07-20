@@ -24,6 +24,19 @@ pub struct ClaudeSessionLink {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ClaudeSessionLinkMutation {
+    pub link: ClaudeSessionLink,
+    pub previous_session_id: Option<Uuid>,
+    pub republished_outbox: u64,
+}
+
+impl ClaudeSessionLinkMutation {
+    pub fn session_changed(&self) -> bool {
+        self.previous_session_id != Some(self.link.session_id)
+    }
+}
+
 #[derive(Debug, Clone, FromRow)]
 struct ExecutorSessionOwner {
     session_id: Uuid,
@@ -58,7 +71,7 @@ impl ClaudeSessionLink {
         pool: &SqlitePool,
         claude_session_id: &str,
         cwd: &str,
-    ) -> Result<Option<Self>, sqlx::Error> {
+    ) -> Result<Option<ClaudeSessionLinkMutation>, sqlx::Error> {
         let owner = sqlx::query_as!(
             ExecutorSessionOwner,
             r#"SELECT ep.session_id AS "session_id!: Uuid",
@@ -75,7 +88,7 @@ impl ClaudeSessionLink {
         .await?;
 
         if let Some(owner) = owner {
-            Self::upsert(
+            return Self::upsert(
                 pool,
                 claude_session_id,
                 owner.session_id,
@@ -83,10 +96,17 @@ impl ClaudeSessionLink {
                 cwd,
                 ClaudeSessionBoundVia::Executor,
             )
-            .await?;
+            .await
+            .map(Some);
         }
 
-        Self::find(pool, claude_session_id).await
+        Ok(Self::find(pool, claude_session_id)
+            .await?
+            .map(|link| ClaudeSessionLinkMutation {
+                previous_session_id: Some(link.session_id),
+                link,
+                republished_outbox: 0,
+            }))
     }
 
     pub async fn assign_manual(
@@ -94,7 +114,7 @@ impl ClaudeSessionLink {
         claude_session_id: &str,
         session_id: Uuid,
         cwd: &str,
-    ) -> Result<Option<Self>, sqlx::Error> {
+    ) -> Result<Option<ClaudeSessionLinkMutation>, sqlx::Error> {
         let workspace_id = sqlx::query_scalar!(
             r#"SELECT workspace_id AS "workspace_id!: Uuid"
                FROM sessions WHERE id = $1"#,
@@ -107,7 +127,7 @@ impl ClaudeSessionLink {
             return Ok(None);
         };
 
-        Self::upsert(
+        let mutation = Self::upsert(
             pool,
             claude_session_id,
             session_id,
@@ -116,7 +136,7 @@ impl ClaudeSessionLink {
             ClaudeSessionBoundVia::Manual,
         )
         .await?;
-        Self::find(pool, claude_session_id).await
+        Ok(Some(mutation))
     }
 
     async fn upsert(
@@ -126,7 +146,17 @@ impl ClaudeSessionLink {
         workspace_id: Uuid,
         cwd: &str,
         bound_via: ClaudeSessionBoundVia,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<ClaudeSessionLinkMutation, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+        let previous_session_id = sqlx::query_scalar!(
+            r#"SELECT session_id AS "session_id!: Uuid"
+               FROM claude_session_links
+               WHERE claude_session_id = $1"#,
+            claude_session_id
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+
         sqlx::query!(
             r#"INSERT INTO claude_session_links
                    (claude_session_id, session_id, workspace_id, cwd, bound_via)
@@ -142,9 +172,56 @@ impl ClaudeSessionLink {
             cwd,
             bound_via
         )
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+
+        // Raw records can predate a binding or survive a session cascade.
+        // Publish every missing record to the new owner in this same
+        // transaction. INSERT OR IGNORE is intentional here: assigning or
+        // resolving the same sid repeatedly is an idempotent replay.
+        let next_seq = sqlx::query_scalar!(
+            r#"SELECT COALESCE(MAX(seq), 0) + 1 AS "seq!: i64"
+               FROM cli_ingest_outbox WHERE session_id = $1"#,
+            session_id
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let republished_outbox = sqlx::query!(
+            r#"INSERT OR IGNORE INTO cli_ingest_outbox
+                   (session_id, seq, file_id, line_seq)
+               SELECT $1,
+                      $2 + ROW_NUMBER() OVER (
+                          ORDER BY f.created_at, f.generation, r.line_seq
+                      ) - 1,
+                      r.file_id,
+                      r.line_seq
+               FROM cli_native_records r
+               JOIN cli_native_files f ON f.id = r.file_id
+               WHERE r.claude_session_id = $3
+                 AND NOT EXISTS (
+                     SELECT 1 FROM cli_ingest_outbox published
+                     WHERE published.session_id = $1
+                       AND published.file_id = r.file_id
+                       AND published.line_seq = r.line_seq
+                 )
+               ORDER BY f.created_at, f.generation, r.line_seq"#,
+            session_id,
+            next_seq,
+            claude_session_id
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        tx.commit().await?;
+        let link = Self::find(pool, claude_session_id)
+            .await?
+            .expect("upserted Claude session link exists");
+        Ok(ClaudeSessionLinkMutation {
+            link,
+            previous_session_id,
+            republished_outbox,
+        })
     }
 
     pub async fn known_session_ids_for_workspace(
