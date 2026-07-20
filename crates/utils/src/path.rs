@@ -1,4 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
+
+static WORKTREE_BASE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Directory name for storing attachments in worktrees
 // TODO(bc-legacy-cleanup): rename deferred - stored free-text prompts and messages embed
@@ -109,24 +114,65 @@ pub fn normalize_macos_private_alias<P: AsRef<Path>>(p: P) -> PathBuf {
     p.to_path_buf()
 }
 
-// TODO(bc-legacy-cleanup): function and temp-dir names are persisted identities; rename needs migration.
-pub fn get_vibe_kanban_temp_dir() -> std::path::PathBuf {
-    let dir_name = if cfg!(debug_assertions) {
-        "vibe-kanban-dev"
-    } else {
-        "vibe-kanban"
-    };
+// TODO(bc-legacy-cleanup): keep the persisted public function name until callers can migrate.
+/// Returns the worktree base directory, resolving and caching it once per process.
+///
+/// `BC_WORKTREE_BASE` is a hard override intended for test and development use.
+/// Unit tests exercise [`resolve_worktree_base_dir`] directly and never mutate
+/// process env.
+pub fn get_vibe_kanban_temp_dir() -> PathBuf {
+    WORKTREE_BASE_DIR
+        .get_or_init(|| {
+            let (bettercoding_dir_name, legacy_dir_name) = if cfg!(debug_assertions) {
+                ("bettercoding-dev", "vibe-kanban-dev")
+            } else {
+                ("bettercoding", "vibe-kanban")
+            };
 
-    if cfg!(target_os = "macos") {
-        // macOS already uses /var/folders/... which is persistent storage
-        std::env::temp_dir().join(dir_name)
-    } else if cfg!(target_os = "linux") {
-        // Linux: use /var/tmp instead of /tmp to avoid RAM usage
-        std::path::PathBuf::from("/var/tmp").join(dir_name)
-    } else {
-        // Windows and other platforms: use temp dir with vibe-kanban subdirectory
-        std::env::temp_dir().join(dir_name)
+            let base_dir = if cfg!(target_os = "macos") {
+                // macOS already uses /var/folders/... which is persistent storage
+                std::env::temp_dir()
+            } else if cfg!(target_os = "linux") {
+                // Linux: use /var/tmp instead of /tmp to avoid RAM usage
+                PathBuf::from("/var/tmp")
+            } else {
+                // Windows and other platforms: use temp dir with a product subdirectory
+                std::env::temp_dir()
+            };
+
+            resolve_worktree_base_dir(
+                std::env::var_os("BC_WORKTREE_BASE").map(PathBuf::from),
+                base_dir.join(bettercoding_dir_name),
+                base_dir.join(legacy_dir_name),
+            )
+        })
+        .clone()
+}
+
+fn resolve_worktree_base_dir(
+    override_dir: Option<PathBuf>,
+    bettercoding_candidate: PathBuf,
+    legacy_candidate: PathBuf,
+) -> PathBuf {
+    if let Some(override_dir) = override_dir {
+        return override_dir;
     }
+
+    if is_non_empty_dir(&bettercoding_candidate) {
+        return bettercoding_candidate;
+    }
+
+    if is_non_empty_dir(&legacy_candidate) {
+        // TODO(bc-legacy-cleanup): remove when no vibe-kanban installs remain.
+        return legacy_candidate;
+    }
+
+    let _ = std::fs::create_dir_all(&bettercoding_candidate);
+    bettercoding_candidate
+}
+
+fn is_non_empty_dir(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 /// Expand leading ~ to user's home directory.
@@ -136,7 +182,23 @@ pub fn expand_tilde(path_str: &str) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
     use super::*;
+
+    fn temp_dir_candidates(root: &TempDir) -> (PathBuf, PathBuf) {
+        (
+            root.path().join("bettercoding"),
+            root.path().join("vibe-kanban"),
+        )
+    }
+
+    fn seed_dir(dir: &Path) {
+        fs::create_dir_all(dir).expect("create scratch worktree directory");
+        fs::write(dir.join("entry"), b"scratch worktree").expect("seed scratch worktree");
+    }
 
     #[test]
     fn test_make_path_relative() {
@@ -156,6 +218,70 @@ mod tests {
         assert_eq!(
             make_path_relative("/other/path/file.js", "/tmp/test-worktree"),
             "/other/path/file.js"
+        );
+    }
+
+    #[test]
+    fn uses_legacy_dir_when_only_legacy_is_non_empty() {
+        let root = TempDir::new().expect("create scratch directory");
+        let (bettercoding_dir, legacy_dir) = temp_dir_candidates(&root);
+        seed_dir(&legacy_dir);
+
+        assert_eq!(
+            resolve_worktree_base_dir(None, bettercoding_dir, legacy_dir.clone()),
+            legacy_dir
+        );
+    }
+
+    #[test]
+    fn prefers_bettercoding_dir_when_both_are_non_empty() {
+        let root = TempDir::new().expect("create scratch directory");
+        let (bettercoding_dir, legacy_dir) = temp_dir_candidates(&root);
+        seed_dir(&bettercoding_dir);
+        seed_dir(&legacy_dir);
+
+        assert_eq!(
+            resolve_worktree_base_dir(None, bettercoding_dir.clone(), legacy_dir),
+            bettercoding_dir
+        );
+    }
+
+    #[test]
+    fn uses_and_creates_bettercoding_dir_when_both_are_absent() {
+        let root = TempDir::new().expect("create scratch directory");
+        let (bettercoding_dir, legacy_dir) = temp_dir_candidates(&root);
+
+        assert_eq!(
+            resolve_worktree_base_dir(None, bettercoding_dir.clone(), legacy_dir),
+            bettercoding_dir
+        );
+        assert!(bettercoding_dir.is_dir());
+    }
+
+    #[test]
+    fn uses_legacy_dir_when_bettercoding_dir_is_empty() {
+        let root = TempDir::new().expect("create scratch directory");
+        let (bettercoding_dir, legacy_dir) = temp_dir_candidates(&root);
+        fs::create_dir_all(&bettercoding_dir).expect("create empty BetterCoding directory");
+        seed_dir(&legacy_dir);
+
+        assert_eq!(
+            resolve_worktree_base_dir(None, bettercoding_dir, legacy_dir.clone()),
+            legacy_dir
+        );
+    }
+
+    #[test]
+    fn override_wins_when_both_are_non_empty() {
+        let root = TempDir::new().expect("create scratch directory");
+        let (bettercoding_dir, legacy_dir) = temp_dir_candidates(&root);
+        let override_dir = root.path().join("override");
+        seed_dir(&bettercoding_dir);
+        seed_dir(&legacy_dir);
+
+        assert_eq!(
+            resolve_worktree_base_dir(Some(override_dir.clone()), bettercoding_dir, legacy_dir,),
+            override_dir
         );
     }
 
