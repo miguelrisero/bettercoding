@@ -33,6 +33,9 @@ dirs = "5.0"
 thiserror = { workspace = true }
 command-group = { version = "5.0", features = ["with-tokio"] }
 
+[dev-dependencies]
+tempfile = "3.21"
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }
 
