@@ -1366,7 +1366,8 @@ async fn paste_via_tmux_buffer(workspace_id: Uuid, target: &str, text: &str) -> 
 }
 
 /// Seconds since the Unix epoch (best-effort; 0 if the system clock is before
-/// the epoch). Used to turn tmux's `session_activity` epoch into an idle age.
+/// the epoch). Used to turn tmux's `session_activity` and `client_activity`
+/// epochs into idle ages.
 pub(crate) fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1488,7 +1489,7 @@ fn tmux_capabilities() -> &'static TmuxCapabilities {
         if !client_flags {
             tracing::warn!(
                 version = version.trim(),
-                "tmux client flags require tmux >= 3.2; shared CLI terminal sizing disabled"
+                "tmux client-flag support could not be confirmed; shared CLI terminal sizing requires a recognized tmux >= 3.2"
             );
         }
         TmuxCapabilities {

@@ -649,12 +649,13 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
               generation,
             };
 
-            // Send the current terminal size once the socket is open. The
-            // initial ResizeObserver fit usually fires before the socket is
-            // ready and is dropped, which would otherwise leave the PTY/tmux
-            // stuck at the URL size forever; resending on every (re)connect
-            // also restores the right size after a reattach.
-            const syncSize = () => {
+            // Synchronize effective presence and the current terminal size
+            // once the socket is open. The initial ResizeObserver fit usually
+            // fires before the socket is ready and is dropped, which would
+            // otherwise leave the PTY/tmux stuck at the URL size forever;
+            // resending on every (re)connect also restores the right state
+            // after a reattach.
+            const syncOpenState = () => {
               // A session switch (or a gate-off that unmounts the terminal
               // child) can land after this socket was registered but before it
               // opened (the transport returns a CONNECTING socket): re-validate
@@ -674,8 +675,8 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
               // Correct connect-time presence before syncing size. This open
               // path keeps its existing ordering; visibility transitions use
               // resize-before-presence in `broadcastPresence` above.
-              // Pass the connection directly: it is not inserted in the map
-              // until after this open-time synchronization completes.
+              // Pass the connection directly so this also works for an
+              // already-open transport, which synchronizes before map insert.
               sendPresence(connection, size, document.visibilityState, {
                 force: true,
               });
@@ -689,13 +690,13 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
                 );
               }
             };
-            ws.onopen = syncSize;
+            ws.onopen = syncOpenState;
             // A pluggable transport may hand back an already-open socket
             // whose `open` event has fired; onopen would then never run.
             if (ws.readyState === WebSocket.OPEN) {
-              syncSize();
-              // Already-open + stale: syncSize discarded it synchronously —
-              // don't register a socket we just closed.
+              syncOpenState();
+              // Already-open + stale: syncOpenState discarded it
+              // synchronously — don't register a socket we just closed.
               if (superseded) {
                 return;
               }

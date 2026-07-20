@@ -479,9 +479,9 @@ async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepSt
 
     for (client, desired_ignore) in transitions {
         // `client_name` is a /dev/pts/N path and can be recycled after the
-        // sweep snapshot. Require the fresh batch snapshot to preserve every
-        // planned PID/name mapping so a stale row can never target another
-        // terminal.
+        // sweep snapshot. The fresh batch rejects mappings already stale when
+        // it was taken; it cannot lock tmux across the async refresh loop, so
+        // any later detach/name reuse remains repair work for the next sweep.
         match fresh_clients.get(&client.client_pid).copied() {
             Some(fresh_name) if fresh_name == client.client_name => {}
             Some(fresh_name) => {
