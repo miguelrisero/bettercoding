@@ -13,7 +13,6 @@ export interface UseSessionNativeFeedResult {
   entries: NativeFeedEntry[];
   forks: NativeFeedFork[];
   revision: bigint | undefined;
-  cliSessionActive: boolean;
   isLoading: boolean;
   isConnected: boolean;
   error: string | null;
@@ -32,7 +31,6 @@ function createEmptyNativeFeedSnapshot(): NativeFeedSnapshot {
       watch_degraded: false,
       files: [],
     },
-    cli_session_active: false,
   };
 }
 
@@ -78,7 +76,6 @@ export function useSessionNativeFeed(
     entries,
     forks: data?.forks ?? [],
     revision: data?.revision,
-    cliSessionActive: data?.cli_session_active ?? false,
     isLoading: Boolean(sessionId) && !isInitialized && !error,
     isConnected,
     error,

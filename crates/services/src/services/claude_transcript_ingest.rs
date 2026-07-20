@@ -32,7 +32,6 @@ use db::{
         cli_native_record::{CliNativeRecord, ImportedCursor, NewCliNativeRecord},
         session::Session,
         workspace::Workspace,
-        workspace_cli_activity::{CliActivityState, WorkspaceCliActivity},
     },
 };
 use executors::executors::claude::native::adapt_native_claude_line;
@@ -170,7 +169,7 @@ impl ClaudeTranscriptIngest {
         &self,
         session_id: Uuid,
     ) -> Result<NativeFeedSnapshot, ClaudeTranscriptIngestError> {
-        let session = Session::find_by_id(&self.db.pool, session_id)
+        Session::find_by_id(&self.db.pool, session_id)
             .await?
             .ok_or(ClaudeTranscriptIngestError::SessionNotFound(session_id))?;
 
@@ -183,11 +182,6 @@ impl ClaudeTranscriptIngest {
         #[cfg(test)]
         self.wait_at_snapshot_watermark().await;
         let rows = CliNativeRecord::list_for_session(&self.db.pool, session_id).await?;
-        let cli_session_active = WorkspaceCliActivity::find_all(&self.db.pool)
-            .await?
-            .into_iter()
-            .find(|activity| activity.workspace_id == session.workspace_id)
-            .is_some_and(|activity| activity.state != CliActivityState::Idle);
 
         let mut seen_files = HashSet::new();
         let mut files = Vec::new();
@@ -211,13 +205,7 @@ impl ClaudeTranscriptIngest {
             watch_degraded: self.watch_degraded.load(Ordering::Relaxed),
             files,
         };
-        Ok(build_projection(
-            &rows,
-            revision,
-            seq,
-            health,
-            cli_session_active,
-        ))
+        Ok(build_projection(&rows, revision, seq, health))
     }
 
     #[cfg(test)]

@@ -73,8 +73,6 @@ pub struct NativeFeedSnapshot {
     pub entries: Vec<NativeFeedEntry>,
     pub forks: Vec<NativeFeedFork>,
     pub health: NativeIngestHealth,
-    // Coarse hint sourced from the existing workspace CLI activity poller.
-    pub cli_session_active: bool,
 }
 
 #[derive(Default)]
@@ -90,7 +88,6 @@ pub fn build_projection(
     revision: u64,
     seq: i64,
     health: NativeIngestHealth,
-    cli_session_active: bool,
 ) -> NativeFeedSnapshot {
     let mut normalizers = HashMap::<String, NativeClaudeNormalizer>::new();
     let mut entry_positions = HashMap::<(String, usize), usize>::new();
@@ -199,6 +196,5 @@ pub fn build_projection(
         entries,
         forks,
         health,
-        cli_session_active,
     }
 }

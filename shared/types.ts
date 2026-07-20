@@ -361,7 +361,7 @@ export type NativeFileImportHealth = { claude_session_id: string, file_name: str
 
 export type NativeIngestHealth = { unknown_kinds: bigint, rescans: bigint, quarantined_files: bigint, watch_degraded: boolean, files: Array<NativeFileImportHealth>, };
 
-export type NativeFeedSnapshot = { revision: bigint, seq: bigint, entries: Array<NativeFeedEntry>, forks: Array<NativeFeedFork>, health: NativeIngestHealth, cli_session_active: boolean, };
+export type NativeFeedSnapshot = { revision: bigint, seq: bigint, entries: Array<NativeFeedEntry>, forks: Array<NativeFeedFork>, health: NativeIngestHealth, };
 
 export type UnassignedCliSession = { claude_session_id: string, cwd: string, dir_path: string, file_name: string, mtime_ms: bigint | null, first_prompt_snippet: string | null, };
 
