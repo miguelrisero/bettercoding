@@ -125,12 +125,18 @@ struct DirectoryContext {
     cwd: PathBuf,
 }
 
+#[derive(Debug, Default)]
+struct ImportPathState {
+    pending: bool,
+    force_rescan: bool,
+}
+
 pub struct ClaudeTranscriptIngest {
     db: DBService,
     projects_dir: PathBuf,
     directories: RwLock<HashMap<PathBuf, DirectoryContext>>,
     watchers: tokio::sync::Mutex<HashMap<PathBuf, JoinHandle<()>>>,
-    importing_paths: tokio::sync::Mutex<HashSet<PathBuf>>,
+    importing_paths: tokio::sync::Mutex<HashMap<PathBuf, ImportPathState>>,
     sid_dir_cache: RwLock<HashMap<String, PathBuf>>,
     quarantined_paths: Mutex<HashSet<PathBuf>>,
     unknown_kinds: AtomicU64,
@@ -141,6 +147,8 @@ pub struct ClaudeTranscriptIngest {
     publisher_notify: Notify,
     #[cfg(test)]
     snapshot_watermark_barrier: tokio::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    path_import_barrier: tokio::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 impl ClaudeTranscriptIngest {
@@ -172,7 +180,7 @@ impl ClaudeTranscriptIngest {
             projects_dir,
             directories: RwLock::new(HashMap::new()),
             watchers: tokio::sync::Mutex::new(HashMap::new()),
-            importing_paths: tokio::sync::Mutex::new(HashSet::new()),
+            importing_paths: tokio::sync::Mutex::new(HashMap::new()),
             sid_dir_cache: RwLock::new(HashMap::new()),
             quarantined_paths: Mutex::new(HashSet::new()),
             unknown_kinds: AtomicU64::new(0),
@@ -183,6 +191,8 @@ impl ClaudeTranscriptIngest {
             publisher_notify: Notify::new(),
             #[cfg(test)]
             snapshot_watermark_barrier: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            path_import_barrier: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -506,17 +516,45 @@ impl ClaudeTranscriptIngest {
         context: &DirectoryContext,
         force_rescan: bool,
     ) -> Result<(), ClaudeTranscriptIngestError> {
+        let path = path.to_path_buf();
         {
             let mut importing = self.importing_paths.lock().await;
-            if !importing.insert(path.to_path_buf()) {
+            if let Some(state) = importing.get_mut(&path) {
+                state.pending = true;
+                state.force_rescan |= force_rescan;
                 return Ok(());
             }
+            importing.insert(path.clone(), ImportPathState::default());
         }
-        let result = self
-            .process_native_path_inner(path, context, force_rescan)
-            .await;
-        self.importing_paths.lock().await.remove(path);
-        result
+
+        let mut next_force_rescan = force_rescan;
+        loop {
+            let result = self
+                .process_native_path_inner(&path, context, next_force_rescan)
+                .await;
+            #[cfg(test)]
+            if let Some(barrier) = self.path_import_barrier.lock().await.take() {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+
+            let mut importing = self.importing_paths.lock().await;
+            let state = importing
+                .get_mut(&path)
+                .expect("active import path state exists");
+            if state.pending {
+                next_force_rescan = state.force_rescan;
+                state.pending = false;
+                state.force_rescan = false;
+                drop(importing);
+                if let Err(error) = result {
+                    tracing::warn!(?error, path = %path.display(), "retrying native transcript path after pending event");
+                }
+                continue;
+            }
+            importing.remove(&path);
+            return result;
+        }
     }
 
     async fn process_native_path_inner(
@@ -811,7 +849,7 @@ impl ClaudeTranscriptIngest {
         // Redrain the durable outbox after restart. New subscribers still use
         // a snapshot, while this closes the startup race for a subscriber that
         // connects during initial backfill.
-        let mut published = HashMap::new();
+        let mut published = HashMap::<Uuid, (i64, u64)>::new();
         let mut interval = tokio::time::interval(OUTBOX_POLL_INTERVAL);
         loop {
             tokio::select! {
@@ -827,35 +865,17 @@ impl ClaudeTranscriptIngest {
                 }
             };
             for maximum in maxima {
-                let cursor = published.entry(maximum.session_id).or_insert(0);
-                while *cursor < maximum.max_seq {
-                    let rows = match CliIngestOutbox::find_after(
-                        &self.db.pool,
-                        maximum.session_id,
-                        *cursor,
-                        256,
-                    )
-                    .await
-                    {
-                        Ok(rows) => rows,
-                        Err(error) => {
-                            tracing::warn!(?error, session_id = %maximum.session_id, "failed to drain native transcript outbox");
-                            break;
-                        }
-                    };
-                    if rows.is_empty() {
-                        break;
-                    }
-                    let revision = self.revision(maximum.session_id).await;
-                    for row in rows {
-                        *cursor = row.seq;
-                        let _ = self.feed_updates.send(NativeFeedUpdate::RecordsAppended {
-                            session_id: maximum.session_id,
-                            seq: row.seq,
-                            revision,
-                        });
-                    }
+                let revision = self.revision(maximum.session_id).await;
+                let state = published.entry(maximum.session_id).or_insert((0, revision));
+                if state.1 == revision && state.0 >= maximum.max_seq {
+                    continue;
                 }
+                *state = (maximum.max_seq, revision);
+                let _ = self.feed_updates.send(NativeFeedUpdate::RecordsAppended {
+                    session_id: maximum.session_id,
+                    seq: maximum.max_seq,
+                    revision,
+                });
             }
         }
     }

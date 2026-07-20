@@ -158,6 +158,37 @@ fn resnapshot_reason(
     }
 }
 
+fn update_session_id(update: NativeFeedUpdate) -> Uuid {
+    match update {
+        NativeFeedUpdate::RecordsAppended { session_id, .. }
+        | NativeFeedUpdate::RevisionInvalidated { session_id, .. } => session_id,
+    }
+}
+
+fn drain_latest_update(
+    first: NativeFeedUpdate,
+    updates: &mut tokio::sync::broadcast::Receiver<NativeFeedUpdate>,
+    session_id: Uuid,
+) -> (Option<NativeFeedUpdate>, bool) {
+    let mut latest = (update_session_id(first) == session_id).then_some(first);
+    let mut lagged = false;
+    loop {
+        match updates.try_recv() {
+            Ok(update) => {
+                if update_session_id(update) == session_id {
+                    latest = Some(update);
+                }
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                lagged = true;
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+    (latest, lagged)
+}
+
 async fn handle_native_feed_ws(
     mut socket: MaybeSignedWebSocket,
     ingest: Arc<ClaudeTranscriptIngest>,
@@ -180,19 +211,24 @@ async fn handle_native_feed_ws(
             update = updates.recv() => {
                 match update {
                     Ok(update) => {
-                        let Some(reason) = resnapshot_reason(
-                            update,
-                            session_id,
-                            last_seq,
-                            revision,
-                        ) else {
+                        let (latest, lagged) =
+                            drain_latest_update(update, &mut updates, session_id);
+                        let reason = latest.and_then(|latest| {
+                            resnapshot_reason(latest, session_id, last_seq, revision)
+                        });
+                        if !lagged && reason.is_none() {
                             continue;
-                        };
-                        if reason.sequence_gap || reason.revision_changed {
+                        }
+                        if lagged
+                            || reason.is_some_and(|reason| {
+                                reason.sequence_gap || reason.revision_changed
+                            })
+                        {
                             tracing::debug!(
                                 %session_id,
-                                sequence_gap = reason.sequence_gap,
-                                revision_changed = reason.revision_changed,
+                                lagged,
+                                sequence_gap = reason.is_some_and(|reason| reason.sequence_gap),
+                                revision_changed = reason.is_some_and(|reason| reason.revision_changed),
                                 "resnapshotting native transcript feed"
                             );
                         }
@@ -331,5 +367,46 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn websocket_update_drain_keeps_only_latest_session_update() {
+        let session_id = Uuid::new_v4();
+        let other_session_id = Uuid::new_v4();
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(8);
+        sender
+            .send(NativeFeedUpdate::RecordsAppended {
+                session_id,
+                seq: 2,
+                revision: 0,
+            })
+            .unwrap();
+        sender
+            .send(NativeFeedUpdate::RecordsAppended {
+                session_id: other_session_id,
+                seq: 99,
+                revision: 0,
+            })
+            .unwrap();
+        sender
+            .send(NativeFeedUpdate::RecordsAppended {
+                session_id,
+                seq: 3,
+                revision: 0,
+            })
+            .unwrap();
+
+        let first = receiver.try_recv().unwrap();
+        let (latest, lagged) = drain_latest_update(first, &mut receiver, session_id);
+        assert!(!lagged);
+        assert_eq!(
+            latest,
+            Some(NativeFeedUpdate::RecordsAppended {
+                session_id,
+                seq: 3,
+                revision: 0,
+            })
+        );
+        assert!(receiver.try_recv().is_err());
     }
 }

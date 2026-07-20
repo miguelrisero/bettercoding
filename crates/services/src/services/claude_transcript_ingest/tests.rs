@@ -28,7 +28,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    ClaudeTranscriptIngest, NativeFeedOrigin, NativeFeedUpdate, claude_project_slug, effective_cwd,
+    ClaudeTranscriptIngest, DirectoryContext, NativeFeedOrigin, NativeFeedUpdate,
+    claude_project_slug, effective_cwd,
 };
 
 const FIXTURE_SID: &str = "06a7eacd-664b-4d9c-83f3-d4774a6216a8";
@@ -301,6 +302,104 @@ async fn large_backfill_imports_across_bounded_line_batches() {
             .await
             .unwrap(),
         300
+    );
+
+    let mut updates = service.subscribe();
+    let shutdown = CancellationToken::new();
+    let publisher = tokio::spawn(service.clone().run_publisher(shutdown.child_token()));
+    match tokio::time::timeout(Duration::from_secs(5), updates.recv())
+        .await
+        .expect("publisher did not drain batched backfill")
+        .unwrap()
+    {
+        NativeFeedUpdate::RecordsAppended {
+            session_id,
+            seq,
+            revision,
+        } => {
+            assert_eq!(session_id, session.id);
+            assert_eq!(seq, 300);
+            assert_eq!(revision, 0);
+        }
+        NativeFeedUpdate::RevisionInvalidated { .. } => {
+            panic!("ordinary backfill should not invalidate its revision")
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), updates.recv())
+            .await
+            .is_err(),
+        "one drain cycle must publish one coalesced append"
+    );
+    shutdown.cancel();
+    publisher.await.unwrap();
+}
+
+#[tokio::test]
+async fn event_arriving_during_import_triggers_immediate_path_rescan() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, &workspace_root).await;
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    let sid = "11101010-1010-4010-8010-101010101010";
+    let native_file = native_dir.join(format!("{sid}.jsonl"));
+    let first = native_user_record(sid, "before-pending", "before", "2026-07-20T20:00:00Z");
+    fs::write(&native_file, &first).unwrap();
+    ClaudeSessionLink::assign_manual(&db.pool, sid, session.id, &cwd.to_string_lossy())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), projects_dir));
+    let context = DirectoryContext {
+        workspace_id: workspace.id,
+        cwd,
+    };
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    *service.path_import_barrier.lock().await = Some(barrier.clone());
+    let import_service = service.clone();
+    let import_path = native_file.clone();
+    let import_context = context.clone();
+    let first_import = tokio::spawn(async move {
+        import_service
+            .process_native_path(&import_path, &import_context, false)
+            .await
+    });
+
+    // The first pass has completed its database transaction but still owns
+    // the path. Append and deliver another event in that exact window.
+    barrier.wait().await;
+    let second = native_user_record(sid, "after-pending", "after", "2026-07-20T20:00:01Z");
+    fs::write(&native_file, format!("{first}{second}")).unwrap();
+    service
+        .process_native_path(&native_file, &context, false)
+        .await
+        .unwrap();
+    barrier.wait().await;
+    first_import.await.unwrap().unwrap();
+
+    let file = CliNativeFile::list_latest_by_sid(&db.pool, sid)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        CliNativeRecord::count_for_file(&db.pool, file.id)
+            .await
+            .unwrap(),
+        2
+    );
+    let snapshot = service.snapshot(session.id).await.unwrap();
+    assert!(
+        snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.uuid.as_deref() == Some("after-pending"))
     );
 }
 
