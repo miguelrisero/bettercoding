@@ -86,7 +86,8 @@ fn normalize_arrows(s: &str) -> String {
 /// path rejects overlong arrow lines up front; the model path caps at
 /// [`TITLE_MAX_CHARS`]).
 fn canonicalize_title(raw: &str, max_chars: usize) -> String {
-    let joined = normalize_arrows(&raw.split_whitespace().collect::<Vec<_>>().join(" "));
+    let joined = normalize_arrows(&raw.split_whitespace().collect::<Vec<_>>().join(" "))
+        .replace(char::is_control, "");
     let capped: String = joined.chars().take(max_chars).collect();
     // A cap cut inside " -> " (or degenerate input like "a -> ->") leaves
     // dangling arrow fragments, possibly shielding more trailing punctuation
@@ -1282,6 +1283,12 @@ printf 'I would implement the requested task by editing the handler.\n'
     fn collapses_title_whitespace() {
         let s = "{\"title\":\"  Add   export  \",\"branch\":\"add-export\"}";
         assert_eq!(parse_workspace_names(s).unwrap().title, "Add export");
+    }
+
+    #[test]
+    fn strips_embedded_control_characters_from_title() {
+        let s = "{\"title\":\"bp -> pipe\\u001b grace\",\"branch\":\"x\"}";
+        assert_eq!(parse_workspace_names(s).unwrap().title, "bp -> pipe grace");
     }
 
     #[test]
