@@ -114,7 +114,9 @@ struct NativeClaudeWireEnvelope {
     #[serde(default)]
     is_sidechain: bool,
     leaf_uuid: Option<String>,
-    message: Option<ClaudeMessage>,
+    // Keep the envelope tolerant even if a newer/private content-block shape
+    // is not yet representable by `ClaudeMessage`.
+    message: Option<serde_json::Value>,
     #[serde(default, rename = "isSynthetic")]
     is_synthetic: bool,
     #[serde(default, rename = "isReplay")]
@@ -164,14 +166,32 @@ pub fn adapt_native_claude_line(
 
     let event = match (kind.as_str(), wire.message) {
         ("user", Some(message)) => ClaudeJson::User {
-            message,
+            message: match serde_json::from_value::<ClaudeMessage>(message) {
+                Ok(message) => message,
+                Err(_) => {
+                    return Ok(NativeClaudeLine {
+                        metadata,
+                        disposition: NativeClaudeDisposition::Unknown,
+                        event: None,
+                    });
+                }
+            },
             session_id: Some(session_id),
             uuid: wire.uuid,
             is_synthetic: wire.is_synthetic,
             is_replay: wire.is_replay,
         },
         ("assistant", Some(message)) => ClaudeJson::Assistant {
-            message,
+            message: match serde_json::from_value::<ClaudeMessage>(message) {
+                Ok(message) => message,
+                Err(_) => {
+                    return Ok(NativeClaudeLine {
+                        metadata,
+                        disposition: NativeClaudeDisposition::Unknown,
+                        event: None,
+                    });
+                }
+            },
             session_id: Some(session_id),
             uuid: wire.uuid,
         },
