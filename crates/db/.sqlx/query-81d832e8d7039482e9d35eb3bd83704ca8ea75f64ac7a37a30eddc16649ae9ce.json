@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COALESCE(MAX(seq), 0) + 1 AS \"seq!: i64\"\n               FROM cli_ingest_outbox WHERE session_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "name": "seq!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "81d832e8d7039482e9d35eb3bd83704ca8ea75f64ac7a37a30eddc16649ae9ce"
+}

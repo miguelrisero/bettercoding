@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO cli_ingest_outbox\n                       (session_id, seq, file_id, line_seq)\n                   VALUES ($1, $2, $3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "f2d59a0a822c94aca3af6641ed2979408811ad470560994c2946c194279985f8"
+}

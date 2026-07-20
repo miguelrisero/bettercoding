@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT session_id AS \"session_id!: Uuid\",\n                      seq,\n                      file_id AS \"file_id!: Uuid\",\n                      line_seq,\n                      created_at AS \"created_at!: DateTime<Utc>\"\n               FROM cli_ingest_outbox\n               WHERE session_id = $1 AND seq > $2\n               ORDER BY seq ASC\n               LIMIT $3",
+  "describe": {
+    "columns": [
+      {
+        "name": "session_id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "seq",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "file_id!: Uuid",
+        "ordinal": 2,
+        "type_info": "Blob"
+      },
+      {
+        "name": "line_seq",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "created_at!: DateTime<Utc>",
+        "ordinal": 4,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "81e6268c48acaa82bc48f376f3941a9ffebf4475a677afdc791ca9acc54f670f"
+}

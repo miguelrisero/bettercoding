@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO cli_native_files\n                   (id, claude_session_id, dir_path, file_name,\n                    discovered_workspace_id, dev, inode, generation,\n                    observed_size, observed_mtime_ms)\n               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 10
+    },
+    "nullable": []
+  },
+  "hash": "6d866c71322588c378b68679969d83e9a8cbd00c8e16706d15416a8195af28b2"
+}

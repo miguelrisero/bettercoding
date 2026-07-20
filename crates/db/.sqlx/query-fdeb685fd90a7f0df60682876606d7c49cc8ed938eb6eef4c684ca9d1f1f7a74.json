@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT EXISTS(\n                   SELECT 1\n                   FROM execution_native_links enl\n                   JOIN execution_processes ep ON ep.id = enl.execution_process_id\n                   WHERE enl.native_uuid = $1 AND ep.created_at <= $2\n               ) AS \"found!: bool\"",
+  "describe": {
+    "columns": [
+      {
+        "name": "found!: bool",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fdeb685fd90a7f0df60682876606d7c49cc8ed938eb6eef4c684ca9d1f1f7a74"
+}

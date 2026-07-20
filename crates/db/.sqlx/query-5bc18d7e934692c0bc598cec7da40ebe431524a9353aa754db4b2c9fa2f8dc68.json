@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO claude_session_links\n                   (claude_session_id, session_id, workspace_id, cwd, bound_via)\n               VALUES ($1, $2, $3, $4, $5)\n               ON CONFLICT(claude_session_id) DO UPDATE SET\n                   session_id = excluded.session_id,\n                   workspace_id = excluded.workspace_id,\n                   cwd = excluded.cwd,\n                   bound_via = excluded.bound_via",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "5bc18d7e934692c0bc598cec7da40ebe431524a9353aa754db4b2c9fa2f8dc68"
+}

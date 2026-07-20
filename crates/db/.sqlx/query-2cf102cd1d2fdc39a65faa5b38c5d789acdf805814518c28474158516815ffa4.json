@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT enl.execution_process_id AS \"execution_process_id!: Uuid\"\n               FROM execution_native_links enl\n               JOIN execution_processes ep ON ep.id = enl.execution_process_id\n               WHERE enl.native_uuid = $1\n               ORDER BY ep.created_at ASC\n               LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "execution_process_id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2cf102cd1d2fdc39a65faa5b38c5d789acdf805814518c28474158516815ffa4"
+}

@@ -1,4 +1,9 @@
+pub mod claude_session_link;
+pub mod cli_ingest_outbox;
+pub mod cli_native_file;
+pub mod cli_native_record;
 pub mod coding_agent_turn;
+pub mod execution_native_link;
 pub mod execution_process;
 pub mod execution_process_logs;
 pub mod execution_process_repo_state;
