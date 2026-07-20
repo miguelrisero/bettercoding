@@ -45,6 +45,9 @@ use crate::{DeploymentImpl, error::ApiError, middleware::load_workspace_middlewa
 
 /// Wall-clock budget for generating a zip archive.
 const ZIP_WALL_TIME: Duration = Duration::from_secs(120);
+/// Maximum number of sibling names tried when preserving a non-regular
+/// `.gitignore` before creating the app-managed replacement.
+const MAX_GITIGNORE_BACKUP_ATTEMPTS: usize = 32;
 
 type WorkspaceFilesystemLock = Arc<RwLock<()>>;
 
@@ -420,6 +423,43 @@ async fn is_symlink(path: &Path) -> Result<bool, ApiError> {
     }
 }
 
+async fn move_aside_non_regular_gitignore(
+    uploads_dir: &Path,
+    gitignore: &Path,
+) -> Result<(), ApiError> {
+    for attempt in 0..MAX_GITIGNORE_BACKUP_ATTEMPTS {
+        let backup_name = if attempt == 0 {
+            ".gitignore.bak".to_string()
+        } else {
+            format!(".gitignore.bak.{attempt}")
+        };
+        let backup = uploads_dir.join(backup_name);
+
+        match tokio::fs::symlink_metadata(&backup).await {
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        tokio::fs::rename(gitignore, &backup).await?;
+        tracing::warn!(
+            original_path = %gitignore.display(),
+            backup_path = %backup.display(),
+            "Moved non-regular uploads .gitignore aside before repair"
+        );
+        return Ok(());
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "No available backup name for non-regular {} after {MAX_GITIGNORE_BACKUP_ATTEMPTS} attempts",
+            gitignore.display()
+        ),
+    )
+    .into())
+}
+
 async fn ensure_uploads_gitignore(uploads_dir: &Path) -> Result<(), ApiError> {
     let gitignore = uploads_dir.join(".gitignore");
     loop {
@@ -429,13 +469,11 @@ async fn ensure_uploads_gitignore(uploads_dir: &Path) -> Result<(), ApiError> {
                 // presence is sufficient, so never overwrite its contents.
                 return Ok(());
             }
-            Ok(metadata) if metadata.file_type().is_dir() => {
-                tokio::fs::remove_dir_all(&gitignore).await?;
-            }
             Ok(_) => {
-                // Remove symlinks and other non-regular entries without following
-                // them, then atomically create the replacement below.
-                tokio::fs::remove_file(&gitignore).await?;
+                // Preserve directories, symlinks, sockets, and every other
+                // non-regular entry. If the move fails, fail closed rather than
+                // deleting user data or continuing without an ignore file.
+                move_aside_non_regular_gitignore(uploads_dir, &gitignore).await?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 match tokio::fs::OpenOptions::new()
@@ -1021,7 +1059,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uploads_dir_resolver_replaces_gitignore_directory() {
+    async fn uploads_dir_resolver_preserves_gitignore_directory_as_backup() {
         let tempdir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(tempdir.path()).unwrap();
         let expected = seed_upload_dir(&base, UPLOADS_DIR);
@@ -1033,12 +1071,41 @@ mod tests {
         let resolved = resolve_uploads_dir(&base).await.unwrap();
 
         assert_eq!(resolved, expected);
+        assert_eq!(
+            fs::read(expected.join(".gitignore.bak/nested")).unwrap(),
+            b"not an ignore file"
+        );
+        assert_gitignored(&expected);
+    }
+
+    #[tokio::test]
+    async fn uploads_dir_resolver_uses_numbered_gitignore_backup_without_clobbering() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let expected = seed_upload_dir(&base, UPLOADS_DIR);
+        let gitignore = expected.join(".gitignore");
+        fs::remove_file(&gitignore).unwrap();
+        fs::create_dir(&gitignore).unwrap();
+        fs::write(gitignore.join("nested"), b"preserve me").unwrap();
+        fs::write(expected.join(".gitignore.bak"), b"existing backup").unwrap();
+
+        let resolved = resolve_uploads_dir(&base).await.unwrap();
+
+        assert_eq!(resolved, expected);
+        assert_eq!(
+            fs::read(expected.join(".gitignore.bak")).unwrap(),
+            b"existing backup"
+        );
+        assert_eq!(
+            fs::read(expected.join(".gitignore.bak.1/nested")).unwrap(),
+            b"preserve me"
+        );
         assert_gitignored(&expected);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn uploads_dir_resolver_replaces_gitignore_symlink_without_writing_through() {
+    async fn uploads_dir_resolver_preserves_gitignore_symlink_as_backup() {
         use std::os::unix::fs::symlink;
 
         let tempdir = tempfile::tempdir().unwrap();
@@ -1055,6 +1122,14 @@ mod tests {
 
         assert_eq!(resolved, expected);
         assert_gitignored(&expected);
+        let backup = expected.join(".gitignore.bak");
+        assert!(
+            fs::symlink_metadata(&backup)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(backup).unwrap(), outside_file);
         assert_eq!(fs::read(outside_file).unwrap(), b"outside data");
     }
 
