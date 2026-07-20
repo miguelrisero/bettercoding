@@ -175,7 +175,7 @@ pub fn build_projection(
                     NativeBranchMetadata {
                         fork_parent_uuid: fork.fork_parent_uuid.clone(),
                         branch_index,
-                        branch_label: branch.label.clone(),
+                        branch_label: format!("Branch {}", branch_index + 1),
                         is_default: fork.default_branch == Some(branch_index),
                     },
                 );

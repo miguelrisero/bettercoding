@@ -72,7 +72,6 @@ function deriveForkAwareDisplayEntries(
       toNativeForkDisplayGroup(
         item.section,
         item.section.branches.map((branch) => ({
-          label: branch.label,
           isDefault: branch.isDefault,
           entries: aggregateRenderableEntries(
             branch.entries.map((entry) => ({

@@ -12,7 +12,6 @@ pub struct NativeDagRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 pub struct NativeForkBranch {
-    pub label: String,
     pub root_uuid: String,
     pub node_uuids: Vec<String>,
     pub leaf_uuids: Vec<String>,
@@ -33,9 +32,9 @@ fn is_conversational_kind(kind: &str) -> bool {
 /// Compute the first observed conversational fork in record order. Raw
 /// bookkeeping nodes preserve the topology, but only child subtrees containing
 /// user or assistant records can form branches. The common prefix includes the
-/// raw fork parent as its anchor; branch nodes and leaves are conversational.
-/// The leaf hint only chooses the default-expanded branch and never hides
-/// another path.
+/// raw fork parent as its anchor; each branch is one linear conversational
+/// path from that parent to a leaf. The leaf hint only chooses the
+/// default-expanded branch and never hides another path.
 pub fn compute_fork_view(
     records: &[NativeDagRecord],
     leaf_hint: Option<&str>,
@@ -104,49 +103,63 @@ pub fn compute_fork_view(
     }
     prefix_uuids.reverse();
 
-    let branch_data = branch_roots
-        .iter()
-        .enumerate()
-        .map(|(index, raw_root_uuid)| {
-            let mut stack = vec![raw_root_uuid.clone()];
-            let mut raw_node_uuids = HashSet::new();
-            let mut node_uuids = Vec::new();
-            let mut leaf_uuids = Vec::new();
-            while let Some(uuid) = stack.pop() {
-                if !raw_node_uuids.insert(uuid.clone()) {
-                    continue;
-                }
-                if conversational.contains(&uuid) {
-                    node_uuids.push(uuid.clone());
-                    let has_conversational_child = children.get(&uuid).is_some_and(|next| {
-                        next.iter()
-                            .any(|child| contains_conversation.contains(child))
-                    });
-                    if !has_conversational_child {
-                        leaf_uuids.push(uuid.clone());
-                    }
-                }
-                if let Some(next) = children.get(&uuid) {
-                    for child in next.iter().rev() {
-                        stack.push(child.clone());
-                    }
-                }
+    let mut branch_data = Vec::new();
+    for raw_root_uuid in &branch_roots {
+        let mut stack = vec![(raw_root_uuid.clone(), Vec::<String>::new())];
+        while let Some((uuid, mut raw_path)) = stack.pop() {
+            if raw_path.contains(&uuid) {
+                continue;
             }
-            let root_uuid = node_uuids
-                .first()
-                .expect("a branch root is known to contain conversation")
-                .clone();
-            (
-                NativeForkBranch {
-                    label: format!("Branch {}", index + 1),
-                    root_uuid,
-                    node_uuids,
-                    leaf_uuids,
-                },
-                raw_node_uuids,
-            )
-        })
-        .collect::<Vec<_>>();
+            raw_path.push(uuid.clone());
+
+            let conversational_children = children
+                .get(&uuid)
+                .into_iter()
+                .flatten()
+                .filter(|child| contains_conversation.contains(*child))
+                .cloned()
+                .collect::<Vec<_>>();
+            if conversational.contains(&uuid) && conversational_children.is_empty() {
+                let node_uuids = raw_path
+                    .iter()
+                    .filter(|path_uuid| conversational.contains(*path_uuid))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let root_uuid = node_uuids
+                    .first()
+                    .expect("a branch root is known to contain conversation")
+                    .clone();
+
+                // Resume hints can point at bookkeeping records written after
+                // the last conversational node, so keep that raw tail in the
+                // branch's private hint-membership set.
+                let mut raw_node_uuids = raw_path.iter().cloned().collect::<HashSet<_>>();
+                let mut raw_tail = children.get(&uuid).cloned().unwrap_or_default();
+                while let Some(raw_uuid) = raw_tail.pop() {
+                    if !raw_node_uuids.insert(raw_uuid.clone()) {
+                        continue;
+                    }
+                    if let Some(next) = children.get(&raw_uuid) {
+                        raw_tail.extend(next.iter().cloned());
+                    }
+                }
+
+                branch_data.push((
+                    NativeForkBranch {
+                        root_uuid,
+                        node_uuids,
+                        leaf_uuids: vec![uuid],
+                    },
+                    raw_node_uuids,
+                ));
+                continue;
+            }
+
+            for child in conversational_children.into_iter().rev() {
+                stack.push((child, raw_path.clone()));
+            }
+        }
+    }
 
     let default_branch = leaf_hint.and_then(|hint| {
         branch_data
@@ -260,7 +273,6 @@ mod tests {
         assert_eq!(
             fork.branches[0],
             NativeForkBranch {
-                label: "Branch 1".to_string(),
                 root_uuid: "d46cae0d-6204-4ccf-9378-8b1f10ad6be3".to_string(),
                 node_uuids: vec![
                     "d46cae0d-6204-4ccf-9378-8b1f10ad6be3".to_string(),
@@ -273,7 +285,6 @@ mod tests {
         assert_eq!(
             fork.branches[1],
             NativeForkBranch {
-                label: "Branch 2".to_string(),
                 root_uuid: "3c1bead3-d7ea-4c53-98dc-028379e0b345".to_string(),
                 node_uuids: vec![
                     "3c1bead3-d7ea-4c53-98dc-028379e0b345".to_string(),
@@ -289,5 +300,50 @@ mod tests {
         let full = compute_fork_view(&full_records, full_hint.as_deref()).unwrap();
         assert_eq!(full.default_branch, Some(1));
         assert_eq!(full.branches.len(), 2);
+    }
+
+    #[test]
+    fn nested_fork_emits_one_linear_branch_per_conversational_leaf() {
+        let records = [
+            ("fork-parent", None, "assistant"),
+            ("shared-root", Some("fork-parent"), "user"),
+            ("third-leaf", Some("fork-parent"), "user"),
+            ("nested-parent", Some("shared-root"), "assistant"),
+            ("first-leaf", Some("nested-parent"), "user"),
+            ("second-leaf", Some("nested-parent"), "user"),
+        ]
+        .into_iter()
+        .map(|(uuid, parent_uuid, kind)| NativeDagRecord {
+            uuid: uuid.to_string(),
+            parent_uuid: parent_uuid.map(str::to_string),
+            kind: kind.to_string(),
+        })
+        .collect::<Vec<_>>();
+
+        let fork = compute_fork_view(&records, Some("second-leaf")).unwrap();
+        assert_eq!(fork.branches.len(), 3);
+        assert_eq!(
+            fork.branches
+                .iter()
+                .map(|branch| branch.node_uuids.as_slice())
+                .collect::<Vec<_>>(),
+            [
+                ["shared-root", "nested-parent", "first-leaf"].as_slice(),
+                ["shared-root", "nested-parent", "second-leaf"].as_slice(),
+                ["third-leaf"].as_slice(),
+            ]
+        );
+        assert_eq!(
+            fork.branches
+                .iter()
+                .map(|branch| branch.leaf_uuids.as_slice())
+                .collect::<Vec<_>>(),
+            [
+                ["first-leaf"].as_slice(),
+                ["second-leaf"].as_slice(),
+                ["third-leaf"].as_slice(),
+            ]
+        );
+        assert_eq!(fork.default_branch, Some(1));
     }
 }

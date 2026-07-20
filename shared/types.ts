@@ -351,7 +351,7 @@ export type NativeBranchMetadata = { fork_parent_uuid: string, branch_index: num
 
 export type NativeFeedEntry = { normalized_entry: NormalizedEntry, claude_session_id: string, uuid: string | null, parent_uuid: string | null, ts: string | null, origin: NativeFeedOrigin, linked_execution_process_id: string | null, git_branch: string | null, version: string | null, branch: NativeBranchMetadata | null, seq: bigint, };
 
-export type NativeForkBranch = { label: string, root_uuid: string, node_uuids: Array<string>, leaf_uuids: Array<string>, };
+export type NativeForkBranch = { root_uuid: string, node_uuids: Array<string>, leaf_uuids: Array<string>, };
 
 export type NativeForkView = { fork_parent_uuid: string, prefix_uuids: Array<string>, branches: Array<NativeForkBranch>, default_branch: number | null, };
 

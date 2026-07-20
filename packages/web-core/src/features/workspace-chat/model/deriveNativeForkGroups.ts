@@ -7,7 +7,6 @@ import type {
 } from '@/shared/hooks/useConversationHistory/types';
 
 export interface NativeForkEntryBranch {
-  label: string;
   isDefault: boolean;
   entries: PatchTypeWithKey[];
   entryIndices: number[];
@@ -98,7 +97,6 @@ export function deriveNativeForkEntrySections(
       });
 
       return {
-        label: branch.label,
         isDefault: feedFork.fork.default_branch === branchIndex,
         entries: branchEntries,
         entryIndices,

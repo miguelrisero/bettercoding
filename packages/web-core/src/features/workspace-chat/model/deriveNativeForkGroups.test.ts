@@ -86,13 +86,11 @@ function feedFork(): NativeFeedFork {
       prefix_uuids: ['root', FORK_PARENT_UUID],
       branches: [
         {
-          label: 'Branch 1',
           root_uuid: 'branch-1-root',
           node_uuids: ['branch-1-root'],
           leaf_uuids: ['branch-1-root'],
         },
         {
-          label: 'Branch 2',
           root_uuid: 'branch-2-root',
           node_uuids: ['branch-2-root'],
           leaf_uuids: ['branch-2-root'],
@@ -104,7 +102,7 @@ function feedFork(): NativeFeedFork {
 }
 
 describe('deriveNativeForkEntrySections', () => {
-  it('keeps the common prefix inline and computes labeled branches', () => {
+  it('keeps the common prefix inline and computes leaf branches', () => {
     const entries = [
       nativePatch(nativeEntry('root', 'common root', 1, null)),
       nativePatch(nativeEntry(FORK_PARENT_UUID, 'fork parent', 2, null)),
@@ -129,18 +127,15 @@ describe('deriveNativeForkEntrySections', () => {
     ]);
     expect(
       section.branches.map((branch) => ({
-        label: branch.label,
         isDefault: branch.isDefault,
         entries: branch.entries.map((entry) => entry.patchKey),
       }))
     ).toEqual([
       {
-        label: 'Branch 1',
         isDefault: false,
         entries: ['native:branch-1-root'],
       },
       {
-        label: 'Branch 2',
         isDefault: true,
         entries: ['native:branch-2-root'],
       },
@@ -172,6 +167,51 @@ describe('deriveNativeForkEntrySections', () => {
     expect(section.branches[0].entries).toEqual([]);
     expect(section.branches[1].entries.map((entry) => entry.patchKey)).toEqual([
       `${processId}:0`,
+    ]);
+  });
+
+  it('preserves one display branch for every nested-fork leaf path', () => {
+    const fork = feedFork();
+    fork.fork.branches = [
+      {
+        root_uuid: 'shared-root',
+        node_uuids: ['shared-root', 'leaf-1'],
+        leaf_uuids: ['leaf-1'],
+      },
+      {
+        root_uuid: 'shared-root',
+        node_uuids: ['shared-root', 'leaf-2'],
+        leaf_uuids: ['leaf-2'],
+      },
+      {
+        root_uuid: 'leaf-3',
+        node_uuids: ['leaf-3'],
+        leaf_uuids: ['leaf-3'],
+      },
+    ];
+    fork.fork.default_branch = 1;
+    const entries = [
+      nativePatch(nativeEntry('shared-root', 'shared', 1, null)),
+      nativePatch(nativeEntry('leaf-1', 'first', 2, null)),
+      nativePatch(nativeEntry('leaf-2', 'second', 3, null)),
+      nativePatch(nativeEntry('leaf-3', 'third', 4, null)),
+    ];
+
+    const [section] = deriveNativeForkEntrySections(entries, [fork]);
+
+    expect(
+      section.branches.map((branch) =>
+        branch.entries.map((entry) => entry.patchKey)
+      )
+    ).toEqual([
+      ['native:shared-root', 'native:leaf-1'],
+      ['native:shared-root', 'native:leaf-2'],
+      ['native:leaf-3'],
+    ]);
+    expect(section.branches.map((branch) => branch.isDefault)).toEqual([
+      false,
+      true,
+      false,
     ]);
   });
 });

@@ -222,7 +222,6 @@ function NativeForkGroupEntry({
           id: `${group.patchKey}:${index}:${branch.isDefault ? 'default' : 'alternate'}`,
           label: t('conversation.fork.branchLabel', {
             index: index + 1,
-            defaultValue: branch.label,
           }),
           isDefault: branch.isDefault,
           content:

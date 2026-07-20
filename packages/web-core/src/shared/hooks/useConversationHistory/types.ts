@@ -80,7 +80,6 @@ export type BaseDisplayEntry =
   | AggregatedThinkingGroup;
 
 export interface NativeForkDisplayBranch {
-  label: string;
   isDefault: boolean;
   entries: BaseDisplayEntry[];
 }
