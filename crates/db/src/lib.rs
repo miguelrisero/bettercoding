@@ -67,6 +67,11 @@ async fn run_migrations(pool: &Pool<Sqlite>) -> Result<(), Error> {
     }
 }
 
+#[doc(hidden)]
+pub async fn run_migrations_for_tests(pool: &Pool<Sqlite>) -> Result<(), Error> {
+    run_migrations(pool).await
+}
+
 #[derive(Clone)]
 pub struct DBService {
     pub pool: Pool<Sqlite>,
