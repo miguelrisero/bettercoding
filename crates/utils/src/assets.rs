@@ -7,18 +7,25 @@ use std::{
 use directories::ProjectDirs;
 use rust_embed::RustEmbed;
 
-use crate::path::normalize_override;
+use crate::env::env_path_override;
 
 const PROJECT_ROOT: &str = env!("CARGO_MANIFEST_DIR");
 const DATABASE_FILE_NAME: &str = "db.v2.sqlite";
 const LEGACY_DATABASE_FILE_NAME: &str = "db.sqlite";
 
 static PROD_ASSET_DIR: OnceLock<PathBuf> = OnceLock::new();
+static DATA_DIR_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+fn data_dir_env_override() -> Option<&'static Path> {
+    DATA_DIR_OVERRIDE
+        .get_or_init(|| env_path_override("BC_DATA_DIR"))
+        .as_deref()
+}
 
 pub fn asset_dir() -> std::path::PathBuf {
     let path = if cfg!(debug_assertions) {
-        match normalize_override(std::env::var_os("BC_DATA_DIR")) {
-            Some(override_dir) => cached_prod_asset_dir_path(Some(override_dir)),
+        match data_dir_env_override() {
+            Some(override_dir) => cached_prod_asset_dir_path(Some(override_dir.to_path_buf())),
             None => std::path::PathBuf::from(PROJECT_ROOT).join("../../dev_assets"),
         }
     } else {
@@ -44,7 +51,7 @@ pub fn asset_dir() -> std::path::PathBuf {
 /// Without an override, [`asset_dir`] keeps using `dev_assets` in debug builds.
 /// Unit tests exercise [`resolve_data_dir`] directly and never mutate process env.
 pub fn prod_asset_dir_path() -> PathBuf {
-    cached_prod_asset_dir_path(normalize_override(std::env::var_os("BC_DATA_DIR")))
+    cached_prod_asset_dir_path(data_dir_env_override().map(Path::to_path_buf))
 }
 
 fn cached_prod_asset_dir_path(override_dir: Option<PathBuf>) -> PathBuf {

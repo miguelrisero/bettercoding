@@ -1,10 +1,10 @@
 use std::{
-    ffi::OsString,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
 
 static WORKTREE_BASE_DIR: OnceLock<PathBuf> = OnceLock::new();
+static WORKTREE_BASE_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// Directory name for storing attachments in worktrees
 // TODO(bc-legacy-cleanup): rename deferred - stored free-text prompts and messages embed
@@ -16,31 +16,6 @@ pub const VIBE_ATTACHMENTS_DIR: &str = ".vibe-attachments";
 /// Directories that should always be skipped regardless of gitignore.
 /// .git is not in .gitignore but should never be watched.
 pub const ALWAYS_SKIP_DIRS: &[&str] = &[".git", "node_modules"];
-
-pub(crate) fn normalize_override(value: Option<OsString>) -> Option<PathBuf> {
-    let value = value?;
-    if value.is_empty() {
-        tracing::warn!("Ignoring empty path override; treating it as unset");
-        return None;
-    }
-
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        return Some(path);
-    }
-
-    match std::path::absolute(&path) {
-        Ok(absolute_path) => Some(absolute_path),
-        Err(error) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %error,
-                "Failed to make relative path override absolute; using it as-is"
-            );
-            Some(path)
-        }
-    }
-}
 
 /// Convert absolute paths to relative paths based on worktree path
 /// This is a robust implementation that handles symlinks and edge cases
@@ -140,6 +115,13 @@ pub fn normalize_macos_private_alias<P: AsRef<Path>>(p: P) -> PathBuf {
     p.to_path_buf()
 }
 
+/// Returns the cached, normalised `BC_WORKTREE_BASE` override, if one is valid.
+pub fn worktree_base_env_override() -> Option<&'static Path> {
+    WORKTREE_BASE_OVERRIDE
+        .get_or_init(|| crate::env::env_path_override("BC_WORKTREE_BASE"))
+        .as_deref()
+}
+
 // TODO(bc-legacy-cleanup): keep the persisted public function name until callers can migrate.
 /// Returns the worktree base directory, resolving and caching it once per process.
 ///
@@ -151,7 +133,7 @@ pub fn normalize_macos_private_alias<P: AsRef<Path>>(p: P) -> PathBuf {
 pub fn get_vibe_kanban_temp_dir() -> PathBuf {
     WORKTREE_BASE_DIR
         .get_or_init(|| {
-            let override_dir = normalize_override(std::env::var_os("BC_WORKTREE_BASE"));
+            let override_dir = worktree_base_env_override().map(Path::to_path_buf);
             let resolution = if let Some(override_dir) = override_dir {
                 let path =
                     resolve_worktree_base_dir(Some(override_dir), PathBuf::new(), PathBuf::new());
@@ -342,9 +324,9 @@ pub fn expand_tilde(path_str: &str) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::{ffi::OsString, fs};
 
     use tempfile::TempDir;
 
@@ -379,24 +361,6 @@ mod tests {
         assert_eq!(
             make_path_relative("/other/path/file.js", "/tmp/test-worktree"),
             "/other/path/file.js"
-        );
-    }
-
-    #[test]
-    fn empty_override_is_treated_as_unset() {
-        assert_eq!(normalize_override(Some(OsString::new())), None);
-    }
-
-    #[test]
-    fn relative_override_is_made_absolute() {
-        let relative = PathBuf::from("relative-worktree-base");
-        let normalized = normalize_override(Some(relative.clone().into_os_string()))
-            .expect("normalize relative override");
-
-        assert!(normalized.is_absolute());
-        assert_eq!(
-            normalized,
-            std::path::absolute(relative).expect("make expected path absolute")
         );
     }
 
