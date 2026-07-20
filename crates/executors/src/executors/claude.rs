@@ -1,5 +1,6 @@
 // SDK submodules
 pub mod client;
+pub mod native;
 pub mod protocol;
 pub mod slash_commands;
 pub mod types;
@@ -1137,6 +1138,9 @@ pub enum HistoryStrategy {
     Default,
     // Amp threads format which includes logs from previous executions
     AmpResume,
+    // Claude's on-disk native store. Unlike executor history, it is the only
+    // source for CLI-authored user turns, so plain user content is renderable.
+    NativeClaude,
 }
 
 /// Default context window for models (used until we get actual value from result)
@@ -1921,6 +1925,39 @@ impl ClaudeLogProcessor {
                     }
                 }
 
+                if matches!(self.strategy, HistoryStrategy::NativeClaude) && !*is_synthetic {
+                    match &message.content {
+                        ClaudeMessageContent::Array(items) => {
+                            for item in items {
+                                if let ClaudeContentItem::Text { text } = item {
+                                    let entry = NormalizedEntry {
+                                        timestamp: None,
+                                        entry_type: NormalizedEntryType::UserMessage,
+                                        content: text.clone(),
+                                        metadata: Some(
+                                            serde_json::to_value(item)
+                                                .unwrap_or(serde_json::Value::Null),
+                                        ),
+                                    };
+                                    let id = entry_index_provider.next();
+                                    patches
+                                        .push(ConversationPatch::add_normalized_entry(id, entry));
+                                }
+                            }
+                        }
+                        ClaudeMessageContent::Text(text) => {
+                            let entry = NormalizedEntry {
+                                timestamp: None,
+                                entry_type: NormalizedEntryType::UserMessage,
+                                content: text.clone(),
+                                metadata: Some(serde_json::Value::String(text.clone())),
+                            };
+                            let id = entry_index_provider.next();
+                            patches.push(ConversationPatch::add_normalized_entry(id, entry));
+                        }
+                    }
+                }
+
                 if *is_synthetic {
                     for item in message.content.items() {
                         if let ClaudeContentItem::Text { text } = item {
@@ -1936,7 +1973,9 @@ impl ClaudeLogProcessor {
                     }
                 }
 
-                if let Some(mut text) = message.content.as_text().cloned() {
+                if !matches!(self.strategy, HistoryStrategy::NativeClaude)
+                    && let Some(mut text) = message.content.as_text().cloned()
+                {
                     if text.starts_with("<local-command-stdout>")
                         && text.ends_with("</local-command-stdout>")
                     {
