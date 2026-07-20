@@ -741,6 +741,14 @@ export function installTerminalTouchGestures(
   // moment the touch actually happened — not when a busy main thread got
   // around to delivering it.
   const onStart = (e: TouchEvent) => {
+    if (
+      primaryTouchIdentifier !== null &&
+      !touchWithIdentifier(e.touches, primaryTouchIdentifier)
+    ) {
+      // Recovery for a lost touchend: the owned contact is no longer alive,
+      // so release its wedged gesture before adopting this fresh touch.
+      cancelGesture();
+    }
     if (primaryTouchIdentifier === null) {
       const initiatingTouch = e.changedTouches[0] ?? e.targetTouches[0];
       if (!initiatingTouch) return;
@@ -749,6 +757,11 @@ export function installTerminalTouchGestures(
     const point = toOwnedPoint(e);
     if (!point) return;
     controller.onTouchStart(point, e.timeStamp);
+    if (point.touches === 1 && !getTerminalMobileState(terminal).selectMode) {
+      // Cancel a pending promotion when a mobile control is touched before
+      // the long-press deadline, not only after the D-pad becomes visible.
+      attachDocumentTouchStart();
+    }
     reschedule();
   };
   const onMove = (e: TouchEvent) => {

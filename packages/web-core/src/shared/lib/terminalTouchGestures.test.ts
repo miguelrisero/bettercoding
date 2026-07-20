@@ -878,6 +878,281 @@ describe('terminal touch gesture DOM adapter', () => {
     vi.unstubAllGlobals();
   });
 
+  it('cancels a pending long press when a touch starts outside', async () => {
+    const harness = adapterHarness();
+    const primary = touch(1, 100, 100);
+    harness.dispatchTerminal(
+      'touchstart',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [primary],
+        changedTouches: [primary],
+        timeStamp: 0,
+      })
+    );
+    expect(harness.documentTarget.listenerCount('touchstart')).toBe(1);
+
+    const outside = touch(2, 20, 20);
+    harness.documentTarget.dispatch(
+      'touchstart',
+      touchEvent({
+        target: {},
+        targetTouches: [outside],
+        touches: [primary, outside],
+        changedTouches: [outside],
+      })
+    );
+
+    expect(getTerminalMobileState(harness.terminal).dpadActive).toBe(false);
+    expect(harness.overlay.style.display).not.toBe('block');
+    expect(harness.documentTarget.listenerCount('touchstart')).toBe(0);
+    await vi.advanceTimersByTimeAsync(LONG_PRESS_MS + 10_000);
+    expect(harness.arrows).toEqual([]);
+  });
+
+  it('recovers ownership when a lost touchend leaves a stale primary', async () => {
+    const harness = adapterHarness();
+    const stalePrimary = touch(1, 100, 100);
+    harness.dispatchTerminal(
+      'touchstart',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [stalePrimary],
+        changedTouches: [stalePrimary],
+        timeStamp: 0,
+      })
+    );
+    await vi.advanceTimersByTimeAsync(LONG_PRESS_MS);
+    expect(getTerminalMobileState(harness.terminal).dpadActive).toBe(true);
+    expect(harness.overlay.style.display).toBe('block');
+
+    const freshPrimary = touch(2, 200, 200);
+    harness.dispatchTerminal(
+      'touchstart',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [freshPrimary],
+        touches: [freshPrimary],
+        changedTouches: [freshPrimary],
+      })
+    );
+
+    expect(getTerminalMobileState(harness.terminal).dpadActive).toBe(false);
+    expect(harness.overlay.style.display).toBe('none');
+    expect(harness.documentTarget.listenerCount('touchstart')).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(LONG_PRESS_MS);
+    const draggedFreshPrimary = touch(2, 200, 270);
+    harness.dispatchTerminal(
+      'touchmove',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [draggedFreshPrimary],
+        changedTouches: [draggedFreshPrimary],
+      })
+    );
+
+    expect(getTerminalMobileState(harness.terminal).dpadActive).toBe(true);
+    expect(harness.arrows).toEqual(['down']);
+    expect(harness.overlay.textContent).toBe('vv');
+    expect(harness.overlay.style.display).toBe('block');
+    expect(harness.documentTarget.listenerCount('touchstart')).toBe(1);
+  });
+
+  it('cancels the D-pad when a second finger lands inside the terminal', async () => {
+    const harness = adapterHarness();
+    const primary = touch(1, 100, 100);
+    harness.dispatchTerminal(
+      'touchstart',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [primary],
+        changedTouches: [primary],
+        timeStamp: 0,
+      })
+    );
+    await vi.advanceTimersByTimeAsync(LONG_PRESS_MS);
+    const draggedPrimary = touch(1, 100, 170);
+    harness.dispatchTerminal(
+      'touchmove',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [draggedPrimary],
+        changedTouches: [draggedPrimary],
+      })
+    );
+    expect(harness.arrows).toEqual(['down']);
+
+    const second = touch(2, 130, 100);
+    const secondStart = touchEvent({
+      target: harness.element,
+      targetTouches: [draggedPrimary, second],
+      changedTouches: [second],
+    });
+    harness.documentTarget.dispatch('touchstart', secondStart);
+    expect(getTerminalMobileState(harness.terminal).dpadActive).toBe(true);
+    harness.dispatchTerminal('touchstart', secondStart);
+
+    expect(getTerminalMobileState(harness.terminal).dpadActive).toBe(false);
+    expect(harness.arrows).toEqual(['down']);
+    expect(harness.overlay.style.display).toBe('none');
+    expect(harness.documentTarget.listenerCount('touchstart')).toBe(0);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(harness.arrows).toEqual(['down']);
+  });
+
+  it('keeps the D-pad active when a non-primary finger lifts first', async () => {
+    const harness = adapterHarness();
+    const primary = touch(1, 100, 100);
+    const nonPrimary = touch(2, 20, 20);
+    harness.dispatchTerminal(
+      'touchstart',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [primary],
+        touches: [primary, nonPrimary],
+        changedTouches: [primary],
+        timeStamp: 0,
+      })
+    );
+    await vi.advanceTimersByTimeAsync(LONG_PRESS_MS);
+    const draggedPrimary = touch(1, 100, 240);
+    harness.dispatchTerminal(
+      'touchmove',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [draggedPrimary],
+        touches: [draggedPrimary, nonPrimary],
+        changedTouches: [draggedPrimary],
+      })
+    );
+    expect(harness.arrows).toEqual(['down']);
+
+    harness.dispatchTerminal(
+      'touchend',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [draggedPrimary],
+        touches: [draggedPrimary],
+        changedTouches: [nonPrimary],
+      })
+    );
+
+    expect(getTerminalMobileState(harness.terminal).dpadActive).toBe(true);
+    expect(harness.overlay.textContent).toBe('vvvv');
+    expect(harness.overlay.style.display).toBe('block');
+    expect(harness.documentTarget.listenerCount('touchstart')).toBe(1);
+    await vi.advanceTimersByTimeAsync(DPAD_REPEAT_FAST_MS);
+    expect(harness.arrows).toEqual(['down', 'down']);
+  });
+
+  it('fully resets ownership and feedback on touchcancel', async () => {
+    const harness = adapterHarness();
+    const primary = touch(1, 100, 100);
+    harness.dispatchTerminal(
+      'touchstart',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [primary],
+        changedTouches: [primary],
+        timeStamp: 0,
+      })
+    );
+    await vi.advanceTimersByTimeAsync(LONG_PRESS_MS);
+    const draggedPrimary = touch(1, 100, 240);
+    harness.dispatchTerminal(
+      'touchmove',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [draggedPrimary],
+        changedTouches: [draggedPrimary],
+      })
+    );
+    expect(harness.arrows).toEqual(['down']);
+
+    harness.dispatchTerminal(
+      'touchcancel',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [],
+        touches: [],
+        changedTouches: [draggedPrimary],
+      })
+    );
+
+    expect(getTerminalMobileState(harness.terminal).dpadActive).toBe(false);
+    expect(harness.overlay.style.display).toBe('none');
+    expect(harness.documentTarget.listenerCount('touchstart')).toBe(0);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(harness.arrows).toEqual(['down']);
+
+    const freshPrimary = touch(2, 200, 200);
+    harness.dispatchTerminal(
+      'touchstart',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [freshPrimary],
+        changedTouches: [freshPrimary],
+      })
+    );
+    expect(harness.documentTarget.listenerCount('touchstart')).toBe(1);
+    await vi.advanceTimersByTimeAsync(LONG_PRESS_MS);
+    expect(getTerminalMobileState(harness.terminal).dpadActive).toBe(true);
+    expect(harness.overlay.style.display).toBe('block');
+  });
+
+  it('adopts a new primary on a rapid re-press after a clean end', async () => {
+    const harness = adapterHarness();
+    const firstPrimary = touch(1, 100, 100);
+    harness.dispatchTerminal(
+      'touchstart',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [firstPrimary],
+        changedTouches: [firstPrimary],
+        timeStamp: 0,
+      })
+    );
+    expect(harness.documentTarget.listenerCount('touchstart')).toBe(1);
+    await vi.advanceTimersByTimeAsync(10);
+    harness.dispatchTerminal(
+      'touchend',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [],
+        changedTouches: [firstPrimary],
+      })
+    );
+    expect(harness.documentTarget.listenerCount('touchstart')).toBe(0);
+
+    const secondPrimary = touch(2, 200, 200);
+    harness.dispatchTerminal(
+      'touchstart',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [secondPrimary],
+        changedTouches: [secondPrimary],
+      })
+    );
+    expect(harness.documentTarget.listenerCount('touchstart')).toBe(1);
+    await vi.advanceTimersByTimeAsync(LONG_PRESS_MS);
+    const draggedSecondPrimary = touch(2, 200, 270);
+    harness.dispatchTerminal(
+      'touchmove',
+      touchEvent({
+        target: harness.element,
+        targetTouches: [draggedSecondPrimary],
+        changedTouches: [draggedSecondPrimary],
+      })
+    );
+
+    expect(getTerminalMobileState(harness.terminal).dpadActive).toBe(true);
+    expect(harness.arrows).toEqual(['down']);
+    expect(harness.overlay.textContent).toBe('vv');
+    expect(harness.overlay.style.display).toBe('block');
+    expect(harness.documentTarget.listenerCount('touchstart')).toBe(1);
+  });
+
   it('ends the D-pad when its terminal touch lifts before an outside touch', async () => {
     const harness = adapterHarness();
     const primary = touch(1, 100, 100);
