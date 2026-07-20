@@ -63,9 +63,15 @@ async fn stream_native_feed_ws(
             Some(ingest) => ingest,
             None => {
                 let mut socket = socket;
-                let _ = socket
-                    .send(LogMsg::Stderr(disabled_error().to_string()).to_ws_message_unchecked())
-                    .await;
+                for message in disabled_feed_bootstrap().unwrap_or_default() {
+                    if socket
+                        .send(message.to_ws_message_unchecked())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 let _ = socket.close().await;
                 return;
             }
@@ -80,6 +86,13 @@ async fn send_snapshot(
     socket: &mut MaybeSignedWebSocket,
     snapshot: &NativeFeedSnapshot,
 ) -> anyhow::Result<()> {
+    socket
+        .send(snapshot_message(snapshot)?.to_ws_message_unchecked())
+        .await?;
+    Ok(())
+}
+
+fn snapshot_message(snapshot: &NativeFeedSnapshot) -> anyhow::Result<LogMsg> {
     // Replace each top-level field instead of the JSON document root. The
     // existing web hook applies patches to an Immer draft in place, so root
     // replacement would discard the replacement value returned by RFC 6902.
@@ -90,10 +103,18 @@ async fn send_snapshot(
         { "op": "replace", "path": "/forks", "value": snapshot.forks },
         { "op": "replace", "path": "/health", "value": snapshot.health },
     ]))?;
-    socket
-        .send(LogMsg::JsonPatch(patch).to_ws_message_unchecked())
-        .await?;
-    Ok(())
+    Ok(LogMsg::JsonPatch(patch))
+}
+
+fn disabled_feed_bootstrap() -> anyhow::Result<Vec<LogMsg>> {
+    let snapshot = NativeFeedSnapshot {
+        revision: 0,
+        seq: 0,
+        entries: Vec::new(),
+        forks: Vec::new(),
+        health: Default::default(),
+    };
+    Ok(vec![snapshot_message(&snapshot)?, LogMsg::Ready])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +272,36 @@ pub fn router() -> Router<DeploymentImpl> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_feed_bootstraps_empty_snapshot_then_ready() {
+        let messages = disabled_feed_bootstrap().unwrap();
+        assert_eq!(messages.len(), 2);
+        let LogMsg::JsonPatch(patch) = &messages[0] else {
+            panic!("disabled feed must start with a snapshot patch");
+        };
+        assert!(matches!(messages[1], LogMsg::Ready));
+        assert_eq!(
+            serde_json::to_value(patch).unwrap(),
+            serde_json::json!([
+                { "op": "replace", "path": "/revision", "value": 0 },
+                { "op": "replace", "path": "/seq", "value": 0 },
+                { "op": "replace", "path": "/entries", "value": [] },
+                { "op": "replace", "path": "/forks", "value": [] },
+                {
+                    "op": "replace",
+                    "path": "/health",
+                    "value": {
+                        "unknown_kinds": 0,
+                        "rescans": 0,
+                        "quarantined_files": 0,
+                        "watch_degraded": false,
+                        "files": []
+                    }
+                }
+            ])
+        );
+    }
 
     #[test]
     fn revision_invalidation_forces_resnapshot_without_sequence_advance() {
