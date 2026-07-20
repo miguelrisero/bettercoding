@@ -27,9 +27,9 @@ pub enum PtyCommand {
     /// The user's interactive shell (default side-terminal behavior).
     Shell,
     /// Attach-or-create a namespaced tmux session running the CLI bootstrap.
-    /// `tmux new-session -A` attaches when the session already exists, so the
-    /// session (and whatever runs inside it) survives WebSocket disconnects
-    /// and server restarts; reconnects reattach instead of respawning.
+    /// Current `bc_` sessions use `tmux new-session -A`; live legacy `vk_`
+    /// sessions are attach-only. Either survives WebSocket disconnects and
+    /// server restarts, so reconnects reattach instead of respawning.
     TmuxCli {
         /// The workspace this pane belongs to; the tmux session name and the
         /// staged prompt-file path are both derived from it
@@ -134,16 +134,16 @@ fn cli_bootstrap(
         // as shell. The file self-deletes (`rm`) once consumed.
         let qfile = shell_single_quote(&file.to_string_lossy());
         // Shared read-and-delete stage for the argv-passing arms: consume the
-        // file into `vk_p`, then delete it (the delete doubles as the delivery
+        // file into `bc_p`, then delete it (the delete doubles as the delivery
         // acknowledgement — see [`cli_prompt_file_exists`]).
-        let read_rm = format!(r#"vk_p="$(cat {qfile})"; rm -f -- {qfile};"#);
+        let read_rm = format!(r#"bc_p="$(cat {qfile})"; rm -f -- {qfile};"#);
         match &spec.prompt_arg {
             // Trailing positional arg. The leading-dash guard and any trailing
             // whitespace handling are baked into the file's contents
             // ([`cli_prompt_file_content`]); command substitution strips a
             // trailing newline, which is harmless.
             CliPromptArg::Positional => {
-                format!(r#"{read_rm} {base} "$vk_p""#)
+                format!(r#"{read_rm} {base} "$bc_p""#)
             }
             // Prompt as a flag value (e.g. gemini/copilot `-i "<prompt>"`); a
             // leading '-' is harmless after the flag. The flag is one of our
@@ -151,7 +151,7 @@ fn cli_bootstrap(
             // base args) so it can never be more than a single command word.
             CliPromptArg::Flag(flag) => {
                 let qflag = shell_single_quote(flag);
-                format!(r#"{read_rm} {base} {qflag} "$vk_p""#)
+                format!(r#"{read_rm} {base} {qflag} "$bc_p""#)
             }
             // Prompt piped on stdin (e.g. amp); the TUI stays interactive
             // because the tmux pane keeps stdout a TTY. No argv-length ceiling
@@ -818,11 +818,11 @@ fn seed_codex_update_dismissal() -> std::io::Result<()> {
 ///   hidden/stale client, so they keep tmux's default sizing behavior.
 /// - `default-shell /bin/sh`: window command strings (our launch bootstrap)
 ///   are run via `default-shell -c`, and the bootstrap is POSIX sh
-///   (`vk_p="$(cat …)"`, `{ …; } | …`) — a fish/csh login shell would fail on
+///   (`bc_p="$(cat …)"`, `{ …; } | …`) — a fish/csh login shell would fail on
 ///   it outright. The pane still ends in the USER'S shell: the bootstrap's
 ///   final `exec "${SHELL:-/bin/sh}"` honors `$SHELL`.
 const CLI_TMUX_CONF: &str = "\
-# BetterCoding embedded terminal tmux server (socket: vibe-kanban).
+# BetterCoding embedded terminal tmux server (socket: bettercoding).
 # Written by the backend before each CLI terminal attach - edits are overwritten.
 set -g mouse on
 set -s set-clipboard on
@@ -946,6 +946,8 @@ fn is_uuid(s: &str) -> bool {
 /// natural terminal backpressure with a ~1MB worst case per session.
 const OUTPUT_CHANNEL_CAPACITY: usize = 256;
 
+/// Dedicated BetterCoding tmux socket. Isolation keeps app-owned sessions out
+/// of the user's default tmux server and gives them an unambiguous owner.
 const DEFAULT_CLI_TMUX_SOCKET: &str = "bettercoding";
 // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
 const DEFAULT_LEGACY_CLI_TMUX_SOCKET: &str = "vibe-kanban";
@@ -1238,8 +1240,8 @@ fn normalize_comm(comm: &str) -> &str {
     comm.rsplit('/').next().unwrap_or(comm)
 }
 
-/// Inverse of [`cli_tmux_session_name`]: recover the workspace id from one of
-/// our tmux session names.
+/// Recover the workspace id from a current `bc_` session name or a legacy
+/// `vk_` session name. Other namespaces and malformed UUIDs are rejected.
 pub(crate) fn workspace_id_from_cli_session_name(name: &str) -> Option<Uuid> {
     let hex = if let Some(hex) = name.strip_prefix(CLI_TMUX_SESSION_PREFIX) {
         hex
@@ -1283,9 +1285,9 @@ async fn kill_cli_tmux_sessions_on(workspace_id: Uuid, current_socket: &str, leg
     }
 }
 
-/// Best-effort kill of a workspace's CLI tmux session (used on workspace
-/// cleanup so sessions don't outlive their worktree). `=` forces exact-name
-/// matching — tmux `-t` is otherwise a prefix match.
+/// Best-effort kill of a workspace's current `bc_` and legacy `vk_` CLI tmux
+/// sessions so neither can outlive its worktree. `=` forces exact-name
+/// matching; tmux `-t` is otherwise a prefix match.
 pub async fn kill_cli_tmux_session(workspace_id: Uuid) {
     if tmux_available() {
         kill_cli_tmux_sessions_on(workspace_id, cli_tmux_socket(), legacy_cli_tmux_socket()).await;
@@ -1309,9 +1311,9 @@ pub async fn capture_cli_pane(workspace_id: Uuid) -> Option<String> {
         return None;
     }
     // Pane-targeting commands (capture-pane / send-keys) reject the `=exact`
-    // session-target syntax; they take a pane target. The full 32-hex session
-    // name can't be a prefix of any other `vk_*` session, so the bare name
-    // resolves unambiguously to this session's (sole) pane.
+    // session-target syntax; they take a pane target. A full 32-hex `bc_*` or
+    // legacy `vk_*` name cannot prefix another valid session in its namespace,
+    // so the bare name resolves unambiguously to this session's sole pane.
     let home = locate_cli_tmux_session(workspace_id).await;
     let (socket, session_name) = cli_tmux_target(home, workspace_id);
     let output = tokio::process::Command::new("tmux")
@@ -1403,7 +1405,7 @@ pub async fn send_cli_keys(workspace_id: Uuid, text: &str) -> bool {
 
 /// Stage `text` into a per-workspace tmux buffer via `load-buffer -` (text on
 /// stdin, so no argv-length limit) and bracketed-paste it into the pane. The
-/// buffer is namespaced (`vk_prompt_<wsid>`) and deleted on paste (`-d`) because
+/// buffer is namespaced (`bc_prompt_<wsid>`) and deleted on paste (`-d`) because
 /// tmux buffers are server-global — otherwise concurrent workspaces could
 /// cross-deliver. `-p` (bracketed paste) makes the TUI treat multi-line text as
 /// one paste so embedded newlines don't submit early.
@@ -1416,7 +1418,7 @@ async fn paste_via_tmux_buffer(socket: &str, workspace_id: Uuid, target: &str, t
     // between load and paste.
     static SEND_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEND_SEQ.fetch_add(1, Ordering::Relaxed);
-    let buffer = format!("vk_prompt_{}_{seq}", workspace_id.simple());
+    let buffer = cli_tmux_prompt_buffer_name(workspace_id, seq);
 
     let mut child = match tokio::process::Command::new("tmux")
         .args(["-L", socket, "load-buffer", "-b", &buffer, "-"])
@@ -1474,6 +1476,10 @@ async fn paste_via_tmux_buffer(socket: &str, workspace_id: Uuid, target: &str, t
     pasted
 }
 
+fn cli_tmux_prompt_buffer_name(workspace_id: Uuid, sequence: u64) -> String {
+    format!("bc_prompt_{}_{sequence}", workspace_id.simple())
+}
+
 /// Seconds since the Unix epoch (best-effort; 0 if the system clock is before
 /// the epoch). Used to turn tmux's `session_activity` and `client_activity`
 /// epochs into idle ages.
@@ -1485,10 +1491,10 @@ pub(crate) fn now_unix_secs() -> i64 {
 }
 
 /// List our CLI tmux sessions for the reaper: `(workspace_id, attached,
-/// idle_secs)` for every `vk_*` session on our socket. Returns empty when tmux
-/// is unavailable or no server is running (both mean "nothing to reap"). Idle is
-/// derived from tmux `session_activity`; non-`vk_` sessions are ignored so we
-/// never touch a user's own session on the same socket.
+/// idle_secs)` for every current `bc_*` and legacy `vk_*` session across both
+/// sockets, merged per workspace with the safest liveness values. Returns empty
+/// when tmux is unavailable or neither server is running. Other namespaces are
+/// ignored, so a user-created session is never reaped.
 pub async fn list_cli_tmux_sessions() -> Vec<(Uuid, bool, i64)> {
     if !tmux_available() {
         return Vec::new();
@@ -1551,7 +1557,7 @@ fn merge_cli_tmux_session_liveness(
 }
 
 /// Parse one `name\tattached\tactivity` tmux row into `(workspace_id, attached,
-/// idle_secs)`, skipping anything outside the `vk_` namespace or malformed.
+/// idle_secs)`, accepting current `bc_` and legacy `vk_` names only.
 fn parse_cli_session_line(line: &str, now: i64) -> Option<(Uuid, bool, i64)> {
     let mut parts = line.split('\t');
     let workspace_id = workspace_id_from_cli_session_name(parts.next()?)?;
@@ -1700,7 +1706,8 @@ pub enum PtyError {
 /// those 2 bytes as client keyboard input and forwards them to the active pane.
 /// In the Claude TUI composer the LF inserts a stray newline (never submits) and
 /// the Ctrl-D is a no-op; in a bare shell the Enter+Ctrl-D EXITS the shell and
-/// kills the (persistent, `vk_`-named) session. Reproduced live 4-6/6 teardowns.
+/// kills the persistent `bc_` (or legacy `vk_`) session. Reproduced live 4-6/6
+/// teardowns.
 ///
 /// This is a TEARDOWN-ONLY fix: a live shell-mode terminal legitimately needs
 /// Ctrl-D/VEOF, so we clear it only right before the writer drops. The writer
@@ -1808,11 +1815,11 @@ impl Drop for PtySession {
         // and reaps it. Without this the reader blocks on its cloned reader
         // forever (dropping `master` doesn't close that clone), leaking a
         // thread + an unreaped child per disconnect. For CLI mode this
-        // detaches the tmux CLIENT — the persistent `vk_` server session
-        // survives. The `child_reaped` gate skips the signal once the reader
-        // has reaped on the natural-exit path; the residual load-then-kill
-        // window (reader completes `wait()` between our load and the kill)
-        // is a few instructions wide and was accepted in the original
+        // detaches the tmux CLIENT — the persistent `bc_` or legacy `vk_`
+        // server session survives. The `child_reaped` gate skips the signal
+        // once the reader has reaped on the natural-exit path; the residual
+        // load-then-kill window (reader completes `wait()` between our load
+        // and the kill) is a few instructions wide and was accepted in the original
         // close_session design — signaling requires the OS to recycle the
         // PID inside that window.
         //
@@ -2512,7 +2519,7 @@ mod tests {
         assert!(b.contains(&format!("--resume {id}")));
         // The prompt file is ignored entirely when resuming.
         assert!(!b.contains("prompt.txt"));
-        assert!(!b.contains("vk_p="));
+        assert!(!b.contains("bc_p="));
         // Non-UUID (injection attempt) is rejected and never interpolated.
         let evil = "x; rm -rf ~";
         let b = cli_bootstrap(&claude_spec(&[]), Some(evil), None, false);
@@ -2553,10 +2560,10 @@ mod tests {
             b.len()
         );
         // Path single-quoted, expansion double-quoted, file self-deletes.
-        assert!(b.contains("vk_p=\"$(cat '/tmp/vk/cli-prompts/abc.txt')\""));
+        assert!(b.contains("bc_p=\"$(cat '/tmp/vk/cli-prompts/abc.txt')\""));
         assert!(b.contains("rm -f -- '/tmp/vk/cli-prompts/abc.txt'"));
         assert!(
-            b.contains("'--dangerously-skip-permissions' \"$vk_p\""),
+            b.contains("'--dangerously-skip-permissions' \"$bc_p\""),
             "positional prompt expands double-quoted after the flags: {b}"
         );
 
@@ -2587,7 +2594,7 @@ mod tests {
         let flag_spec = CliLaunchSpec::new("gemini", vec![])
             .with_prompt_arg(CliPromptArg::Flag("-i".to_string()));
         let b = cli_bootstrap(&flag_spec, None, Some(file), false);
-        assert!(b.contains("rm -f -- '/tmp/vk/p.txt'; 'gemini' '-i' \"$vk_p\""));
+        assert!(b.contains("rm -f -- '/tmp/vk/p.txt'; 'gemini' '-i' \"$bc_p\""));
 
         // StdinPipe agents pipe the file into the program — no argv ceiling.
         // The `rm` runs inside the producer group, right after `cat` streams
@@ -2605,7 +2612,7 @@ mod tests {
         let spec = claude_spec(&["--dangerously-skip-permissions"]);
         let b = cli_bootstrap(&spec, None, None, false);
         assert!(b.contains("--continue || 'claude'"));
-        assert!(!b.contains("vk_p="));
+        assert!(!b.contains("bc_p="));
     }
 
     #[test]
@@ -2642,6 +2649,15 @@ mod tests {
         assert!(needs_paste_transport("two\nlines"));
         assert!(needs_paste_transport(&"x".repeat(4096)));
         assert!(!needs_paste_transport(&"x".repeat(4095)));
+    }
+
+    #[test]
+    fn tmux_prompt_buffers_use_the_bettercoding_namespace() {
+        let id = Uuid::parse_str("bccad5cc-3bd4-4f80-b75d-35db5f087ac0").unwrap();
+        assert_eq!(
+            cli_tmux_prompt_buffer_name(id, 7),
+            "bc_prompt_bccad5cc3bd44f80b75d35db5f087ac0_7"
+        );
     }
 
     #[test]

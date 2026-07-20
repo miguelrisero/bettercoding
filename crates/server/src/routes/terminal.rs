@@ -59,7 +59,7 @@ struct TerminalQuery {
     pub rows: Option<u16>,
     #[serde(default)]
     mode: TerminalMode,
-    /// VibeKanban session whose claude conversation CLI mode should resume,
+    /// BetterCoding session whose claude conversation CLI mode should resume,
     /// so the terminal joins the exact chat the UI is showing (handover).
     #[serde(default)]
     session_id: Option<Uuid>,
@@ -510,11 +510,11 @@ async fn handle_terminal_ws(
     prompt_delivery: Option<PromptDelivery>,
 ) {
     // FIX 4 tripwire label: the pty session name, captured before `command` is
-    // moved into `create_session`. For CLI mode this is the tmux `vk_<uuid>`
-    // name, so the logged bytes line up with tmux server logs.
+    // moved into `create_session`. For CLI mode this is the actual current
+    // `bc_<uuid>` or legacy `vk_<uuid>` name, so the bytes line up with tmux logs.
     let tripwire_session = match &command {
-        // #30 carries the workspace id on TmuxCli (the tmux session name is
-        // derived from it); recover the `vk_<uuid>` name for the tripwire label.
+        // Resolve the workspace-derived name through both homes so legacy
+        // attaches carry their real `vk_<uuid>` label rather than a `bc_` guess.
         PtyCommand::TmuxCli { workspace_id, .. } => {
             resolved_cli_tmux_session_name(*workspace_id).await
         }
@@ -790,8 +790,8 @@ async fn deliver_deferred_prompt(workspace_id: Uuid, text: &str, program: &str) 
 /// integer compare with no allocation, so it is permanently safe to leave
 /// enabled.
 struct AttachInputTripwire {
-    /// The pty session name (tmux `vk_<uuid>` for CLI mode) so the logged
-    /// bytes line up with tmux server logs.
+    /// The pty session name (current `bc_<uuid>` or legacy `vk_<uuid>` in CLI
+    /// mode) so the logged bytes line up with tmux server logs.
     session: String,
     /// The per-attach PTY session id.
     attach_id: Uuid,
@@ -1036,7 +1036,7 @@ mod tripwire_tests {
     use super::{AttachInputTripwire, hex_dump};
 
     fn tripwire() -> AttachInputTripwire {
-        AttachInputTripwire::new("vk_test".to_string(), Uuid::new_v4())
+        AttachInputTripwire::new("bc_test".to_string(), Uuid::new_v4())
     }
 
     /// The byte budget: chunks are truncated to the remaining budget, and a

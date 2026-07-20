@@ -240,7 +240,7 @@ impl LocalContainerService {
 
     async fn cleanup_workspace(&self, workspace: &Workspace) {
         // The workspace's CLI tmux session (if any) must not outlive its
-        // worktree. Best-effort; only ever targets the vk_ namespace.
+        // worktree. Best-effort; targets current `bc_` and legacy `vk_` namespaces.
         crate::pty::kill_cli_tmux_session(workspace.id).await;
 
         let Some(container_ref) = &workspace.container_ref else {

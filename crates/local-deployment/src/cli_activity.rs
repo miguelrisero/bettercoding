@@ -3,8 +3,8 @@
 //!
 //! The chat path gets its Running/Needs-Attention signals from execution
 //! processes and agent turns; a claude running inside a CLI tmux session is
-//! invisible to all of that. This monitor polls the dedicated tmux socket and
-//! derives an equivalent signal from pane behavior:
+//! invisible to all of that. This monitor polls the current and legacy tmux
+//! sockets and derives an equivalent signal from pane behavior:
 //!
 //! - pane producing output recently            → `running`
 //! - run went quiet while nobody was attached  → `attention`
@@ -38,11 +38,12 @@ use crate::pty::{
 };
 
 /// Poll cadence. Two seconds keeps bucket transitions snappy while the cost
-/// stays one `tmux list-panes` fork per tick.
+/// stays two `tmux list-panes` forks per tick during the legacy transition.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Client sizing is a safety/repair pass, not activity UI state, so keep it to
-/// one `list-clients` fork roughly every 30 seconds instead of every poll.
+/// one `list-clients` fork per socket roughly every 30 seconds instead of every
+/// poll.
 const SIZE_SWEEP_TICKS: u8 = 15;
 
 /// Input newer than a hidden transition can disprove a delayed browser event,
@@ -138,9 +139,9 @@ struct SocketTmuxClientRow {
     client: TmuxClientRow,
 }
 
-/// Parse one tab-delimited `list-clients` row and discard clients outside our
-/// strict `vk_<uuid>` session namespace. `client_flags` is comma-separated;
-/// `ignore-size` may appear anywhere in it.
+/// Parse one tab-delimited `list-clients` row and discard clients outside the
+/// current `bc_<uuid>` and legacy `vk_<uuid>` namespaces. `client_flags` is
+/// comma-separated; `ignore-size` may appear anywhere in it.
 fn parse_cli_client_line(line: &str) -> Option<TmuxClientRow> {
     let mut fields = line.split('\t');
     let client_pid = fields.next()?.trim().parse().ok()?;
@@ -447,8 +448,8 @@ async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepSt
     }
 
     // LOAD-BEARING ORDERING — do not harmlessly swap these snapshots. The
-    // sweep reads both servers' tmux flags above BEFORE snapshotting presence, while
-    // the event path writes the presence registry BEFORE refreshing tmux.
+    // sweep reads both servers' tmux flags above BEFORE snapshotting presence,
+    // while the event path writes the presence registry BEFORE refreshing tmux.
     // A race can therefore only make this sweep re-issue an event decision;
     // it cannot observe the new tmux flag with the old registry state and
     // revert that decision.
@@ -636,9 +637,9 @@ fn next_state(
     }
 }
 
-/// Snapshot all `vk_*` sessions on our tmux socket. Returns `None` when the
-/// tmux server isn't running (which is indistinguishable from — and treated
-/// as — "no sessions").
+/// Snapshot current `bc_*` and legacy `vk_*` sessions across both tmux sockets.
+/// Returns `None` when neither server is running (which is treated as "no
+/// sessions").
 async fn observe_tmux() -> Option<HashMap<Uuid, Observation>> {
     observe_tmux_on(&[
         cli_tmux_socket(),
