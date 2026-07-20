@@ -47,6 +47,7 @@ const PROMPT_MAX_CHARS: usize = 2000;
 const CAPTURE_MAX_BYTES: usize = 64 * 1024;
 const LOG_SNIPPET_MAX_BYTES: usize = 256;
 const GROUP_EXIT_BARRIER: Duration = Duration::from_secs(2);
+#[cfg(unix)]
 const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DISALLOWED_TOOLS: &str = "Bash,Edit,Write,WebFetch,WebSearch,NotebookEdit";
 // Measured successes take 5-17s, while legitimate naming calls can take up to
@@ -632,14 +633,46 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
+    #[cfg(unix)]
+    use super::GROUP_POLL_INTERVAL;
     use super::{
         CAPTURE_MAX_BYTES, DISALLOWED_TOOLS, LOG_SNIPPET_MAX_BYTES, TITLE_MAX_CHARS,
         build_title_request, escaped_log_snippet, first_line_title_hint,
         generate_workspace_names_with_command, parse_workspace_names, read_bounded, slugify,
     };
+
+    #[cfg(unix)]
+    const GRANDCHILD_LOOP_SCRIPT: &str = r#"
+        (
+            printf ready > "$1"
+            while :; do
+                printf x >> "$2"
+                sleep 0.02
+            done
+        ) &
+        wait
+    "#;
+
+    #[cfg(unix)]
+    fn grandchild_fixture(
+        script: &str,
+        test_name: &str,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, Vec<String>) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ready_path = temp_dir.path().join("grandchild-ready");
+        let progress_path = temp_dir.path().join("grandchild-progress");
+        let args = vec![
+            "-c".to_string(),
+            script.to_string(),
+            test_name.to_string(),
+            ready_path.to_string_lossy().into_owned(),
+            progress_path.to_string_lossy().into_owned(),
+        ];
+        (temp_dir, ready_path, progress_path, args)
+    }
 
     #[tokio::test]
     async fn capture_is_bounded() {
@@ -659,7 +692,7 @@ mod tests {
                 "timed out waiting for readiness marker {}",
                 path.display()
             );
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(GROUP_POLL_INTERVAL).await;
         }
     }
 
@@ -670,7 +703,7 @@ mod tests {
         let mut stable_since = tokio::time::Instant::now();
 
         loop {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(GROUP_POLL_INTERVAL).await;
             let size = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
             if size == last_size {
                 if stable_since.elapsed() >= Duration::from_millis(200) {
@@ -691,26 +724,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn timeout_kills_background_grandchild() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let ready_path = temp_dir.path().join("grandchild-ready");
-        let progress_path = temp_dir.path().join("grandchild-progress");
-        let script = r#"
-            (
-                printf ready > "$1"
-                while :; do
-                    printf x >> "$2"
-                    sleep 0.02
-                done
-            ) &
-            wait
-        "#;
-        let args = vec![
-            "-c".to_string(),
-            script.to_string(),
-            "title-gen-timeout-test".to_string(),
-            ready_path.to_string_lossy().into_owned(),
-            progress_path.to_string_lossy().into_owned(),
-        ];
+        let (_temp_dir, ready_path, progress_path, args) =
+            grandchild_fixture(GRANDCHILD_LOOP_SCRIPT, "title-gen-timeout-test");
 
         let call = tokio::spawn(async move {
             generate_workspace_names_with_command(
@@ -736,9 +751,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn successful_leader_exit_still_kills_background_grandchild() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let ready_path = temp_dir.path().join("grandchild-ready");
-        let progress_path = temp_dir.path().join("grandchild-progress");
         let script = r#"
             (
                 printf ready > "$1"
@@ -752,13 +764,8 @@ mod tests {
             done
             exit 0
         "#;
-        let args = vec![
-            "-c".to_string(),
-            script.to_string(),
-            "title-gen-leader-exit-test".to_string(),
-            ready_path.to_string_lossy().into_owned(),
-            progress_path.to_string_lossy().into_owned(),
-        ];
+        let (_temp_dir, ready_path, progress_path, args) =
+            grandchild_fixture(script, "title-gen-leader-exit-test");
 
         let names = generate_workspace_names_with_command(
             "/bin/sh",
@@ -780,26 +787,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_kills_background_grandchild() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let ready_path = temp_dir.path().join("grandchild-ready");
-        let progress_path = temp_dir.path().join("grandchild-progress");
-        let script = r#"
-            (
-                printf ready > "$1"
-                while :; do
-                    printf x >> "$2"
-                    sleep 0.02
-                done
-            ) &
-            wait
-        "#;
-        let args = vec![
-            "-c".to_string(),
-            script.to_string(),
-            "title-gen-cancellation-test".to_string(),
-            ready_path.to_string_lossy().into_owned(),
-            progress_path.to_string_lossy().into_owned(),
-        ];
+        let (_temp_dir, ready_path, progress_path, args) =
+            grandchild_fixture(GRANDCHILD_LOOP_SCRIPT, "title-gen-cancellation-test");
         let mut call = Box::pin(generate_workspace_names_with_command(
             "/bin/sh",
             &args,
