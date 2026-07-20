@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -141,7 +141,7 @@ pub struct ClaudeTranscriptIngest {
     quarantined_paths: Mutex<HashSet<PathBuf>>,
     unknown_kinds: AtomicU64,
     rescans: AtomicU64,
-    watch_degraded: AtomicBool,
+    degraded_watchers: RwLock<HashSet<PathBuf>>,
     revisions: RwLock<HashMap<Uuid, u64>>,
     feed_updates: broadcast::Sender<NativeFeedUpdate>,
     publisher_notify: Notify,
@@ -185,7 +185,7 @@ impl ClaudeTranscriptIngest {
             quarantined_paths: Mutex::new(HashSet::new()),
             unknown_kinds: AtomicU64::new(0),
             rescans: AtomicU64::new(0),
-            watch_degraded: AtomicBool::new(false),
+            degraded_watchers: RwLock::new(HashSet::new()),
             revisions: RwLock::new(HashMap::new()),
             feed_updates,
             publisher_notify: Notify::new(),
@@ -204,7 +204,7 @@ impl ClaudeTranscriptIngest {
         &self,
         session_id: Uuid,
     ) -> Result<NativeFeedSnapshot, ClaudeTranscriptIngestError> {
-        Session::find_by_id(&self.db.pool, session_id)
+        let session = Session::find_by_id(&self.db.pool, session_id)
             .await?
             .ok_or(ClaudeTranscriptIngestError::SessionNotFound(session_id))?;
 
@@ -233,11 +233,19 @@ impl ClaudeTranscriptIngest {
                 });
             }
         }
+        let degraded_paths = self.degraded_watchers.read().await.clone();
+        let directories = self.directories.read().await;
+        let watch_degraded = degraded_paths.iter().any(|path| {
+            directories
+                .get(path)
+                .is_some_and(|context| context.workspace_id == session.workspace_id)
+        });
+        drop(directories);
         let health = NativeIngestHealth {
             unknown_kinds: self.unknown_kinds.load(Ordering::Relaxed),
             rescans: self.rescans.load(Ordering::Relaxed),
             quarantined_files: self.quarantined_paths.lock().unwrap().len() as u64,
-            watch_degraded: self.watch_degraded.load(Ordering::Relaxed),
+            watch_degraded,
             files,
         };
         Ok(build_projection(&rows, revision, seq, health))
@@ -375,77 +383,116 @@ impl ClaudeTranscriptIngest {
         start_watchers: bool,
         shutdown: CancellationToken,
     ) -> Result<(), ClaudeTranscriptIngestError> {
-        if !self.projects_dir.is_dir() {
-            return Ok(());
-        }
-        for workspace in Workspace::fetch_all(&self.db.pool).await? {
-            if workspace.archived || workspace.worktree_deleted {
-                continue;
-            }
-            let Some(session) =
-                Session::find_latest_by_workspace_id(&self.db.pool, workspace.id).await?
-            else {
-                continue;
-            };
-            let Some(cwd) = effective_cwd(&workspace, &session) else {
-                continue;
-            };
-            let context = DirectoryContext {
-                workspace_id: workspace.id,
-                cwd: cwd.clone(),
-            };
-            let computed_dir = self.projects_dir.join(claude_project_slug(&cwd));
-            if computed_dir.is_dir() {
-                self.register_directory(
-                    computed_dir.clone(),
-                    context.clone(),
-                    start_watchers,
-                    shutdown.child_token(),
-                )
-                .await?;
-            }
-
-            for sid in
-                ClaudeSessionLink::known_session_ids_for_workspace(&self.db.pool, workspace.id)
-                    .await?
-            {
-                if computed_dir.join(format!("{sid}.jsonl")).is_file() {
+        let mut desired = HashMap::new();
+        if self.projects_dir.is_dir() {
+            for workspace in Workspace::fetch_all(&self.db.pool).await? {
+                if workspace.archived || workspace.worktree_deleted {
                     continue;
                 }
-                if let Some(found_dir) = self.locate_sid(&sid).await? {
-                    self.register_directory(
-                        found_dir,
-                        context.clone(),
-                        start_watchers,
-                        shutdown.child_token(),
-                    )
-                    .await?;
+                let Some(session) =
+                    Session::find_latest_by_workspace_id(&self.db.pool, workspace.id).await?
+                else {
+                    continue;
+                };
+                let Some(cwd) = effective_cwd(&workspace, &session) else {
+                    continue;
+                };
+                let context = DirectoryContext {
+                    workspace_id: workspace.id,
+                    cwd: cwd.clone(),
+                };
+                let computed_dir = self.projects_dir.join(claude_project_slug(&cwd));
+                if computed_dir.is_dir() {
+                    let dir = fs::canonicalize(&computed_dir).unwrap_or(computed_dir.clone());
+                    desired.insert(dir, context.clone());
+                }
+
+                for sid in
+                    ClaudeSessionLink::known_session_ids_for_workspace(&self.db.pool, workspace.id)
+                        .await?
+                {
+                    if computed_dir.join(format!("{sid}.jsonl")).is_file() {
+                        continue;
+                    }
+                    if let Some(found_dir) = self.locate_sid(&sid).await? {
+                        let dir = fs::canonicalize(&found_dir).unwrap_or(found_dir);
+                        desired.insert(dir, context.clone());
+                    }
                 }
             }
         }
-        Ok(())
+        self.reconcile_directories(desired, start_watchers, shutdown)
+            .await
     }
 
-    async fn register_directory(
+    async fn reconcile_directories(
         self: &Arc<Self>,
-        dir: PathBuf,
-        context: DirectoryContext,
-        start_watcher: bool,
+        desired: HashMap<PathBuf, DirectoryContext>,
+        start_watchers: bool,
         shutdown: CancellationToken,
     ) -> Result<(), ClaudeTranscriptIngestError> {
-        let dir = fs::canonicalize(&dir).unwrap_or(dir);
-        self.directories.write().await.insert(dir.clone(), context);
-        self.scan_directory(&dir, false).await?;
-        if start_watcher {
-            self.ensure_watcher(dir, shutdown).await;
+        let watched_paths = if start_watchers {
+            desired.keys().cloned().collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+        *self.directories.write().await = desired;
+
+        let mut removed = Vec::new();
+        {
+            let mut watchers = self.watchers.lock().await;
+            let stale_or_finished = watchers
+                .iter()
+                .filter_map(|(path, handle)| {
+                    (!watched_paths.contains(path) || handle.is_finished()).then_some(path.clone())
+                })
+                .collect::<Vec<_>>();
+            for path in stale_or_finished {
+                if let Some(handle) = watchers.remove(&path) {
+                    if !handle.is_finished() {
+                        handle.abort();
+                    }
+                    removed.push(path);
+                }
+            }
+        }
+        if !removed.is_empty() {
+            let mut degraded = self.degraded_watchers.write().await;
+            for path in removed {
+                degraded.remove(&path);
+            }
+        }
+        self.degraded_watchers
+            .write()
+            .await
+            .retain(|path| watched_paths.contains(path));
+
+        if start_watchers {
+            for dir in &watched_paths {
+                self.ensure_watcher(dir.clone(), shutdown.child_token())
+                    .await;
+            }
+        }
+        let directories = self
+            .directories
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for dir in directories {
+            self.scan_directory(&dir, false).await?;
         }
         Ok(())
     }
 
     async fn ensure_watcher(self: &Arc<Self>, dir: PathBuf, shutdown: CancellationToken) {
         let mut watchers = self.watchers.lock().await;
-        if watchers.contains_key(&dir) {
-            return;
+        if let Some(handle) = watchers.get(&dir) {
+            if !handle.is_finished() {
+                return;
+            }
+            watchers.remove(&dir);
         }
         let service = self.clone();
         let watched_dir = dir.clone();
@@ -453,28 +500,46 @@ impl ClaudeTranscriptIngest {
             let Ok((fs_guard, mut receiver, _)) =
                 filesystem_watcher::async_watcher(watched_dir.clone())
             else {
-                service.watch_degraded.store(true, Ordering::Relaxed);
+                service
+                    .degraded_watchers
+                    .write()
+                    .await
+                    .insert(watched_dir.clone());
                 tracing::warn!(path = %watched_dir.display(), "native transcript watcher unavailable; using reconcile polling");
                 return;
             };
+            service.degraded_watchers.write().await.remove(&watched_dir);
             let _fs_guard = fs_guard;
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     event = receiver.next() => match event {
                         Some(Ok(_)) => {
+                            service.degraded_watchers.write().await.remove(&watched_dir);
                             if let Err(error) = service.scan_directory(&watched_dir, false).await {
                                 tracing::warn!(?error, path = %watched_dir.display(), "native transcript watch scan failed");
                             }
                         }
                         Some(Err(error)) => {
-                            service.watch_degraded.store(true, Ordering::Relaxed);
+                            service
+                                .degraded_watchers
+                                .write()
+                                .await
+                                .insert(watched_dir.clone());
                             tracing::warn!(?error, path = %watched_dir.display(), "native transcript watcher error; forcing rescan");
                             if let Err(error) = service.scan_directory(&watched_dir, true).await {
                                 tracing::warn!(?error, path = %watched_dir.display(), "native transcript forced rescan failed");
                             }
+                            break;
                         }
-                        None => break,
+                        None => {
+                            service
+                                .degraded_watchers
+                                .write()
+                                .await
+                                .insert(watched_dir.clone());
+                            break;
+                        },
                     }
                 }
             }

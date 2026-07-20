@@ -1355,3 +1355,156 @@ async fn subscribe_during_import_preserves_update_after_snapshot_watermark() {
     shutdown.cancel();
     publisher.await.unwrap();
 }
+
+#[tokio::test]
+async fn reconcile_restarts_finished_native_transcript_watcher() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, &workspace_root).await;
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    let canonical_dir = fs::canonicalize(&native_dir).unwrap();
+    let service = Arc::new(ClaudeTranscriptIngest::new(db, projects_dir));
+    let shutdown = CancellationToken::new();
+
+    service
+        .reconcile_registry(true, shutdown.child_token())
+        .await
+        .unwrap();
+    let old_task_id = {
+        let watchers = service.watchers.lock().await;
+        watchers.get(&canonical_dir).unwrap().id()
+    };
+    {
+        let watchers = service.watchers.lock().await;
+        watchers.get(&canonical_dir).unwrap().abort();
+    }
+    for _ in 0..20 {
+        if service
+            .watchers
+            .lock()
+            .await
+            .get(&canonical_dir)
+            .unwrap()
+            .is_finished()
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    service
+        .reconcile_registry(true, shutdown.child_token())
+        .await
+        .unwrap();
+    let watchers = service.watchers.lock().await;
+    let replacement = watchers.get(&canonical_dir).unwrap();
+    assert_ne!(replacement.id(), old_task_id);
+    assert!(!replacement.is_finished());
+    drop(watchers);
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn reconcile_removes_watcher_when_workspace_is_archived() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, &workspace_root).await;
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    let canonical_dir = fs::canonicalize(&native_dir).unwrap();
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), projects_dir));
+    let shutdown = CancellationToken::new();
+
+    service
+        .reconcile_registry(true, shutdown.child_token())
+        .await
+        .unwrap();
+    assert!(service.watchers.lock().await.contains_key(&canonical_dir));
+    assert!(
+        service
+            .directories
+            .read()
+            .await
+            .contains_key(&canonical_dir)
+    );
+
+    Workspace::set_archived(&db.pool, workspace.id, true)
+        .await
+        .unwrap();
+    service
+        .reconcile_registry(true, shutdown.child_token())
+        .await
+        .unwrap();
+    assert!(!service.watchers.lock().await.contains_key(&canonical_dir));
+    assert!(
+        !service
+            .directories
+            .read()
+            .await
+            .contains_key(&canonical_dir)
+    );
+    assert!(
+        !service
+            .degraded_watchers
+            .read()
+            .await
+            .contains(&canonical_dir)
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn watcher_degradation_is_scoped_to_its_workspace() {
+    let temp = TempDir::new().unwrap();
+    let first_root = temp.path().join("first-worktree");
+    let second_root = temp.path().join("second-worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&first_root).unwrap();
+    fs::create_dir_all(&second_root).unwrap();
+    let db = test_db().await;
+    let (first_workspace, first_session) = create_workspace_and_session(&db, &first_root).await;
+    let (second_workspace, second_session) = create_workspace_and_session(&db, &second_root).await;
+    let first_dir = store_dir(
+        &projects_dir,
+        &effective_cwd(&first_workspace, &first_session).unwrap(),
+    );
+    let second_dir = store_dir(
+        &projects_dir,
+        &effective_cwd(&second_workspace, &second_session).unwrap(),
+    );
+    fs::create_dir_all(&first_dir).unwrap();
+    fs::create_dir_all(&second_dir).unwrap();
+    let second_dir = fs::canonicalize(second_dir).unwrap();
+    let service = Arc::new(ClaudeTranscriptIngest::new(db, projects_dir));
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+    service.degraded_watchers.write().await.insert(second_dir);
+
+    assert!(
+        !service
+            .snapshot(first_session.id)
+            .await
+            .unwrap()
+            .health
+            .watch_degraded
+    );
+    assert!(
+        service
+            .snapshot(second_session.id)
+            .await
+            .unwrap()
+            .health
+            .watch_degraded
+    );
+}
