@@ -16,19 +16,47 @@
 //! then re-broadcasts the owning workspace's status patch, so the sidebar
 //! moves in near-real-time without any new streaming plumbing.
 
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use db::{
     DBService,
     models::workspace_cli_activity::{CliActivityState, WorkspaceCliActivity},
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::pty::{CLI_TMUX_SOCKET, tmux_available, workspace_id_from_cli_session_name};
+use crate::pty::{
+    CLI_TMUX_SOCKET, CliClientPresence, PtyService, now_unix_secs,
+    refresh_cli_tmux_client_ignore_size, run_cli_tmux, tmux_available, tmux_client_flags_supported,
+    workspace_id_from_cli_session_name,
+};
 
 /// Poll cadence. Two seconds keeps bucket transitions snappy while the cost
 /// stays one `tmux list-panes` fork per tick.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Client sizing is a safety/repair pass, not activity UI state, so keep it to
+/// one `list-clients` fork roughly every 30 seconds instead of every poll.
+const SIZE_SWEEP_TICKS: u8 = 15;
+
+/// Input newer than a hidden transition can disprove a delayed browser event,
+/// but only briefly; old input must never override an explicit hidden record.
+const FRESH_INPUT_SECS: u64 = 60;
+
+/// Visible browser heartbeats arrive every minute (see
+/// `TerminalProvider.tsx::PRESENCE_HEARTBEAT_MS`). Five missed heartbeats mean
+/// the host is gone; visible tabs are not meaningfully timer-throttled.
+const VISIBLE_PRESENCE_STALE_SECS: u64 = 5 * 60;
+
+/// Manually attached tmux clients have no browser heartbeat. Keep passive
+/// watchers participating until they have been input-idle for twenty minutes.
+const MANUAL_CLIENT_IDLE_SECS: u64 = 20 * 60;
 
 /// Output newer than this counts as "actively running". claude's TUI repaints
 /// continuously (spinner/progress) while working, so a working pane never
@@ -57,6 +85,80 @@ struct Observation {
     last_activity: i64,
     /// Whether any client (browser terminal) is attached.
     attached: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SizingPresence {
+    visible: bool,
+    last_visible_ago_secs: u64,
+    changed_ago_secs: u64,
+}
+
+/// Decide whether one attached tmux client should be excluded from window
+/// sizing. Pure over ordinary ages/booleans so precedence and boundary
+/// semantics cannot be obscured by tmux or clock I/O.
+fn should_ignore_client_size(input_idle_secs: u64, presence: Option<SizingPresence>) -> bool {
+    match presence {
+        Some(presence) if !presence.visible => {
+            // A delayed hidden browser event loses only to demonstrably newer,
+            // still-fresh input. Input from before the transition cannot make
+            // an explicitly hidden client rejoin sizing.
+            !(input_idle_secs < presence.changed_ago_secs && input_idle_secs < FRESH_INPUT_SECS)
+        }
+        Some(presence) => presence.last_visible_ago_secs >= VISIBLE_PRESENCE_STALE_SECS,
+        // Manual clients have no heartbeat, so use input idleness and flag
+        // only after the generous passive-watcher threshold.
+        None => input_idle_secs > MANUAL_CLIENT_IDLE_SECS,
+    }
+}
+
+/// `None` gives a never-before-seen client one sweep to acquire its web
+/// presence record; a new manual client cannot be stale during that grace.
+fn desired_ignore_client_size(
+    input_idle_secs: u64,
+    presence: Option<SizingPresence>,
+    seen_in_previous_sweep: bool,
+) -> Option<bool> {
+    if presence.is_none() && !seen_in_previous_sweep {
+        return None;
+    }
+    Some(should_ignore_client_size(input_idle_secs, presence))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TmuxClientRow {
+    client_pid: u32,
+    client_name: String,
+    client_activity: i64,
+    ignore_size: bool,
+}
+
+/// Parse one tab-delimited `list-clients` row and discard clients outside our
+/// strict `vk_<uuid>` session namespace. `client_flags` is comma-separated;
+/// `ignore-size` may appear anywhere in it.
+fn parse_cli_client_line(line: &str) -> Option<TmuxClientRow> {
+    let mut fields = line.split('\t');
+    let client_pid = fields.next()?.trim().parse().ok()?;
+    let client_name = fields.next()?;
+    if client_name.is_empty() {
+        return None;
+    }
+    let client_activity: i64 = fields.next()?.trim().parse().ok()?;
+    if client_activity < 0 {
+        return None;
+    }
+    let flags = fields.next()?;
+    workspace_id_from_cli_session_name(fields.next()?)?;
+    if fields.next().is_some() {
+        return None;
+    }
+
+    Some(TmuxClientRow {
+        client_pid,
+        client_name: client_name.to_string(),
+        client_activity,
+        ignore_size: flags.split(',').any(|flag| flag.trim() == "ignore-size"),
+    })
 }
 
 /// Snapshot of the process table: pid → (parent pid, "is a claude process").
@@ -133,8 +235,27 @@ fn subtree_has_claude(root: u32, procs: &ProcSnapshot) -> bool {
 
 pub struct CliActivityMonitor;
 
+#[derive(Default)]
+struct ClientSizeSweepState {
+    refresh_failures: HashMap<u32, ClientSizeRefreshFailure>,
+    seen_client_pids: HashSet<u32>,
+}
+
+struct ClientSizeRefreshFailure {
+    client_name: String,
+    count: u8,
+}
+
+struct ClientSizeSweepPermit(Arc<AtomicBool>);
+
+impl Drop for ClientSizeSweepPermit {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl CliActivityMonitor {
-    pub fn spawn(db: DBService) {
+    pub fn spawn(db: DBService, pty: PtyService, shutdown: CancellationToken) {
         tokio::spawn(async move {
             if !tmux_available() {
                 tracing::debug!("tmux unavailable; CLI activity monitor not started");
@@ -162,9 +283,36 @@ impl CliActivityMonitor {
 
             let mut interval = tokio::time::interval(POLL_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut size_sweep_ticks = 0;
+            let size_sweep_running = Arc::new(AtomicBool::new(false));
+            let size_sweep_state =
+                Arc::new(tokio::sync::Mutex::new(ClientSizeSweepState::default()));
 
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
+
+                size_sweep_ticks += 1;
+                if size_sweep_ticks == SIZE_SWEEP_TICKS {
+                    size_sweep_ticks = 0;
+                    // Sizing repair must never delay the activity state
+                    // machine. Skip this tick instead of queuing overlap.
+                    if size_sweep_running
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        let pty = pty.clone();
+                        let running = size_sweep_running.clone();
+                        let state = size_sweep_state.clone();
+                        tokio::spawn(async move {
+                            let _permit = ClientSizeSweepPermit(running);
+                            let mut state = state.lock().await;
+                            sweep_client_size_flags(&pty, &mut state).await;
+                        });
+                    }
+                }
 
                 // A missing tmux server (no sessions yet, or it died) reads
                 // as "no sessions": every known session is gone.
@@ -229,6 +377,183 @@ impl CliActivityMonitor {
                 tracing::debug!("Failed to record CLI activity for {workspace_id}: {e}");
             }
         }
+    }
+}
+
+/// Reconcile tmux's per-client flag with web presence. One list command gives
+/// every field needed for every workspace. Steady state stops there; a batch
+/// with transitions takes one fresh PID/name snapshot before any mutation.
+async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepState) {
+    if !tmux_client_flags_supported() {
+        return;
+    }
+
+    let output = match run_cli_tmux(&[
+        "-L",
+        CLI_TMUX_SOCKET,
+        "list-clients",
+        "-F",
+        "#{client_pid}\t#{client_name}\t#{client_activity}\t#{client_flags}\t#{session_name}",
+    ])
+    .await
+    {
+        Ok(output) => output,
+        Err(e) => {
+            tracing::debug!("Failed to list tmux clients for size sweep: {e}");
+            return;
+        }
+    };
+
+    // LOAD-BEARING ORDERING — do not harmlessly swap these snapshots. The
+    // sweep reads tmux flags above BEFORE snapshotting presence here, while
+    // the event path writes the presence registry BEFORE refreshing tmux.
+    // A race can therefore only make this sweep re-issue an event decision;
+    // it cannot observe the new tmux flag with the old registry state and
+    // revert that decision.
+    let presence = pty.cli_presence_snapshot();
+    let now_instant = std::time::Instant::now();
+    let now_unix = now_unix_secs();
+
+    let clients: Vec<_> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_cli_client_line)
+        .collect();
+    let previous_client_pids = std::mem::replace(
+        &mut state.seen_client_pids,
+        clients.iter().map(|client| client.client_pid).collect(),
+    );
+    state.refresh_failures.retain(|client_pid, failure| {
+        clients.iter().any(|client| {
+            client.client_pid == *client_pid && client.client_name == failure.client_name
+        })
+    });
+
+    let mut transitions = Vec::new();
+    for client in clients {
+        let input_idle_secs = now_unix.saturating_sub(client.client_activity).max(0) as u64;
+        let sizing_presence = presence
+            .get(&client.client_pid)
+            .map(|presence| sizing_presence(*presence, now_instant));
+        let Some(desired_ignore) = desired_ignore_client_size(
+            input_idle_secs,
+            sizing_presence,
+            previous_client_pids.contains(&client.client_pid),
+        ) else {
+            continue;
+        };
+        if desired_ignore == client.ignore_size {
+            state.refresh_failures.remove(&client.client_pid);
+            continue;
+        }
+        transitions.push((client, desired_ignore));
+    }
+
+    if transitions.is_empty() {
+        return;
+    }
+
+    let output = match run_cli_tmux(&[
+        "-L",
+        CLI_TMUX_SOCKET,
+        "list-clients",
+        "-F",
+        "#{client_pid}\t#{client_name}",
+    ])
+    .await
+    {
+        Ok(output) => output,
+        Err(e) => {
+            tracing::debug!("Failed to refresh tmux client map for size transitions: {e}");
+            return;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let fresh_clients: HashMap<u32, &str> = stdout
+        .lines()
+        .filter_map(|line| {
+            let (pid, name) = line.split_once('\t')?;
+            let pid = pid.trim().parse().ok()?;
+            (!name.is_empty()).then_some((pid, name))
+        })
+        .collect();
+
+    for (client, desired_ignore) in transitions {
+        // `client_name` is a /dev/pts/N path and can be recycled after the
+        // sweep snapshot. The fresh batch rejects mappings already stale when
+        // it was taken; it cannot lock tmux across the async refresh loop, so
+        // any later detach/name reuse remains repair work for the next sweep.
+        match fresh_clients.get(&client.client_pid).copied() {
+            Some(fresh_name) if fresh_name == client.client_name => {}
+            Some(fresh_name) => {
+                state.refresh_failures.remove(&client.client_pid);
+                tracing::debug!(
+                    client_name = %client.client_name,
+                    client_pid = client.client_pid,
+                    resolved_name = %fresh_name,
+                    "Skipping stale tmux client size transition"
+                );
+                continue;
+            }
+            None => {
+                state.refresh_failures.remove(&client.client_pid);
+                tracing::debug!(
+                    client_name = %client.client_name,
+                    client_pid = client.client_pid,
+                    "Skipping vanished tmux client size transition"
+                );
+                continue;
+            }
+        }
+
+        match refresh_cli_tmux_client_ignore_size(&client.client_name, desired_ignore).await {
+            Ok(()) => {
+                state.refresh_failures.remove(&client.client_pid);
+            }
+            Err(e) => {
+                let failure = state
+                    .refresh_failures
+                    .entry(client.client_pid)
+                    .or_insert_with(|| ClientSizeRefreshFailure {
+                        client_name: client.client_name.clone(),
+                        count: 0,
+                    });
+                if failure.client_name != client.client_name {
+                    failure.client_name.clone_from(&client.client_name);
+                    failure.count = 0;
+                }
+                failure.count = failure.count.saturating_add(1);
+                if failure.count == 2 {
+                    tracing::warn!(
+                        client_name = %client.client_name,
+                        client_pid = client.client_pid,
+                        error = %e,
+                        "Failed to reconcile tmux client size twice consecutively"
+                    );
+                    continue;
+                }
+                // First and later failures stay at debug; the second failure
+                // above is the single operator signal until success resets it.
+                tracing::debug!(
+                    client_name = %client.client_name,
+                    client_pid = client.client_pid,
+                    error = %e,
+                    consecutive_failures = failure.count,
+                    "Failed to reconcile tmux client size"
+                );
+            }
+        }
+    }
+}
+
+fn sizing_presence(presence: CliClientPresence, now: std::time::Instant) -> SizingPresence {
+    SizingPresence {
+        visible: presence.visible,
+        last_visible_ago_secs: now
+            .saturating_duration_since(presence.last_visible_at)
+            .as_secs(),
+        changed_ago_secs: now
+            .saturating_duration_since(presence.last_changed_at)
+            .as_secs(),
     }
 }
 
@@ -356,6 +681,145 @@ mod tests {
             .iter()
             .map(|(pid, ppid, claude)| (*pid, (*ppid, *claude)))
             .collect()
+    }
+
+    #[test]
+    fn hidden_transition_overrides_input_that_came_before_it() {
+        let hidden = Some(SizingPresence {
+            visible: false,
+            last_visible_ago_secs: 10,
+            changed_ago_secs: 10,
+        });
+        assert!(should_ignore_client_size(30, hidden));
+    }
+
+    #[test]
+    fn input_after_hidden_transition_temporarily_keeps_client_in_sizing() {
+        let hidden = Some(SizingPresence {
+            visible: false,
+            last_visible_ago_secs: 10,
+            changed_ago_secs: 10,
+        });
+        assert!(!should_ignore_client_size(5, hidden));
+    }
+
+    #[test]
+    fn hidden_input_override_is_strict_at_transition_and_freshness_boundaries() {
+        let hidden_ten_seconds_ago = Some(SizingPresence {
+            visible: false,
+            last_visible_ago_secs: 10,
+            changed_ago_secs: 10,
+        });
+        assert!(should_ignore_client_size(10, hidden_ten_seconds_ago));
+
+        let hidden_before_freshness_window = Some(SizingPresence {
+            visible: false,
+            last_visible_ago_secs: FRESH_INPUT_SECS + 1,
+            changed_ago_secs: FRESH_INPUT_SECS + 1,
+        });
+        assert!(should_ignore_client_size(
+            FRESH_INPUT_SECS,
+            hidden_before_freshness_window
+        ));
+        assert!(!should_ignore_client_size(
+            FRESH_INPUT_SECS - 1,
+            hidden_before_freshness_window
+        ));
+    }
+
+    #[test]
+    fn fresh_visible_heartbeat_keeps_client_in_sizing() {
+        let fresh = Some(SizingPresence {
+            visible: true,
+            last_visible_ago_secs: VISIBLE_PRESENCE_STALE_SECS - 1,
+            changed_ago_secs: VISIBLE_PRESENCE_STALE_SECS - 1,
+        });
+        assert!(!should_ignore_client_size(FRESH_INPUT_SECS, fresh));
+    }
+
+    #[test]
+    fn visible_heartbeat_is_stale_at_exact_threshold() {
+        let stale = Some(SizingPresence {
+            visible: true,
+            last_visible_ago_secs: VISIBLE_PRESENCE_STALE_SECS,
+            changed_ago_secs: VISIBLE_PRESENCE_STALE_SECS,
+        });
+        assert!(should_ignore_client_size(FRESH_INPUT_SECS, stale));
+    }
+
+    #[test]
+    fn manual_client_is_flagged_only_after_twenty_minutes_idle() {
+        assert!(!should_ignore_client_size(MANUAL_CLIENT_IDLE_SECS, None));
+        assert!(should_ignore_client_size(MANUAL_CLIENT_IDLE_SECS + 1, None));
+    }
+
+    #[test]
+    fn never_seen_unknown_client_gets_one_sweep_of_grace() {
+        let idle = MANUAL_CLIENT_IDLE_SECS + 1;
+        assert_eq!(desired_ignore_client_size(idle, None, false), None);
+        assert_eq!(desired_ignore_client_size(idle, None, true), Some(true));
+
+        let hidden = Some(SizingPresence {
+            visible: false,
+            last_visible_ago_secs: 0,
+            changed_ago_secs: 0,
+        });
+        assert_eq!(desired_ignore_client_size(idle, hidden, false), Some(true));
+    }
+
+    #[test]
+    fn parses_tabbed_cli_client_and_finds_ignore_size_between_flags() {
+        let row = parse_cli_client_line(
+            "4242\t/dev/pts/30\t999900\tattached,ignore-size,focused\t\
+             vk_00000000000000000000000000000001",
+        )
+        .expect("valid CLI client row");
+        assert_eq!(
+            row,
+            TmuxClientRow {
+                client_pid: 4242,
+                client_name: "/dev/pts/30".to_string(),
+                client_activity: 999900,
+                ignore_size: true,
+            }
+        );
+
+        let unflagged = parse_cli_client_line(
+            "4243\t/dev/pts/31\t999901\tattached,focused\t\
+             vk_00000000000000000000000000000001",
+        )
+        .expect("unflagged CLI client row");
+        assert!(!unflagged.ignore_size);
+    }
+
+    #[test]
+    fn client_parser_skips_malformed_and_non_cli_rows() {
+        assert!(
+            parse_cli_client_line(
+                "bad\t/dev/pts/1\t10\tattached\tvk_00000000000000000000000000000001"
+            )
+            .is_none()
+        );
+        assert!(
+            parse_cli_client_line(
+                "1\t/dev/pts/1\tbad\tattached\tvk_00000000000000000000000000000001"
+            )
+            .is_none()
+        );
+        assert!(
+            parse_cli_client_line(
+                "1\t/dev/pts/1\t-1\tattached\tvk_00000000000000000000000000000001"
+            )
+            .is_none()
+        );
+        assert!(parse_cli_client_line("1\t/dev/pts/1\t10\tattached").is_none());
+        assert!(parse_cli_client_line("1\t/dev/pts/1\t10\tattached\twork").is_none());
+        assert!(
+            parse_cli_client_line(
+                "1\t/dev/pts/1\t10\tattached\tvk_00000000000000000000000000000001\textra"
+            )
+            .is_none()
+        );
     }
 
     #[test]

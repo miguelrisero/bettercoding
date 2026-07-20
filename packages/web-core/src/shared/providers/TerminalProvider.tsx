@@ -1,4 +1,11 @@
-import { useReducer, useMemo, useCallback, useRef, ReactNode } from 'react';
+import {
+  useReducer,
+  useMemo,
+  useCallback,
+  useEffect,
+  useRef,
+  ReactNode,
+} from 'react';
 import type { Terminal } from '@xterm/xterm';
 import type { FitAddon } from '@xterm/addon-fit';
 import {
@@ -7,12 +14,16 @@ import {
   type TerminalInstance,
 } from '@/shared/hooks/useTerminal';
 import { openLocalApiWebSocket } from '@/shared/lib/localApiTransport';
+import { sendPresence } from '@/shared/lib/terminalPresence';
 import { terminalAttemptIsStale } from '@/shared/lib/terminalWsUrl';
 
 interface TerminalConnection {
   ws: WebSocket;
   send: (data: string) => void;
   resize: (cols: number, rows: number) => void;
+  /** Last effective presence sent on this socket; null until open sync. */
+  lastSentPresence: boolean | null;
+  generation: ConnectionGeneration;
 }
 
 /**
@@ -21,6 +32,16 @@ interface TerminalConnection {
  * never spend the retry budget (see `connectWebSocket`).
  */
 const UNMEASURED_POLL_MS = 1000;
+
+// The backend's VISIBLE_PRESENCE_STALE_SECS threshold is defined in terms of
+// missed intervals from this heartbeat; keep the two sides in sync.
+const PRESENCE_HEARTBEAT_MS = 60_000;
+
+interface BroadcastPresenceOptions {
+  force?: boolean;
+  resendVisibleSize?: boolean;
+  onlyTab?: string;
+}
 
 interface ConnectionGeneration {
   /**
@@ -225,6 +246,63 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
     new Map()
   );
 
+  // One document-level broadcaster serves every terminal. Presence is
+  // connection-specific: a visible document can still have a gated/detached
+  // pane whose stale grid must not participate in tmux sizing. The generation
+  // check prevents a socket discarded during a session switch from receiving
+  // a late heartbeat before its close event settles.
+  const broadcastPresence = useCallback(
+    ({
+      force = false,
+      resendVisibleSize = false,
+      onlyTab,
+    }: BroadcastPresenceOptions = {}) => {
+      terminalConnectionsRef.current.forEach((connection, tabId) => {
+        if (
+          (onlyTab !== undefined && tabId !== onlyTab) ||
+          connection.generation.closed ||
+          reconnectStateRef.current.get(tabId) !== connection.generation ||
+          connection.ws.readyState !== WebSocket.OPEN
+        ) {
+          return;
+        }
+
+        const size =
+          connectionCallbacksRef.current.get(tabId)?.getSize?.() ?? null;
+        sendPresence(connection, size, document.visibilityState, {
+          force,
+          resendVisibleSize,
+        });
+      });
+    },
+    []
+  );
+
+  const broadcastTerminalPresence = useCallback(
+    (tabId: string) => {
+      broadcastPresence({ onlyTab: tabId });
+    },
+    [broadcastPresence]
+  );
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      broadcastPresence({ resendVisibleSize: true });
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    const heartbeat = window.setInterval(() => {
+      // Backend staleness is heartbeat-based. Send each connection's current
+      // effective state even when unchanged; same-state updates are in-memory.
+      broadcastPresence({ force: true });
+    }, PRESENCE_HEARTBEAT_MS);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.clearInterval(heartbeat);
+    };
+  }, [broadcastPresence]);
+
   const getTabsForWorkspace = useCallback(
     (workspaceId: string): TerminalTab[] => {
       return state.tabsByWorkspace[workspaceId] || [];
@@ -337,6 +415,9 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
         terminalConnectionsRef.current.get(tabId)?.send(data);
       },
       resize: (cols: number, rows: number) => {
+        // Pane-driven presence is deliberately published in XTermInstance's
+        // fit path, where measurability is known. Its per-tab broadcaster is
+        // the single publisher for both hidden and visible pane transitions.
         terminalConnectionsRef.current.get(tabId)?.resize(cols, rows);
       },
     }),
@@ -546,12 +627,35 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
               }
             };
 
-            // Send the current terminal size once the socket is open. The
-            // initial ResizeObserver fit usually fires before the socket is
-            // ready and is dropped, which would otherwise leave the PTY/tmux
-            // stuck at the URL size forever; resending on every (re)connect
-            // also restores the right size after a reattach.
-            const syncSize = () => {
+            const send = (data: string) => {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(
+                  JSON.stringify({ type: 'input', data: encodeBase64(data) })
+                );
+              }
+            };
+
+            const resize = (cols: number, rows: number) => {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+              }
+            };
+
+            const connection: TerminalConnection = {
+              ws,
+              send,
+              resize,
+              lastSentPresence: null,
+              generation,
+            };
+
+            // Synchronize effective presence and the current terminal size
+            // once the socket is open. The initial ResizeObserver fit usually
+            // fires before the socket is ready and is dropped, which would
+            // otherwise leave the PTY/tmux stuck at the URL size forever;
+            // resending on every (re)connect also restores the right state
+            // after a reattach.
+            const syncOpenState = () => {
               // A session switch (or a gate-off that unmounts the terminal
               // child) can land after this socket was registered but before it
               // opened (the transport returns a CONNECTING socket): re-validate
@@ -561,26 +665,35 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
                 return;
               }
               generation.retryCount = 0;
-              const size = connectionCallbacksRef.current
-                .get(tabId)
-                ?.getSize?.();
-              if (size && ws.readyState === WebSocket.OPEN) {
-                ws.send(
-                  JSON.stringify({
-                    type: 'resize',
-                    cols: size.cols,
-                    rows: size.rows,
-                  })
-                );
+              if (ws.readyState !== WebSocket.OPEN) {
+                return;
+              }
+
+              const size =
+                connectionCallbacksRef.current.get(tabId)?.getSize?.() ?? null;
+              // A visible client must publish its fresh grid before presence
+              // asynchronously clears ignore-size; reversing that order can
+              // reflow once at the stale connect grid and again at this one.
+              // Hidden clients publish presence first so they are excluded
+              // before any size synchronization.
+              // Pass the connection directly so this also works for an
+              // already-open transport, which synchronizes before map insert.
+              const documentVisible = document.visibilityState === 'visible';
+              sendPresence(connection, size, document.visibilityState, {
+                force: true,
+                resendVisibleSize: documentVisible,
+              });
+              if (!documentVisible && size) {
+                connection.resize(size.cols, size.rows);
               }
             };
-            ws.onopen = syncSize;
+            ws.onopen = syncOpenState;
             // A pluggable transport may hand back an already-open socket
             // whose `open` event has fired; onopen would then never run.
             if (ws.readyState === WebSocket.OPEN) {
-              syncSize();
-              // Already-open + stale: syncSize discarded it synchronously —
-              // don't register a socket we just closed.
+              syncOpenState();
+              // Already-open + stale: syncOpenState discarded it
+              // synchronously — don't register a socket we just closed.
               if (superseded) {
                 return;
               }
@@ -636,21 +749,6 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
               scheduleReconnect();
             };
 
-            const send = (data: string) => {
-              if (ws.readyState === WebSocket.OPEN) {
-                ws.send(
-                  JSON.stringify({ type: 'input', data: encodeBase64(data) })
-                );
-              }
-            };
-
-            const resize = (cols: number, rows: number) => {
-              if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'resize', cols, rows }));
-              }
-            };
-
-            const connection: TerminalConnection = { ws, send, resize };
             terminalConnectionsRef.current.set(tabId, connection);
           } catch {
             scheduleReconnect();
@@ -686,6 +784,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       unregisterTerminalInstance,
       createTerminalConnection,
       getTerminalConnection,
+      broadcastTerminalPresence,
     }),
     [
       getTabsForWorkspace,
@@ -700,6 +799,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       unregisterTerminalInstance,
       createTerminalConnection,
       getTerminalConnection,
+      broadcastTerminalPresence,
     ]
   );
 

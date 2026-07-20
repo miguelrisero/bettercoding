@@ -7,6 +7,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
+    time::Instant,
 };
 
 use executors::executors::cli::{CliContinue, CliLaunchSpec, CliPromptArg, CliResume};
@@ -50,6 +51,10 @@ pub enum PtyCommand {
         /// `--continue` first leg of a brand-new workspace lives just long
         /// enough to swallow the paste and exit, silently discarding it.
         deferred_prompt_pending: bool,
+        /// Browser visibility captured in the WebSocket URL. When supported,
+        /// the tmux client starts with `ignore-size` before it can affect the
+        /// shared grid; later presence messages keep the flag synchronized.
+        connect_hidden: bool,
         /// How to launch the selected agent's interactive CLI — binary, flags
         /// (model/effort/sandbox/approval pre-resolved from the session's
         /// ExecutorConfig), and the resume/prompt/continue forms. Claude is the
@@ -807,6 +812,10 @@ fn seed_codex_update_dismissal() -> std::io::Result<()> {
 ///   no keystroke.
 /// - right-click is unbound from tmux's context menu so the web terminal can
 ///   use it for paste.
+/// - `window-size smallest` (tmux >= 3.2 only): when several browser clients
+///   share a workspace, the pane grid fits every client that participates in
+///   sizing. Older tmux versions lack the client flags needed to exclude a
+///   hidden/stale client, so they keep tmux's default sizing behavior.
 /// - `default-shell /bin/sh`: window command strings (our launch bootstrap)
 ///   are run via `default-shell -c`, and the bootstrap is POSIX sh
 ///   (`vk_p="$(cat …)"`, `{ …; } | …`) — a fish/csh login shell would fail on
@@ -822,14 +831,23 @@ set -g default-shell /bin/sh
 unbind-key -n MouseDown3Pane
 ";
 
+fn cli_tmux_conf(client_flags_supported: bool) -> String {
+    let mut conf = CLI_TMUX_CONF.to_string();
+    if client_flags_supported {
+        conf.push_str("set -g window-size smallest\n");
+    }
+    conf
+}
+
 /// Write the embedded server config (idempotent) and return its path.
 fn cli_tmux_conf_path() -> Option<PathBuf> {
     let dir = utils::assets::asset_dir();
     let path = dir.join("cli-tmux.conf");
+    let desired = cli_tmux_conf(tmux_client_flags_supported());
     let current = std::fs::read_to_string(&path).ok();
-    if current.as_deref() != Some(CLI_TMUX_CONF) {
+    if current.as_deref() != Some(desired.as_str()) {
         std::fs::create_dir_all(&dir).ok()?;
-        std::fs::write(&path, CLI_TMUX_CONF).ok()?;
+        std::fs::write(&path, desired).ok()?;
     }
     Some(path)
 }
@@ -839,9 +857,13 @@ fn cli_tmux_conf_path() -> Option<PathBuf> {
 /// first so the append-style options aren't re-applied on every attach.
 /// Best-effort: no server running is the common case and simply a no-op.
 fn ensure_cli_tmux_server_options() {
+    ensure_cli_tmux_server_options_on(CLI_TMUX_SOCKET, tmux_client_flags_supported());
+}
+
+fn ensure_cli_tmux_server_options_on(socket: &str, client_flags_supported: bool) {
     let tmux = |args: &[&str]| {
         std::process::Command::new("tmux")
-            .args(["-L", CLI_TMUX_SOCKET])
+            .args(["-L", socket])
             .args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -852,7 +874,49 @@ fn ensure_cli_tmux_server_options() {
     // launch bootstrap) is parsed; apply unconditionally (idempotent, no-op
     // without a running server) so servers started before this option joined
     // the conf don't hand the bootstrap to a fish/csh login shell.
-    let _ = tmux(&["set-option", "-g", "default-shell", "/bin/sh"]);
+    let migration = if client_flags_supported {
+        // This migration MUST stay above the clipboard probe: a production
+        // server commonly already has `set-clipboard on`, which makes the
+        // probe return early, but may have started before window-size joined
+        // the config.
+        tmux(&[
+            "set-option",
+            "-g",
+            "default-shell",
+            "/bin/sh",
+            ";",
+            "set-option",
+            "-g",
+            "window-size",
+            "smallest",
+        ])
+    } else {
+        // A server can outlive this backend process. Actively release a
+        // `smallest` clamp left by an earlier supported build/probe result.
+        tmux(&[
+            "set-option",
+            "-g",
+            "default-shell",
+            "/bin/sh",
+            ";",
+            "set-option",
+            "-gu",
+            "window-size",
+        ])
+    };
+    match migration {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => tracing::debug!(
+            socket,
+            status = %output.status,
+            "CLI tmux server option migration exited unsuccessfully"
+        ),
+        Err(error) => tracing::debug!(
+            socket,
+            error = %error,
+            "Failed to spawn CLI tmux server option migration"
+        ),
+    }
 
     let Ok(probe) = tmux(&["show-options", "-s", "set-clipboard"]) else {
         return;
@@ -892,6 +956,11 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 256;
 /// `tmux -L <socket> kill-server` can reclaim everything; and the long-lived
 /// server that inherits the backend environment is clearly ours, not shared.
 pub(crate) const CLI_TMUX_SOCKET: &str = "vibe-kanban";
+
+/// Bound every tmux fork used for client-flag reconciliation. These commands
+/// are best-effort and the periodic sweep repairs failures, so a wedged tmux
+/// must never retain a task indefinitely.
+const CLI_TMUX_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// tmux session name for a workspace's CLI-mode terminal. The `vk_` namespace
 /// is ours: creation, attach, and cleanup only ever target these names.
@@ -1297,8 +1366,9 @@ async fn paste_via_tmux_buffer(workspace_id: Uuid, target: &str, text: &str) -> 
 }
 
 /// Seconds since the Unix epoch (best-effort; 0 if the system clock is before
-/// the epoch). Used to turn tmux's `session_activity` epoch into an idle age.
-fn now_unix_secs() -> i64 {
+/// the epoch). Used to turn tmux's `session_activity` and `client_activity`
+/// epochs into idle ages.
+pub(crate) fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1367,25 +1437,78 @@ pub async fn cli_tmux_session_liveness(workspace_id: Uuid) -> Option<(bool, i64)
         .map(|(_, attached, idle)| (attached, idle))
 }
 
-/// Whether tmux is on PATH. Checked once per process; when unavailable
-/// (e.g. Windows, minimal containers) CLI mode degrades to a bare shell.
-pub(crate) fn tmux_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        let available = std::process::Command::new("tmux")
+#[derive(Debug, Clone, Copy)]
+struct TmuxCapabilities {
+    available: bool,
+    client_flags: bool,
+}
+
+/// Parse tmux's stable `tmux -V` output and recognize the first release with
+/// per-client flags. A version gate is preferable to probing `refresh-client`
+/// because the latter needs a live client and would perturb it; tmux 3.2 added
+/// the `-f` client-flag option used by the sizing feature.
+fn tmux_version_supports_client_flags(output: &str) -> bool {
+    let Some(version) = output.trim().strip_prefix("tmux ") else {
+        return false;
+    };
+    let version = version.strip_prefix("next-").unwrap_or(version);
+    let Some((major, minor_and_suffix)) = version.split_once('.') else {
+        return false;
+    };
+    let minor: String = minor_and_suffix
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else {
+        return false;
+    };
+    (major, minor) >= (3, 2)
+}
+
+fn tmux_capabilities() -> &'static TmuxCapabilities {
+    static CAPABILITIES: OnceLock<TmuxCapabilities> = OnceLock::new();
+    CAPABILITIES.get_or_init(|| {
+        let output = std::process::Command::new("tmux")
             .arg("-V")
-            .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if !available {
+            .output()
+            .ok()
+            .filter(|output| output.status.success());
+        let Some(output) = output else {
             tracing::warn!(
                 "tmux not found on PATH; CLI mode terminals will degrade to ephemeral shells"
             );
+            return TmuxCapabilities {
+                available: false,
+                client_flags: false,
+            };
+        };
+
+        let version = String::from_utf8_lossy(&output.stdout);
+        let client_flags = tmux_version_supports_client_flags(&version);
+        if !client_flags {
+            tracing::warn!(
+                version = version.trim(),
+                "tmux client-flag support could not be confirmed; shared CLI terminal sizing requires a recognized tmux >= 3.2"
+            );
         }
-        available
+        TmuxCapabilities {
+            available: true,
+            client_flags,
+        }
     })
+}
+
+/// Whether tmux is on PATH. Checked once per process; when unavailable
+/// (e.g. Windows, minimal containers) CLI mode degrades to a bare shell.
+pub(crate) fn tmux_available() -> bool {
+    tmux_capabilities().available
+}
+
+/// Whether tmux can exclude individual clients from `window-size smallest`.
+/// Shares the cached `tmux -V` probe with [`tmux_available`].
+pub(crate) fn tmux_client_flags_supported() -> bool {
+    tmux_capabilities().client_flags
 }
 
 /// Visible notice written into a CLI pane when tmux is unavailable, so the
@@ -1494,7 +1617,40 @@ struct PtySession {
     /// `Drop` checks this before signalling so it never targets a PID that
     /// was already reaped (and possibly recycled) on the natural-exit path.
     child_reaped: Arc<AtomicBool>,
+    /// Per-client tmux sizing state. Shell sessions (including CLI fallback
+    /// when tmux is absent) have none; PID and presence always exist together.
+    tmux_client: Option<CliTmuxClient>,
     _output_handle: thread::JoinHandle<()>,
+}
+
+struct CliTmuxClient {
+    /// PID of the `tmux new-session/attach` client process. This is the stable
+    /// bridge from a web PTY session to tmux's per-client `ignore-size` flag.
+    pid: u32,
+    /// Kept beside the session so teardown removes the presence record
+    /// atomically with the PTY client it describes.
+    presence: CliClientPresence,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CliClientPresence {
+    pub(crate) visible: bool,
+    pub(crate) last_visible_at: Instant,
+    /// When `visible` last changed value. Same-value heartbeats must not move
+    /// this timestamp: the sizing sweep compares it with tmux's last input to
+    /// decide whether input happened after a delayed hidden transition.
+    pub(crate) last_changed_at: Instant,
+}
+
+impl CliClientPresence {
+    fn new(visible: bool) -> Self {
+        let now = Instant::now();
+        Self {
+            visible,
+            last_visible_at: now,
+            last_changed_at: now,
+        }
+    }
 }
 
 impl Drop for PtySession {
@@ -1567,10 +1723,18 @@ impl PtyService {
 
             // CLI mode rides tmux when present; otherwise (and for the
             // default side terminal) spawn the user's shell directly.
-            let (tmux_workspace, tmux_resume_id, tmux_initial_prompt, tmux_deferred, tmux_spec): (
+            let (
+                tmux_workspace,
+                tmux_resume_id,
+                tmux_initial_prompt,
+                tmux_deferred,
+                tmux_connect_hidden,
+                tmux_spec,
+            ): (
                 Option<Uuid>,
                 Option<String>,
                 Option<String>,
+                bool,
                 bool,
                 Option<CliLaunchSpec>,
             ) = match &command {
@@ -1579,16 +1743,23 @@ impl PtyService {
                     resume_session_id,
                     initial_prompt,
                     deferred_prompt_pending,
+                    connect_hidden,
                     spec,
                 } if tmux_available() => (
                     Some(*workspace_id),
                     resume_session_id.clone(),
                     initial_prompt.clone(),
                     *deferred_prompt_pending,
+                    *connect_hidden,
                     Some(spec.clone()),
                 ),
-                _ => (None, None, None, false, None),
+                _ => (None, None, None, false, false, None),
             };
+            // Client flags are the release valve that makes smallest sizing
+            // safe. The cached client-flags capability gates the entire
+            // feature; without it smallest sizing would clamp with no release
+            // valve.
+            let tmux_connect_hidden = tmux_connect_hidden && tmux_client_flags_supported();
 
             // Never silently break the persistence promise: if CLI mode was
             // requested but tmux is absent, say so in the pane itself.
@@ -1622,7 +1793,7 @@ impl PtyService {
                 let mut cmd = CommandBuilder::new("tmux");
                 // Our own config instead of the user's ~/.tmux.conf — the
                 // embedded terminal needs deterministic mouse/clipboard
-                // behavior (see CLI_TMUX_CONF); the user's personal tmux on
+                // behavior (see `cli_tmux_conf`); the user's personal tmux on
                 // the default socket is unaffected.
                 if let Some(conf) = cli_tmux_conf_path() {
                     cmd.arg("-f");
@@ -1632,6 +1803,10 @@ impl PtyService {
                 cmd.arg("-L");
                 cmd.arg(CLI_TMUX_SOCKET);
                 cmd.arg("new-session");
+                if tmux_connect_hidden {
+                    cmd.arg("-f");
+                    cmd.arg("ignore-size");
+                }
                 // -A: attach if the session exists, else create.
                 //
                 // We deliberately do NOT pass -D (detach other clients): a new
@@ -1733,6 +1908,15 @@ impl PtyService {
                 .spawn_command(cmd)
                 .map_err(|e| PtyError::CreateFailed(e.to_string()))?;
 
+            // `Child` moves into the reader/reaper thread below, so capture its
+            // tmux client PID now. Shell-mode PIDs must never enter the presence
+            // registry: they have no tmux client whose size flag can be changed.
+            let tmux_client_pid = if tmux_workspace.is_some() {
+                child.process_id()
+            } else {
+                None
+            };
+
             // Independent kill handle so teardown can unblock the reader.
             let mut child_killer = child.clone_killer();
             let child_reaped = Arc::new(AtomicBool::new(false));
@@ -1808,6 +1992,10 @@ impl PtyService {
                 master: pty_pair.master,
                 child_killer,
                 child_reaped,
+                tmux_client: tmux_client_pid.map(|pid| CliTmuxClient {
+                    pid,
+                    presence: CliClientPresence::new(!tmux_connect_hidden),
+                }),
                 _output_handle: output_handle,
             })
         })
@@ -1878,6 +2066,94 @@ impl PtyService {
         Ok(())
     }
 
+    /// Record browser visibility for a CLI tmux client and schedule an update
+    /// to whether it participates in `window-size smallest`. Shell sessions
+    /// and same-state heartbeats are synchronous no-ops outside the registry;
+    /// transition reconciliation is bounded, fire-and-forget work because the
+    /// periodic activity sweep is the repair path.
+    pub fn set_cli_presence(&self, session_id: Uuid, visible: bool) {
+        if !tmux_client_flags_supported() {
+            return;
+        }
+
+        let client_pid = {
+            let mut sessions = match self.sessions.lock() {
+                Ok(sessions) => sessions,
+                Err(e) => {
+                    tracing::debug!("Failed to lock CLI presence registry: {e}");
+                    return;
+                }
+            };
+            let Some(session) = sessions.get_mut(&session_id) else {
+                tracing::debug!("CLI presence session {session_id} no longer exists");
+                return;
+            };
+            let Some(tmux_client) = session.tmux_client.as_mut() else {
+                return;
+            };
+            let presence = &mut tmux_client.presence;
+            let now = Instant::now();
+            if presence.visible == visible {
+                if visible {
+                    presence.last_visible_at = now;
+                }
+                return;
+            }
+
+            presence.visible = visible;
+            presence.last_changed_at = now;
+            if visible {
+                presence.last_visible_at = now;
+            }
+            tmux_client.pid
+        };
+
+        // Two rapid transitions can finish out of order; the periodic sweep
+        // repairs any resulting divergence within one sweep period.
+        tokio::spawn(async move {
+            let client_name = match cli_tmux_client_name(client_pid).await {
+                Ok(Some(client_name)) => client_name,
+                Ok(None) => {
+                    tracing::debug!(
+                        "tmux client pid {client_pid} not found for CLI presence update"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to resolve tmux client pid {client_pid}: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = refresh_cli_tmux_client_ignore_size(&client_name, !visible).await {
+                tracing::debug!(
+                    "Failed to update ignore-size for tmux client {client_name} (pid {client_pid}): {e}"
+                );
+            }
+        });
+    }
+
+    /// Snapshot web presence by the tmux client PID used in `list-clients`.
+    /// A poisoned registry yields an empty view; the sweep then falls back to
+    /// tmux activity instead of letting a monitoring failure affect terminals.
+    pub(crate) fn cli_presence_snapshot(&self) -> HashMap<u32, CliClientPresence> {
+        let sessions = match self.sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                tracing::debug!("Failed to snapshot CLI presence registry: {e}");
+                return HashMap::new();
+            }
+        };
+        sessions
+            .values()
+            .filter_map(|session| {
+                session
+                    .tmux_client
+                    .as_ref()
+                    .map(|client| (client.pid, client.presence))
+            })
+            .collect()
+    }
+
     pub async fn close_session(&self, session_id: Uuid) -> Result<(), PtyError> {
         // Dropping the removed session runs the full teardown — VEOF disarm
         // then child kill — in `Drop for PtySession`. Bound OUTSIDE the lock
@@ -1892,6 +2168,71 @@ impl PtyService {
         drop(session);
         Ok(())
     }
+}
+
+pub(crate) async fn cli_tmux_client_name(client_pid: u32) -> Result<Option<String>, String> {
+    let output = run_cli_tmux(&[
+        "-L",
+        CLI_TMUX_SOCKET,
+        "list-clients",
+        "-F",
+        "#{client_pid}\t#{client_name}",
+    ])
+    .await?;
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let (pid, name) = line.split_once('\t')?;
+            (pid.trim().parse::<u32>().ok()? == client_pid).then(|| name.to_string())
+        }))
+}
+
+pub(crate) async fn refresh_cli_tmux_client_ignore_size(
+    client_name: &str,
+    ignore_size: bool,
+) -> Result<(), String> {
+    let flag = if ignore_size {
+        "ignore-size"
+    } else {
+        "!ignore-size"
+    };
+    run_cli_tmux(&[
+        "-L",
+        CLI_TMUX_SOCKET,
+        "refresh-client",
+        "-t",
+        client_name,
+        "-f",
+        flag,
+    ])
+    .await
+    .map(|_| ())
+}
+
+pub(crate) async fn run_cli_tmux(args: &[&str]) -> Result<std::process::Output, String> {
+    let output = tokio::time::timeout(
+        CLI_TMUX_COMMAND_TIMEOUT,
+        tokio::process::Command::new("tmux")
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("tmux command timed out after {CLI_TMUX_COMMAND_TIMEOUT:?}"))?
+    .map_err(|e| e.to_string())?;
+
+    if output.status.success() {
+        return Ok(output);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    Err(if stderr.is_empty() {
+        format!("tmux command exited with {}", output.status)
+    } else {
+        format!("tmux command exited with {}: {stderr}", output.status)
+    })
 }
 
 impl Default for PtyService {
@@ -2393,13 +2734,104 @@ mod tests {
     fn cli_tmux_conf_keeps_mouse_scroll_and_osc52_copy() {
         // The reconciliation contract: wheel scrolling stays (mouse on) AND
         // selections land in the system clipboard via OSC 52.
-        assert!(CLI_TMUX_CONF.contains("set -g mouse on"));
-        assert!(CLI_TMUX_CONF.contains("set -s set-clipboard on"));
-        assert!(CLI_TMUX_CONF.contains("clipboard"));
-        assert!(CLI_TMUX_CONF.contains("unbind-key -n MouseDown3Pane"));
-        // Window command strings (the POSIX-sh launch bootstrap) are parsed by
-        // default-shell; a fish/csh login shell would reject them outright.
-        assert!(CLI_TMUX_CONF.contains("set -g default-shell /bin/sh"));
+        for conf in [cli_tmux_conf(false), cli_tmux_conf(true)] {
+            assert!(conf.contains("set -g mouse on"));
+            assert!(conf.contains("set -s set-clipboard on"));
+            assert!(conf.contains("set -as terminal-features ',xterm*:clipboard'"));
+            assert!(conf.contains("unbind-key -n MouseDown3Pane"));
+            // Window command strings (the POSIX-sh launch bootstrap) are
+            // parsed by default-shell; fish/csh would reject them outright.
+            assert!(conf.contains("set -g default-shell /bin/sh"));
+        }
+        assert!(cli_tmux_conf(true).contains("set -g window-size smallest"));
+        assert!(!cli_tmux_conf(false).contains("window-size smallest"));
+    }
+
+    #[test]
+    fn tmux_client_flag_version_gate_handles_release_formats() {
+        assert!(tmux_version_supports_client_flags("tmux 3.2a\n"));
+        assert!(tmux_version_supports_client_flags("tmux 3.4"));
+        assert!(tmux_version_supports_client_flags("tmux next-3.6"));
+        assert!(tmux_version_supports_client_flags("tmux 4.0"));
+        assert!(!tmux_version_supports_client_flags("tmux 3.1c"));
+        assert!(!tmux_version_supports_client_flags("tmux 2.9"));
+        assert!(!tmux_version_supports_client_flags("tmux master"));
+    }
+
+    struct ScratchTmuxServer {
+        socket: String,
+    }
+
+    impl Drop for ScratchTmuxServer {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &self.socket, "kill-server"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
+    #[test]
+    fn ensure_reconciles_window_size_in_both_capability_directions() {
+        if !tmux_client_flags_supported() {
+            return;
+        }
+
+        static SOCKET_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SOCKET_SEQ.fetch_add(1, Ordering::Relaxed);
+        let socket = format!("bc-smallest-test-{}-{seq}", std::process::id());
+        let server = ScratchTmuxServer {
+            socket: socket.clone(),
+        };
+
+        let dir = tempfile::tempdir().expect("scratch tmux config dir");
+        let conf = dir.path().join("old-cli-tmux.conf");
+        std::fs::write(
+            &conf,
+            "set -s set-clipboard on\nset -g default-shell /bin/bash\n",
+        )
+        .expect("write old-style tmux config");
+        let started = std::process::Command::new("tmux")
+            .args(["-L", &socket, "-f"])
+            .arg(&conf)
+            .args(["new-session", "-d", "-s", "old-server"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("start scratch tmux server");
+        assert!(
+            started.status.success(),
+            "scratch tmux server failed: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+
+        ensure_cli_tmux_server_options_on(&socket, true);
+
+        let shown = std::process::Command::new("tmux")
+            .args(["-L", &socket, "show-options", "-gv", "window-size"])
+            .output()
+            .expect("show scratch window-size");
+        assert!(shown.status.success(), "show window-size must succeed");
+        assert_eq!(String::from_utf8_lossy(&shown.stdout).trim(), "smallest");
+
+        let shown = std::process::Command::new("tmux")
+            .args(["-L", &socket, "show-options", "-gv", "default-shell"])
+            .output()
+            .expect("show scratch default-shell");
+        assert!(shown.status.success(), "show default-shell must succeed");
+        assert_eq!(String::from_utf8_lossy(&shown.stdout).trim(), "/bin/sh");
+
+        ensure_cli_tmux_server_options_on(&socket, false);
+
+        let shown = std::process::Command::new("tmux")
+            .args(["-L", &socket, "show-options", "-gv", "window-size"])
+            .output()
+            .expect("show downgraded scratch window-size");
+        assert!(shown.status.success(), "show window-size must succeed");
+        assert_eq!(String::from_utf8_lossy(&shown.stdout).trim(), "latest");
+
+        drop(server);
     }
 
     #[test]
@@ -2525,6 +2957,7 @@ mod tests {
             master,
             child_killer,
             child_reaped: child_reaped.clone(),
+            tmux_client: None,
             _output_handle: output_handle,
         };
         drop(session);

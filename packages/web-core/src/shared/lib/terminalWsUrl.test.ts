@@ -61,6 +61,27 @@ describe('buildTerminalWsUrl', () => {
     expect(url.startsWith('http://localhost:3000/api/terminal/ws?')).toBe(true);
     expect(url).toContain('workspace_id=abc');
   });
+
+  it('carries hidden only for a connect that starts out non-visible', () => {
+    const base = {
+      workspaceId: 'ws-1',
+      cols: 80,
+      rows: 24,
+      protocol: 'https:',
+      host: 'example.test',
+      mode: 'cli' as const,
+    };
+    expect(buildTerminalWsUrl({ ...base, hidden: true })).toContain(
+      '&hidden=true'
+    );
+    expect(buildTerminalWsUrl({ ...base, hidden: false })).not.toContain(
+      'hidden='
+    );
+    expect(buildTerminalWsUrl(base)).not.toContain('hidden=');
+    expect(
+      buildTerminalWsUrl({ ...base, mode: 'shell', hidden: true })
+    ).not.toContain('hidden=');
+  });
 });
 
 describe('resolveTerminalEndpoint', () => {
@@ -191,6 +212,18 @@ describe('terminalAttemptIsStale', () => {
     // must not discard the attempt.
     expect(
       terminalAttemptIsStale(true, make({}), make({ cols: 203, rows: 51 }))
+    ).toBe(false);
+  });
+
+  it('epoch changed but connect-time visibility drift is not stale', () => {
+    // Visibility can flip between endpoint resolution and open. The socket's
+    // presence sync converges it without reconnect churn.
+    expect(
+      terminalAttemptIsStale(
+        true,
+        make({ hidden: true }),
+        make({ hidden: false })
+      )
     ).toBe(false);
   });
 
