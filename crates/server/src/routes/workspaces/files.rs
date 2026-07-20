@@ -122,6 +122,20 @@ async fn workspace_root(
     Ok(PathBuf::from(container_ref))
 }
 
+/// Every Files handler must resolve paths only while holding the read side of
+/// this lock, keyed by the canonical worktree root.
+async fn canonical_workspace(
+    deployment: &DeploymentImpl,
+    workspace: &Workspace,
+) -> Result<(PathBuf, PathBuf, WorkspaceFilesystemLock), ApiError> {
+    let base = workspace_root(deployment, workspace).await?;
+    let canonical_base = tokio::fs::canonicalize(&base)
+        .await
+        .map_err(|_| ApiError::File(FileError::NotFound))?;
+    let filesystem_lock = workspace_filesystem_lock(&canonical_base);
+    Ok((base, canonical_base, filesystem_lock))
+}
+
 /// Render `full` as a worktree-relative, forward-slash path. Fails closed if
 /// `full` is not under `base` rather than leaking an absolute server path.
 #[allow(clippy::result_large_err)]
@@ -140,11 +154,8 @@ pub async fn list_files(
     State(deployment): State<DeploymentImpl>,
     Query(query): Query<PathQuery>,
 ) -> Result<ResponseJson<ApiResponse<WorkspaceDirListing>>, ApiError> {
-    let base = workspace_root(&deployment, &workspace).await?;
-    let canonical_base = tokio::fs::canonicalize(&base)
-        .await
-        .map_err(|_| ApiError::File(FileError::NotFound))?;
-    let filesystem_lock = workspace_filesystem_lock(&canonical_base);
+    let (base, canonical_base, filesystem_lock) =
+        canonical_workspace(&deployment, &workspace).await?;
     let _read_guard = filesystem_lock.read_owned().await;
     let dir = file_policy::resolve_existing_path(&base, &query.path)?;
     if !dir.is_dir() {
@@ -219,11 +230,8 @@ pub async fn download_file(
     State(deployment): State<DeploymentImpl>,
     Query(query): Query<PathQuery>,
 ) -> Result<Response, ApiError> {
-    let base = workspace_root(&deployment, &workspace).await?;
-    let canonical_base = tokio::fs::canonicalize(&base)
-        .await
-        .map_err(|_| ApiError::File(FileError::NotFound))?;
-    let filesystem_lock = workspace_filesystem_lock(&canonical_base);
+    let (base, _canonical_base, filesystem_lock) =
+        canonical_workspace(&deployment, &workspace).await?;
     let read_guard = filesystem_lock.read_owned().await;
     let path = file_policy::resolve_existing_path(&base, &query.path)?;
     // Open once, then read metadata from the handle so the streamed bytes and
@@ -358,11 +366,8 @@ pub async fn download_zip(
     State(deployment): State<DeploymentImpl>,
     Query(query): Query<PathQuery>,
 ) -> Result<Response, ApiError> {
-    let base = workspace_root(&deployment, &workspace).await?;
-    let canonical_base = tokio::fs::canonicalize(&base)
-        .await
-        .map_err(|_| ApiError::File(FileError::NotFound))?;
-    let filesystem_lock = workspace_filesystem_lock(&canonical_base);
+    let (base, _canonical_base, filesystem_lock) =
+        canonical_workspace(&deployment, &workspace).await?;
     let read_guard = filesystem_lock.read_owned().await;
     let root = file_policy::resolve_existing_path(&base, &query.path)?;
     if !root.is_dir() {
@@ -464,19 +469,15 @@ async fn ensure_uploads_gitignore(uploads_dir: &Path) -> Result<(), ApiError> {
     }
 }
 
-async fn canonical_uploads_directory(
+async fn existing_canonical_uploads(
     canonical_base: &Path,
     directory: &Path,
-) -> Result<PathBuf, ApiError> {
-    let metadata = tokio::fs::symlink_metadata(directory)
-        .await
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ApiError::BadRequest("Upload directory no longer exists".to_string())
-            } else {
-                ApiError::Io(error)
-            }
-        })?;
+) -> Result<Option<PathBuf>, ApiError> {
+    let metadata = match tokio::fs::symlink_metadata(directory).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     if !metadata.file_type().is_dir() {
         return Err(ApiError::BadRequest(
             "Upload directory must be a real directory".to_string(),
@@ -489,7 +490,7 @@ async fn canonical_uploads_directory(
             "Upload directory escapes the workspace".to_string(),
         ));
     }
-    Ok(canonical)
+    Ok(Some(canonical))
 }
 
 async fn create_real_uploads_directory(uploads_dir: &Path) -> Result<(), ApiError> {
@@ -506,6 +507,22 @@ async fn create_real_uploads_directory(uploads_dir: &Path) -> Result<(), ApiErro
 enum ResolvedUploadsDirectory {
     Current,
     Legacy,
+}
+
+async fn probe_resolved_state(
+    uploads_dir: &Path,
+    legacy_uploads_dir: &Path,
+) -> Result<ResolvedUploadsDirectory, ApiError> {
+    if is_real_directory(uploads_dir).await? {
+        Ok(ResolvedUploadsDirectory::Current)
+    } else if is_real_directory(legacy_uploads_dir).await? {
+        Ok(ResolvedUploadsDirectory::Legacy)
+    } else {
+        // Both paths may vanish between earlier probes and this re-check.
+        // Re-create the current directory instead of returning a dead path.
+        create_real_uploads_directory(uploads_dir).await?;
+        Ok(ResolvedUploadsDirectory::Current)
+    }
 }
 
 /// Resolve the default upload directory, migrating the legacy directory when
@@ -562,17 +579,7 @@ where
                             );
                             // Keep this re-check even with the in-process lock: an
                             // old binary or another process can still win the race.
-                            if is_real_directory(&uploads_dir).await? {
-                                ResolvedUploadsDirectory::Current
-                            } else if is_real_directory(&legacy_uploads_dir).await? {
-                                ResolvedUploadsDirectory::Legacy
-                            } else {
-                                // Both paths may vanish between the probes and the
-                                // failed rename. Re-create the current directory
-                                // instead of returning a dead legacy path.
-                                create_real_uploads_directory(&uploads_dir).await?;
-                                ResolvedUploadsDirectory::Current
-                            }
+                            probe_resolved_state(&uploads_dir, &legacy_uploads_dir).await?
                         }
                     }
                 }
@@ -593,14 +600,7 @@ where
                         Err(_) => filesystem_lock.clone().read_owned().await,
                     });
 
-                    if is_real_directory(&uploads_dir).await? {
-                        ResolvedUploadsDirectory::Current
-                    } else if is_real_directory(&legacy_uploads_dir).await? {
-                        ResolvedUploadsDirectory::Legacy
-                    } else {
-                        create_real_uploads_directory(&uploads_dir).await?;
-                        ResolvedUploadsDirectory::Current
-                    }
+                    probe_resolved_state(&uploads_dir, &legacy_uploads_dir).await?
                 }
             }
         }
@@ -612,13 +612,14 @@ where
 
     // Both-present is intentional. Validate containment before writing either
     // .gitignore, then assert the ignore file on every real upload directory.
-    let mut current = if is_real_directory(&uploads_dir).await? {
-        Some(canonical_uploads_directory(canonical_base, &uploads_dir).await?)
+    let mut current = if uploads_exists || matches!(resolved_dir, ResolvedUploadsDirectory::Current)
+    {
+        existing_canonical_uploads(canonical_base, &uploads_dir).await?
     } else {
         None
     };
-    let mut legacy = if is_real_directory(&legacy_uploads_dir).await? {
-        Some(canonical_uploads_directory(canonical_base, &legacy_uploads_dir).await?)
+    let mut legacy = if legacy_exists || matches!(resolved_dir, ResolvedUploadsDirectory::Legacy) {
+        existing_canonical_uploads(canonical_base, &legacy_uploads_dir).await?
     } else {
         None
     };
@@ -627,10 +628,9 @@ where
         // The two probes above can straddle another process's atomic legacy ->
         // current rename (current absent just before it, legacy absent just
         // after it). A final current-path probe closes that false-neither edge.
-        if is_real_directory(&uploads_dir).await? {
-            current = Some(canonical_uploads_directory(canonical_base, &uploads_dir).await?);
-        } else if is_real_directory(&legacy_uploads_dir).await? {
-            legacy = Some(canonical_uploads_directory(canonical_base, &legacy_uploads_dir).await?);
+        current = existing_canonical_uploads(canonical_base, &uploads_dir).await?;
+        if current.is_none() {
+            legacy = existing_canonical_uploads(canonical_base, &legacy_uploads_dir).await?;
         }
     }
 
@@ -654,28 +654,10 @@ where
     }
 }
 
-/// Resolve the current or legacy default upload directory.
-///
-/// Both-present is an intentional state after rollback and re-upgrade. In that
-/// state neither directory is merged or deleted. An older binary rolled back
-/// after migration hides `.bettercoding-uploads` in its Files panel because its
-/// `is_hidden` exempts only `.vibe-uploads`; the files are not lost, and become
-/// visible again after re-upgrading. Older binaries also ignore `BC_`-prefixed
-/// environment configuration, so keep the matching `VK_` variables set during
-/// a rollback window.
+/// Resolve the default upload directory; see [`LEGACY_UPLOADS_DIR`] for the
+/// rollback caveat.
 async fn resolve_uploads_dir(canonical_base: &Path) -> Result<PathBuf, ApiError> {
     resolve_uploads_dir_impl(canonical_base, |_, _| {}).await
-}
-
-#[cfg(test)]
-async fn resolve_uploads_dir_with_probe_seam<F>(
-    canonical_base: &Path,
-    after_state_probes: F,
-) -> Result<PathBuf, ApiError>
-where
-    F: FnOnce(&Path, &Path),
-{
-    resolve_uploads_dir_impl(canonical_base, after_state_probes).await
 }
 
 pub async fn upload_files(
@@ -684,18 +666,11 @@ pub async fn upload_files(
     Query(query): Query<UploadQuery>,
     mut multipart: Multipart,
 ) -> Result<ResponseJson<ApiResponse<Vec<WorkspaceFileEntry>>>, ApiError> {
-    let base = workspace_root(&deployment, &workspace).await?;
-    let canonical_base = tokio::fs::canonicalize(&base)
-        .await
-        .map_err(|_| ApiError::File(FileError::NotFound))?;
+    let (base, canonical_base, filesystem_lock) =
+        canonical_workspace(&deployment, &workspace).await?;
+    let custom_path = query.path.as_deref().filter(|path| !path.trim().is_empty());
 
-    let filesystem_lock = workspace_filesystem_lock(&canonical_base);
-    let use_default_uploads_dir = !matches!(
-        query.path.as_deref(),
-        Some(path) if !path.trim().is_empty()
-    );
-
-    if use_default_uploads_dir {
+    if custom_path.is_none() {
         // Give migration one non-blocking chance before taking this request's
         // read guard. The result is deliberately discarded: after acquiring the
         // read side we resolve again, so no other in-process migration can move
@@ -704,9 +679,9 @@ pub async fn upload_files(
     }
     let _read_guard = filesystem_lock.read_owned().await;
 
-    let target_dir = match (use_default_uploads_dir, query.path.as_deref()) {
-        (false, Some(path)) => file_policy::resolve_existing_dir(&base, path)?,
-        _ => resolve_uploads_dir(&canonical_base).await?,
+    let target_dir = match custom_path {
+        Some(path) => file_policy::resolve_existing_dir(&base, path)?,
+        None => resolve_uploads_dir(&canonical_base).await?,
     };
 
     let mut uploaded = Vec::new();
@@ -947,7 +922,7 @@ mod tests {
         fs::write(legacy.join("report.txt"), b"legacy report").unwrap();
         let expected = base.join(UPLOADS_DIR);
 
-        let resolved = resolve_uploads_dir_with_probe_seam(base, |current, legacy| {
+        let resolved = resolve_uploads_dir_impl(base, |current, legacy| {
             fs::rename(legacy, current).unwrap();
         })
         .await
@@ -970,7 +945,7 @@ mod tests {
         fs::write(legacy.join("legacy.txt"), b"legacy data").unwrap();
         let expected = base.join(UPLOADS_DIR);
 
-        let resolved = resolve_uploads_dir_with_probe_seam(base, |current, _legacy| {
+        let resolved = resolve_uploads_dir_impl(base, |current, _legacy| {
             fs::create_dir(current).unwrap();
             fs::write(current.join("new.txt"), b"new data").unwrap();
         })
@@ -992,7 +967,7 @@ mod tests {
         let legacy = seed_upload_dir(base, LEGACY_UPLOADS_DIR);
         let expected = base.join(UPLOADS_DIR);
 
-        let resolved = resolve_uploads_dir_with_probe_seam(base, |_current, legacy| {
+        let resolved = resolve_uploads_dir_impl(base, |_current, legacy| {
             fs::remove_dir_all(legacy).unwrap();
         })
         .await
