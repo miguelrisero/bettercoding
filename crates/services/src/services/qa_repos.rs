@@ -3,7 +3,10 @@
 //! This module provides two hardcoded QA repositories that are cloned
 //! to a persistent temp directory and returned as the only "recent" repos.
 
-use std::{path::PathBuf, process::Command};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use once_cell::sync::Lazy;
 use tracing::{info, warn};
@@ -18,14 +21,17 @@ const QA_REPOS: &[(&str, &str)] = &[
 ];
 
 /// Persistent directory for QA repos - survives server restarts
-static QA_REPOS_DIR: Lazy<PathBuf> = Lazy::new(|| {
-    let dir = utils::path::get_vibe_kanban_temp_dir().join("qa-repos");
+static QA_REPOS_DIR: Lazy<PathBuf> =
+    Lazy::new(|| qa_repos_dir_in(&utils::path::get_vibe_kanban_temp_dir()));
+
+fn qa_repos_dir_in(base: &Path) -> PathBuf {
+    let dir = base.join("qa-repos");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!("Failed to create QA repos directory: {}", e);
     }
     info!("QA repos directory: {:?}", dir);
     dir
-});
+}
 
 /// Get the list of QA repositories, cloning them if necessary.
 ///
@@ -105,13 +111,17 @@ fn clone_qa_repos_if_needed(base_dir: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
 
     #[test]
     fn test_qa_repos_dir_is_persistent() {
-        let dir1 = &*QA_REPOS_DIR;
-        let dir2 = &*QA_REPOS_DIR;
+        let base = TempDir::new().expect("create scratch QA base directory");
+        let dir1 = qa_repos_dir_in(base.path());
+        let dir2 = qa_repos_dir_in(base.path());
         assert_eq!(dir1, dir2);
         assert!(dir1.ends_with("qa-repos"));
+        assert!(dir1.is_dir());
     }
 }

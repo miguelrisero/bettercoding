@@ -7,10 +7,14 @@ use std::{
 use directories::ProjectDirs;
 use rust_embed::RustEmbed;
 
-use crate::env::env_path_override;
+use crate::{
+    env::env_path_override,
+    path::{Resolution, ResolutionReason},
+};
 
 const PROJECT_ROOT: &str = env!("CARGO_MANIFEST_DIR");
 pub const DB_FILE_NAME: &str = "db.v2.sqlite";
+// TODO(bc-legacy-cleanup): remove after legacy databases no longer need adoption.
 pub const LEGACY_DB_FILE_NAME: &str = "db.sqlite";
 
 static PROD_ASSET_DIR: OnceLock<Result<PathBuf, String>> = OnceLock::new();
@@ -37,21 +41,26 @@ pub fn asset_dir() -> std::path::PathBuf {
         std::fs::create_dir_all(&path).expect("Failed to create asset directory");
     }
 
+    // Production resolution is dual-home: existing database state in either the
+    // BetterCoding or legacy vibe-kanban home determines which directory is used.
     path
-    // ✔ macOS → ~/Library/Application Support/MyApp
-    // ✔ Linux → ~/.local/share/myapp   (respects XDG_DATA_HOME)
-    // ✔ Windows → %APPDATA%\Example\MyApp
 }
 
 /// Returns the production data directory, resolving and caching it once per process.
 ///
-/// `BC_DATA_DIR` is read before platform home discovery and is a hard override in
-/// both debug and release builds. An empty value is ignored with a warning. A
-/// relative value is made absolute, or retained with a warning if that fails.
-/// Without an override, [`asset_dir`] keeps using `dev_assets` in debug builds.
-/// Unit tests exercise [`resolve_data_dir`] directly and never mutate process env.
+/// Resolution order is: `BC_DATA_DIR`; a BetterCoding home containing
+/// `db.v2.sqlite`; a legacy home containing `db.v2.sqlite` or `db.sqlite`; then a
+/// fresh BetterCoding home. An unknowable database probe returns an error instead
+/// of guessing. Without an override, [`asset_dir`] keeps using `dev_assets` in
+/// debug builds. Unit tests exercise `resolve_data_dir` directly and never mutate
+/// process env.
 /// Startup-critical consumers deliberately panic if resolution is unknowable;
 /// best-effort consumers should use [`try_prod_asset_dir_path`] instead.
+///
+/// In-repo downgrade caveat: a fresh install stores state under the BetterCoding
+/// home, which pre-dual-home binaries never probe. Downgrading therefore boots an
+/// empty database at the legacy path; older binaries also ignore `BC_DATA_DIR`
+/// and `BC_WORKTREE_BASE`.
 pub fn prod_asset_dir_path() -> PathBuf {
     try_prod_asset_dir_path().unwrap_or_else(|error| {
         panic!("Cannot safely resolve the startup-critical data directory: {error}")
@@ -74,22 +83,19 @@ fn cached_prod_asset_dir_path(override_dir: Option<PathBuf>) -> Result<PathBuf, 
             // consumers skip work that depends on the production directory.
             let resolution = if let Some(override_dir) = override_dir {
                 resolve_data_dir(Some(override_dir), PathBuf::new(), PathBuf::new())
-                    .map(|path| DataDirResolution {
-                        path,
-                        reason: DataDirReason::Override,
-                    })
                     .map_err(|error| error.to_string())
             } else {
                 let bettercoding_dir = ProjectDirs::from("ai", "bloop", "bettercoding")
                     .ok_or_else(|| "OS didn't give us a home directory".to_string())?
                     .data_dir()
                     .to_path_buf();
+                // TODO(bc-legacy-cleanup): remove legacy ProjectDirs discovery.
                 let legacy_dir = ProjectDirs::from("ai", "bloop", "vibe-kanban")
                     .ok_or_else(|| "OS didn't give us a home directory".to_string())?
                     .data_dir()
                     .to_path_buf();
 
-                resolve_data_dir_with_reason(None, bettercoding_dir, legacy_dir)
+                resolve_data_dir(None, bettercoding_dir, legacy_dir)
                     .map_err(|error| error.to_string())
             }?;
 
@@ -113,62 +119,30 @@ struct DataDirResolveError {
     source: io::Error,
 }
 
+#[derive(Debug)]
 enum FileProbe {
     Present,
     Absent,
     Unknown(DataDirResolveError),
 }
 
-#[derive(Clone, Copy)]
-enum DataDirReason {
-    Override,
-    Bettercoding,
-    LegacyAdopt,
-    Fresh,
-}
-
-impl DataDirReason {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Override => "override",
-            Self::Bettercoding => "bettercoding",
-            Self::LegacyAdopt => "legacy-adopt",
-            Self::Fresh => "fresh",
-        }
-    }
-}
-
-struct DataDirResolution {
-    path: PathBuf,
-    reason: DataDirReason,
-}
-
 fn resolve_data_dir(
     override_dir: Option<PathBuf>,
     bettercoding_dir: PathBuf,
     legacy_dir: PathBuf,
-) -> Result<PathBuf, DataDirResolveError> {
-    resolve_data_dir_with_reason(override_dir, bettercoding_dir, legacy_dir)
-        .map(|resolution| resolution.path)
-}
-
-fn resolve_data_dir_with_reason(
-    override_dir: Option<PathBuf>,
-    bettercoding_dir: PathBuf,
-    legacy_dir: PathBuf,
-) -> Result<DataDirResolution, DataDirResolveError> {
+) -> Result<Resolution, DataDirResolveError> {
     if let Some(override_dir) = override_dir {
-        return Ok(DataDirResolution {
+        return Ok(Resolution {
             path: override_dir,
-            reason: DataDirReason::Override,
+            reason: ResolutionReason::Override,
         });
     }
 
     match probe_file(&bettercoding_dir.join(DB_FILE_NAME)) {
         FileProbe::Present => {
-            return Ok(DataDirResolution {
+            return Ok(Resolution {
                 path: bettercoding_dir,
-                reason: DataDirReason::Bettercoding,
+                reason: ResolutionReason::Bettercoding,
             });
         }
         FileProbe::Unknown(error) => return Err(error),
@@ -178,35 +152,29 @@ fn resolve_data_dir_with_reason(
     match probe_legacy_database(&legacy_dir) {
         FileProbe::Present => {
             // TODO(bc-legacy-cleanup): remove when no vibe-kanban installs remain.
-            return Ok(DataDirResolution {
+            return Ok(Resolution {
                 path: legacy_dir,
-                reason: DataDirReason::LegacyAdopt,
+                reason: ResolutionReason::LegacyAdopt,
             });
         }
         FileProbe::Unknown(error) => return Err(error),
         FileProbe::Absent => {}
     }
 
-    Ok(DataDirResolution {
+    Ok(Resolution {
         path: bettercoding_dir,
-        reason: DataDirReason::Fresh,
+        reason: ResolutionReason::Fresh,
     })
 }
 
+/// Probes the v2 database first. An unknown v2 result short-circuits instead of
+/// probing the pre-v2 name, matching the parent resolver's refuse-to-guess policy.
+// TODO(bc-legacy-cleanup): remove with support for the legacy data home.
 fn probe_legacy_database(legacy_dir: &Path) -> FileProbe {
-    let mut first_unknown = None;
-
-    for file_name in [DB_FILE_NAME, LEGACY_DB_FILE_NAME] {
-        match probe_file(&legacy_dir.join(file_name)) {
-            FileProbe::Present => return FileProbe::Present,
-            FileProbe::Absent => {}
-            FileProbe::Unknown(error) => {
-                first_unknown.get_or_insert(error);
-            }
-        }
+    match probe_file(&legacy_dir.join(DB_FILE_NAME)) {
+        FileProbe::Absent => probe_file(&legacy_dir.join(LEGACY_DB_FILE_NAME)),
+        result => result,
     }
-
-    first_unknown.map_or(FileProbe::Absent, FileProbe::Unknown)
 }
 
 fn probe_file(path: &Path) -> FileProbe {
@@ -279,16 +247,31 @@ mod tests {
         fs::write(dir.join(file_name), b"scratch database").expect("seed scratch database");
     }
 
+    fn assert_resolution(
+        result: Result<Resolution, DataDirResolveError>,
+        expected_path: &Path,
+        expected_reason: ResolutionReason,
+    ) {
+        let resolution = result.expect("resolve data directory");
+        assert_eq!(resolution.path, expected_path);
+        assert_eq!(resolution.reason, expected_reason);
+    }
+
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        nix::unistd::geteuid().is_root()
+    }
+
     #[test]
     fn uses_legacy_dir_when_only_legacy_has_database() {
         let root = TempDir::new().expect("create scratch directory");
         let (bettercoding_dir, legacy_dir) = candidates(&root);
         seed_database(&legacy_dir);
 
-        assert_eq!(
-            resolve_data_dir(None, bettercoding_dir, legacy_dir.clone())
-                .expect("resolve data directory"),
-            legacy_dir
+        assert_resolution(
+            resolve_data_dir(None, bettercoding_dir, legacy_dir.clone()),
+            &legacy_dir,
+            ResolutionReason::LegacyAdopt,
         );
     }
 
@@ -298,10 +281,10 @@ mod tests {
         let (bettercoding_dir, legacy_dir) = candidates(&root);
         seed_database_named(&legacy_dir, LEGACY_DB_FILE_NAME);
 
-        assert_eq!(
-            resolve_data_dir(None, bettercoding_dir, legacy_dir.clone())
-                .expect("resolve data directory"),
-            legacy_dir
+        assert_resolution(
+            resolve_data_dir(None, bettercoding_dir, legacy_dir.clone()),
+            &legacy_dir,
+            ResolutionReason::LegacyAdopt,
         );
     }
 
@@ -312,10 +295,10 @@ mod tests {
         seed_database_named(&bettercoding_dir, LEGACY_DB_FILE_NAME);
         seed_database(&legacy_dir);
 
-        assert_eq!(
-            resolve_data_dir(None, bettercoding_dir, legacy_dir.clone())
-                .expect("resolve data directory"),
-            legacy_dir
+        assert_resolution(
+            resolve_data_dir(None, bettercoding_dir, legacy_dir.clone()),
+            &legacy_dir,
+            ResolutionReason::LegacyAdopt,
         );
     }
 
@@ -326,10 +309,10 @@ mod tests {
         seed_database(&bettercoding_dir);
         seed_database(&legacy_dir);
 
-        assert_eq!(
-            resolve_data_dir(None, bettercoding_dir.clone(), legacy_dir)
-                .expect("resolve data directory"),
-            bettercoding_dir
+        assert_resolution(
+            resolve_data_dir(None, bettercoding_dir.clone(), legacy_dir),
+            &bettercoding_dir,
+            ResolutionReason::Bettercoding,
         );
     }
 
@@ -338,10 +321,10 @@ mod tests {
         let root = TempDir::new().expect("create scratch directory");
         let (bettercoding_dir, legacy_dir) = candidates(&root);
 
-        assert_eq!(
-            resolve_data_dir(None, bettercoding_dir.clone(), legacy_dir)
-                .expect("resolve data directory"),
-            bettercoding_dir
+        assert_resolution(
+            resolve_data_dir(None, bettercoding_dir.clone(), legacy_dir),
+            &bettercoding_dir,
+            ResolutionReason::Fresh,
         );
     }
 
@@ -353,10 +336,10 @@ mod tests {
         seed_database(&bettercoding_dir);
         seed_database(&legacy_dir);
 
-        assert_eq!(
-            resolve_data_dir(Some(override_dir.clone()), bettercoding_dir, legacy_dir)
-                .expect("resolve data directory"),
-            override_dir
+        assert_resolution(
+            resolve_data_dir(Some(override_dir.clone()), bettercoding_dir, legacy_dir),
+            &override_dir,
+            ResolutionReason::Override,
         );
     }
 
@@ -366,16 +349,35 @@ mod tests {
         let (bettercoding_dir, legacy_dir) = candidates(&root);
         fs::create_dir_all(&legacy_dir).expect("create empty legacy data directory");
 
-        assert_eq!(
-            resolve_data_dir(None, bettercoding_dir.clone(), legacy_dir)
-                .expect("resolve data directory"),
-            bettercoding_dir
+        assert_resolution(
+            resolve_data_dir(None, bettercoding_dir.clone(), legacy_dir),
+            &bettercoding_dir,
+            ResolutionReason::Fresh,
+        );
+    }
+
+    #[test]
+    fn wrong_type_database_candidate_is_treated_as_absent() {
+        let root = TempDir::new().expect("create scratch directory");
+        let (bettercoding_dir, legacy_dir) = candidates(&root);
+        fs::create_dir_all(bettercoding_dir.join(DB_FILE_NAME))
+            .expect("create wrong-type database candidate");
+        seed_database(&legacy_dir);
+
+        assert_resolution(
+            resolve_data_dir(None, bettercoding_dir, legacy_dir.clone()),
+            &legacy_dir,
+            ResolutionReason::LegacyAdopt,
         );
     }
 
     #[cfg(unix)]
     #[test]
     fn errors_when_bettercoding_database_probe_is_unknown() {
+        if running_as_root() {
+            return;
+        }
+
         let root = TempDir::new().expect("create scratch directory");
         let blocked_parent = root.path().join("blocked");
         let bettercoding_dir = blocked_parent.join("bettercoding");
@@ -397,6 +399,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn errors_when_legacy_database_probe_is_unknown() {
+        if running_as_root() {
+            return;
+        }
+
         let root = TempDir::new().expect("create scratch directory");
         let bettercoding_dir = root.path().join("bettercoding");
         let blocked_parent = root.path().join("blocked");
