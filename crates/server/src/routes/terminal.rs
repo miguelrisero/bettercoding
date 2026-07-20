@@ -23,8 +23,8 @@ use executors::{
 use local_deployment::pty::{
     CLI_PROMPT_PARKED_NOTICE, CliPromptDelivery, CliPromptRouting, PtyCommand,
     cli_pane_agent_running, cli_prompt_file_exists, cli_tmux_available, cli_tmux_session_exists,
-    cli_tmux_session_name, remove_cli_prompt_file, route_followup_prompt, route_initial_prompt,
-    send_cli_keys,
+    remove_cli_prompt_file, resolved_cli_tmux_session_name, route_followup_prompt,
+    route_initial_prompt, send_cli_keys,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -515,7 +515,9 @@ async fn handle_terminal_ws(
     let tripwire_session = match &command {
         // #30 carries the workspace id on TmuxCli (the tmux session name is
         // derived from it); recover the `vk_<uuid>` name for the tripwire label.
-        PtyCommand::TmuxCli { workspace_id, .. } => cli_tmux_session_name(*workspace_id),
+        PtyCommand::TmuxCli { workspace_id, .. } => {
+            resolved_cli_tmux_session_name(*workspace_id).await
+        }
         PtyCommand::Shell => "shell".to_string(),
     };
 

@@ -856,10 +856,6 @@ fn cli_tmux_conf_path() -> Option<PathBuf> {
 /// `-f` config only applies to fresh server starts). Probes `set-clipboard`
 /// first so the append-style options aren't re-applied on every attach.
 /// Best-effort: no server running is the common case and simply a no-op.
-fn ensure_cli_tmux_server_options() {
-    ensure_cli_tmux_server_options_on(CLI_TMUX_SOCKET, tmux_client_flags_supported());
-}
-
 fn ensure_cli_tmux_server_options_on(socket: &str, client_flags_supported: bool) {
     let tmux = |args: &[&str]| {
         std::process::Command::new("tmux")
@@ -950,23 +946,141 @@ fn is_uuid(s: &str) -> bool {
 /// natural terminal backpressure with a ~1MB worst case per session.
 const OUTPUT_CHANNEL_CAPACITY: usize = 256;
 
-/// Dedicated tmux socket for all VibeKanban CLI sessions. Isolating onto our
-/// own server (rather than the user's default tmux) means: our sessions never
-/// collide with or appear in the user's personal tmux; a single
-/// `tmux -L <socket> kill-server` can reclaim everything; and the long-lived
-/// server that inherits the backend environment is clearly ours, not shared.
-pub(crate) const CLI_TMUX_SOCKET: &str = "vibe-kanban";
+const DEFAULT_CLI_TMUX_SOCKET: &str = "bettercoding";
+// TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+const DEFAULT_LEGACY_CLI_TMUX_SOCKET: &str = "vibe-kanban";
+
+/// Dedicated socket for newly-created CLI sessions. The override is a test/dev
+/// seam for scratch verification and parallel dev stacks that must not touch
+/// the production socket; unit tests pass explicit sockets to `_on` helpers
+/// instead of mutating process-global environment variables.
+pub(crate) fn cli_tmux_socket() -> &'static str {
+    static SOCKET: OnceLock<String> = OnceLock::new();
+    SOCKET
+        .get_or_init(|| {
+            std::env::var("BC_CLI_TMUX_SOCKET")
+                .unwrap_or_else(|_| DEFAULT_CLI_TMUX_SOCKET.to_string())
+        })
+        .as_str()
+}
+
+/// Legacy socket lookup seam for live sessions created before the identity
+/// migration. Like the current override, this is intended for test/dev stacks;
+/// unit tests use explicit scratch sockets and never set it.
+// TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+pub(crate) fn legacy_cli_tmux_socket() -> &'static str {
+    static SOCKET: OnceLock<String> = OnceLock::new();
+    SOCKET
+        .get_or_init(|| {
+            std::env::var("BC_CLI_TMUX_LEGACY_SOCKET")
+                .unwrap_or_else(|_| DEFAULT_LEGACY_CLI_TMUX_SOCKET.to_string())
+        })
+        .as_str()
+}
 
 /// Bound every tmux fork used for client-flag reconciliation. These commands
 /// are best-effort and the periodic sweep repairs failures, so a wedged tmux
 /// must never retain a task indefinitely.
 const CLI_TMUX_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// tmux session name for a workspace's CLI-mode terminal. The `vk_` namespace
-/// is ours: creation, attach, and cleanup only ever target these names.
-/// `simple()` (32 hex chars, no hyphens) avoids tmux-special characters.
+const CLI_TMUX_SESSION_PREFIX: &str = "bc_";
+// TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+const LEGACY_CLI_TMUX_SESSION_PREFIX: &str = "vk_";
+
+/// tmux session name for a workspace's CLI-mode terminal. `simple()` (32 hex
+/// chars, no hyphens) avoids tmux-special characters.
 pub fn cli_tmux_session_name(workspace_id: Uuid) -> String {
-    format!("vk_{}", workspace_id.simple())
+    format!("{CLI_TMUX_SESSION_PREFIX}{}", workspace_id.simple())
+}
+
+// TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+fn legacy_cli_tmux_session_name(workspace_id: Uuid) -> String {
+    format!("{LEGACY_CLI_TMUX_SESSION_PREFIX}{}", workspace_id.simple())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliTmuxHome {
+    Current,
+    // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+    Legacy,
+}
+
+fn cli_tmux_target_on<'a>(
+    home: CliTmuxHome,
+    workspace_id: Uuid,
+    current_socket: &'a str,
+    legacy_socket: &'a str,
+) -> (&'a str, String) {
+    match home {
+        CliTmuxHome::Current => (current_socket, cli_tmux_session_name(workspace_id)),
+        // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+        CliTmuxHome::Legacy => (legacy_socket, legacy_cli_tmux_session_name(workspace_id)),
+    }
+}
+
+fn cli_tmux_target(home: CliTmuxHome, workspace_id: Uuid) -> (&'static str, String) {
+    cli_tmux_target_on(
+        home,
+        workspace_id,
+        cli_tmux_socket(),
+        legacy_cli_tmux_socket(),
+    )
+}
+
+async fn tmux_session_exists_on(socket: &str, session_name: &str) -> bool {
+    tmux_ok(&[
+        "-L",
+        socket,
+        "has-session",
+        "-t",
+        &format!("={session_name}"),
+    ])
+    .await
+}
+
+async fn locate_cli_tmux_session_on(
+    workspace_id: Uuid,
+    current_socket: &str,
+    legacy_socket: &str,
+) -> CliTmuxHome {
+    let current_name = cli_tmux_session_name(workspace_id);
+    if tmux_session_exists_on(current_socket, &current_name).await {
+        return CliTmuxHome::Current;
+    }
+
+    // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+    let legacy_name = legacy_cli_tmux_session_name(workspace_id);
+    if tmux_session_exists_on(legacy_socket, &legacy_name).await {
+        CliTmuxHome::Legacy
+    } else {
+        // The current home is also the creation target when neither exists.
+        CliTmuxHome::Current
+    }
+}
+
+async fn locate_cli_tmux_session(workspace_id: Uuid) -> CliTmuxHome {
+    if !tmux_available() {
+        return CliTmuxHome::Current;
+    }
+    locate_cli_tmux_session_on(workspace_id, cli_tmux_socket(), legacy_cli_tmux_socket()).await
+}
+
+/// Resolve the name currently used by a workspace for diagnostic labels. When
+/// neither home exists, this returns the current-home creation name.
+pub async fn resolved_cli_tmux_session_name(workspace_id: Uuid) -> String {
+    let home = locate_cli_tmux_session(workspace_id).await;
+    cli_tmux_target(home, workspace_id).1
+}
+
+async fn cli_tmux_session_exists_on(
+    workspace_id: Uuid,
+    current_socket: &str,
+    legacy_socket: &str,
+) -> bool {
+    let home = locate_cli_tmux_session_on(workspace_id, current_socket, legacy_socket).await;
+    let (socket, session_name) =
+        cli_tmux_target_on(home, workspace_id, current_socket, legacy_socket);
+    tmux_session_exists_on(socket, &session_name).await
 }
 
 /// Whether a workspace's CLI tmux session already exists. Lets the terminal
@@ -978,15 +1092,7 @@ pub async fn cli_tmux_session_exists(workspace_id: Uuid) -> bool {
     if !tmux_available() {
         return false;
     }
-    let session_name = cli_tmux_session_name(workspace_id);
-    tmux_ok(&[
-        "-L",
-        CLI_TMUX_SOCKET,
-        "has-session",
-        "-t",
-        &format!("={session_name}"),
-    ])
-    .await
+    cli_tmux_session_exists_on(workspace_id, cli_tmux_socket(), legacy_cli_tmux_socket()).await
 }
 
 /// Whether CLI mode can actually run claude in a tmux session (vs. degrading
@@ -1025,11 +1131,12 @@ pub async fn cli_pane_agent_running(workspace_id: Uuid, program: &str) -> Option
     if !tmux_available() {
         return None;
     }
-    let target = cli_tmux_session_name(workspace_id);
+    let home = locate_cli_tmux_session(workspace_id).await;
+    let (socket, target) = cli_tmux_target(home, workspace_id);
     let output = tokio::process::Command::new("tmux")
         .args([
             "-L",
-            CLI_TMUX_SOCKET,
+            socket,
             "list-panes",
             "-t",
             &target,
@@ -1132,26 +1239,34 @@ fn normalize_comm(comm: &str) -> &str {
 }
 
 /// Inverse of [`cli_tmux_session_name`]: recover the workspace id from one of
-/// our tmux session names. Returns `None` for anything outside the `vk_`
-/// namespace (e.g. a user-created session on the same socket).
+/// our tmux session names.
 pub(crate) fn workspace_id_from_cli_session_name(name: &str) -> Option<Uuid> {
-    let hex = name.strip_prefix("vk_")?;
+    let hex = if let Some(hex) = name.strip_prefix(CLI_TMUX_SESSION_PREFIX) {
+        hex
+    // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+    } else if let Some(hex) = name.strip_prefix(LEGACY_CLI_TMUX_SESSION_PREFIX) {
+        hex
+    } else {
+        return None;
+    };
     if hex.len() != 32 {
         return None;
     }
     Uuid::parse_str(hex).ok()
 }
 
-/// Best-effort kill of a workspace's CLI tmux session (used on workspace
-/// cleanup so sessions don't outlive their worktree). `=` forces exact-name
-/// matching — tmux `-t` is otherwise a prefix match.
-pub async fn kill_cli_tmux_session(workspace_id: Uuid) {
-    if tmux_available() {
-        let session_name = cli_tmux_session_name(workspace_id);
+async fn kill_cli_tmux_sessions_on(workspace_id: Uuid, current_socket: &str, legacy_socket: &str) {
+    for home in [
+        CliTmuxHome::Current,
+        // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+        CliTmuxHome::Legacy,
+    ] {
+        let (socket, session_name) =
+            cli_tmux_target_on(home, workspace_id, current_socket, legacy_socket);
         match tokio::process::Command::new("tmux")
             .args([
                 "-L",
-                CLI_TMUX_SOCKET,
+                socket,
                 "kill-session",
                 "-t",
                 &format!("={session_name}"),
@@ -1165,6 +1280,15 @@ pub async fn kill_cli_tmux_session(workspace_id: Uuid) {
             Ok(_) => {}
             Err(e) => tracing::debug!("Failed to run tmux kill-session for {session_name}: {e}"),
         }
+    }
+}
+
+/// Best-effort kill of a workspace's CLI tmux session (used on workspace
+/// cleanup so sessions don't outlive their worktree). `=` forces exact-name
+/// matching — tmux `-t` is otherwise a prefix match.
+pub async fn kill_cli_tmux_session(workspace_id: Uuid) {
+    if tmux_available() {
+        kill_cli_tmux_sessions_on(workspace_id, cli_tmux_socket(), legacy_cli_tmux_socket()).await;
     }
     // Drop any transient prompt file AFTER the session is dead (covers the
     // never-attached case where the bootstrap never ran to self-delete it).
@@ -1188,16 +1312,10 @@ pub async fn capture_cli_pane(workspace_id: Uuid) -> Option<String> {
     // session-target syntax; they take a pane target. The full 32-hex session
     // name can't be a prefix of any other `vk_*` session, so the bare name
     // resolves unambiguously to this session's (sole) pane.
-    let session_name = cli_tmux_session_name(workspace_id);
+    let home = locate_cli_tmux_session(workspace_id).await;
+    let (socket, session_name) = cli_tmux_target(home, workspace_id);
     let output = tokio::process::Command::new("tmux")
-        .args([
-            "-L",
-            CLI_TMUX_SOCKET,
-            "capture-pane",
-            "-p",
-            "-t",
-            &session_name,
-        ])
+        .args(["-L", socket, "capture-pane", "-p", "-t", &session_name])
         .stderr(std::process::Stdio::null())
         .output()
         .await
@@ -1251,25 +1369,16 @@ pub async fn send_cli_keys(workspace_id: Uuid, text: &str) -> bool {
     // Bare name (not `=exact`): send-keys/paste-buffer take a pane target, for
     // which the `=` session-target syntax is rejected. Unambiguous given
     // full-hex names.
-    let target = cli_tmux_session_name(workspace_id);
+    let home = locate_cli_tmux_session(workspace_id).await;
+    let (socket, target) = cli_tmux_target(home, workspace_id);
 
     let delivered = if needs_paste_transport(text) {
-        paste_via_tmux_buffer(workspace_id, &target, text).await
+        paste_via_tmux_buffer(socket, workspace_id, &target, text).await
     } else {
         // `--` ends option parsing so text starting with `-` (e.g. a prompt
         // like "-rf ...") is treated as a literal key rather than an unknown
         // send-keys flag (verified: `send-keys -l "-x"` fails "unknown flag").
-        tmux_ok(&[
-            "-L",
-            CLI_TMUX_SOCKET,
-            "send-keys",
-            "-t",
-            &target,
-            "-l",
-            "--",
-            text,
-        ])
-        .await
+        tmux_ok(&["-L", socket, "send-keys", "-t", &target, "-l", "--", text]).await
     };
     if !delivered {
         return false;
@@ -1280,7 +1389,7 @@ pub async fn send_cli_keys(workspace_id: Uuid, text: &str) -> bool {
     // (a doubled prompt). Retry the Enter once, then accept: delivered (the
     // user can press Enter themselves), submission best-effort.
     for _ in 0..2 {
-        if tmux_ok(&["-L", CLI_TMUX_SOCKET, "send-keys", "-t", &target, "Enter"]).await {
+        if tmux_ok(&["-L", socket, "send-keys", "-t", &target, "Enter"]).await {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -1298,7 +1407,7 @@ pub async fn send_cli_keys(workspace_id: Uuid, text: &str) -> bool {
 /// tmux buffers are server-global — otherwise concurrent workspaces could
 /// cross-deliver. `-p` (bracketed paste) makes the TUI treat multi-line text as
 /// one paste so embedded newlines don't submit early.
-async fn paste_via_tmux_buffer(workspace_id: Uuid, target: &str, text: &str) -> bool {
+async fn paste_via_tmux_buffer(socket: &str, workspace_id: Uuid, target: &str, text: &str) -> bool {
     use tokio::io::AsyncWriteExt;
 
     // Per-send sequence number on top of the workspace namespace: two
@@ -1310,7 +1419,7 @@ async fn paste_via_tmux_buffer(workspace_id: Uuid, target: &str, text: &str) -> 
     let buffer = format!("vk_prompt_{}_{seq}", workspace_id.simple());
 
     let mut child = match tokio::process::Command::new("tmux")
-        .args(["-L", CLI_TMUX_SOCKET, "load-buffer", "-b", &buffer, "-"])
+        .args(["-L", socket, "load-buffer", "-b", &buffer, "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1347,7 +1456,7 @@ async fn paste_via_tmux_buffer(workspace_id: Uuid, target: &str, text: &str) -> 
 
     let pasted = tmux_ok(&[
         "-L",
-        CLI_TMUX_SOCKET,
+        socket,
         "paste-buffer",
         "-d",
         "-p",
@@ -1360,7 +1469,7 @@ async fn paste_via_tmux_buffer(workspace_id: Uuid, target: &str, text: &str) -> 
     if !pasted {
         // `-d` only fires on a successful paste; don't leave the staged prompt
         // readable in the server-global buffer list after a failed one.
-        tmux_ok(&["-L", CLI_TMUX_SOCKET, "delete-buffer", "-b", &buffer]).await;
+        tmux_ok(&["-L", socket, "delete-buffer", "-b", &buffer]).await;
     }
     pasted
 }
@@ -1387,7 +1496,7 @@ pub async fn list_cli_tmux_sessions() -> Vec<(Uuid, bool, i64)> {
     let output = tokio::process::Command::new("tmux")
         .args([
             "-L",
-            CLI_TMUX_SOCKET,
+            cli_tmux_socket(),
             "list-sessions",
             "-F",
             "#{session_name}\t#{session_attached}\t#{session_activity}",
@@ -1708,6 +1817,12 @@ impl PtyService {
         let session_id = Uuid::new_v4();
         let (output_tx, output_rx) = mpsc::channel(OUTPUT_CHANNEL_CAPACITY);
         let shell = get_interactive_shell().await;
+        let tmux_home = match &command {
+            PtyCommand::TmuxCli { workspace_id, .. } if tmux_available() => {
+                Some(locate_cli_tmux_session(*workspace_id).await)
+            }
+            _ => None,
+        };
 
         let result = tokio::task::spawn_blocking(move || {
             let pty_system = NativePtySystem::default();
@@ -1765,11 +1880,16 @@ impl PtyService {
             // requested but tmux is absent, say so in the pane itself.
             if matches!(&command, PtyCommand::TmuxCli { .. }) {
                 match tmux_workspace {
-                    Some(workspace_id) => tracing::info!(
-                        "CLI terminal attaching tmux session {} at {cols}x{rows} in {}",
-                        cli_tmux_session_name(workspace_id),
-                        working_dir.display()
-                    ),
+                    Some(workspace_id) => {
+                        let (_, session_name) = cli_tmux_target(
+                            tmux_home.unwrap_or(CliTmuxHome::Current),
+                            workspace_id,
+                        );
+                        tracing::info!(
+                            "CLI terminal attaching tmux session {session_name} at {cols}x{rows} in {}",
+                            working_dir.display()
+                        );
+                    }
                     None => {
                         let _ = output_tx.blocking_send(TMUX_MISSING_NOTICE.to_vec());
                     }
@@ -1779,93 +1899,90 @@ impl PtyService {
             let (mut cmd, shell_name) = if let (Some(workspace_id), Some(spec)) =
                 (tmux_workspace, &tmux_spec)
             {
-                let session_name = cli_tmux_session_name(workspace_id);
+                let home = tmux_home.unwrap_or(CliTmuxHome::Current);
+                let (socket, session_name) = cli_tmux_target(home, workspace_id);
                 // Bring an already-running server in line with our config
                 // (options are server-wide; `-f` below only affects a fresh
                 // server start).
-                ensure_cli_tmux_server_options();
-
-                // Pre-accept the agent's per-directory folder-trust / first-run
-                // dialog for this app-created worktree so the launch never
-                // blocks on it.
-                maybe_seed_cli_trust(&spec.program, &working_dir);
+                ensure_cli_tmux_server_options_on(socket, tmux_client_flags_supported());
 
                 let mut cmd = CommandBuilder::new("tmux");
-                // Our own config instead of the user's ~/.tmux.conf — the
-                // embedded terminal needs deterministic mouse/clipboard
-                // behavior (see `cli_tmux_conf`); the user's personal tmux on
-                // the default socket is unaffected.
-                if let Some(conf) = cli_tmux_conf_path() {
-                    cmd.arg("-f");
-                    cmd.arg(conf);
-                }
                 // Dedicated socket isolates our sessions from the user's tmux.
                 cmd.arg("-L");
-                cmd.arg(CLI_TMUX_SOCKET);
-                cmd.arg("new-session");
-                if tmux_connect_hidden {
-                    cmd.arg("-f");
-                    cmd.arg("ignore-size");
-                }
-                // -A: attach if the session exists, else create.
-                //
-                // We deliberately do NOT pass -D (detach other clients): a new
-                // attach would detach the prior client, whose tmux process then
-                // exits → its PTY hits EOF → the WebSocket closes → the frontend
-                // reconnects → the new attach detaches it again, a self-
-                // sustaining reconnect loop that also resets the session to the
-                // attaching client's 80x24 default on every cycle. Without -D,
-                // reconnects simply attach; the prior client is cleaned up by
-                // close_session killing its PTY child. Two simultaneous browser
-                // windows would mirror (tmux sizes to the smaller) — a rare,
-                // benign trade vs. the loop.
-                cmd.arg("-A");
-                cmd.arg("-s");
-                cmd.arg(&session_name);
-                cmd.arg("-c");
-                cmd.arg(&working_dir);
-                // Materialize the initial prompt to a private file so the
-                // bootstrap reads it back rather than carrying it inline
-                // (tmux rejects `new-session` commands past ~16KB). Only when
-                // an existing conversation won't take precedence (the same
-                // predicate the bootstrap applies) and the prompt isn't blank;
-                // the file self-deletes once consumed.
-                let resume_active = active_resume_id(tmux_resume_id.as_deref()).is_some();
-                let prompt_file: Option<PathBuf> = if resume_active {
-                    None
-                } else {
-                    match tmux_initial_prompt
-                        .as_deref()
-                        .and_then(|p| cli_prompt_file_content(&spec.prompt_arg, p))
-                    {
-                        // There is a prompt to deliver: its file MUST be staged.
-                        // If the write fails we CANNOT fall through to
-                        // `continue_launch` — that yields a healthy-looking but
-                        // empty TUI that could then be mistaken for delivery.
-                        // Fail the spawn instead so the parked prompt survives
-                        // for the next attach and the user sees the recovery
-                        // notice (the "never destroy the prompt" invariant).
-                        Some(content) => {
-                            Some(write_cli_prompt_file(workspace_id, &content).map_err(|e| {
-                                tracing::error!(
-                                    "Failed to write CLI prompt file for {session_name}: \
-                                     {e}; leaving prompt parked"
-                                );
-                                // Drop any partial file so a torn write can't
-                                // leave a stale prompt readable on disk.
-                                remove_cli_prompt_file(workspace_id);
-                                PtyError::PromptStageFailed
-                            })?)
+                cmd.arg(socket);
+                match home {
+                    CliTmuxHome::Current => {
+                        // Our own config instead of the user's ~/.tmux.conf —
+                        // the embedded terminal needs deterministic mouse /
+                        // clipboard behavior (see `cli_tmux_conf`).
+                        if let Some(conf) = cli_tmux_conf_path() {
+                            cmd.arg("-f");
+                            cmd.arg(conf);
                         }
-                        None => None,
+
+                        // Pre-accept the agent's per-directory folder-trust /
+                        // first-run dialog before a new pane can launch.
+                        maybe_seed_cli_trust(&spec.program, &working_dir);
+
+                        cmd.arg("new-session");
+                        if tmux_connect_hidden {
+                            cmd.arg("-f");
+                            cmd.arg("ignore-size");
+                        }
+                        // -A: attach if the current-home session exists, else
+                        // create it. We deliberately do NOT pass -D: multiple
+                        // browser clients may mirror without detaching each
+                        // other into a reconnect loop.
+                        cmd.arg("-A");
+                        cmd.arg("-s");
+                        cmd.arg(&session_name);
+                        cmd.arg("-c");
+                        cmd.arg(&working_dir);
+
+                        // Materialize the initial prompt to a private file so
+                        // the bootstrap reads it instead of carrying it inline.
+                        let resume_active =
+                            active_resume_id(tmux_resume_id.as_deref()).is_some();
+                        let prompt_file: Option<PathBuf> = if resume_active {
+                            None
+                        } else {
+                            match tmux_initial_prompt
+                                .as_deref()
+                                .and_then(|p| cli_prompt_file_content(&spec.prompt_arg, p))
+                            {
+                                Some(content) => Some(
+                                    write_cli_prompt_file(workspace_id, &content).map_err(|e| {
+                                        tracing::error!(
+                                            "Failed to write CLI prompt file for {session_name}: \
+                                             {e}; leaving prompt parked"
+                                        );
+                                        remove_cli_prompt_file(workspace_id);
+                                        PtyError::PromptStageFailed
+                                    })?,
+                                ),
+                                None => None,
+                            }
+                        };
+                        cmd.arg(cli_bootstrap(
+                            spec,
+                            tmux_resume_id.as_deref(),
+                            prompt_file.as_deref(),
+                            tmux_deferred,
+                        ));
                     }
-                };
-                cmd.arg(cli_bootstrap(
-                    spec,
-                    tmux_resume_id.as_deref(),
-                    prompt_file.as_deref(),
-                    tmux_deferred,
-                ));
+                    // Attach only: if the legacy session vanished after the
+                    // locator ran, this fails instead of recreating it.
+                    // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+                    CliTmuxHome::Legacy => {
+                        cmd.arg("attach-session");
+                        if tmux_connect_hidden {
+                            cmd.arg("-f");
+                            cmd.arg("ignore-size");
+                        }
+                        cmd.arg("-t");
+                        cmd.arg(format!("={session_name}"));
+                    }
+                }
                 cmd.cwd(&working_dir);
                 // No shell-specific prompt configuration for the tmux client.
                 (cmd, String::new())
@@ -2173,7 +2290,7 @@ impl PtyService {
 pub(crate) async fn cli_tmux_client_name(client_pid: u32) -> Result<Option<String>, String> {
     let output = run_cli_tmux(&[
         "-L",
-        CLI_TMUX_SOCKET,
+        cli_tmux_socket(),
         "list-clients",
         "-F",
         "#{client_pid}\t#{client_name}",
@@ -2199,7 +2316,7 @@ pub(crate) async fn refresh_cli_tmux_client_ignore_size(
     };
     run_cli_tmux(&[
         "-L",
-        CLI_TMUX_SOCKET,
+        cli_tmux_socket(),
         "refresh-client",
         "-t",
         client_name,
@@ -2249,11 +2366,32 @@ mod tests {
     fn cli_session_names_are_namespaced_and_tmux_safe() {
         let id = Uuid::parse_str("bccad5cc-3bd4-4f80-b75d-35db5f087ac0").unwrap();
         let name = cli_tmux_session_name(id);
-        assert_eq!(name, "vk_bccad5cc3bd44f80b75d35db5f087ac0");
+        assert_eq!(name, "bc_bccad5cc3bd44f80b75d35db5f087ac0");
         // tmux treats `.` and `:` specially in targets; the name must stay
         // strictly alphanumeric + underscore.
         assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
-        assert!(name.starts_with("vk_"));
+        assert!(name.starts_with("bc_"));
+    }
+
+    #[test]
+    fn current_and_legacy_cli_session_names_round_trip_strictly() {
+        let id = Uuid::parse_str("bccad5cc-3bd4-4f80-b75d-35db5f087ac0").unwrap();
+        let current = cli_tmux_session_name(id);
+        let legacy = legacy_cli_tmux_session_name(id);
+
+        assert_eq!(workspace_id_from_cli_session_name(&current), Some(id));
+        assert_eq!(workspace_id_from_cli_session_name(&legacy), Some(id));
+        assert_eq!(workspace_id_from_cli_session_name("bc_short"), None);
+        assert_eq!(workspace_id_from_cli_session_name("vk_short"), None);
+        assert_eq!(
+            workspace_id_from_cli_session_name("bc_0000000000000000000000000000000"),
+            None
+        );
+        assert_eq!(
+            workspace_id_from_cli_session_name("vk_000000000000000000000000000000000"),
+            None
+        );
+        assert_eq!(workspace_id_from_cli_session_name("other_session"), None);
     }
 
     /// A claude-shaped spec (flag resume, positional prompt, `--continue`
@@ -2762,6 +2900,41 @@ mod tests {
         socket: String,
     }
 
+    impl ScratchTmuxServer {
+        fn start_session(&self, session_name: &str) {
+            let output = std::process::Command::new("tmux")
+                .args(["-L", &self.socket, "new-session", "-d", "-s", session_name])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .expect("start scratch tmux session");
+            assert!(
+                output.status.success(),
+                "scratch tmux session failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    struct ScratchTmuxPair {
+        current: ScratchTmuxServer,
+        legacy: ScratchTmuxServer,
+    }
+
+    fn scratch_tmux_pair() -> ScratchTmuxPair {
+        static SOCKET_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SOCKET_SEQ.fetch_add(1, Ordering::Relaxed);
+        let base = format!("bc-b2-test-{}-{seq}", std::process::id());
+        ScratchTmuxPair {
+            current: ScratchTmuxServer {
+                socket: format!("{base}-current"),
+            },
+            legacy: ScratchTmuxServer {
+                socket: format!("{base}-legacy"),
+            },
+        }
+    }
+
     impl Drop for ScratchTmuxServer {
         fn drop(&mut self) {
             let _ = std::process::Command::new("tmux")
@@ -2770,6 +2943,71 @@ mod tests {
                 .stderr(std::process::Stdio::null())
                 .status();
         }
+    }
+
+    #[tokio::test]
+    async fn locator_finds_legacy_only_session_on_scratch_pair() {
+        if !tmux_available() {
+            return;
+        }
+        let pair = scratch_tmux_pair();
+        let workspace_id = Uuid::new_v4();
+        pair.legacy
+            .start_session(&legacy_cli_tmux_session_name(workspace_id));
+
+        assert_eq!(
+            locate_cli_tmux_session_on(workspace_id, &pair.current.socket, &pair.legacy.socket)
+                .await,
+            CliTmuxHome::Legacy
+        );
+    }
+
+    #[tokio::test]
+    async fn locator_defaults_to_current_on_empty_scratch_pair() {
+        if !tmux_available() {
+            return;
+        }
+        let pair = scratch_tmux_pair();
+        assert_eq!(
+            locate_cli_tmux_session_on(Uuid::new_v4(), &pair.current.socket, &pair.legacy.socket)
+                .await,
+            CliTmuxHome::Current
+        );
+    }
+
+    #[tokio::test]
+    async fn locator_prefers_current_when_both_scratch_homes_exist() {
+        if !tmux_available() {
+            return;
+        }
+        let pair = scratch_tmux_pair();
+        let workspace_id = Uuid::new_v4();
+        pair.current
+            .start_session(&cli_tmux_session_name(workspace_id));
+        pair.legacy
+            .start_session(&legacy_cli_tmux_session_name(workspace_id));
+
+        assert_eq!(
+            locate_cli_tmux_session_on(workspace_id, &pair.current.socket, &pair.legacy.socket)
+                .await,
+            CliTmuxHome::Current
+        );
+    }
+
+    #[tokio::test]
+    async fn session_exists_finds_legacy_only_session_on_scratch_pair() {
+        if !tmux_available() {
+            return;
+        }
+        let pair = scratch_tmux_pair();
+        let workspace_id = Uuid::new_v4();
+        pair.legacy
+            .start_session(&legacy_cli_tmux_session_name(workspace_id));
+
+        assert!(
+            cli_tmux_session_exists_on(workspace_id, &pair.current.socket, &pair.legacy.socket)
+                .await
+        );
     }
 
     #[test]

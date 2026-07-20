@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::pty::{
-    CLI_TMUX_SOCKET, CliClientPresence, PtyService, now_unix_secs,
+    CliClientPresence, PtyService, cli_tmux_socket, now_unix_secs,
     refresh_cli_tmux_client_ignore_size, run_cli_tmux, tmux_available, tmux_client_flags_supported,
     workspace_id_from_cli_session_name,
 };
@@ -390,7 +390,7 @@ async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepSt
 
     let output = match run_cli_tmux(&[
         "-L",
-        CLI_TMUX_SOCKET,
+        cli_tmux_socket(),
         "list-clients",
         "-F",
         "#{client_pid}\t#{client_name}\t#{client_activity}\t#{client_flags}\t#{session_name}",
@@ -454,7 +454,7 @@ async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepSt
 
     let output = match run_cli_tmux(&[
         "-L",
-        CLI_TMUX_SOCKET,
+        cli_tmux_socket(),
         "list-clients",
         "-F",
         "#{client_pid}\t#{client_name}",
@@ -607,7 +607,7 @@ async fn observe_tmux() -> Option<HashMap<Uuid, Observation>> {
     let output = tokio::process::Command::new("tmux")
         .args([
             "-L",
-            CLI_TMUX_SOCKET,
+            cli_tmux_socket(),
             "list-panes",
             "-a",
             "-F",
