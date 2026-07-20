@@ -386,9 +386,10 @@ pub async fn download_zip(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "workspace".to_string());
 
-    let std_file = tokio::task::spawn_blocking(move || build_zip(&root))
-        .await
-        .map_err(zip_io_error)??;
+    let (std_file, read_guard) =
+        tokio::task::spawn_blocking(move || build_zip(&root).map(|file| (file, read_guard)))
+            .await
+            .map_err(zip_io_error)??;
     let file = tokio::fs::File::from_std(std_file);
     let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
     let body = guarded_file_body(file, read_guard);
@@ -567,14 +568,17 @@ async fn probe_resolved_state(
 
 /// Resolve the default upload directory, migrating the legacy directory when
 /// possible while preserving it as a lossless fallback on any rename failure.
-/// The migration takes the per-workspace write lock only with `try_write`, so a
-/// request already holding a read lock is never blocked or renamed underneath.
-async fn resolve_uploads_dir_impl<F>(
+/// The migration takes the per-workspace write lock only with
+/// `try_write_owned`, so a request already holding a read lock is never blocked
+/// or renamed underneath.
+async fn resolve_uploads_dir_impl<F, R>(
     canonical_base: &Path,
     after_state_probes: F,
+    before_rename: R,
 ) -> Result<PathBuf, ApiError>
 where
     F: FnOnce(&Path, &Path),
+    R: FnOnce() + Send + 'static,
 {
     let uploads_dir = canonical_base.join(UPLOADS_DIR);
     let legacy_uploads_dir = canonical_base.join(LEGACY_UPLOADS_DIR);
@@ -599,9 +603,27 @@ where
         (true, _) => ResolvedUploadsDirectory::Current,
         (false, true) => {
             let filesystem_lock = workspace_filesystem_lock(canonical_base);
-            match filesystem_lock.try_write() {
-                Ok(_write_guard) => {
-                    match tokio::fs::rename(&legacy_uploads_dir, &uploads_dir).await {
+            match filesystem_lock.clone().try_write_owned() {
+                Ok(write_guard) => {
+                    let rename_old_path = legacy_uploads_dir.clone();
+                    let rename_new_path = uploads_dir.clone();
+                    let rename_result = tokio::task::spawn_blocking(move || {
+                        // Keep the owned guard inside the blocking task. Dropping
+                        // the awaiting resolver detaches this task, so the guard
+                        // must live here until the real filesystem call returns.
+                        let _write_guard = write_guard;
+                        before_rename();
+                        std::fs::rename(rename_old_path, rename_new_path)
+                    })
+                    .await;
+                    let rename_result = match rename_result {
+                        Ok(result) => result,
+                        Err(error) => Err(std::io::Error::other(format!(
+                            "Uploads directory migration task failed: {error}"
+                        ))),
+                    };
+
+                    match rename_result {
                         Ok(()) => {
                             tracing::info!(
                                 old_path = %legacy_uploads_dir.display(),
@@ -697,7 +719,7 @@ where
 /// Resolve the default upload directory; see [`LEGACY_UPLOADS_DIR`] for the
 /// rollback caveat.
 async fn resolve_uploads_dir(canonical_base: &Path) -> Result<PathBuf, ApiError> {
-    resolve_uploads_dir_impl(canonical_base, |_, _| {}).await
+    resolve_uploads_dir_impl(canonical_base, |_, _| {}, || {}).await
 }
 
 pub async fn upload_files(
@@ -960,6 +982,63 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uploads_dir_migration_guard_outlives_resolver_cancellation() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
+        fs::write(legacy.join("report.txt"), b"legacy report").unwrap();
+        let expected = base.join(UPLOADS_DIR);
+        let filesystem_lock = workspace_filesystem_lock(&base);
+        let (rename_started_tx, rename_started_rx) = tokio::sync::oneshot::channel();
+        let (release_rename_tx, release_rename_rx) = tokio::sync::oneshot::channel();
+
+        let resolver_base = base.clone();
+        let resolver = tokio::spawn(async move {
+            resolve_uploads_dir_impl(
+                &resolver_base,
+                |_, _| {},
+                move || {
+                    let _ = rename_started_tx.send(());
+                    let _ = release_rename_rx.blocking_recv();
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), rename_started_rx)
+            .await
+            .expect("blocking rename did not start")
+            .unwrap();
+        resolver.abort();
+        assert!(resolver.await.unwrap_err().is_cancelled());
+
+        // The blocking task has not renamed yet, but it must still own the
+        // write guard after its awaiting resolver has been cancelled.
+        assert!(legacy.is_dir());
+        assert!(!expected.exists());
+        assert_eq!(
+            fs::read(legacy.join("report.txt")).unwrap(),
+            b"legacy report"
+        );
+        assert!(filesystem_lock.clone().try_read_owned().is_err());
+
+        release_rename_tx.send(()).unwrap();
+        let completed_guard =
+            tokio::time::timeout(Duration::from_secs(5), filesystem_lock.clone().read_owned())
+                .await
+                .expect("blocking rename did not release the write guard");
+        drop(completed_guard);
+
+        assert!(expected.is_dir());
+        assert!(!legacy.exists());
+        assert_eq!(
+            fs::read(expected.join("report.txt")).unwrap(),
+            b"legacy report"
+        );
+        assert_eq!(resolve_uploads_dir(&base).await.unwrap(), expected);
+    }
+
     #[tokio::test]
     async fn uploads_dir_resolver_rechecks_after_losing_rename_race() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -968,9 +1047,13 @@ mod tests {
         fs::write(legacy.join("report.txt"), b"legacy report").unwrap();
         let expected = base.join(UPLOADS_DIR);
 
-        let resolved = resolve_uploads_dir_impl(&base, |current, legacy| {
-            fs::rename(legacy, current).unwrap();
-        })
+        let resolved = resolve_uploads_dir_impl(
+            &base,
+            |current, legacy| {
+                fs::rename(legacy, current).unwrap();
+            },
+            || {},
+        )
         .await
         .unwrap();
 
@@ -991,10 +1074,14 @@ mod tests {
         fs::write(legacy.join("legacy.txt"), b"legacy data").unwrap();
         let expected = base.join(UPLOADS_DIR);
 
-        let resolved = resolve_uploads_dir_impl(&base, |current, _legacy| {
-            fs::create_dir(current).unwrap();
-            fs::write(current.join("new.txt"), b"new data").unwrap();
-        })
+        let resolved = resolve_uploads_dir_impl(
+            &base,
+            |current, _legacy| {
+                fs::create_dir(current).unwrap();
+                fs::write(current.join("new.txt"), b"new data").unwrap();
+            },
+            || {},
+        )
         .await
         .unwrap();
 
@@ -1013,9 +1100,13 @@ mod tests {
         let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
         let expected = base.join(UPLOADS_DIR);
 
-        let resolved = resolve_uploads_dir_impl(&base, |_current, legacy| {
-            fs::remove_dir_all(legacy).unwrap();
-        })
+        let resolved = resolve_uploads_dir_impl(
+            &base,
+            |_current, legacy| {
+                fs::remove_dir_all(legacy).unwrap();
+            },
+            || {},
+        )
         .await
         .unwrap();
 
