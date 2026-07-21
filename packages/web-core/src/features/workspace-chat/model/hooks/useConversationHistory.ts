@@ -10,9 +10,11 @@ import type {
   AddEntryType,
   ConversationTimelineSource,
   ExecutionProcessStateStore,
+  NativeConversationTimelineSource,
   PatchTypeWithKey,
   UseConversationHistoryParams,
 } from '@/shared/hooks/useConversationHistory/types';
+import { useSessionNativeFeed } from './useSessionNativeFeed';
 
 // Result type for the new UI's conversation history hook
 export interface UseConversationHistoryResult {
@@ -27,6 +29,7 @@ import {
 } from '@/shared/hooks/useConversationHistory/constants';
 
 export const useConversationHistory = ({
+  attempt,
   onTimelineUpdated,
   scopeKey,
 }: UseConversationHistoryParams): UseConversationHistoryResult => {
@@ -35,8 +38,26 @@ export const useConversationHistory = ({
     isLoading,
     isConnected,
   } = useExecutionProcessesContext();
+  const nativeFeed = useSessionNativeFeed(attempt.session?.id);
+  const nativeFeedSource = useMemo<
+    NativeConversationTimelineSource | undefined
+  >(() => {
+    if (!nativeFeed.snapshot) return undefined;
+    return {
+      revision: nativeFeed.snapshot.revision,
+      seq: nativeFeed.snapshot.seq,
+      entries: nativeFeed.entries,
+      forks: nativeFeed.forks,
+    };
+  }, [nativeFeed.entries, nativeFeed.forks, nativeFeed.snapshot]);
   const executionProcesses = useRef<ExecutionProcess[]>(executionProcessesRaw);
   const displayedExecutionProcesses = useRef<ExecutionProcessStateStore>({});
+  const nativeFeedRef = useRef<NativeConversationTimelineSource | undefined>(
+    nativeFeedSource
+  );
+  const nativeFeedLoadingRef = useRef(nativeFeed.isLoading);
+  nativeFeedRef.current = nativeFeedSource;
+  nativeFeedLoadingRef.current = nativeFeed.isLoading;
   const loadedInitialEntries = useRef(false);
   const emittedEmptyInitialRef = useRef(false);
   const streamingProcessIdsRef = useRef<Set<string>>(new Set());
@@ -74,6 +95,7 @@ export const useConversationHistory = ({
     ): ConversationTimelineSource => ({
       executionProcessState,
       liveExecutionProcesses: executionProcesses.current,
+      nativeFeed: nativeFeedRef.current,
     }),
     []
   );
@@ -198,7 +220,7 @@ export const useConversationHistory = ({
       onTimelineUpdatedRef.current?.(
         timelineSource,
         modifiedAddEntryType,
-        loading
+        loading || nativeFeedLoadingRef.current
       );
     },
     [buildTimelineSource]
@@ -387,6 +409,25 @@ export const useConversationHistory = ({
     previousStatusMapRef.current.clear();
     emitEntries(displayedExecutionProcesses.current, 'initial', true);
   }, [scopeKey, emitEntries]);
+
+  const nativeFeedUpdateKey = nativeFeed.snapshot
+    ? `${nativeFeed.snapshot.revision}:${nativeFeed.snapshot.seq}:${nativeFeed.isLoading}`
+    : `none:${nativeFeed.isLoading}`;
+
+  useEffect(() => {
+    if (!attempt.session?.id) return;
+    emitEntries(
+      displayedExecutionProcesses.current,
+      loadedInitialEntries.current ? 'running' : 'initial',
+      isLoading
+    );
+  }, [
+    attempt.session?.id,
+    emitEntries,
+    isLoading,
+    nativeFeedUpdateKey,
+    scopeKey,
+  ]);
 
   useEffect(() => {
     let cancelled = false;

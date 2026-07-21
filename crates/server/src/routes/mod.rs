@@ -18,6 +18,7 @@ pub mod frontend;
 pub mod health;
 pub mod host_relay;
 pub mod loop_automation;
+pub mod native_transcripts;
 pub mod oauth;
 pub mod organizations;
 pub mod preview;
@@ -55,6 +56,7 @@ pub fn router(deployment: DeploymentImpl) -> IntoMakeService<Router> {
         .merge(sessions::router(&deployment))
         .merge(terminal::router())
         .merge(loop_automation::router())
+        .merge(native_transcripts::router())
         .route("/ssh-session", get(ssh_session::ssh_session_ws))
         .nest("/remote", remote::router())
         .merge(webrtc::router())

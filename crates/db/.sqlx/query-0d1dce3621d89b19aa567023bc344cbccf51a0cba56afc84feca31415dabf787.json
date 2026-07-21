@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE cli_native_files SET\n                   cursor_offset = $1,\n                   next_line_seq = $2,\n                   last_line_offset = $3,\n                   last_line_hash = $4,\n                   observed_size = $5,\n                   observed_mtime_ms = $6,\n                   last_import_at = datetime('now', 'subsec'),\n                   updated_at = datetime('now', 'subsec')\n               WHERE id = $7",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "0d1dce3621d89b19aa567023bc344cbccf51a0cba56afc84feca31415dabf787"
+}

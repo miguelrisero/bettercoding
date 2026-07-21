@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO cli_ingest_outbox\n                       (session_id, seq, file_id, line_seq)\n                   VALUES ($1, $2, $3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "044abff4280aaeb41af05eba2ccc4982810cc911f42e9ef06e58712ecd07ef6a"
+}

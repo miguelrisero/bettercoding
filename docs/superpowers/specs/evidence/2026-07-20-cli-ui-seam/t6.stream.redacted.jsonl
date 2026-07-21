@@ -1,0 +1,20 @@
+{"type": "system", "subtype": "hook_started", "uuid": "25754308-3883-4407-a6aa-39cb2c18353e", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}
+{"type": "system", "subtype": "hook_started", "uuid": "ee364a49-eaae-45ca-9e5f-d2d1d137e4a1", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}
+{"type": "system", "subtype": "hook_started", "uuid": "d6e40559-1376-450a-bf8e-91fe91de56bd", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}
+{"type": "system", "subtype": "hook_started", "uuid": "7d2fa04f-ee3e-4424-8306-7978c2f9c0d1", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}
+{"type": "system", "subtype": "hook_started", "uuid": "c5f2dd1d-3784-4926-b533-6eaa99691b73", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}
+{"type": "system", "subtype": "hook_started", "uuid": "6c24031a-c2bb-4f3f-a5ae-1a2433f6e871", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}
+{"type": "system", "subtype": "hook_started", "uuid": "0869536a-83e5-45fe-802c-b5bc5a4a4d8b", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}
+{"type": "system", "subtype": "hook_response", "uuid": "f0947051-89e3-4f00-86b2-696a8db1aeb0", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}
+{"type": "system", "subtype": "hook_response", "uuid": "874e1891-f5df-49b2-804a-54d6c5ac02ba", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}
+{"type": "system", "subtype": "hook_response", "uuid": "40e1933f-e859-4725-ae02-5b8faf0c150b", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}
+{"type": "system", "subtype": "hook_response", "uuid": "7845d3d3-87c4-4184-85c5-2b731145c1f7", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}
+{"type": "system", "subtype": "hook_response", "uuid": "244fb17c-1461-4f7c-9e08-ef83a044c3e9", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}
+{"type": "system", "subtype": "hook_response", "uuid": "9e02ddc3-be44-4c90-9599-5d7c00ddff70", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}
+{"type": "system", "subtype": "init", "uuid": "08a7a717-939a-4b0f-bfc8-bd0e0223f9e1", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}
+{"type": "system", "subtype": "hook_progress", "uuid": "f287f600-bf5a-46da-a245-c56407b371a5", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}
+{"type": "assistant", "uuid": "a198696c-c5ff-4acd-8918-3852e2546da5", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "parent_tool_use_id": null, "message": {"id": "msg_011CdDbbDxkFtCMwKBPHAKCr", "role": "assistant", "content": []}}
+{"type": "assistant", "uuid": "cd827a38-d7eb-4ff5-914e-f5627198e47a", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "parent_tool_use_id": null, "message": {"id": "msg_011CdDbbDxkFtCMwKBPHAKCr", "role": "assistant", "content": [{"type": "text", "text": "T6-ACK"}]}}
+{"type": "rate_limit_event", "uuid": "14ca0882-5d4e-4179-ab85-3383883f2dd6", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}
+{"type": "result", "subtype": "success", "uuid": "05021a01-1c02-48e6-a8d8-c203a2e73423", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "result": "T6-ACK"}
+{"type": "system", "subtype": "hook_response", "uuid": "8983b8c9-8ed4-4a6b-a615-798d5c0f2c5e", "session_id": "ee554d9b-ce17-4230-9374-b101505e3c46", "redacted_payload": true}

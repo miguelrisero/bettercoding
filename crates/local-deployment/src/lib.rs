@@ -19,6 +19,7 @@ use services::services::{
     analytics::{AnalyticsConfig, AnalyticsContext, AnalyticsService, generate_user_id},
     approvals::Approvals,
     auth::AuthContext,
+    claude_transcript_ingest::ClaudeTranscriptIngest,
     config::{Config, load_config_from_file, save_config_to_file},
     container::ContainerService,
     events::EventService,
@@ -66,6 +67,7 @@ pub struct LocalDeployment {
     file_search_cache: Arc<FileSearchCache>,
     approvals: Approvals,
     queued_message_service: QueuedMessageService,
+    claude_transcript_ingest: Option<Arc<ClaudeTranscriptIngest>>,
     remote_client: Result<RemoteClient, RemoteClientNotConfigured>,
     auth_context: AuthContext,
     oauth_handoffs: Arc<RwLock<HashMap<Uuid, PendingHandoff>>>,
@@ -272,6 +274,11 @@ impl Deployment for LocalDeployment {
         // (Running / Needs Attention buckets in the sidebar).
         cli_activity::CliActivityMonitor::spawn(db.clone(), pty.clone(), shutdown.child_token());
 
+        // Read-only Claude native-store tailing for CLI-authored transcript
+        // backfill and live session feeds. The service owns its watcher guards.
+        let claude_transcript_ingest =
+            ClaudeTranscriptIngest::spawn(db.clone(), shutdown.child_token());
+
         // Keep opted-in CLI loops going across usage/rate limits: detect the
         // limit banner, schedule a wake-up, and re-prompt the agent.
         loop_supervisor::LoopSupervisor::spawn(db.clone());
@@ -291,6 +298,7 @@ impl Deployment for LocalDeployment {
             file_search_cache,
             approvals,
             queued_message_service,
+            claude_transcript_ingest,
             remote_client,
             auth_context,
             oauth_handoffs,
@@ -361,6 +369,10 @@ impl Deployment for LocalDeployment {
 
     fn queued_message_service(&self) -> &QueuedMessageService {
         &self.queued_message_service
+    }
+
+    fn claude_transcript_ingest(&self) -> Option<&Arc<ClaudeTranscriptIngest>> {
+        self.claude_transcript_ingest.as_ref()
     }
 
     fn auth_context(&self) -> &AuthContext {

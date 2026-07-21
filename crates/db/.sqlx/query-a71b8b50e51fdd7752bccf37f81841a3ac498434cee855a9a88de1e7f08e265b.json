@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT EXISTS(\n                           SELECT 1 FROM execution_native_links\n                           WHERE native_uuid = $1\n                       ) AS \"linked!: bool\"",
+  "describe": {
+    "columns": [
+      {
+        "name": "linked!: bool",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a71b8b50e51fdd7752bccf37f81841a3ac498434cee855a9a88de1e7f08e265b"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO execution_native_links\n               (execution_process_id, native_uuid)\n               VALUES ($1, $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "fd568130857ced5f47b86a48446fad0c835060aede189e73507d670b7db1806d"
+}

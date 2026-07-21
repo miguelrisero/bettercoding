@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT claude_session_id AS \"claude_session_id!\"\n               FROM claude_session_links\n               WHERE workspace_id = $1\n               UNION\n               SELECT cat.agent_session_id AS \"claude_session_id!\"\n               FROM coding_agent_turns cat\n               JOIN execution_processes ep ON ep.id = cat.execution_process_id\n               JOIN sessions s ON s.id = ep.session_id\n               WHERE s.workspace_id = $1 AND cat.agent_session_id IS NOT NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "claude_session_id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "cc0ccc09312dddc2d9ca3d57f2e81de4b1827d40f8d5ce8f813ea53aa1f6d795"
+}

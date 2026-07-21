@@ -1,0 +1,11 @@
+{
+ "type": "result",
+ "subtype": "success",
+ "is_error": false,
+ "result": "CODEWORD=PLUM",
+ "session_id": "06a7eacd-664b-4d9c-83f3-d4774a6216a8",
+ "num_turns": 1,
+ "stop_reason": "end_turn",
+ "uuid": "41a8899d-8a33-4e61-b791-3ad6c7392aeb",
+ "duration_ms": 2788
+}

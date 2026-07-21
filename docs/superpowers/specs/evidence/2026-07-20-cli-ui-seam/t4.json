@@ -1,0 +1,11 @@
+{
+ "type": "result",
+ "subtype": "success",
+ "is_error": false,
+ "result": "T4-CODEWORD=MANGO",
+ "session_id": "06a7eacd-664b-4d9c-83f3-d4774a6216a8",
+ "num_turns": 1,
+ "stop_reason": "end_turn",
+ "uuid": "943dfb15-07c0-4e57-b1cc-c2add715058e",
+ "duration_ms": 3563
+}

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT DISTINCT l.session_id AS \"session_id!: Uuid\"\n               FROM cli_native_records r\n               JOIN claude_session_links l\n                 ON l.claude_session_id = r.claude_session_id\n               WHERE r.uuid = $1",
+  "describe": {
+    "columns": [
+      {
+        "name": "session_id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "42691a99996bbb04c51ab6b179a1c0f36f0061693e5c7a1e08bec507c8e64e80"
+}

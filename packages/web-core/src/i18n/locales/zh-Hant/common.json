@@ -67,6 +67,19 @@
     "deniedByUser": "使用者拒絕了 {{toolName}}",
     "tool": "工具",
     "thinking": "思考中",
+    "assistant": "Claude",
+    "viaCli": "透過 CLI",
+    "cliSessionActive": "CLI 工作階段使用中",
+    "quarantine": {
+      "affordance": "未分配的 CLI",
+      "openLabel": "開啟 {{count}} 個未分配的 CLI 對話",
+      "title": "未分配的 CLI 對話",
+      "description": "這些對話在此工作區中被發現，但尚未連結到應用程式對話。可將其中一個分配給目前開啟的對話。",
+      "noPreview": "沒有可用的提示預覽",
+      "assign": "分配到此處",
+      "assigning": "正在分配…",
+      "error": "無法分配此對話，請再試一次。"
+    },
     "toolSummary": {
       "read": "讀取 {{path}}",
       "searched": "搜尋 \"{{query}}\"",
@@ -77,6 +90,12 @@
     },
     "subagent": {
       "defaultType": "子代理"
+    },
+    "fork": {
+      "explanation": "部分訊息進入了代理不再繼續的路徑。",
+      "branchLabel": "分支 {{index}}",
+      "resumeHint": "Claude 將從這裡繼續",
+      "emptyBranch": "此分支中沒有可見訊息"
     },
     "loadingEarlierMessages": "正在載入先前的訊息",
     "cliEmptyTitle": "此工作區通常在終端機中執行",

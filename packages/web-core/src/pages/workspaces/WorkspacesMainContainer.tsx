@@ -101,6 +101,7 @@ interface WorkspacesMainContainerProps {
   isSessionsLoading?: boolean;
   isNewSessionMode: boolean;
   onStartNewSession: () => void;
+  cliSessionActive?: boolean;
 }
 
 export const WorkspacesMainContainer = forwardRef<
@@ -118,6 +119,7 @@ export const WorkspacesMainContainer = forwardRef<
     isSessionsLoading: _isSessionsLoading,
     isNewSessionMode,
     onStartNewSession,
+    cliSessionActive = false,
   },
   ref
 ) {
@@ -218,6 +220,7 @@ export const WorkspacesMainContainer = forwardRef<
             // chat offers "Open terminal" (the VS Code page, which renders
             // ConversationList without a terminal, omits this).
             cliAvailable
+            cliSessionActive={cliSessionActive}
           />
         </RetryUiProvider>
       </div>
