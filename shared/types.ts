@@ -187,6 +187,25 @@ is_coding_agent_running: boolean, is_errored: boolean, id: string, task_id: stri
 
 export type Session = { id: string, workspace_id: string, name: string | null, executor: string | null, agent_working_dir: string | null, created_at: string, updated_at: string, };
 
+export type QueuedMessageSource = "ui" | "recovery";
+
+export type QueuedMessageState = "queued" | "pasting" | "pasted" | "imported" | "failed" | "consumed" | "cancelled";
+
+export type SessionQueuedMessage = { id: string, session_id: string, prompt: string, 
+/**
+ * Serialized [`ExecutorConfig`]. Paste delivery does not need it, but a
+ * queued prompt must retain it across a restart before executor dispatch.
+ */
+executor_config: ExecutorConfig | null, source: QueuedMessageSource, state: QueuedMessageState, failure_reason: string | null, claude_session_id: string | null, pasted_at: string | null, acked_at: string | null, created_at: string, updated_at: string, };
+
+export type CliPaneBoundVia = "cli-resume" | "cli-fresh";
+
+export type CliPaneBinding = { id: string, workspace_id: string, session_id: string, claude_session_id: string | null, bound_via: CliPaneBoundVia, created_at: string, released_at: string | null, };
+
+export type SpawnReservationHolder = "executor" | "cli";
+
+export type WorkspaceSpawnReservation = { workspace_id: string, holder: SpawnReservationHolder, fence: string, created_at: string, expires_at: string, };
+
 export type ExecutionProcess = { id: string, session_id: string, run_reason: ExecutionProcessRunReason, executor_action: ExecutorAction, status: ExecutionProcessStatus, exit_code: bigint | null, 
 /**
  * dropped: true if this process is excluded from the current
@@ -359,7 +378,7 @@ export type NativeFeedFork = { claude_session_id: string, file_id: string, fork:
 
 export type NativeFileImportHealth = { claude_session_id: string, file_name: string, generation: bigint, last_import_at: string | null, };
 
-export type NativeIngestHealth = { unknown_kinds: bigint, rescans: bigint, quarantined_files: bigint, watch_degraded: boolean, files: Array<NativeFileImportHealth>, };
+export type NativeIngestHealth = { unknown_kinds: bigint, rescans: bigint, quarantined_files: bigint, watch_degraded: boolean, foreign_writer_seen_at: string | null, files: Array<NativeFileImportHealth>, };
 
 export type NativeFeedSnapshot = { revision: bigint, seq: bigint, entries: Array<NativeFeedEntry>, forks: Array<NativeFeedFork>, health: NativeIngestHealth, };
 
@@ -385,7 +404,11 @@ export type RefreshRelaySigningSessionRequest = { client_id: string, timestamp: 
 
 export type RefreshRelaySigningSessionResponse = { signing_session_id: string, };
 
-export type CreateFollowUpAttempt = { prompt: string, executor_config: ExecutorConfig, retry_process_id: string | null, force_when_dirty: boolean | null, perform_git_reset: boolean | null, };
+export type CreateFollowUpAttempt = { prompt: string, executor_config: ExecutorConfig, retry_process_id: string | null, force_when_dirty: boolean | null, perform_git_reset: boolean | null, replace: boolean, };
+
+export type ForkRecoveryRequest = { fork_parent_uuid: string, branch_leaf_uuid: string, };
+
+export type QueueMessageRequest = { message: string, executor_config: ExecutorConfig, replace: boolean, };
 
 export type ResetProcessRequest = { process_id: string, force_when_dirty: boolean | null, perform_git_reset: boolean | null, };
 
@@ -625,21 +648,11 @@ export type SendMessageShortcut = "ModifierEnter" | "Enter";
 
 export type GitBranch = { name: string, is_current: boolean, is_remote: boolean, last_commit_date: Date, };
 
-export type QueuedMessage = { 
-/**
- * The session this message is queued for
- */
-session_id: string, 
-/**
- * The follow-up data (message + variant)
- */
-data: DraftFollowUpData, 
-/**
- * Timestamp when the message was queued
- */
-queued_at: string, };
+export type QueuedMessage = { id: string, session_id: string, data: DraftFollowUpData, source: QueuedMessageSource, state: QueuedMessageState, failure_reason: string | null, claude_session_id: string | null, pasted_at: string | null, acked_at: string | null, queued_at: string, updated_at: string, };
 
-export type QueueStatus = { "status": "empty" } | { "status": "queued", message: QueuedMessage, };
+export type QueueStatus = { "status": "empty" } | { "status": "queued", message: QueuedMessage, } | { "status": "pasting", message: QueuedMessage, } | { "status": "pasted", message: QueuedMessage, };
+
+export type DispatchOutcome = { "outcome": "started", execution_process: ExecutionProcess, } | { "outcome": "queued", status: QueueStatus, } | { "outcome": "routed_to_cli", delivery: QueueStatus, } | { "outcome": "conflict", status: QueueStatus, };
 
 export type ConflictOp = "rebase" | "merge" | "cherry_pick" | "revert";
 
