@@ -20,6 +20,7 @@ pub struct CliNativeRecord {
     pub raw: String,
     pub disposition: String,
     pub bound_coding_agent_turn_id: Option<Uuid>,
+    pub bound_queued_message_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +93,7 @@ pub struct SessionNativeRecord {
     pub disposition: String,
     pub linked_execution_process_id: Option<Uuid>,
     pub bound_turn_execution_process_id: Option<Uuid>,
+    pub bound_queued_message_id: Option<Uuid>,
     pub seq: i64,
     pub dir_path: String,
     pub file_name: String,
@@ -400,6 +402,7 @@ impl CliNativeRecord {
                           LIMIT 1
                       ) AS "linked_execution_process_id: Uuid",
                       cat.execution_process_id AS "bound_turn_execution_process_id: Uuid",
+                      r.bound_queued_message_id AS "bound_queued_message_id: Uuid",
                       outbox.seq,
                       f.dir_path,
                       f.file_name,

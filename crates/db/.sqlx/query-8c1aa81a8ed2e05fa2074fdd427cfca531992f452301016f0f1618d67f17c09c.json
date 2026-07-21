@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE cli_pane_bindings SET claude_session_id = $1\n               WHERE id = $2 AND released_at IS NULL\n                 AND bound_via = 'cli-fresh'\n                 AND claude_session_id IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "8c1aa81a8ed2e05fa2074fdd427cfca531992f452301016f0f1618d67f17c09c"
+}

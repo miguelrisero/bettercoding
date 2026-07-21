@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE session_queued_messages SET\n                   state = 'imported',\n                   acked_at = COALESCE(acked_at, datetime('now', 'subsec')),\n                   updated_at = datetime('now', 'subsec')\n               WHERE state IN ('pasting', 'pasted')\n                 AND EXISTS (\n                     SELECT 1 FROM cli_native_records record\n                     WHERE record.bound_queued_message_id = session_queued_messages.id\n                 )",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "16f187e3600311ad7502f6034f6a84d85b80ad65dba417b5115dbd02562737bc"
+}

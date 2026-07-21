@@ -24,6 +24,7 @@ pub struct ClaudeSessionLink {
     pub cwd: String,
     pub bound_via: ClaudeSessionBoundVia,
     pub created_at: DateTime<Utc>,
+    pub foreign_writer_seen_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,7 +58,8 @@ impl ClaudeSessionLink {
                       workspace_id AS "workspace_id!: Uuid",
                       cwd AS "cwd!",
                       bound_via AS "bound_via!: ClaudeSessionBoundVia",
-                      created_at AS "created_at!: DateTime<Utc>"
+                      created_at AS "created_at!: DateTime<Utc>",
+                      foreign_writer_seen_at AS "foreign_writer_seen_at: DateTime<Utc>"
                FROM claude_session_links
                WHERE claude_session_id = $1"#,
             claude_session_id

@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT workspace_id AS \"workspace_id!: Uuid\",\n                      holder AS \"holder!: SpawnReservationHolder\",\n                      fence,\n                      created_at AS \"created_at!: DateTime<Utc>\",\n                      expires_at AS \"expires_at!: DateTime<Utc>\"\n               FROM workspace_spawn_reservations\n               WHERE workspace_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "name": "workspace_id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "holder!: SpawnReservationHolder",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "fence",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at!: DateTime<Utc>",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "expires_at!: DateTime<Utc>",
+        "ordinal": 4,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a1c5617fb090de7823da7297966510f19c64508c80cf42344ee563cf6d5a6c18"
+}

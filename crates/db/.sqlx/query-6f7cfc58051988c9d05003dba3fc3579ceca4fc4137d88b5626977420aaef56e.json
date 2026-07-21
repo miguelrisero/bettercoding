@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE session_queued_messages SET\n                   state = 'pasting',\n                   claude_session_id = $1,\n                   pasted_at = datetime('now', 'subsec'),\n                   failure_reason = NULL,\n                   updated_at = datetime('now', 'subsec')\n               WHERE id = $2 AND state = 'queued'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "6f7cfc58051988c9d05003dba3fc3579ceca4fc4137d88b5626977420aaef56e"
+}

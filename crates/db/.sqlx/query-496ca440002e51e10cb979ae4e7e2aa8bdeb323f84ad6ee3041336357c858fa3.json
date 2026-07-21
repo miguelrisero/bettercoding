@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM workspace_spawn_reservations\n               WHERE workspace_id = $1 AND fence = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "496ca440002e51e10cb979ae4e7e2aa8bdeb323f84ad6ee3041336357c858fa3"
+}
