@@ -493,7 +493,7 @@ export const useUiPreferencesStore = create<State>()((set, get) => ({
   listViewStatusFilter: null,
 
   // Mobile tab state
-  mobileActiveTab: 'chat' as MobileTab,
+  mobileActiveTab: 'chat',
 
   // Mobile font scale
   mobileFontScale: loadMobileFontScale(),
