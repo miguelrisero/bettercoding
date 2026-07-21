@@ -62,6 +62,7 @@ export function useRetryProcess(
         retry_process_id: executionProcessId,
         force_when_dirty: modalResult.forceWhenDirty ?? false,
         perform_git_reset: modalResult.performGitReset ?? true,
+        replace: false,
       });
     },
     onSuccess: () => {

@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useDropzone } from 'react-dropzone';
+import { useTranslation } from 'react-i18next';
 import {
   type AskUserQuestionItem,
   BaseAgentCapability,
   type Session,
   type BaseCodingAgent,
   ExecutionProcessStatus,
+  type QueueStatus,
 } from 'shared/types';
 import { AgentIcon } from '@/shared/components/AgentIcon';
 import { useHostId } from '@/shared/providers/HostIdProvider';
@@ -25,7 +27,10 @@ import { useTodos } from '../model/hooks/useTodos';
 import { getLatestConfigFromProcesses } from '@/shared/lib/executor';
 import { useExecutorConfig } from '@/shared/hooks/useExecutorConfig';
 import { useSessionMessageEditor } from '../model/hooks/useSessionMessageEditor';
-import { useSessionQueueInteraction } from '../model/hooks/useSessionQueueInteraction';
+import {
+  sessionQueueKeys,
+  useSessionQueueInteraction,
+} from '../model/hooks/useSessionQueueInteraction';
 import { useSessionSend } from '../model/hooks/useSessionSend';
 import { useSessionAttachments } from '../model/hooks/useSessionAttachments';
 import { useMessageEditRetry } from '../model/hooks/useMessageEditRetry';
@@ -65,6 +70,14 @@ import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
 import { sessionsApi } from '@/shared/lib/api';
 import { RenameSessionDialog } from '@vibe/ui/components/RenameSessionDialog';
 import type { TurnNavigationItem } from '@vibe/ui/components/TurnNavigationPopup';
+import { ConfirmDialog } from '@vibe/ui/components/ConfirmDialog';
+import {
+  deriveQueueChipState,
+  getActiveQueuedMessage,
+  mapDispatchOutcomeToUiState,
+  type DispatchNoticeKind,
+} from '../model/collaborationUiState';
+import { useTransientToast } from '@/shared/hooks/useTransientToast';
 
 /** Compute execution status from boolean flags */
 function computeExecutionStatus(params: {
@@ -141,6 +154,8 @@ type SessionChatBoxContainerProps =
   | PlaceholderProps;
 
 export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
+  const { t } = useTranslation('tasks');
+  const { toast, showToast, dismissToast } = useTransientToast();
   const {
     mode,
     sessions,
@@ -475,12 +490,15 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
 
   // Queue interaction
   const {
+    queueStatus,
     isQueued,
     queuedMessage,
     queuedConfig,
     isQueueLoading,
     queueMessage,
+    retryQueuedMessage,
     cancelQueue,
+    setQueueStatus,
     refreshQueueStatus,
   } = useSessionQueueInteraction({ sessionId });
 
@@ -498,6 +516,65 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
     executorConfig,
   });
 
+  const showDispatchNotice = useCallback(
+    (notice: DispatchNoticeKind) => {
+      switch (notice) {
+        case 'held':
+          showToast(t('conversation.queue.heldToast'), 'warning');
+          break;
+        case 'delivery-failed':
+          showToast(t('conversation.queue.deliveryFailedToast'), 'warning');
+          break;
+        case 'routed-to-cli':
+          showToast(t('conversation.queue.routedToast'), 'info');
+          break;
+        case 'none':
+          break;
+      }
+    },
+    [showToast, t]
+  );
+
+  const confirmQueueReplacement = useCallback(
+    async (status: QueueStatus): Promise<boolean> => {
+      const current = getActiveQueuedMessage(status);
+      if (!current) {
+        showToast(t('conversation.queue.replaceChangedToast'), 'warning');
+        return false;
+      }
+
+      const result = await ConfirmDialog.show({
+        title: t('conversation.queue.replaceTitle'),
+        message:
+          current.source === 'recovery'
+            ? t('conversation.queue.replaceRecoveryMessage', {
+                message: current.data.message,
+              })
+            : t('conversation.queue.replaceUiMessage', {
+                message: current.data.message,
+              }),
+        confirmText: t('conversation.queue.replaceConfirm'),
+        cancelText: t('conversation.actions.cancel'),
+        variant: 'destructive',
+      });
+
+      return result === 'confirmed';
+    },
+    [showToast, t]
+  );
+
+  const showReplacementConflict = useCallback(
+    (status: QueueStatus) => {
+      showToast(
+        status.status === 'pasting' || status.status === 'pasted'
+          ? t('conversation.queue.replaceInProgressToast')
+          : t('conversation.queue.replaceChangedToast'),
+        'warning'
+      );
+    },
+    [showToast, t]
+  );
+
   const handleSend = useCallback(async () => {
     const { prompt, isSlashCommand } = buildAgentPrompt(localMessage, [
       reviewMarkdown,
@@ -505,26 +582,61 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
 
     onScrollToBottom('auto');
 
-    const success = await send(prompt);
-    if (success) {
-      cancelDebouncedSave();
-      setLocalMessage('');
-      clearUploadedAttachments();
-      if (isNewSessionMode) await clearDraft();
-      if (!isSlashCommand) {
-        reviewContext?.clearComments();
+    let dispatchSessionId: string | undefined;
+    const attemptDispatch = async (replace: boolean): Promise<boolean> => {
+      const result = await send(prompt, replace, dispatchSessionId);
+      if (!result) return false;
+      dispatchSessionId = result.sessionId;
+
+      const uiState = mapDispatchOutcomeToUiState(result.outcome);
+      if (result.sessionId === sessionId) {
+        setQueueStatus(uiState.queueStatus);
+      } else {
+        queryClient.setQueryData(
+          sessionQueueKeys.status(result.sessionId),
+          uiState.queueStatus
+        );
       }
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          onScrollToBottom('auto');
-        });
-      });
+
+      if (uiState.confirmReplacement) {
+        if (replace) {
+          showReplacementConflict(uiState.queueStatus);
+          return false;
+        }
+        const confirmed = await confirmQueueReplacement(uiState.queueStatus);
+        return confirmed ? attemptDispatch(true) : false;
+      }
+
+      showDispatchNotice(uiState.notice);
+      return uiState.clearComposer;
+    };
+
+    const accepted = await attemptDispatch(false);
+    if (!accepted) return;
+
+    cancelDebouncedSave();
+    setLocalMessage('');
+    clearUploadedAttachments();
+    if (isNewSessionMode) await clearDraft();
+    if (!isSlashCommand) {
+      reviewContext?.clearComments();
     }
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        onScrollToBottom('auto');
+      });
+    });
   }, [
     onScrollToBottom,
     send,
     localMessage,
     reviewMarkdown,
+    sessionId,
+    queryClient,
+    setQueueStatus,
+    showReplacementConflict,
+    confirmQueueReplacement,
+    showDispatchNotice,
     cancelDebouncedSave,
     setLocalMessage,
     clearUploadedAttachments,
@@ -560,25 +672,64 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
 
     const { prompt } = buildAgentPrompt(localMessage, [reviewMarkdown]);
 
-    cancelDebouncedSave();
-    await saveToScratch(localMessage, executorConfig);
-    await queueMessage(prompt, executorConfig);
+    const attemptQueue = async (replace: boolean): Promise<boolean> => {
+      const result = await queueMessage(prompt, executorConfig, replace);
+      if (!result) return false;
+      if (result.outcome === 'stored') return true;
+
+      if (replace) {
+        showReplacementConflict(result.status);
+        return false;
+      }
+      const confirmed = await confirmQueueReplacement(result.status);
+      return confirmed ? attemptQueue(true) : false;
+    };
+
+    try {
+      cancelDebouncedSave();
+      await saveToScratch(localMessage, executorConfig);
+      const accepted = await attemptQueue(false);
+      if (!accepted) return;
+    } catch {
+      showToast(t('conversation.queue.queueErrorToast'), 'error');
+      return;
+    }
 
     // Clear local state after queueing (same as handleSend)
     setLocalMessage('');
     clearUploadedAttachments();
     reviewContext?.clearComments();
+    showDispatchNotice('held');
   }, [
     localMessage,
     reviewMarkdown,
     executorConfig,
     queueMessage,
+    showReplacementConflict,
+    confirmQueueReplacement,
     cancelDebouncedSave,
     saveToScratch,
     setLocalMessage,
     clearUploadedAttachments,
     reviewContext,
+    showToast,
+    showDispatchNotice,
+    t,
   ]);
+
+  const handleRetryQueuedMessage = useCallback(async () => {
+    try {
+      const result = await retryQueuedMessage();
+      if (!result) return;
+      if (result.outcome === 'conflict') {
+        showReplacementConflict(result.status);
+        return;
+      }
+      showToast(t('conversation.queue.retryingToast'), 'info');
+    } catch {
+      showToast(t('conversation.queue.retryErrorToast'), 'error');
+    }
+  }, [retryQueuedMessage, showReplacementConflict, showToast, t]);
 
   // Editor change handler
   const handleEditorChange = useCallback(
@@ -887,6 +1038,39 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
     isAttemptRunning,
   });
 
+  const queueChip = useMemo(
+    () => deriveQueueChipState(queueStatus),
+    [queueStatus]
+  );
+  const queueState = useMemo(() => {
+    if (!queueChip) return null;
+
+    const label = (() => {
+      switch (queueChip.kind) {
+        case 'queued':
+          return t('conversation.queue.queued');
+        case 'pasting':
+          return t('conversation.queue.pasting');
+        case 'pasted':
+          return t('conversation.queue.pasted');
+        case 'failed':
+          return t('conversation.queue.failed');
+      }
+    })();
+
+    return {
+      state: queueChip.kind,
+      label,
+      failureReason: queueChip.failureReason,
+      canSendAgain: queueChip.canSendAgain,
+      onSendAgain: handleRetryQueuedMessage,
+      sendAgainLabel: isQueueLoading
+        ? t('conversation.queue.sendingAgain')
+        : t('conversation.queue.sendAgain'),
+      isSendingAgain: isQueueLoading,
+    };
+  }, [queueChip, handleRetryQueuedMessage, isQueueLoading, t]);
+
   // During loading, render with empty editor to preserve container UI
   // In approval mode, don't show queued message - it's for follow-up, not approval response
   const editorValue = useMemo(() => {
@@ -1059,6 +1243,18 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
         onResolveConflicts: handleResolveConflicts,
       }}
       error={sendError}
+      queueState={queueState}
+      toast={
+        toast
+          ? {
+              message: toast.message,
+              tone: toast.tone,
+              onDismiss: dismissToast,
+              dismissLabel: t('conversation.queue.dismissToast'),
+            }
+          : null
+      }
+      canStop={isAttemptRunning}
       agent={effectiveExecutor}
       todos={todos}
       inProgressTodo={inProgressTodo}

@@ -39,7 +39,6 @@ import {
   CliAgentAvailability,
   BaseCodingAgent,
   ExecutorConfig,
-  DraftFollowUpData,
   AgentPresetOptionsQuery,
   RunAgentSetupRequest,
   RunAgentSetupResponse,
@@ -68,7 +67,10 @@ import {
   PushError,
   TokenResponse,
   CurrentUserResponse,
+  DispatchOutcome,
+  ForkRecoveryRequest,
   QueueStatus,
+  QueueMessageRequest,
   PrCommentsResponse,
   MergeWorkspaceRequest,
   PushWorkspaceRequest,
@@ -252,12 +254,16 @@ export const handleApiResponse = async <T, E = T>(
 ): Promise<T> => {
   if (!response.ok) {
     let errorMessage = `Request failed with status ${response.status}`;
+    let structuredError: E | undefined;
 
     try {
-      const errorData = await response.json();
-      if (errorData.message) {
-        errorMessage = errorData.message;
+      const errorBody = (await response.json()) as Partial<
+        ApiResponse<unknown, E>
+      >;
+      if (errorBody.message) {
+        errorMessage = errorBody.message;
       }
+      structuredError = errorBody.error_data ?? undefined;
     } catch {
       // Fallback to status text if JSON parsing fails
       errorMessage = response.statusText || errorMessage;
@@ -270,7 +276,12 @@ export const handleApiResponse = async <T, E = T>(
       endpoint: response.url,
       timestamp: new Date().toISOString(),
     });
-    throw new ApiError<E>(errorMessage, response.status, response);
+    throw new ApiError<E>(
+      errorMessage,
+      response.status,
+      response,
+      structuredError
+    );
   }
 
   if (response.status === 204) {
@@ -316,6 +327,24 @@ export const handleApiResponse = async <T, E = T>(
   return result.data as T;
 };
 
+async function handleDispatchResponse(
+  response: Response
+): Promise<DispatchOutcome> {
+  try {
+    return await handleApiResponse<DispatchOutcome, DispatchOutcome>(response);
+  } catch (error) {
+    const dispatchError = error as ApiError<DispatchOutcome>;
+    if (
+      error instanceof ApiError &&
+      dispatchError.statusCode === 409 &&
+      dispatchError.error_data?.outcome === 'conflict'
+    ) {
+      return dispatchError.error_data;
+    }
+    throw error;
+  }
+}
+
 // Sessions API
 export const sessionsApi = {
   getByWorkspace: async (workspaceId: string): Promise<Session[]> => {
@@ -345,12 +374,26 @@ export const sessionsApi = {
   followUp: async (
     sessionId: string,
     data: CreateFollowUpAttempt
-  ): Promise<ExecutionProcess> => {
+  ): Promise<DispatchOutcome> => {
     const response = await makeRequest(`/api/sessions/${sessionId}/follow-up`, {
       method: 'POST',
       body: JSON.stringify(data),
     });
-    return handleApiResponse<ExecutionProcess>(response);
+    return handleDispatchResponse(response);
+  },
+
+  forkRecovery: async (
+    sessionId: string,
+    data: ForkRecoveryRequest
+  ): Promise<DispatchOutcome> => {
+    const response = await makeRequest(
+      `/api/sessions/${sessionId}/fork-recovery`,
+      {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }
+    );
+    return handleDispatchResponse(response);
   },
 
   startReview: async (
@@ -1668,13 +1711,13 @@ export const queueApi = {
    */
   queue: async (
     sessionId: string,
-    data: DraftFollowUpData
+    data: QueueMessageRequest
   ): Promise<QueueStatus> => {
     const response = await makeRequest(`/api/sessions/${sessionId}/queue`, {
       method: 'POST',
       body: JSON.stringify(data),
     });
-    return handleApiResponse<QueueStatus>(response);
+    return handleApiResponse<QueueStatus, QueueStatus>(response);
   },
 
   /**
