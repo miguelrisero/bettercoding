@@ -5,7 +5,12 @@ import { useActions } from '@/shared/hooks/useActions';
 import { useSyncErrorContext } from '@/shared/hooks/useSyncErrorContext';
 import { useUserOrganizations } from '@/shared/hooks/useUserOrganizations';
 import { useOrganizationStore } from '@/shared/stores/useOrganizationStore';
-import { Navbar, type NavbarSectionItem } from '@vibe/ui/components/Navbar';
+import {
+  MOBILE_TABS,
+  Navbar,
+  type MobileTabId,
+  type NavbarSectionItem,
+} from '@vibe/ui/components/Navbar';
 import { Tooltip } from '@vibe/ui/components/Tooltip';
 import { AppBarUserPopoverContainer } from './AppBarUserPopoverContainer';
 import { AppBarNotificationBellContainer } from '@/pages/workspaces/AppBarNotificationBellContainer';
@@ -33,6 +38,7 @@ import { CommandBarDialog } from '@/shared/dialogs/command-bar/CommandBarDialog'
 import { SettingsDialog } from '@/shared/dialogs/settings/SettingsDialog';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
 import { getRemoteAuthDegradedMessage } from '@/shared/lib/auth/remoteAuthDegraded';
+import { useHostId } from '@/shared/providers/HostIdProvider';
 
 /**
  * Check if a NavbarItem is a divider
@@ -113,6 +119,7 @@ export function NavbarContainer({
   mobileMode?: boolean;
 }) {
   const { t } = useTranslation('common');
+  const hostId = useHostId();
   const { executeAction } = useActions();
   const { workspace: selectedWorkspace, isCreateMode } = useWorkspaceContext();
   const syncErrorContext = useSyncErrorContext();
@@ -122,6 +129,10 @@ export function NavbarContainer({
   const { isSignedIn } = useAuth();
   const appNavigation = useAppNavigation();
   const [mobileActiveTab, setMobileActiveTab] = useMobileActiveTab();
+  const mobileTabs = useMemo(
+    () => (hostId ? MOBILE_TABS.filter((t) => t.id !== 'files') : MOBILE_TABS),
+    [hostId]
+  );
 
   const { data: orgsData } = useUserOrganizations();
   const organizations = useMemo(
@@ -324,7 +335,8 @@ export function NavbarContainer({
       onOpenSettings={handleOpenSettings}
       onNavigateBack={handleNavigateBack}
       mobileActiveTab={mobileActiveTab}
-      onMobileTabChange={(tab) => setMobileActiveTab(tab)}
+      onMobileTabChange={(tab: MobileTabId) => setMobileActiveTab(tab)}
+      mobileTabs={mobileTabs}
     />
   );
 }
