@@ -312,6 +312,7 @@ mod tests {
                         "rescans": 0,
                         "quarantined_files": 0,
                         "watch_degraded": false,
+                        "foreign_writer_seen_at": null,
                         "files": []
                     }
                 }
