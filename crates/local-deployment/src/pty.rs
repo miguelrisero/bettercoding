@@ -2595,6 +2595,15 @@ impl PtyService {
 
             // CLI mode rides tmux when present; otherwise (and for the
             // default side terminal) spawn the user's shell directly.
+            type CliTmuxCommandParts = (
+                Option<Uuid>,
+                Option<String>,
+                Option<String>,
+                bool,
+                bool,
+                bool,
+                Option<CliLaunchSpec>,
+            );
             let (
                 tmux_workspace,
                 tmux_resume_id,
@@ -2603,15 +2612,7 @@ impl PtyService {
                 tmux_busy_wait,
                 tmux_connect_hidden,
                 tmux_spec,
-            ): (
-                Option<Uuid>,
-                Option<String>,
-                Option<String>,
-                bool,
-                bool,
-                bool,
-                Option<CliLaunchSpec>,
-            ) = match &command {
+            ): CliTmuxCommandParts = match &command {
                 PtyCommand::TmuxCli {
                     workspace_id,
                     resume_session_id,

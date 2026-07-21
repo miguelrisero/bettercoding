@@ -516,8 +516,10 @@ async fn terminal_ws(
             socket,
             deployment,
             working_dir,
-            query.cols.unwrap_or(DEFAULT_COLS),
-            query.rows.unwrap_or(DEFAULT_ROWS),
+            (
+                query.cols.unwrap_or(DEFAULT_COLS),
+                query.rows.unwrap_or(DEFAULT_ROWS),
+            ),
             command,
             prompt_delivery,
             cli_launch_registration,
@@ -563,12 +565,12 @@ async fn handle_terminal_ws(
     mut socket: MaybeSignedWebSocket,
     deployment: DeploymentImpl,
     working_dir: PathBuf,
-    cols: u16,
-    rows: u16,
+    dimensions: (u16, u16),
     command: PtyCommand,
     prompt_delivery: Option<PromptDelivery>,
     cli_launch_registration: Option<CliLaunchRegistration>,
 ) {
+    let (cols, rows) = dimensions;
     // FIX 4 tripwire label: the pty session name, captured before `command` is
     // moved into `create_session`. For CLI mode this is the actual current
     // `bc_<uuid>` or legacy `vk_<uuid>` name, so the bytes line up with tmux logs.
