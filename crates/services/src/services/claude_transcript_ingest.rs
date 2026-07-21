@@ -759,8 +759,8 @@ impl ClaudeTranscriptIngest {
                 .probe(context.workspace_id, &context.cwd, Some(claude_session_id))
                 .await;
             NativeImportContext {
-                app_pane_absent: !report.probe_failed
-                    && !(report.pane_session_exists && report.agent_running == Some(true)),
+                app_pane_absent: !(report.probe_failed
+                    || report.pane_session_exists && report.agent_running == Some(true)),
             }
         } else {
             NativeImportContext::default()
