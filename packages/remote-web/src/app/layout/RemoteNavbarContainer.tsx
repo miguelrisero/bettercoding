@@ -27,7 +27,9 @@ export function RemoteNavbarContainer({
 
   const remoteMobileTabs = useMemo(
     () =>
-      MOBILE_TABS.filter((t) => t.id !== "preview" && t.id !== "workspaces"),
+      MOBILE_TABS.filter(
+        (t) => t.id !== "preview" && t.id !== "workspaces" && t.id !== "files",
+      ),
     [],
   );
 
