@@ -690,7 +690,7 @@ impl LocalContainerService {
                     ExecutionProcessStatus::Running
                 );
 
-                let mut already_finalized = false;
+                let mut skipped_cleanup = false;
 
                 if success || cleanup_done {
                     // Commit changes (if any) and get feedback about whether changes were made
@@ -727,14 +727,14 @@ impl LocalContainerService {
                             "Skipping cleanup script for workspace {} - no changes made by coding agent",
                             ctx.workspace.id
                         );
-
-                        // Manually finalize task since we're bypassing normal execution flow
-                        container.finalize_task(&ctx).await;
-                        already_finalized = true;
+                        skipped_cleanup = true;
                     }
                 }
 
-                if !already_finalized && container.should_finalize(&ctx) {
+                // A no-change coding turn bypasses its configured cleanup action,
+                // but it still releases the collaboration writer just like the
+                // normal final action in the chain.
+                if skipped_cleanup || container.should_finalize(&ctx) {
                     let has_chained_follow_up = ctx
                         .execution_process
                         .executor_action()
@@ -764,7 +764,8 @@ impl LocalContainerService {
                     let should_mark_turn_unseen = matches!(
                         ctx.execution_process.run_reason,
                         ExecutionProcessRunReason::CodingAgent
-                    ) && !has_chained_follow_up
+                    ) && !skipped_cleanup
+                        && !has_chained_follow_up
                         && !started_queued_follow_up;
 
                     if should_mark_turn_unseen
