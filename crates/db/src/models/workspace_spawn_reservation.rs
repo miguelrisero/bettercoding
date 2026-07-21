@@ -119,7 +119,7 @@ mod tests {
     use crate::models::workspace::{CreateWorkspace, Workspace};
 
     #[tokio::test]
-    async fn reservation_fence_and_ttl_prevent_overlapping_spawns() {
+    async fn reservation_fence_release_and_ttl_prevent_overlapping_spawns() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -165,17 +165,22 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert!(
+            WorkspaceSpawnReservation::release(&pool, workspace_id, &first.fence)
+                .await
+                .unwrap()
+        );
 
         let second = WorkspaceSpawnReservation::acquire_at(
             &pool,
             workspace_id,
             SpawnReservationHolder::Cli,
-            now + Duration::seconds(16),
+            now + Duration::seconds(14),
             Duration::seconds(15),
         )
         .await
         .unwrap()
-        .expect("expired reservation must be replaced");
+        .expect("matching release must free the reservation");
         assert_ne!(first.fence, second.fence);
         assert_eq!(second.holder, SpawnReservationHolder::Cli);
         assert!(
@@ -183,8 +188,21 @@ mod tests {
                 .await
                 .unwrap()
         );
+
+        let third = WorkspaceSpawnReservation::acquire_at(
+            &pool,
+            workspace_id,
+            SpawnReservationHolder::Executor,
+            now + Duration::seconds(30),
+            Duration::seconds(15),
+        )
+        .await
+        .unwrap()
+        .expect("expired reservation must be replaced");
+        assert_ne!(second.fence, third.fence);
+        assert_eq!(third.holder, SpawnReservationHolder::Executor);
         assert!(
-            WorkspaceSpawnReservation::release(&pool, workspace_id, &second.fence)
+            WorkspaceSpawnReservation::release(&pool, workspace_id, &third.fence)
                 .await
                 .unwrap()
         );

@@ -341,7 +341,8 @@ impl SessionQueuedMessage {
                    claude_session_id = NULL,
                    pasted_at = NULL,
                    updated_at = datetime('now', 'subsec')
-               WHERE state = 'pasting' AND updated_at <= $1"#,
+               WHERE state = 'pasting'
+                 AND julianday(updated_at) <= julianday($1)"#,
             pasting_cutoff
         )
         .execute(pool)
@@ -356,7 +357,8 @@ impl SessionQueuedMessage {
                    claude_session_id = NULL,
                    pasted_at = NULL,
                    updated_at = datetime('now', 'subsec')
-               WHERE state = 'pasted' AND pasted_at <= $1"#,
+               WHERE state = 'pasted'
+                 AND julianday(pasted_at) <= julianday($1)"#,
             pasted_cutoff
         )
         .execute(pool)

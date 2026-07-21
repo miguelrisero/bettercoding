@@ -825,6 +825,7 @@ mod tests {
 
     use db::models::{
         claude_session_link::ClaudeSessionLink,
+        cli_native_file::{CliNativeFile, RegisterCliNativeFile},
         cli_pane_binding::{CliPaneBinding, CliPaneBoundVia},
         execution_process::{CreateExecutionProcess, ExecutionProcessRunReason},
         session::CreateSession,
@@ -874,6 +875,44 @@ mod tests {
         async fn signal_resume_ready(&self, _workspace_id: Uuid, _sid: &str) {}
     }
 
+    #[derive(Debug, Default)]
+    struct TransportState {
+        pasted_prompts: Vec<String>,
+        observed_states: Vec<QueuedMessageState>,
+    }
+
+    struct RecordingTransport {
+        db: DBService,
+        session_id: Uuid,
+        state: Arc<StdMutex<TransportState>>,
+        paste_succeeds: bool,
+    }
+
+    #[async_trait]
+    impl CliPasteTransport for RecordingTransport {
+        async fn paste_and_submit(&self, _workspace_id: Uuid, text: &str) -> bool {
+            let state = SessionQueuedMessage::find_active(&self.db.pool, self.session_id)
+                .await
+                .unwrap()
+                .map(|row| row.state)
+                .expect("paste transport must observe an active delivery row");
+            let mut observations = self.state.lock().unwrap();
+            observations.pasted_prompts.push(text.to_string());
+            observations.observed_states.push(state);
+            self.paste_succeeds
+        }
+
+        async fn pane_alive(&self, _workspace_id: Uuid) -> bool {
+            true
+        }
+
+        async fn agent_running(&self, _workspace_id: Uuid) -> Option<bool> {
+            Some(true)
+        }
+
+        async fn signal_resume_ready(&self, _workspace_id: Uuid, _sid: &str) {}
+    }
+
     struct NeverDispatcher;
 
     #[async_trait]
@@ -885,6 +924,38 @@ mod tests {
             _executor_config: &ExecutorConfig,
         ) -> AnyhowResult<ExecutionProcess> {
             panic!("lease-only tests must not dispatch")
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct DispatcherState {
+        prompts: Vec<String>,
+        reservation_seen: bool,
+    }
+
+    struct RecordingDispatcher {
+        db: DBService,
+        state: Arc<StdMutex<DispatcherState>>,
+    }
+
+    #[async_trait]
+    impl CliExecutorDispatcher for RecordingDispatcher {
+        async fn dispatch(
+            &self,
+            session: &Session,
+            prompt: &str,
+            _executor_config: &ExecutorConfig,
+        ) -> AnyhowResult<ExecutionProcess> {
+            let reservation_seen =
+                WorkspaceSpawnReservation::find(&self.db.pool, session.workspace_id)
+                    .await?
+                    .is_some();
+            {
+                let mut state = self.state.lock().unwrap();
+                state.prompts.push(prompt.to_string());
+                state.reservation_seen = reservation_seen;
+            }
+            Ok(create_running_executor(&self.db, session.id, prompt).await)
         }
     }
 
@@ -928,14 +999,19 @@ mod tests {
         (db, workspace, session)
     }
 
-    fn service(db: DBService, report: ProbeReport) -> (CliCollabService, FakeProbe) {
+    fn service_with_components(
+        db: DBService,
+        report: ProbeReport,
+        transport: Arc<dyn CliPasteTransport>,
+        dispatcher: Arc<dyn CliExecutorDispatcher>,
+    ) -> (CliCollabService, FakeProbe) {
         let probe = FakeProbe(Arc::new(StdMutex::new(report)));
         (
             CliCollabService {
                 db,
                 probe: Arc::new(probe.clone()),
-                transport: Arc::new(FakeTransport),
-                dispatcher: Arc::new(NeverDispatcher),
+                transport,
+                dispatcher,
                 ingest: None,
                 session_locks: Mutex::new(HashMap::new()),
                 notify: Notify::new(),
@@ -943,6 +1019,15 @@ mod tests {
                 shutdown: CancellationToken::new(),
             },
             probe,
+        )
+    }
+
+    fn service(db: DBService, report: ProbeReport) -> (CliCollabService, FakeProbe) {
+        service_with_components(
+            db,
+            report,
+            Arc::new(FakeTransport),
+            Arc::new(NeverDispatcher),
         )
     }
 
@@ -960,8 +1045,83 @@ mod tests {
         }
     }
 
+    fn executor_config() -> ExecutorConfig {
+        ExecutorConfig::new(BaseCodingAgent::ClaudeCode)
+    }
+
+    async fn create_running_executor(
+        db: &DBService,
+        session_id: Uuid,
+        prompt: &str,
+    ) -> ExecutionProcess {
+        let action = ExecutorAction::new(
+            ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
+                prompt: prompt.to_string(),
+                executor_config: executor_config(),
+                working_dir: None,
+            }),
+            None,
+        );
+        ExecutionProcess::create(
+            &db.pool,
+            &CreateExecutionProcess {
+                session_id,
+                executor_action: action,
+                run_reason: ExecutionProcessRunReason::CodingAgent,
+            },
+            Uuid::new_v4(),
+            &[],
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn store_message(
+        db: &DBService,
+        session_id: Uuid,
+        prompt: &str,
+        source: QueuedMessageSource,
+    ) -> SessionQueuedMessage {
+        let serialized = serde_json::to_string(&executor_config()).unwrap();
+        match SessionQueuedMessage::store(
+            &db.pool,
+            session_id,
+            prompt,
+            Some(&serialized),
+            source,
+            false,
+        )
+        .await
+        .unwrap()
+        {
+            StoreQueuedMessageResult::Stored(row) => row,
+            StoreQueuedMessageResult::Conflict(_) => panic!("fixture slot must be empty"),
+        }
+    }
+
+    async fn bind_confirmed_cli(
+        db: &DBService,
+        workspace: &Workspace,
+        session: &Session,
+        sid: &str,
+    ) {
+        CliPaneBinding::record_launch(
+            &db.pool,
+            workspace.id,
+            session.id,
+            Some(sid),
+            CliPaneBoundVia::CliResume,
+        )
+        .await
+        .unwrap();
+        ClaudeSessionLink::assign_manual(&db.pool, sid, session.id, "/tmp/collab-fixture")
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
-    async fn lease_derivation_covers_executor_cli_ambiguous_free_and_db_failure() {
+    async fn lease_derivation_covers_executor_confirmed_cli_ambiguous_and_free() {
         let (db, workspace, session) = fixture().await;
         let (service, probe) =
             service(db.clone(), report(false, Some(false), SidEvidence::Unknown));
@@ -1003,29 +1163,463 @@ mod tests {
             WriterLease::CliAmbiguous
         );
 
-        let action = ExecutorAction::new(
-            ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
-                prompt: "running".to_string(),
-                executor_config: ExecutorConfig::new(BaseCodingAgent::ClaudeCode),
-                working_dir: None,
-            }),
-            None,
-        );
-        ExecutionProcess::create(
-            &db.pool,
-            &CreateExecutionProcess {
-                session_id: session.id,
-                executor_action: action,
-                run_reason: ExecutionProcessRunReason::CodingAgent,
-            },
-            Uuid::new_v4(),
-            &[],
-        )
-        .await
-        .unwrap();
+        create_running_executor(&db, session.id, "running").await;
         assert_eq!(service.derive_lease(&session).await, WriterLease::Executor);
+    }
+
+    #[tokio::test]
+    async fn lease_derivation_fails_closed_on_database_and_probe_errors() {
+        let (db, _workspace, session) = fixture().await;
+        let (service, probe) =
+            service(db.clone(), report(false, Some(false), SidEvidence::Unknown));
+
+        *probe.0.lock().unwrap() = ProbeReport::failed();
+        assert_eq!(service.derive_lease(&session).await, WriterLease::Busy);
 
         db.pool.close().await;
         assert_eq!(service.derive_lease(&session).await, WriterLease::Busy);
+    }
+
+    #[tokio::test]
+    async fn dispatch_gate_queues_while_executor_is_running() {
+        let (db, _workspace, session) = fixture().await;
+        create_running_executor(&db, session.id, "already running").await;
+        let transport_state = Arc::new(StdMutex::new(TransportState::default()));
+        let transport = Arc::new(RecordingTransport {
+            db: db.clone(),
+            session_id: session.id,
+            state: transport_state.clone(),
+            paste_succeeds: true,
+        });
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(false, Some(false), SidEvidence::Unknown),
+            transport,
+            Arc::new(NeverDispatcher),
+        );
+
+        let outcome = service
+            .dispatch_gate(
+                &session,
+                "wait for executor".to_string(),
+                executor_config(),
+                QueuedMessageSource::Ui,
+                false,
+            )
+            .await
+            .unwrap();
+        let DispatchOutcome::Queued { status } = outcome else {
+            panic!("running executor must queue the prompt");
+        };
+        let message = status.message().unwrap();
+        assert_eq!(message.data.message, "wait for executor");
+        assert_eq!(message.state, QueuedMessageState::Queued);
+        assert!(transport_state.lock().unwrap().pasted_prompts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_gate_routes_confirmed_cli_through_pasting_to_pasted() {
+        let (db, workspace, session) = fixture().await;
+        let sid = "22222222-2222-4222-8222-222222222222";
+        bind_confirmed_cli(&db, &workspace, &session, sid).await;
+        let transport_state = Arc::new(StdMutex::new(TransportState::default()));
+        let transport = Arc::new(RecordingTransport {
+            db: db.clone(),
+            session_id: session.id,
+            state: transport_state.clone(),
+            paste_succeeds: true,
+        });
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(
+                true,
+                Some(true),
+                SidEvidence::ConfirmedResume(sid.to_string()),
+            ),
+            transport,
+            Arc::new(NeverDispatcher),
+        );
+
+        let outcome = service
+            .dispatch_gate(
+                &session,
+                "route to CLI".to_string(),
+                executor_config(),
+                QueuedMessageSource::Ui,
+                false,
+            )
+            .await
+            .unwrap();
+        let DispatchOutcome::RoutedToCli { delivery } = outcome else {
+            panic!("confirmed CLI must receive the prompt");
+        };
+        let message = delivery.message().unwrap();
+        assert_eq!(message.data.message, "route to CLI");
+        assert_eq!(message.state, QueuedMessageState::Pasted);
+        assert_eq!(message.claude_session_id.as_deref(), Some(sid));
+        let observations = transport_state.lock().unwrap();
+        assert_eq!(observations.pasted_prompts, ["route to CLI"]);
+        assert_eq!(observations.observed_states, [QueuedMessageState::Pasting]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_gate_queues_ambiguous_sid_without_pasting() {
+        let (db, workspace, session) = fixture().await;
+        let sid = "23232323-2323-4232-8232-232323232323";
+        bind_confirmed_cli(&db, &workspace, &session, sid).await;
+        let transport_state = Arc::new(StdMutex::new(TransportState::default()));
+        let transport = Arc::new(RecordingTransport {
+            db: db.clone(),
+            session_id: session.id,
+            state: transport_state.clone(),
+            paste_succeeds: true,
+        });
+        let (service, _) = service_with_components(
+            db,
+            report(true, Some(true), SidEvidence::Ambiguous),
+            transport,
+            Arc::new(NeverDispatcher),
+        );
+
+        let outcome = service
+            .dispatch_gate(
+                &session,
+                "do not paste ambiguously".to_string(),
+                executor_config(),
+                QueuedMessageSource::Ui,
+                false,
+            )
+            .await
+            .unwrap();
+        let DispatchOutcome::Queued { status } = outcome else {
+            panic!("ambiguous CLI sid must queue the prompt");
+        };
+        assert_eq!(
+            status.message().unwrap().data.message,
+            "do not paste ambiguously"
+        );
+        assert!(transport_state.lock().unwrap().pasted_prompts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_gate_starts_free_executor_with_scoped_reservation() {
+        let (db, _workspace, session) = fixture().await;
+        let dispatcher_state = Arc::new(StdMutex::new(DispatcherState::default()));
+        let dispatcher = Arc::new(RecordingDispatcher {
+            db: db.clone(),
+            state: dispatcher_state.clone(),
+        });
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(false, Some(false), SidEvidence::Unknown),
+            Arc::new(FakeTransport),
+            dispatcher,
+        );
+
+        let outcome = service
+            .dispatch_gate(
+                &session,
+                "start immediately".to_string(),
+                executor_config(),
+                QueuedMessageSource::Ui,
+                false,
+            )
+            .await
+            .unwrap();
+        let DispatchOutcome::Started { execution_process } = outcome else {
+            panic!("free lease must start the executor");
+        };
+        assert_eq!(execution_process.session_id, session.id);
+        let (prompts, reservation_seen) = {
+            let state = dispatcher_state.lock().unwrap();
+            (state.prompts.clone(), state.reservation_seen)
+        };
+        assert_eq!(prompts, ["start immediately"]);
+        assert!(reservation_seen);
+        assert!(
+            WorkspaceSpawnReservation::find(&db.pool, session.workspace_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            SessionQueuedMessage::find_active(&db.pool, session.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_contract_preserves_conflict_details_and_rejects_in_flight_replace() {
+        let (db, _workspace, session) = fixture().await;
+        let (service, _) = service(db.clone(), report(false, Some(false), SidEvidence::Unknown));
+
+        let first = service
+            .queue_only(
+                &session,
+                "queued from recovery".to_string(),
+                executor_config(),
+                QueuedMessageSource::Recovery,
+                false,
+            )
+            .await
+            .unwrap();
+        let DispatchOutcome::Queued { status } = first else {
+            panic!("empty slot must accept the first prompt");
+        };
+        let first_id = status.message().unwrap().id;
+
+        let conflict = service
+            .queue_only(
+                &session,
+                "new UI prompt".to_string(),
+                executor_config(),
+                QueuedMessageSource::Ui,
+                false,
+            )
+            .await
+            .unwrap();
+        let DispatchOutcome::Conflict { status } = conflict else {
+            panic!("queued replacement requires explicit confirmation");
+        };
+        let conflict_message = status.message().unwrap();
+        assert_eq!(conflict_message.id, first_id);
+        assert_eq!(conflict_message.data.message, "queued from recovery");
+        assert_eq!(conflict_message.source, QueuedMessageSource::Recovery);
+
+        let replaced = service
+            .queue_only(
+                &session,
+                "new UI prompt".to_string(),
+                executor_config(),
+                QueuedMessageSource::Ui,
+                true,
+            )
+            .await
+            .unwrap();
+        let DispatchOutcome::Queued { status } = replaced else {
+            panic!("explicit queued replacement must succeed");
+        };
+        let replaced_message = status.message().unwrap();
+        assert_eq!(replaced_message.id, first_id);
+        assert_eq!(replaced_message.data.message, "new UI prompt");
+        assert_eq!(replaced_message.source, QueuedMessageSource::Ui);
+
+        SessionQueuedMessage::claim(&db.pool, first_id, Some("sid"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            SessionQueuedMessage::mark_pasted(&db.pool, first_id)
+                .await
+                .unwrap()
+        );
+        let in_flight = service
+            .queue_only(
+                &session,
+                "replace pasted".to_string(),
+                executor_config(),
+                QueuedMessageSource::Recovery,
+                true,
+            )
+            .await
+            .unwrap();
+        let DispatchOutcome::Conflict { status } = in_flight else {
+            panic!("pasted delivery must never be replaced");
+        };
+        let in_flight_message = status.message().unwrap();
+        assert_eq!(in_flight_message.id, first_id);
+        assert_eq!(in_flight_message.data.message, "new UI prompt");
+        assert_eq!(in_flight_message.state, QueuedMessageState::Pasted);
+    }
+
+    #[tokio::test]
+    async fn delivery_reconciliation_requeues_expired_paste_without_losing_message() {
+        let (db, workspace, expired_session) = fixture().await;
+        let fresh_session = Session::create(
+            &db.pool,
+            &CreateSession {
+                executor: Some("CLAUDE_CODE".to_string()),
+                name: None,
+            },
+            Uuid::new_v4(),
+            workspace.id,
+        )
+        .await
+        .unwrap();
+        let expired = store_message(
+            &db,
+            expired_session.id,
+            "preserve after timeout",
+            QueuedMessageSource::Recovery,
+        )
+        .await;
+        SessionQueuedMessage::claim(&db.pool, expired.id, Some("expired-sid"))
+            .await
+            .unwrap()
+            .unwrap();
+        SessionQueuedMessage::mark_pasted(&db.pool, expired.id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE session_queued_messages \
+             SET pasted_at = datetime('now', '-31 seconds') WHERE id = ?",
+        )
+        .bind(expired.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let fresh = store_message(
+            &db,
+            fresh_session.id,
+            "still awaiting ack",
+            QueuedMessageSource::Ui,
+        )
+        .await;
+        SessionQueuedMessage::claim(&db.pool, fresh.id, Some("fresh-sid"))
+            .await
+            .unwrap()
+            .unwrap();
+        SessionQueuedMessage::mark_pasted(&db.pool, fresh.id)
+            .await
+            .unwrap();
+
+        let (service, _) = service(db.clone(), report(false, Some(false), SidEvidence::Unknown));
+        service.reconcile_delivery_state().await;
+
+        let expired = SessionQueuedMessage::find_by_id(&db.pool, expired.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.state, QueuedMessageState::Queued);
+        assert_eq!(expired.prompt, "preserve after timeout");
+        assert_eq!(expired.source, QueuedMessageSource::Recovery);
+        assert!(
+            expired
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not acknowledged"))
+        );
+        let fresh = SessionQueuedMessage::find_by_id(&db.pool, fresh.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.state, QueuedMessageState::Pasted);
+        assert_eq!(fresh.prompt, "still awaiting ack");
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_recovers_pasting_and_honors_ack_without_repaste() {
+        let (db, workspace, interrupted_session) = fixture().await;
+        let acknowledged_session = Session::create(
+            &db.pool,
+            &CreateSession {
+                executor: Some("CLAUDE_CODE".to_string()),
+                name: None,
+            },
+            Uuid::new_v4(),
+            workspace.id,
+        )
+        .await
+        .unwrap();
+        let interrupted = store_message(
+            &db,
+            interrupted_session.id,
+            "recover interrupted paste",
+            QueuedMessageSource::Recovery,
+        )
+        .await;
+        SessionQueuedMessage::claim(&db.pool, interrupted.id, Some("interrupted-sid"))
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(
+            "UPDATE session_queued_messages \
+             SET updated_at = datetime('now', '-6 seconds') WHERE id = ?",
+        )
+        .bind(interrupted.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let acknowledged = store_message(
+            &db,
+            acknowledged_session.id,
+            "already imported",
+            QueuedMessageSource::Ui,
+        )
+        .await;
+        SessionQueuedMessage::claim(&db.pool, acknowledged.id, Some("acknowledged-sid"))
+            .await
+            .unwrap()
+            .unwrap();
+        SessionQueuedMessage::mark_pasted(&db.pool, acknowledged.id)
+            .await
+            .unwrap();
+        let native_file = CliNativeFile::register(
+            &db.pool,
+            &RegisterCliNativeFile {
+                claude_session_id: "acknowledged-sid",
+                dir_path: "/tmp/collab-native",
+                file_name: "acknowledged-sid.jsonl",
+                discovered_workspace_id: Some(workspace.id),
+                dev: 1,
+                inode: 1,
+                observed_size: 1,
+                observed_mtime_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO cli_native_records \
+                 (file_id, line_seq, claude_session_id, uuid, kind, raw, \
+                  disposition, bound_queued_message_id) \
+             VALUES (?, 0, ?, ?, 'user', '{}', 'renderable', ?)",
+        )
+        .bind(native_file.id)
+        .bind("acknowledged-sid")
+        .bind("acknowledged-user")
+        .bind(acknowledged.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let transport_state = Arc::new(StdMutex::new(TransportState::default()));
+        let transport = Arc::new(RecordingTransport {
+            db: db.clone(),
+            session_id: acknowledged_session.id,
+            state: transport_state.clone(),
+            paste_succeeds: true,
+        });
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(false, Some(false), SidEvidence::Unknown),
+            transport,
+            Arc::new(NeverDispatcher),
+        );
+        service.reconcile_delivery_state().await;
+
+        let interrupted = SessionQueuedMessage::find_by_id(&db.pool, interrupted.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(interrupted.state, QueuedMessageState::Queued);
+        assert_eq!(interrupted.prompt, "recover interrupted paste");
+        let acknowledged = SessionQueuedMessage::find_by_id(&db.pool, acknowledged.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(acknowledged.state, QueuedMessageState::Imported);
+        assert!(acknowledged.acked_at.is_some());
+        assert!(
+            !service
+                .drain_session(acknowledged_session.id)
+                .await
+                .unwrap()
+        );
+        assert!(transport_state.lock().unwrap().pasted_prompts.is_empty());
     }
 }
