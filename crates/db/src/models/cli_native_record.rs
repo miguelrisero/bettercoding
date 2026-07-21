@@ -494,8 +494,8 @@ impl CliNativeRecord {
                                  AND prompt = $2
                                  AND (claude_session_id IS NULL OR claude_session_id = $3)
                                  AND pasted_at IS NOT NULL
-                                 AND pasted_at >= $4
-                                 AND pasted_at <= $5
+                                 AND julianday(pasted_at) >= julianday($4)
+                                 AND julianday(pasted_at) <= julianday($5)
                                ORDER BY pasted_at DESC
                                LIMIT 1"#,
                                 session_id,
