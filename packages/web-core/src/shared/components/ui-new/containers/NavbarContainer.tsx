@@ -5,11 +5,7 @@ import { useActions } from '@/shared/hooks/useActions';
 import { useSyncErrorContext } from '@/shared/hooks/useSyncErrorContext';
 import { useUserOrganizations } from '@/shared/hooks/useUserOrganizations';
 import { useOrganizationStore } from '@/shared/stores/useOrganizationStore';
-import {
-  Navbar,
-  type NavbarSectionItem,
-  type MobileTabId,
-} from '@vibe/ui/components/Navbar';
+import { Navbar, type NavbarSectionItem } from '@vibe/ui/components/Navbar';
 import { Tooltip } from '@vibe/ui/components/Tooltip';
 import { AppBarUserPopoverContainer } from './AppBarUserPopoverContainer';
 import { AppBarNotificationBellContainer } from '@/pages/workspaces/AppBarNotificationBellContainer';
@@ -327,7 +323,7 @@ export function NavbarContainer({
       onOpenCommandBar={handleOpenCommandBar}
       onOpenSettings={handleOpenSettings}
       onNavigateBack={handleNavigateBack}
-      mobileActiveTab={mobileActiveTab as MobileTabId}
+      mobileActiveTab={mobileActiveTab}
       onMobileTabChange={(tab) => setMobileActiveTab(tab)}
     />
   );
