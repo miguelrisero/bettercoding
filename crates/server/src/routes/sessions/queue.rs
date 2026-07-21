@@ -49,9 +49,19 @@ async fn queue_message(
         executor_config: payload.executor_config,
     };
     let result = deployment
-        .queued_message_service()
-        .queue_message(session.id, data, QueuedMessageSource::Ui, payload.replace)
-        .await?;
+        .cli_collab()
+        .queue_message(
+            &session,
+            data.message,
+            data.executor_config,
+            QueuedMessageSource::Ui,
+            payload.replace,
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(?error, session_id = %session.id, "queue mutation failed closed");
+            ApiError::Conflict("Queue state changed; reload and try again".to_string())
+        })?;
 
     if matches!(result, QueueMutation::Stored(_)) {
         deployment
@@ -72,9 +82,13 @@ async fn cancel_queued_message(
     State(deployment): State<DeploymentImpl>,
 ) -> Result<QueueResponse, ApiError> {
     let result = deployment
-        .queued_message_service()
+        .cli_collab()
         .cancel_queued(session.id)
-        .await?;
+        .await
+        .map_err(|error| {
+            tracing::warn!(?error, session_id = %session.id, "queue cancellation failed closed");
+            ApiError::Conflict("Queue state changed; reload and try again".to_string())
+        })?;
     if matches!(result, QueueMutation::Stored(_)) {
         deployment
             .track_if_analytics_allowed(

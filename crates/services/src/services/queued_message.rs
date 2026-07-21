@@ -3,10 +3,7 @@ use db::{
     DBService,
     models::{
         scratch::DraftFollowUpData,
-        session_queued_message::{
-            CancelQueuedMessageResult, QueuedMessageSource, QueuedMessageState,
-            SessionQueuedMessage, StoreQueuedMessageResult,
-        },
+        session_queued_message::{QueuedMessageSource, QueuedMessageState, SessionQueuedMessage},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -125,53 +122,6 @@ pub struct QueuedMessageService {
 impl QueuedMessageService {
     pub fn new(db: DBService) -> Self {
         Self { db }
-    }
-
-    pub async fn queue_message(
-        &self,
-        session_id: Uuid,
-        data: DraftFollowUpData,
-        source: QueuedMessageSource,
-        replace: bool,
-    ) -> Result<QueueMutation, QueuedMessageError> {
-        let executor_config = serde_json::to_string(&data.executor_config).map_err(|source| {
-            QueuedMessageError::InvalidExecutorConfig {
-                id: Uuid::nil(),
-                source,
-            }
-        })?;
-        match SessionQueuedMessage::store(
-            &self.db.pool,
-            session_id,
-            &data.message,
-            Some(&executor_config),
-            source,
-            replace,
-        )
-        .await?
-        {
-            StoreQueuedMessageResult::Stored(row) => Ok(QueueMutation::Stored(
-                QueueStatus::from_message(row.try_into()?),
-            )),
-            StoreQueuedMessageResult::Conflict(row) => Ok(QueueMutation::Conflict(
-                QueueStatus::from_message(row.try_into()?),
-            )),
-        }
-    }
-
-    pub async fn cancel_queued(
-        &self,
-        session_id: Uuid,
-    ) -> Result<QueueMutation, QueuedMessageError> {
-        match SessionQueuedMessage::cancel_queued(&self.db.pool, session_id).await? {
-            CancelQueuedMessageResult::Empty => Ok(QueueMutation::Stored(QueueStatus::Empty)),
-            CancelQueuedMessageResult::Cancelled(_) => {
-                Ok(QueueMutation::Stored(QueueStatus::Empty))
-            }
-            CancelQueuedMessageResult::Conflict(row) => Ok(QueueMutation::Conflict(
-                QueueStatus::from_message(row.try_into()?),
-            )),
-        }
     }
 
     pub async fn get_queued(

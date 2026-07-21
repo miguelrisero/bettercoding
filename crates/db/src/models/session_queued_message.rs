@@ -144,24 +144,8 @@ impl SessionQueuedMessage {
         source: QueuedMessageSource,
         replace: bool,
     ) -> Result<StoreQueuedMessageResult, sqlx::Error> {
-        let mut tx = pool.begin().await?;
-        let sql = format!(
-            "SELECT {} FROM session_queued_messages \
-             WHERE session_id = ? AND state IN ('queued', 'pasting', 'pasted') \
-             ORDER BY created_at DESC LIMIT 1",
-            Self::SELECT_FIELDS
-        );
-        let existing = sqlx::query_as::<_, Self>(&sql)
-            .bind(session_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-
-        let id = if let Some(existing) = existing {
-            if !replace || existing.state != QueuedMessageState::Queued {
-                tx.rollback().await?;
-                return Ok(StoreQueuedMessageResult::Conflict(existing));
-            }
-            sqlx::query!(
+        if replace {
+            let sql = format!(
                 r#"UPDATE session_queued_messages SET
                        prompt = $1,
                        executor_config = $2,
@@ -172,37 +156,43 @@ impl SessionQueuedMessage {
                        pasted_at = NULL,
                        acked_at = NULL,
                        updated_at = datetime('now', 'subsec')
-                   WHERE id = $4 AND state = 'queued'"#,
-                prompt,
-                executor_config,
-                source,
-                existing.id
-            )
-            .execute(&mut *tx)
-            .await?;
-            existing.id
-        } else {
-            let id = Uuid::new_v4();
-            sqlx::query!(
-                r#"INSERT INTO session_queued_messages
-                       (id, session_id, prompt, executor_config, source, state)
-                   VALUES ($1, $2, $3, $4, $5, 'queued')"#,
-                id,
-                session_id,
-                prompt,
-                executor_config,
-                source
-            )
-            .execute(&mut *tx)
-            .await?;
-            id
-        };
-        tx.commit().await?;
-        Ok(StoreQueuedMessageResult::Stored(
-            Self::find_by_id(pool, id)
+                   WHERE session_id = $4 AND state = 'queued'
+                   RETURNING {}"#,
+                Self::SELECT_FIELDS
+            );
+            if let Some(row) = sqlx::query_as::<_, Self>(&sql)
+                .bind(prompt)
+                .bind(executor_config)
+                .bind(source)
+                .bind(session_id)
+                .fetch_optional(pool)
                 .await?
-                .expect("stored queue row exists"),
-        ))
+            {
+                return Ok(StoreQueuedMessageResult::Stored(row));
+            }
+        }
+
+        if let Some(existing) = Self::find_active(pool, session_id).await? {
+            return Ok(StoreQueuedMessageResult::Conflict(existing));
+        }
+
+        let id = Uuid::new_v4();
+        sqlx::query!(
+            r#"INSERT INTO session_queued_messages
+                   (id, session_id, prompt, executor_config, source, state)
+               VALUES ($1, $2, $3, $4, $5, 'queued')"#,
+            id,
+            session_id,
+            prompt,
+            executor_config,
+            source
+        )
+        .execute(pool)
+        .await?;
+        Self::find_by_id(pool, id)
+            .await?
+            .map(StoreQueuedMessageResult::Stored)
+            .ok_or(sqlx::Error::RowNotFound)
     }
 
     async fn claim(
@@ -344,26 +334,25 @@ impl SessionQueuedMessage {
         pool: &SqlitePool,
         session_id: Uuid,
     ) -> Result<CancelQueuedMessageResult, sqlx::Error> {
-        let Some(active) = Self::find_active(pool, session_id).await? else {
-            return Ok(CancelQueuedMessageResult::Empty);
-        };
-        if active.state != QueuedMessageState::Queued {
-            return Ok(CancelQueuedMessageResult::Conflict(active));
-        }
-        sqlx::query!(
+        let sql = format!(
             r#"UPDATE session_queued_messages SET
                    state = 'cancelled',
                    updated_at = datetime('now', 'subsec')
-               WHERE id = $1 AND state = 'queued'"#,
-            active.id
-        )
-        .execute(pool)
-        .await?;
-        Ok(CancelQueuedMessageResult::Cancelled(
-            Self::find_by_id(pool, active.id)
-                .await?
-                .expect("cancelled queue row exists"),
-        ))
+               WHERE session_id = $1 AND state = 'queued'
+               RETURNING {}"#,
+            Self::SELECT_FIELDS
+        );
+        if let Some(cancelled) = sqlx::query_as::<_, Self>(&sql)
+            .bind(session_id)
+            .fetch_optional(pool)
+            .await?
+        {
+            return Ok(CancelQueuedMessageResult::Cancelled(cancelled));
+        }
+        Ok(match Self::find_active(pool, session_id).await? {
+            Some(active) => CancelQueuedMessageResult::Conflict(active),
+            None => CancelQueuedMessageResult::Empty,
+        })
     }
 
     /// Reconcile delivery rows after startup or a periodic drain. Ack evidence
@@ -556,6 +545,87 @@ mod tests {
         assert!(matches!(
             in_flight,
             StoreQueuedMessageResult::Conflict(ref row)
+                if row.state == QueuedMessageState::Pasting
+        ));
+    }
+
+    #[tokio::test]
+    async fn replace_losing_a_queued_slot_reports_conflict_instead_of_success() {
+        let (pool, session_id) = session_fixture().await;
+        SessionQueuedMessage::store(
+            &pool,
+            session_id,
+            "original",
+            None,
+            QueuedMessageSource::Ui,
+            false,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"CREATE TRIGGER simulate_replace_claim_race
+               BEFORE UPDATE OF prompt ON session_queued_messages
+               WHEN OLD.state = 'queued'
+               BEGIN
+                   UPDATE session_queued_messages SET state = 'pasting'
+                   WHERE id = OLD.id;
+                   SELECT RAISE(IGNORE);
+               END"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = SessionQueuedMessage::store(
+            &pool,
+            session_id,
+            "replacement",
+            None,
+            QueuedMessageSource::Recovery,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            StoreQueuedMessageResult::Conflict(ref row)
+                if row.prompt == "original" && row.state == QueuedMessageState::Pasting
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancel_losing_a_claim_race_does_not_report_false_success() {
+        let (pool, session_id) = session_fixture().await;
+        SessionQueuedMessage::store(
+            &pool,
+            session_id,
+            "claim wins",
+            None,
+            QueuedMessageSource::Ui,
+            false,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"CREATE TRIGGER simulate_cancel_claim_race
+               BEFORE UPDATE OF state ON session_queued_messages
+               WHEN OLD.state = 'queued' AND NEW.state = 'cancelled'
+               BEGIN
+                   UPDATE session_queued_messages SET state = 'pasting'
+                   WHERE id = OLD.id;
+                   SELECT RAISE(IGNORE);
+               END"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = SessionQueuedMessage::cancel_queued(&pool, session_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            CancelQueuedMessageResult::Conflict(ref row)
                 if row.state == QueuedMessageState::Pasting
         ));
     }

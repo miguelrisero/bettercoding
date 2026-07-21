@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use super::{
     claude_transcript_ingest::ClaudeTranscriptIngest,
-    queued_message::{QueueStatus, QueuedMessage, QueuedMessageError},
+    queued_message::{QueueMutation, QueueStatus, QueuedMessage, QueuedMessageError},
 };
 
 const DRAIN_INTERVAL: Duration = Duration::from_secs(1);
@@ -381,32 +381,34 @@ impl CliCollabService {
         Ok(outcome)
     }
 
-    pub async fn queue_only(
+    pub async fn queue_message(
         &self,
         session: &Session,
         prompt: String,
         executor_config: ExecutorConfig,
         source: QueuedMessageSource,
         replace: bool,
-    ) -> Result<DispatchOutcome, CliCollabError> {
+    ) -> Result<QueueMutation, CliCollabError> {
         let lock = self.session_lock(session.id).await;
         let _guard = lock.lock().await;
         let result = self
             .store_slot_result(session.id, &prompt, &executor_config, source, replace)
             .await?;
         let outcome = match result {
-            StoreQueuedMessageResult::Stored(row) => DispatchOutcome::Queued {
-                status: Self::status_from_row(row)?,
-            },
-            StoreQueuedMessageResult::Conflict(row) => DispatchOutcome::Conflict {
-                status: Self::status_from_row(row)?,
-            },
+            StoreQueuedMessageResult::Stored(row) => {
+                QueueMutation::Stored(Self::status_from_row(row)?)
+            }
+            StoreQueuedMessageResult::Conflict(row) => {
+                QueueMutation::Conflict(Self::status_from_row(row)?)
+            }
         };
-        self.notify.notify_one();
+        if matches!(outcome, QueueMutation::Stored(_)) {
+            self.notify.notify_one();
+        }
         Ok(outcome)
     }
 
-    pub async fn cancel_queued(&self, session_id: Uuid) -> Result<QueueStatus, CliCollabError> {
+    pub async fn cancel_queued(&self, session_id: Uuid) -> Result<QueueMutation, CliCollabError> {
         let lock = self.session_lock(session_id).await;
         let _guard = lock.lock().await;
         match db::models::session_queued_message::SessionQueuedMessage::cancel_queued(
@@ -417,10 +419,10 @@ impl CliCollabService {
         {
             db::models::session_queued_message::CancelQueuedMessageResult::Empty
             | db::models::session_queued_message::CancelQueuedMessageResult::Cancelled(_) => {
-                Ok(QueueStatus::Empty)
+                Ok(QueueMutation::Stored(QueueStatus::Empty))
             }
             db::models::session_queued_message::CancelQueuedMessageResult::Conflict(row) => {
-                Self::status_from_row(row)
+                Ok(QueueMutation::Conflict(Self::status_from_row(row)?))
             }
         }
     }
@@ -2138,7 +2140,7 @@ mod tests {
         let (service, _) = service(db.clone(), report(false, Some(false), SidEvidence::Unknown));
 
         let first = service
-            .queue_only(
+            .queue_message(
                 &session,
                 "queued from recovery".to_string(),
                 executor_config(),
@@ -2147,13 +2149,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let DispatchOutcome::Queued { status } = first else {
+        let QueueMutation::Stored(status) = first else {
             panic!("empty slot must accept the first prompt");
         };
         let first_id = status.message().unwrap().id;
 
         let conflict = service
-            .queue_only(
+            .queue_message(
                 &session,
                 "new UI prompt".to_string(),
                 executor_config(),
@@ -2162,7 +2164,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let DispatchOutcome::Conflict { status } = conflict else {
+        let QueueMutation::Conflict(status) = conflict else {
             panic!("queued replacement requires explicit confirmation");
         };
         let conflict_message = status.message().unwrap();
@@ -2171,7 +2173,7 @@ mod tests {
         assert_eq!(conflict_message.source, QueuedMessageSource::Recovery);
 
         let replaced = service
-            .queue_only(
+            .queue_message(
                 &session,
                 "new UI prompt".to_string(),
                 executor_config(),
@@ -2180,7 +2182,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let DispatchOutcome::Queued { status } = replaced else {
+        let QueueMutation::Stored(status) = replaced else {
             panic!("explicit queued replacement must succeed");
         };
         let replaced_message = status.message().unwrap();
@@ -2198,7 +2200,7 @@ mod tests {
                 .unwrap()
         );
         let in_flight = service
-            .queue_only(
+            .queue_message(
                 &session,
                 "replace pasted".to_string(),
                 executor_config(),
@@ -2207,7 +2209,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let DispatchOutcome::Conflict { status } = in_flight else {
+        let QueueMutation::Conflict(status) = in_flight else {
             panic!("pasted delivery must never be replaced");
         };
         let in_flight_message = status.message().unwrap();
