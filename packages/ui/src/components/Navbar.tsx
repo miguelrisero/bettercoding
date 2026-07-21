@@ -281,7 +281,7 @@ export function Navbar({
                       className="size-icon-sm"
                       weight={isActive ? 'fill' : 'regular'}
                     />
-                    <span className={cn('hidden', isActive && 'inline')}>
+                    <span className={isActive ? 'inline' : 'hidden'}>
                       {tab.label}
                     </span>
                   </button>
