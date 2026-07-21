@@ -38,7 +38,7 @@ use super::{
 
 const DRAIN_INTERVAL: Duration = Duration::from_secs(1);
 const PASTING_STARTUP_GRACE: ChronoDuration = ChronoDuration::seconds(5);
-const PASTE_ACK_TIMEOUT: ChronoDuration = ChronoDuration::seconds(30);
+const PASTE_ACK_HARD_CAP: ChronoDuration = ChronoDuration::minutes(15);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidEvidence {
@@ -691,6 +691,9 @@ impl CliCollabService {
         match self.derive_lease_locked(&session).await {
             WriterLease::Executor | WriterLease::CliAmbiguous | WriterLease::Busy => Ok(false),
             WriterLease::Cli { claude_session_id } => {
+                if self.original_paste_binding_is_active(&row).await? {
+                    return Ok(false);
+                }
                 let routed = self
                     .paste_slot(&session, row, claude_session_id.as_deref())
                     .await?;
@@ -713,29 +716,131 @@ impl CliCollabService {
         }
     }
 
+    async fn original_paste_binding_is_active(
+        &self,
+        row: &SessionQueuedMessage,
+    ) -> Result<bool, CliCollabError> {
+        if !row.was_requeued_from_pasted() {
+            return Ok(false);
+        }
+        let Some(pasted_at) = row.pasted_at else {
+            return Ok(false);
+        };
+        Ok(
+            CliPaneBinding::find_active_for_session(&self.db.pool, row.session_id)
+                .await?
+                .is_some_and(|binding| binding.created_at <= pasted_at),
+        )
+    }
+
+    async fn reconcile_pasted_delivery(
+        &self,
+        row: SessionQueuedMessage,
+    ) -> Result<bool, CliCollabError> {
+        let lock = self.session_lock(row.session_id).await;
+        let _guard = lock.lock().await;
+        let Some(row) = SessionQueuedMessage::find_by_id(&self.db.pool, row.id).await? else {
+            return Ok(false);
+        };
+        if row.state != QueuedMessageState::Pasted {
+            return Ok(false);
+        }
+        let session = Session::find_by_id(&self.db.pool, row.session_id)
+            .await?
+            .ok_or(CliCollabError::WorkspaceMissing(row.session_id))?;
+        let binding =
+            CliPaneBinding::find_active_for_session(&self.db.pool, row.session_id).await?;
+        let Some(binding) = binding else {
+            return Ok(SessionQueuedMessage::requeue_pasted(&self.db.pool, row.id).await?);
+        };
+        if row
+            .pasted_at
+            .is_some_and(|pasted_at| binding.created_at > pasted_at)
+        {
+            return Ok(SessionQueuedMessage::requeue_pasted(&self.db.pool, row.id).await?);
+        }
+        let workspace = Workspace::find_by_id(&self.db.pool, session.workspace_id)
+            .await?
+            .ok_or(CliCollabError::WorkspaceMissing(row.session_id))?;
+        let Some(effective_dir) = workspace
+            .container_ref
+            .as_deref()
+            .and_then(|root| session.effective_working_dir(Path::new(root)))
+        else {
+            return Ok(false);
+        };
+        let report = self
+            .probe
+            .probe(
+                session.workspace_id,
+                &effective_dir,
+                row.claude_session_id.as_deref(),
+            )
+            .await;
+        if report.probe_failed || report.agent_running.is_none() {
+            return Ok(false);
+        }
+        if !report.pane_session_exists {
+            CliPaneBinding::release(&self.db.pool, binding.id).await?;
+        }
+        if !report.pane_session_exists || report.agent_running == Some(false) {
+            return Ok(SessionQueuedMessage::requeue_pasted(&self.db.pool, row.id).await?);
+        }
+        Ok(false)
+    }
+
     async fn reconcile_delivery_state(&self) {
-        match SessionQueuedMessage::reconcile(
+        let reconciled = match SessionQueuedMessage::reconcile(
             &self.db.pool,
             Utc::now(),
             PASTING_STARTUP_GRACE,
-            PASTE_ACK_TIMEOUT,
+            PASTE_ACK_HARD_CAP,
         )
         .await
         {
-            Ok(reconciled)
-                if reconciled.imported > 0
-                    || reconciled.requeued_pasting > 0
-                    || reconciled.requeued_pasted > 0 =>
-            {
-                tracing::info!(
-                    imported = reconciled.imported,
-                    requeued_pasting = reconciled.requeued_pasting,
-                    requeued_pasted = reconciled.requeued_pasted,
-                    "reconciled durable CLI delivery state"
-                );
+            Ok(reconciled) => reconciled,
+            Err(error) => {
+                tracing::warn!(?error, "failed to reconcile CLI delivery state");
+                return;
             }
-            Ok(_) => {}
-            Err(error) => tracing::warn!(?error, "failed to reconcile CLI delivery state"),
+        };
+        let rows = match SessionQueuedMessage::list_active(&self.db.pool).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(?error, "failed to scan pasted CLI delivery evidence");
+                return;
+            }
+        };
+        let mut requeued_lost_evidence = 0_u64;
+        for row in rows
+            .into_iter()
+            .filter(|row| row.state == QueuedMessageState::Pasted)
+        {
+            let queue_id = row.id;
+            let session_id = row.session_id;
+            match self.reconcile_pasted_delivery(row).await {
+                Ok(true) => requeued_lost_evidence += 1,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    ?error,
+                    %queue_id,
+                    %session_id,
+                    "failed closed while reconciling CLI delivery evidence"
+                ),
+            }
+        }
+        if reconciled.imported > 0
+            || reconciled.requeued_pasting > 0
+            || reconciled.requeued_pasted > 0
+            || requeued_lost_evidence > 0
+        {
+            tracing::info!(
+                imported = reconciled.imported,
+                requeued_pasting = reconciled.requeued_pasting,
+                requeued_pasted = reconciled.requeued_pasted,
+                requeued_lost_evidence,
+                "reconciled durable CLI delivery state"
+            );
         }
     }
 
@@ -1104,8 +1209,8 @@ mod tests {
         workspace: &Workspace,
         session: &Session,
         sid: &str,
-    ) {
-        CliPaneBinding::record_launch(
+    ) -> CliPaneBinding {
+        let binding = CliPaneBinding::record_launch(
             &db.pool,
             workspace.id,
             session.id,
@@ -1118,6 +1223,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        binding
     }
 
     #[tokio::test]
@@ -1435,79 +1541,253 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_reconciliation_requeues_expired_paste_without_losing_message() {
-        let (db, workspace, expired_session) = fixture().await;
-        let fresh_session = Session::create(
-            &db.pool,
-            &CreateSession {
-                executor: Some("CLAUDE_CODE".to_string()),
-                name: None,
-            },
-            Uuid::new_v4(),
-            workspace.id,
-        )
-        .await
-        .unwrap();
-        let expired = store_message(
+    async fn delivery_reconciliation_keeps_long_live_paste_without_repasting() {
+        let (db, workspace, session) = fixture().await;
+        let sid = "31313131-3131-4131-8131-313131313131";
+        let binding = bind_confirmed_cli(&db, &workspace, &session, sid).await;
+        let row = store_message(
             &db,
-            expired_session.id,
-            "preserve after timeout",
-            QueuedMessageSource::Recovery,
+            session.id,
+            "wait through long CLI turn",
+            QueuedMessageSource::Ui,
         )
         .await;
-        SessionQueuedMessage::claim(&db.pool, expired.id, Some("expired-sid"))
+        SessionQueuedMessage::claim(&db.pool, row.id, Some(sid))
             .await
             .unwrap()
             .unwrap();
-        SessionQueuedMessage::mark_pasted(&db.pool, expired.id)
+        SessionQueuedMessage::mark_pasted(&db.pool, row.id)
             .await
             .unwrap();
+        sqlx::query(
+            "UPDATE cli_pane_bindings \
+             SET created_at = datetime('now', '-32 seconds') WHERE id = ?",
+        )
+        .bind(binding.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE session_queued_messages \
              SET pasted_at = datetime('now', '-31 seconds') WHERE id = ?",
         )
-        .bind(expired.id)
+        .bind(row.id)
         .execute(&db.pool)
         .await
         .unwrap();
+        let transport_state = Arc::new(StdMutex::new(TransportState::default()));
+        let transport = Arc::new(RecordingTransport {
+            db: db.clone(),
+            session_id: session.id,
+            state: transport_state.clone(),
+            paste_succeeds: true,
+        });
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(
+                true,
+                Some(true),
+                SidEvidence::ConfirmedResume(sid.to_string()),
+            ),
+            transport,
+            Arc::new(NeverDispatcher),
+        );
 
-        let fresh = store_message(
+        service.reconcile_delivery_state().await;
+
+        let row = SessionQueuedMessage::find_by_id(&db.pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, QueuedMessageState::Pasted);
+        assert_eq!(row.prompt, "wait through long CLI turn");
+        assert!(row.failure_reason.is_none());
+        assert!(!service.drain_session(session.id).await.unwrap());
+        assert!(transport_state.lock().unwrap().pasted_prompts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delivery_reconciliation_requeues_dead_pane_with_notice() {
+        let (db, workspace, session) = fixture().await;
+        let sid = "32323232-3232-4232-8232-323232323232";
+        let binding = bind_confirmed_cli(&db, &workspace, &session, sid).await;
+        let row = store_message(
             &db,
-            fresh_session.id,
-            "still awaiting ack",
+            session.id,
+            "recover after pane death",
+            QueuedMessageSource::Recovery,
+        )
+        .await;
+        SessionQueuedMessage::claim(&db.pool, row.id, Some(sid))
+            .await
+            .unwrap()
+            .unwrap();
+        SessionQueuedMessage::mark_pasted(&db.pool, row.id)
+            .await
+            .unwrap();
+        let pasted_at = SessionQueuedMessage::find_by_id(&db.pool, row.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .pasted_at;
+        let (service, _) = service(db.clone(), report(false, Some(false), SidEvidence::Unknown));
+
+        service.reconcile_delivery_state().await;
+
+        let row = SessionQueuedMessage::find_by_id(&db.pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.was_requeued_from_pasted());
+        assert_eq!(row.pasted_at, pasted_at);
+        assert_eq!(
+            row.failure_reason.as_deref(),
+            Some(db::models::session_queued_message::PASTED_REQUEUE_FAILURE_REASON)
+        );
+        assert!(
+            CliPaneBinding::find_by_id(&db.pool, binding.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .released_at
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_reconciliation_hard_cap_requeues_with_notice() {
+        let (db, workspace, session) = fixture().await;
+        let sid = "33333333-3333-4333-8333-333333333333";
+        let binding = bind_confirmed_cli(&db, &workspace, &session, sid).await;
+        let row = store_message(
+            &db,
+            session.id,
+            "hard capped CLI delivery",
             QueuedMessageSource::Ui,
         )
         .await;
-        SessionQueuedMessage::claim(&db.pool, fresh.id, Some("fresh-sid"))
+        SessionQueuedMessage::claim(&db.pool, row.id, Some(sid))
             .await
             .unwrap()
             .unwrap();
-        SessionQueuedMessage::mark_pasted(&db.pool, fresh.id)
+        SessionQueuedMessage::mark_pasted(&db.pool, row.id)
             .await
             .unwrap();
+        sqlx::query(
+            "UPDATE cli_pane_bindings \
+             SET created_at = datetime('now', '-17 minutes') WHERE id = ?",
+        )
+        .bind(binding.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE session_queued_messages \
+             SET pasted_at = datetime('now', '-16 minutes') WHERE id = ?",
+        )
+        .bind(row.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let transport_state = Arc::new(StdMutex::new(TransportState::default()));
+        let transport = Arc::new(RecordingTransport {
+            db: db.clone(),
+            session_id: session.id,
+            state: transport_state.clone(),
+            paste_succeeds: true,
+        });
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(
+                true,
+                Some(true),
+                SidEvidence::ConfirmedResume(sid.to_string()),
+            ),
+            transport,
+            Arc::new(NeverDispatcher),
+        );
 
-        let (service, _) = service(db.clone(), report(false, Some(false), SidEvidence::Unknown));
         service.reconcile_delivery_state().await;
 
-        let expired = SessionQueuedMessage::find_by_id(&db.pool, expired.id)
+        let row = SessionQueuedMessage::find_by_id(&db.pool, row.id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(expired.state, QueuedMessageState::Queued);
-        assert_eq!(expired.prompt, "preserve after timeout");
-        assert_eq!(expired.source, QueuedMessageSource::Recovery);
-        assert!(
-            expired
-                .failure_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("not acknowledged"))
+        assert!(row.was_requeued_from_pasted());
+        assert_eq!(
+            row.failure_reason.as_deref(),
+            Some(db::models::session_queued_message::PASTED_REQUEUE_FAILURE_REASON)
         );
-        let fresh = SessionQueuedMessage::find_by_id(&db.pool, fresh.id)
+        assert!(!service.drain_session(session.id).await.unwrap());
+        assert!(transport_state.lock().unwrap().pasted_prompts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn requeued_paste_waits_for_original_binding_then_drains_after_release() {
+        let (db, workspace, session) = fixture().await;
+        let sid = "34343434-3434-4434-8434-343434343434";
+        let binding = bind_confirmed_cli(&db, &workspace, &session, sid).await;
+        let row = store_message(
+            &db,
+            session.id,
+            "dispatch only after pane release",
+            QueuedMessageSource::Ui,
+        )
+        .await;
+        SessionQueuedMessage::claim(&db.pool, row.id, Some(sid))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(fresh.state, QueuedMessageState::Pasted);
-        assert_eq!(fresh.prompt, "still awaiting ack");
+        SessionQueuedMessage::mark_pasted(&db.pool, row.id)
+            .await
+            .unwrap();
+        SessionQueuedMessage::requeue_pasted(&db.pool, row.id)
+            .await
+            .unwrap();
+        let transport_state = Arc::new(StdMutex::new(TransportState::default()));
+        let transport = Arc::new(RecordingTransport {
+            db: db.clone(),
+            session_id: session.id,
+            state: transport_state.clone(),
+            paste_succeeds: true,
+        });
+        let dispatcher_state = Arc::new(StdMutex::new(DispatcherState::default()));
+        let dispatcher = Arc::new(RecordingDispatcher {
+            db: db.clone(),
+            state: dispatcher_state.clone(),
+        });
+        let (service, probe) = service_with_components(
+            db.clone(),
+            report(
+                true,
+                Some(true),
+                SidEvidence::ConfirmedResume(sid.to_string()),
+            ),
+            transport,
+            dispatcher,
+        );
+
+        assert!(!service.drain_session(session.id).await.unwrap());
+        assert!(transport_state.lock().unwrap().pasted_prompts.is_empty());
+        assert!(dispatcher_state.lock().unwrap().prompts.is_empty());
+
+        CliPaneBinding::release(&db.pool, binding.id).await.unwrap();
+        *probe.0.lock().unwrap() = report(false, Some(false), SidEvidence::Unknown);
+        assert!(service.drain_session(session.id).await.unwrap());
+
+        assert!(transport_state.lock().unwrap().pasted_prompts.is_empty());
+        assert_eq!(
+            dispatcher_state.lock().unwrap().prompts,
+            ["dispatch only after pane release"]
+        );
+        assert_eq!(
+            SessionQueuedMessage::find_by_id(&db.pool, row.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            QueuedMessageState::Consumed
+        );
     }
 
     #[tokio::test]
