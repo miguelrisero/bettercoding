@@ -31,6 +31,7 @@ function createHarness({
   let mode = initialMode;
   let suppressed = false;
   let nextFrameId = 1;
+  let scheduledFrameCount = 0;
   const frames = new Map<number, (t: number) => void>();
   const wheels: WheelRecord[] = [];
 
@@ -40,6 +41,7 @@ function createHarness({
     isSuppressed: () => suppressed,
     now: () => nowT,
     scheduleFrame: (cb) => {
+      scheduledFrameCount += 1;
       const id = nextFrameId++;
       frames.set(id, cb);
       return id;
@@ -81,6 +83,7 @@ function createHarness({
     pumpFrame,
     pumpUntilIdle,
     pendingFrames: () => frames.size,
+    scheduledFrameCount: () => scheduledFrameCount,
     setMode: (nextMode: string) => {
       mode = nextMode;
     },
@@ -376,6 +379,42 @@ describe('createTouchScrollController (gesture ownership)', () => {
 });
 
 describe('createTouchScrollController (momentum)', () => {
+  it('does not schedule momentum when suppression starts immediately before lift', () => {
+    const harness = createHarness();
+    harness.ctrl.onTouchStart({ touches: 1, clientX: 0, clientY: 300 });
+    harness.advance(16);
+    harness.ctrl.onTouchMove({ touches: 1, clientX: 0, clientY: 240 });
+    harness.advance(16);
+    harness.ctrl.onTouchMove({ touches: 1, clientX: 0, clientY: 180 });
+    const wheelsAtLift = harness.wheels.length;
+
+    harness.setSuppressed(true);
+    harness.ctrl.onTouchEnd();
+
+    expect(harness.scheduledFrameCount()).toBe(0);
+    for (let frame = 0; frame < 10; frame += 1) harness.pumpFrame();
+    expect(harness.wheels).toHaveLength(wheelsAtLift);
+    expect(harness.pendingFrames()).toBe(0);
+  });
+
+  it('does not schedule momentum when mouse tracking stops immediately before lift', () => {
+    const harness = createHarness();
+    harness.ctrl.onTouchStart({ touches: 1, clientX: 0, clientY: 300 });
+    harness.advance(16);
+    harness.ctrl.onTouchMove({ touches: 1, clientX: 0, clientY: 240 });
+    harness.advance(16);
+    harness.ctrl.onTouchMove({ touches: 1, clientX: 0, clientY: 180 });
+    const wheelsAtLift = harness.wheels.length;
+
+    harness.setMode('none');
+    harness.ctrl.onTouchEnd();
+
+    expect(harness.scheduledFrameCount()).toBe(0);
+    for (let frame = 0; frame < 10; frame += 1) harness.pumpFrame();
+    expect(harness.wheels).toHaveLength(wheelsAtLift);
+    expect(harness.pendingFrames()).toBe(0);
+  });
+
   it('does not start momentum after a fast drag is held still for 200ms', () => {
     const harness = createHarness();
     harness.ctrl.onTouchStart({ touches: 1, clientX: 0, clientY: 300 });
@@ -452,6 +491,27 @@ describe('createTouchScrollController (momentum)', () => {
     for (let i = 1; i < fullBuckets.length; i += 1) {
       expect(fullBuckets[i]).toBeLessThanOrEqual(fullBuckets[i - 1]);
     }
+  });
+
+  it('keeps irregular 48ms-frame momentum within the 16ms-frame envelope', () => {
+    const tailWheelCount = (dt: number): number => {
+      const harness = createHarness();
+      startFlick(harness);
+      const dragWheelCount = harness.wheels.length;
+
+      harness.pumpUntilIdle(500, dt);
+      expect(harness.pendingFrames()).toBe(0);
+      return harness.wheels.length - dragWheelCount;
+    };
+
+    const regularTailWheels = tailWheelCount(16);
+    const irregularTailWheels = tailWheelCount(48);
+
+    expect(irregularTailWheels).toBeGreaterThan(0);
+    expect(irregularTailWheels).toBeGreaterThanOrEqual(
+      regularTailWheels * 0.75
+    );
+    expect(irregularTailWheels).toBeLessThanOrEqual(regularTailWheels * 1.25);
   });
 
   it('cancels the tail on re-grab and requires a full row of new travel', () => {
@@ -562,6 +622,29 @@ describe('createTouchScrollController (momentum)', () => {
     expect(harness.wheels).toHaveLength(wheelsBeforeStall);
     expect(harness.pendingFrames()).toBe(0);
     expect(MOMENTUM_MAX_FRAME_GAP_MS).toBe(250);
+  });
+
+  it('continues below the frame-gap limit and cancels above it', () => {
+    const continued = createHarness();
+    startFlick(continued);
+    const continuedSchedulesBeforeGap = continued.scheduledFrameCount();
+
+    continued.pumpFrame(MOMENTUM_MAX_FRAME_GAP_MS - 1);
+
+    expect(continued.pendingFrames()).toBe(1);
+    expect(continued.scheduledFrameCount()).toBe(
+      continuedSchedulesBeforeGap + 1
+    );
+
+    const canceled = createHarness();
+    startFlick(canceled);
+    const wheelsBeforeGap = canceled.wheels.length;
+    const canceledSchedulesBeforeGap = canceled.scheduledFrameCount();
+
+    expect(canceled.pumpFrame(MOMENTUM_MAX_FRAME_GAP_MS + 1)).toBe(0);
+    expect(canceled.wheels).toHaveLength(wheelsBeforeGap);
+    expect(canceled.pendingFrames()).toBe(0);
+    expect(canceled.scheduledFrameCount()).toBe(canceledSchedulesBeforeGap);
   });
 
   it('never flings opposite the final motion after a direction reversal', () => {
