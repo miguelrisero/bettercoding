@@ -300,7 +300,9 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
 
   return {
     onTouchStart(p: TouchPoint): TouchStartResult {
-      sequenceBeganAsCatch = p.touches === 1 && momentumFrameId !== undefined;
+      if (p.touches === 1) {
+        sequenceBeganAsCatch = momentumFrameId !== undefined;
+      }
       verticalTravelOccurred = false;
       cancelMomentum();
       resetGesture(p.touches === 1 ? 'undecided' : 'ignore');
@@ -391,9 +393,9 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
       return { caughtFling };
     },
 
-    onTouchCancel(): void {
+    onTouchCancel(remainingTouches = 0): void {
       cancelMomentum();
-      resetGesture('undecided');
+      resetGesture(remainingTouches === 0 ? 'undecided' : 'ignore');
     },
   };
 }
@@ -482,7 +484,8 @@ export function installTerminalTouchScroll(terminal: Terminal): () => void {
     );
     if (caughtFling && e.cancelable) e.preventDefault();
   };
-  const onCancel = () => controller.onTouchCancel();
+  const onCancel = (e: TouchEvent) =>
+    controller.onTouchCancel(e.touches.length);
 
   el.addEventListener('touchstart', onStart, { passive: true });
   el.addEventListener('touchmove', onMove, { passive: false });

@@ -304,6 +304,26 @@ describe('createTouchScrollController (gesture ownership)', () => {
     expect(harness.wheels.map((wheel) => wheel.direction)).toEqual([1, -1]);
   });
 
+  it('keeps a surviving finger ignored after a partial touchcancel', () => {
+    const harness = createHarness();
+    harness.ctrl.onTouchStart({ touches: 1, clientX: 0, clientY: 0 });
+    harness.ctrl.onTouchStart({ touches: 2, clientX: 0, clientY: 0 });
+
+    harness.ctrl.onTouchCancel(1);
+    const stillIgnored = harness.ctrl.onTouchMove({
+      touches: 1,
+      clientX: 0,
+      clientY: -100,
+    });
+    expect(stillIgnored.prevent).toBe(false);
+    expect(harness.wheels).toHaveLength(0);
+
+    harness.ctrl.onTouchEnd(0);
+    harness.ctrl.onTouchStart({ touches: 1, clientX: 0, clientY: 100 });
+    harness.ctrl.onTouchMove({ touches: 1, clientX: 0, clientY: 85 });
+    expect(harness.wheels.map((wheel) => wheel.direction)).toEqual([1]);
+  });
+
   it('abandons when a multi-touch move arrives without a second touchstart', () => {
     const harness = createHarness();
     harness.ctrl.onTouchStart({ touches: 1, clientX: 0, clientY: 0 });
@@ -550,6 +570,27 @@ describe('createTouchScrollController (momentum)', () => {
     expect(start).toEqual({ flingCatch: true });
     expect(end).toEqual({ caughtFling: true });
     expect(harness.pendingFrames()).toBe(0);
+  });
+
+  it('retains a caught fling when another finger joins the sequence', () => {
+    const harness = createHarness();
+    startFlick(harness);
+
+    const firstStart = harness.ctrl.onTouchStart({
+      touches: 1,
+      clientX: 50,
+      clientY: 200,
+    });
+    const secondStart = harness.ctrl.onTouchStart({
+      touches: 2,
+      clientX: 50,
+      clientY: 200,
+    });
+
+    expect(firstStart).toEqual({ flingCatch: true });
+    expect(secondStart).toEqual({ flingCatch: true });
+    expect(harness.ctrl.onTouchEnd(1)).toEqual({ caughtFling: false });
+    expect(harness.ctrl.onTouchEnd(0)).toEqual({ caughtFling: true });
   });
 
   it('reports a normal stationary tap as not catching a fling', () => {
