@@ -104,6 +104,15 @@ impl CliPaneBinding {
             .await
     }
 
+    pub async fn list_active(pool: &SqlitePool) -> Result<Vec<Self>, sqlx::Error> {
+        let sql = format!(
+            "SELECT {} FROM cli_pane_bindings \
+             WHERE released_at IS NULL ORDER BY created_at ASC",
+            Self::SELECT_FIELDS
+        );
+        sqlx::query_as::<_, Self>(&sql).fetch_all(pool).await
+    }
+
     pub async fn bind_discovered_sid(
         pool: &SqlitePool,
         id: Uuid,

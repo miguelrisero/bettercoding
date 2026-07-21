@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Weak},
     time::Duration,
@@ -37,6 +37,8 @@ use super::{
 };
 
 const DRAIN_INTERVAL: Duration = Duration::from_secs(1);
+const RESUME_SIGNAL_ATTEMPTS: u32 = 3;
+const RESUME_SIGNAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 const PASTING_STARTUP_GRACE: ChronoDuration = ChronoDuration::seconds(5);
 const PASTE_ACK_HARD_CAP: ChronoDuration = ChronoDuration::minutes(15);
 
@@ -86,9 +88,9 @@ pub trait CliWriterProbe: Send + Sync {
 #[async_trait]
 pub trait CliPasteTransport: Send + Sync {
     async fn paste_and_submit(&self, workspace_id: Uuid, text: &str) -> bool;
-    async fn pane_alive(&self, workspace_id: Uuid) -> bool;
+    async fn pane_alive(&self, workspace_id: Uuid) -> AnyhowResult<bool>;
     async fn agent_running(&self, workspace_id: Uuid) -> Option<bool>;
-    async fn signal_resume_ready(&self, workspace_id: Uuid, sid: &str);
+    async fn signal_resume_ready(&self, workspace_id: Uuid, sid: &str) -> AnyhowResult<()>;
 }
 
 /// Deployment-owned executor bridge. The trait lives in services so
@@ -132,6 +134,12 @@ pub enum CliCollabError {
     Serialize(#[from] serde_json::Error),
     #[error("session {0} has no workspace")]
     WorkspaceMissing(Uuid),
+    #[error("CLI transport failed for workspace {workspace_id}: {source}")]
+    Transport {
+        workspace_id: Uuid,
+        #[source]
+        source: anyhow::Error,
+    },
 }
 
 pub struct CliCollabService {
@@ -141,6 +149,7 @@ pub struct CliCollabService {
     dispatcher: Arc<dyn CliExecutorDispatcher>,
     ingest: Option<Arc<ClaudeTranscriptIngest>>,
     session_locks: Mutex<HashMap<Uuid, Weak<Mutex<()>>>>,
+    resume_signaled_bindings: Mutex<HashSet<Uuid>>,
     notify: Notify,
     routing_disabled: bool,
     shutdown: CancellationToken,
@@ -162,6 +171,7 @@ impl CliCollabService {
             dispatcher,
             ingest,
             session_locks: Mutex::new(HashMap::new()),
+            resume_signaled_bindings: Mutex::new(HashSet::new()),
             notify: Notify::new(),
             routing_disabled: std::env::var_os("DISABLE_CLI_COLLAB_ROUTING").is_some(),
             shutdown,
@@ -257,8 +267,29 @@ impl CliCollabService {
         }
         match report.agent_running {
             None => return WriterLease::Busy,
-            Some(false) => return WriterLease::Free,
-            Some(true) => {}
+            Some(false) => {
+                let handoff_pending = match binding.as_ref() {
+                    Some(binding) => self
+                        .resume_signaled_bindings
+                        .lock()
+                        .await
+                        .contains(&binding.id),
+                    None => false,
+                };
+                return if handoff_pending {
+                    WriterLease::CliAmbiguous
+                } else {
+                    WriterLease::Free
+                };
+            }
+            Some(true) => {
+                if let Some(binding) = binding.as_ref() {
+                    self.resume_signaled_bindings
+                        .lock()
+                        .await
+                        .remove(&binding.id);
+                }
+            }
         }
 
         let Some(binding) = binding.filter(|binding| binding.session_id == session.id) else {
@@ -603,52 +634,167 @@ impl CliCollabService {
     }
 
     pub async fn on_executor_finished(&self, session_id: Uuid) -> Result<bool, CliCollabError> {
+        let lock = self.session_lock(session_id).await;
+        let guard = lock.lock().await;
         let session = Session::find_by_id(&self.db.pool, session_id)
             .await?
             .ok_or(CliCollabError::WorkspaceMissing(session_id))?;
-        let binding = match CliPaneBinding::find_active_for_session(&self.db.pool, session_id).await
+        match ExecutionProcess::has_running_coding_agent_for_session(&self.db.pool, session_id)
+            .await
         {
-            Ok(binding) => binding,
+            Ok(true) => {
+                tracing::debug!(
+                    %session_id,
+                    "CLI resume handoff deferred while another executor is running"
+                );
+                return Ok(false);
+            }
+            Ok(false) => {}
             Err(error) => {
-                tracing::warn!(?error, %session_id, "finish hook pane lookup failed closed");
-                return Ok(false);
+                tracing::warn!(?error, %session_id, "finish hook executor probe failed closed");
+                return Err(error.into());
             }
-        };
-        if let Some(binding) = binding
-            && self.transport.pane_alive(session.workspace_id).await
+        }
+        if let Some(binding) =
+            CliPaneBinding::find_active_for_session(&self.db.pool, session_id).await?
+            && self
+                .hold_or_resume_bound_pane_locked(&session, binding)
+                .await?
         {
-            let sid = match binding.claude_session_id.as_ref() {
-                Some(sid) => Some(sid.clone()),
-                None => match self.expected_sid(session_id).await {
-                    Ok(sid) => sid,
-                    Err(error) => {
-                        tracing::warn!(?error, %session_id, "finish hook sid lookup failed closed");
-                        return Ok(false);
-                    }
-                },
-            };
-            let Some(sid) = sid else {
-                return Ok(false);
-            };
-            if binding.bound_via == db::models::cli_pane_binding::CliPaneBoundVia::CliFresh
-                && binding.claude_session_id.is_none()
-                && let Err(error) =
-                    CliPaneBinding::bind_discovered_sid(&self.db.pool, binding.id, &sid).await
-            {
-                tracing::warn!(?error, %session_id, "finish hook pane sid update failed closed");
-                return Ok(false);
-            }
-            self.transport
-                .signal_resume_ready(session.workspace_id, &sid)
-                .await;
             // Give the 1 s bootstrap poll a chance to exec the resumed TUI;
             // the durable queue remains untouched during this transition.
             self.notify.notify_one();
             return Ok(false);
         }
+        drop(guard);
         let started = self.drain_session(session_id).await?;
         self.notify.notify_one();
         Ok(started)
+    }
+
+    async fn hold_or_resume_bound_pane_locked(
+        &self,
+        session: &Session,
+        binding: CliPaneBinding,
+    ) -> Result<bool, CliCollabError> {
+        let pane_alive = self
+            .transport
+            .pane_alive(session.workspace_id)
+            .await
+            .map_err(|source| CliCollabError::Transport {
+                workspace_id: session.workspace_id,
+                source,
+            })?;
+        if !pane_alive {
+            CliPaneBinding::release(&self.db.pool, binding.id).await?;
+            self.resume_signaled_bindings
+                .lock()
+                .await
+                .remove(&binding.id);
+            return Ok(false);
+        }
+        match self.transport.agent_running(session.workspace_id).await {
+            Some(true) => {
+                self.resume_signaled_bindings
+                    .lock()
+                    .await
+                    .remove(&binding.id);
+                return Ok(true);
+            }
+            None => {
+                tracing::warn!(
+                    session_id = %session.id,
+                    workspace_id = %session.workspace_id,
+                    "busy CLI pane agent probe failed closed; resume handoff will retry"
+                );
+                return Ok(true);
+            }
+            Some(false) => {}
+        }
+        if self
+            .resume_signaled_bindings
+            .lock()
+            .await
+            .contains(&binding.id)
+        {
+            return Ok(true);
+        }
+
+        let sid = match binding.claude_session_id.as_ref() {
+            Some(sid) => Some(sid.clone()),
+            None => self.expected_sid(session.id).await?,
+        };
+        let Some(sid) = sid else {
+            tracing::warn!(
+                session_id = %session.id,
+                workspace_id = %session.workspace_id,
+                "busy CLI pane has no resume sid yet; resume handoff will retry"
+            );
+            return Ok(true);
+        };
+        if binding.bound_via == db::models::cli_pane_binding::CliPaneBoundVia::CliFresh
+            && binding.claude_session_id.is_none()
+            && !CliPaneBinding::bind_discovered_sid(&self.db.pool, binding.id, &sid).await?
+        {
+            tracing::warn!(
+                session_id = %session.id,
+                binding_id = %binding.id,
+                "busy CLI pane sid binding changed before resume handoff; retrying from fresh state"
+            );
+            return Ok(true);
+        }
+
+        self.signal_resume_ready_with_retry(session.workspace_id, &sid)
+            .await?;
+        self.resume_signaled_bindings
+            .lock()
+            .await
+            .insert(binding.id);
+        tracing::info!(
+            session_id = %session.id,
+            workspace_id = %session.workspace_id,
+            binding_id = %binding.id,
+            claude_session_id = %sid,
+            "signaled busy CLI pane to resume"
+        );
+        Ok(true)
+    }
+
+    async fn signal_resume_ready_with_retry(
+        &self,
+        workspace_id: Uuid,
+        sid: &str,
+    ) -> Result<(), CliCollabError> {
+        let mut last_error = None;
+        for attempt in 1..=RESUME_SIGNAL_ATTEMPTS {
+            match self.transport.signal_resume_ready(workspace_id, sid).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        %workspace_id,
+                        attempt,
+                        max_attempts = RESUME_SIGNAL_ATTEMPTS,
+                        "failed to write CLI resume-ready signal"
+                    );
+                    last_error = Some(error);
+                    if attempt < RESUME_SIGNAL_ATTEMPTS {
+                        tokio::time::sleep(RESUME_SIGNAL_RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
+        let source = last_error.expect("resume signaling always makes at least one attempt");
+        tracing::error!(
+            ?source,
+            %workspace_id,
+            attempts = RESUME_SIGNAL_ATTEMPTS,
+            "CLI resume-ready signal exhausted retries; busy pane remains blocked"
+        );
+        Err(CliCollabError::Transport {
+            workspace_id,
+            source,
+        })
     }
 
     async fn drain_session(&self, session_id: Uuid) -> Result<bool, CliCollabError> {
@@ -844,7 +990,99 @@ impl CliCollabService {
         }
     }
 
+    async fn reconcile_waiting_panes(&self) {
+        let bindings = match CliPaneBinding::list_active(&self.db.pool).await {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                tracing::warn!(?error, "failed to scan active CLI pane bindings");
+                return;
+            }
+        };
+        let active_ids: HashSet<_> = bindings.iter().map(|binding| binding.id).collect();
+        self.resume_signaled_bindings
+            .lock()
+            .await
+            .retain(|id| active_ids.contains(id));
+
+        for observed_binding in bindings {
+            let session_id = observed_binding.session_id;
+            let lock = self.session_lock(session_id).await;
+            let _guard = lock.lock().await;
+            let binding =
+                match CliPaneBinding::find_active_for_session(&self.db.pool, session_id).await {
+                    Ok(Some(binding)) if binding.id == observed_binding.id => binding,
+                    Ok(_) => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            %session_id,
+                            "failed to refresh CLI pane binding during resume reconciliation"
+                        );
+                        continue;
+                    }
+                };
+            match ExecutionProcess::has_running_coding_agent_for_session(&self.db.pool, session_id)
+                .await
+            {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        %session_id,
+                        "resume reconciliation executor probe failed closed"
+                    );
+                    continue;
+                }
+            }
+            let processes =
+                match ExecutionProcess::find_by_session_id(&self.db.pool, session_id, true).await {
+                    Ok(processes) => processes,
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            %session_id,
+                            "failed to load executor release evidence for CLI resume"
+                        );
+                        continue;
+                    }
+                };
+            let writer_released_after_binding = processes.iter().any(|process| {
+                process.run_reason == ExecutionProcessRunReason::CodingAgent
+                    && process
+                        .completed_at
+                        .is_some_and(|completed_at| completed_at >= binding.created_at)
+            });
+            if !writer_released_after_binding {
+                continue;
+            }
+            let session = match Session::find_by_id(&self.db.pool, session_id).await {
+                Ok(Some(session)) => session,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        %session_id,
+                        "failed to load session during CLI resume reconciliation"
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = self
+                .hold_or_resume_bound_pane_locked(&session, binding)
+                .await
+            {
+                tracing::error!(
+                    ?error,
+                    %session_id,
+                    "failed to reconcile busy CLI resume handoff; will retry"
+                );
+            }
+        }
+    }
+
     async fn drain_all(&self) {
+        self.reconcile_waiting_panes().await;
         self.reconcile_delivery_state().await;
         if self.routing_disabled {
             return;
@@ -932,7 +1170,9 @@ mod tests {
         claude_session_link::ClaudeSessionLink,
         cli_native_file::{CliNativeFile, RegisterCliNativeFile},
         cli_pane_binding::{CliPaneBinding, CliPaneBoundVia},
-        execution_process::{CreateExecutionProcess, ExecutionProcessRunReason},
+        execution_process::{
+            CreateExecutionProcess, ExecutionProcessRunReason, ExecutionProcessStatus,
+        },
         session::CreateSession,
         workspace::CreateWorkspace,
     };
@@ -969,15 +1209,17 @@ mod tests {
             true
         }
 
-        async fn pane_alive(&self, _workspace_id: Uuid) -> bool {
-            true
+        async fn pane_alive(&self, _workspace_id: Uuid) -> AnyhowResult<bool> {
+            Ok(true)
         }
 
         async fn agent_running(&self, _workspace_id: Uuid) -> Option<bool> {
             Some(true)
         }
 
-        async fn signal_resume_ready(&self, _workspace_id: Uuid, _sid: &str) {}
+        async fn signal_resume_ready(&self, _workspace_id: Uuid, _sid: &str) -> AnyhowResult<()> {
+            Ok(())
+        }
     }
 
     #[derive(Debug, Default)]
@@ -1007,15 +1249,52 @@ mod tests {
             self.paste_succeeds
         }
 
-        async fn pane_alive(&self, _workspace_id: Uuid) -> bool {
-            true
+        async fn pane_alive(&self, _workspace_id: Uuid) -> AnyhowResult<bool> {
+            Ok(true)
         }
 
         async fn agent_running(&self, _workspace_id: Uuid) -> Option<bool> {
             Some(true)
         }
 
-        async fn signal_resume_ready(&self, _workspace_id: Uuid, _sid: &str) {}
+        async fn signal_resume_ready(&self, _workspace_id: Uuid, _sid: &str) -> AnyhowResult<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ResumeTransportState {
+        signals: Vec<(Uuid, String)>,
+        failures_remaining: u32,
+    }
+
+    struct ResumeRecordingTransport {
+        state: Arc<StdMutex<ResumeTransportState>>,
+    }
+
+    #[async_trait]
+    impl CliPasteTransport for ResumeRecordingTransport {
+        async fn paste_and_submit(&self, _workspace_id: Uuid, _text: &str) -> bool {
+            true
+        }
+
+        async fn pane_alive(&self, _workspace_id: Uuid) -> AnyhowResult<bool> {
+            Ok(true)
+        }
+
+        async fn agent_running(&self, _workspace_id: Uuid) -> Option<bool> {
+            Some(false)
+        }
+
+        async fn signal_resume_ready(&self, workspace_id: Uuid, sid: &str) -> AnyhowResult<()> {
+            let mut state = self.state.lock().unwrap();
+            state.signals.push((workspace_id, sid.to_string()));
+            if state.failures_remaining > 0 {
+                state.failures_remaining -= 1;
+                anyhow::bail!("intentional resume signal failure");
+            }
+            Ok(())
+        }
     }
 
     struct NeverDispatcher;
@@ -1143,6 +1422,7 @@ mod tests {
                 dispatcher,
                 ingest: None,
                 session_locks: Mutex::new(HashMap::new()),
+                resume_signaled_bindings: Mutex::new(HashSet::new()),
                 notify: Notify::new(),
                 routing_disabled: false,
                 shutdown: CancellationToken::new(),
@@ -1345,6 +1625,173 @@ mod tests {
         assert_eq!(message.data.message, "wait for executor");
         assert_eq!(message.state, QueuedMessageState::Queued);
         assert!(transport_state.lock().unwrap().pasted_prompts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn finish_hook_waits_for_auto_drained_executor_before_resuming_busy_pane() {
+        let (db, workspace, session) = fixture().await;
+        let sid = "24242424-2424-4242-8242-242424242424";
+        let first = create_running_executor(&db, session.id, "blocking writer").await;
+        bind_confirmed_cli(&db, &workspace, &session, sid).await;
+        ExecutionProcess::update_completion(
+            &db.pool,
+            first.id,
+            ExecutionProcessStatus::Completed,
+            Some(0),
+        )
+        .await
+        .unwrap();
+        let second = create_running_executor(&db, session.id, "auto-drained follow-up").await;
+        let transport_state = Arc::new(StdMutex::new(ResumeTransportState::default()));
+        let transport = Arc::new(ResumeRecordingTransport {
+            state: transport_state.clone(),
+        });
+        let (service, probe) = service_with_components(
+            db.clone(),
+            report(false, Some(false), SidEvidence::Unknown),
+            transport,
+            Arc::new(NeverDispatcher),
+        );
+
+        assert!(!service.on_executor_finished(session.id).await.unwrap());
+        assert!(
+            transport_state.lock().unwrap().signals.is_empty(),
+            "a prior finish hook must not resume the pane over a newer executor"
+        );
+
+        ExecutionProcess::update_completion(
+            &db.pool,
+            second.id,
+            ExecutionProcessStatus::Completed,
+            Some(0),
+        )
+        .await
+        .unwrap();
+        assert!(!service.on_executor_finished(session.id).await.unwrap());
+        assert_eq!(
+            transport_state.lock().unwrap().signals,
+            [(workspace.id, sid.to_string())]
+        );
+
+        *probe.0.lock().unwrap() = report(
+            true,
+            Some(true),
+            SidEvidence::ConfirmedResume(sid.to_string()),
+        );
+        assert_eq!(
+            service.derive_lease(&session).await,
+            WriterLease::Cli {
+                claude_session_id: Some(sid.to_string())
+            }
+        );
+        *probe.0.lock().unwrap() = report(true, Some(false), SidEvidence::Unknown);
+        assert_eq!(service.derive_lease(&session).await, WriterLease::Free);
+    }
+
+    #[tokio::test]
+    async fn drain_recovers_busy_resume_pane_when_finish_hook_was_missed() {
+        let (db, workspace, session) = fixture().await;
+        let sid = "25252525-2525-4252-8252-252525252525";
+        let execution = create_running_executor(&db, session.id, "blocking writer").await;
+        bind_confirmed_cli(&db, &workspace, &session, sid).await;
+        ExecutionProcess::update_completion(
+            &db.pool,
+            execution.id,
+            ExecutionProcessStatus::Completed,
+            Some(0),
+        )
+        .await
+        .unwrap();
+        let transport_state = Arc::new(StdMutex::new(ResumeTransportState::default()));
+        let transport = Arc::new(ResumeRecordingTransport {
+            state: transport_state.clone(),
+        });
+        let (service, _) = service_with_components(
+            db,
+            report(false, Some(false), SidEvidence::Unknown),
+            transport,
+            Arc::new(NeverDispatcher),
+        );
+
+        service.drain_all().await;
+
+        assert_eq!(
+            transport_state.lock().unwrap().signals,
+            [(workspace.id, sid.to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_ready_signal_retries_transient_failures() {
+        let (db, workspace, session) = fixture().await;
+        let sid = "26262626-2626-4262-8262-262626262626";
+        let execution = create_running_executor(&db, session.id, "blocking writer").await;
+        bind_confirmed_cli(&db, &workspace, &session, sid).await;
+        ExecutionProcess::update_completion(
+            &db.pool,
+            execution.id,
+            ExecutionProcessStatus::Completed,
+            Some(0),
+        )
+        .await
+        .unwrap();
+        let transport_state = Arc::new(StdMutex::new(ResumeTransportState {
+            signals: Vec::new(),
+            failures_remaining: 2,
+        }));
+        let transport = Arc::new(ResumeRecordingTransport {
+            state: transport_state.clone(),
+        });
+        let (service, _) = service_with_components(
+            db,
+            report(false, Some(false), SidEvidence::Unknown),
+            transport,
+            Arc::new(NeverDispatcher),
+        );
+
+        assert!(!service.on_executor_finished(session.id).await.unwrap());
+
+        assert_eq!(
+            transport_state.lock().unwrap().signals,
+            vec![(workspace.id, sid.to_string()); 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_ready_signal_exhaustion_is_returned_to_finish_hook() {
+        let (db, workspace, session) = fixture().await;
+        let sid = "27272727-2727-4272-8272-272727272727";
+        let execution = create_running_executor(&db, session.id, "blocking writer").await;
+        bind_confirmed_cli(&db, &workspace, &session, sid).await;
+        ExecutionProcess::update_completion(
+            &db.pool,
+            execution.id,
+            ExecutionProcessStatus::Completed,
+            Some(0),
+        )
+        .await
+        .unwrap();
+        let transport_state = Arc::new(StdMutex::new(ResumeTransportState {
+            signals: Vec::new(),
+            failures_remaining: RESUME_SIGNAL_ATTEMPTS,
+        }));
+        let transport = Arc::new(ResumeRecordingTransport {
+            state: transport_state.clone(),
+        });
+        let (service, _) = service_with_components(
+            db,
+            report(false, Some(false), SidEvidence::Unknown),
+            transport,
+            Arc::new(NeverDispatcher),
+        );
+
+        let error = service.on_executor_finished(session.id).await.unwrap_err();
+
+        assert!(matches!(error, CliCollabError::Transport { .. }));
+        assert_eq!(
+            transport_state.lock().unwrap().signals,
+            vec![(workspace.id, sid.to_string()); RESUME_SIGNAL_ATTEMPTS as usize]
+        );
     }
 
     #[tokio::test]

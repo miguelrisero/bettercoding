@@ -18,19 +18,15 @@ impl CliPasteTransport for LocalCliPasteTransport {
         pty::send_cli_keys(workspace_id, text).await
     }
 
-    async fn pane_alive(&self, workspace_id: Uuid) -> bool {
-        pty::cli_tmux_session_exists_checked(workspace_id)
-            .await
-            .unwrap_or(false)
+    async fn pane_alive(&self, workspace_id: Uuid) -> anyhow::Result<bool> {
+        Ok(pty::cli_tmux_session_exists_checked(workspace_id).await?)
     }
 
     async fn agent_running(&self, workspace_id: Uuid) -> Option<bool> {
         pty::cli_pane_agent_running(workspace_id, "claude").await
     }
 
-    async fn signal_resume_ready(&self, workspace_id: Uuid, sid: &str) {
-        if let Err(error) = pty::write_cli_resume_ready_file(workspace_id, sid) {
-            tracing::warn!(?error, %workspace_id, "failed to signal CLI resume readiness");
-        }
+    async fn signal_resume_ready(&self, workspace_id: Uuid, sid: &str) -> anyhow::Result<()> {
+        Ok(pty::write_cli_resume_ready_file(workspace_id, sid)?)
     }
 }
