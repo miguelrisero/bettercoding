@@ -150,7 +150,6 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
   let axis: Axis = 'undecided';
   let startX = 0;
   let startY = 0;
-  let lastY = 0;
   let lastClientX = 0;
   let lastClientY = 0;
   let stepPx = FALLBACK_WHEEL_STEP_PX;
@@ -208,27 +207,14 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
     momentumVelocity *= Math.exp(-dt / MOMENTUM_TIME_CONSTANT_MS);
     momentumCarry += momentumVelocity * dt;
 
-    let frameWheelCount = 0;
-    while (
-      momentumCarry >= stepPx &&
-      frameWheelCount < MAX_WHEELS_PER_FRAME &&
-      momentumWheelCount < MAX_MOMENTUM_WHEELS
-    ) {
-      deps.dispatchWheel(1, lastClientX, lastClientY);
-      momentumCarry -= stepPx;
-      frameWheelCount += 1;
-      momentumWheelCount += 1;
-    }
-    while (
-      momentumCarry <= -stepPx &&
-      frameWheelCount < MAX_WHEELS_PER_FRAME &&
-      momentumWheelCount < MAX_MOMENTUM_WHEELS
-    ) {
-      deps.dispatchWheel(-1, lastClientX, lastClientY);
-      momentumCarry += stepPx;
-      frameWheelCount += 1;
-      momentumWheelCount += 1;
-    }
+    const drained = drain(
+      momentumCarry,
+      Math.min(MAX_WHEELS_PER_FRAME, MAX_MOMENTUM_WHEELS - momentumWheelCount),
+      lastClientX,
+      lastClientY
+    );
+    momentumCarry = drained.carry;
+    momentumWheelCount += drained.count;
 
     if (
       Math.abs(momentumVelocity) < MOMENTUM_STOP_PX_PER_MS ||
@@ -250,6 +236,22 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
     }
   }
 
+  function drain(
+    carry: number,
+    budget: number,
+    clientX: number,
+    clientY: number
+  ): { carry: number; count: number } {
+    const direction: 1 | -1 = carry >= 0 ? 1 : -1;
+    let count = 0;
+    while (Math.abs(carry) >= stepPx && count < budget) {
+      deps.dispatchWheel(direction, clientX, clientY);
+      carry -= direction * stepPx;
+      count += 1;
+    }
+    return { carry, count };
+  }
+
   function getExitVelocity(releaseAt: number): number | undefined {
     if (velocitySamples.length < 2) return undefined;
     const newestIndex = velocitySamples.length - 1;
@@ -264,9 +266,7 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
     for (let index = newestIndex; index > 0; index -= 1) {
       const delta = velocitySamples[index].y - velocitySamples[index - 1].y;
       const nextDirection =
-        Math.abs(delta) < VELOCITY_DIRECTION_EPSILON_PX
-          ? 0
-          : Math.sign(delta);
+        Math.abs(delta) < VELOCITY_DIRECTION_EPSILON_PX ? 0 : Math.sign(delta);
       if (nextDirection !== 0) {
         if (direction !== 0 && nextDirection !== direction) break;
         direction = nextDirection;
@@ -300,23 +300,19 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
 
   return {
     onTouchStart(p: TouchPoint): TouchStartResult {
-      sequenceBeganAsCatch =
-        p.touches === 1 && momentumFrameId !== undefined;
+      sequenceBeganAsCatch = p.touches === 1 && momentumFrameId !== undefined;
       verticalTravelOccurred = false;
       cancelMomentum();
       resetGesture(p.touches === 1 ? 'undecided' : 'ignore');
       stepPx = sanitizeWheelStep(deps.getLineHeightPx?.());
       startX = p.clientX;
       startY = p.clientY;
-      lastY = p.clientY;
       lastClientX = p.clientX;
       lastClientY = p.clientY;
 
-      if (p.touches !== 1) {
-        // Pinch / multi-touch — leave it to the browser.
-        return { flingCatch: sequenceBeganAsCatch };
+      if (p.touches === 1) {
+        appendVelocitySample(p.timeStampMs ?? readNow(), p.clientY);
       }
-      appendVelocitySample(p.timeStampMs ?? readNow(), p.clientY);
       return { flingCatch: sequenceBeganAsCatch };
     },
 
@@ -342,39 +338,31 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
         if (axis !== 'vertical') return { prevent: false };
       }
 
-      lastClientX = p.clientX;
-      lastClientY = p.clientY;
-      appendVelocitySample(p.timeStampMs ?? readNow(), p.clientY);
-
-      const deltaY = lastY - p.clientY;
-      lastY = p.clientY;
-
       // Only bridge when xterm's own touch scroll is disabled (mouse tracking on).
       // Otherwise let xterm scroll its scrollback natively — avoids double-scroll.
       if (deps.getMouseTrackingMode() === 'none') return { prevent: false };
 
+      const deltaY = lastClientY - p.clientY;
+      lastClientX = p.clientX;
+      lastClientY = p.clientY;
+      appendVelocitySample(p.timeStampMs ?? readNow(), p.clientY);
+
       // Natural scrolling: finger up (clientY decreases) reveals newer content
       // (scroll down, +1); finger down reveals history (scroll up, -1).
       accumulated += deltaY;
-
-      while (accumulated >= stepPx) {
-        deps.dispatchWheel(1, p.clientX, p.clientY);
-        accumulated -= stepPx;
-      }
-      while (accumulated <= -stepPx) {
-        deps.dispatchWheel(-1, p.clientX, p.clientY);
-        accumulated += stepPx;
-      }
+      accumulated = drain(
+        accumulated,
+        Number.POSITIVE_INFINITY,
+        p.clientX,
+        p.clientY
+      ).carry;
 
       // We've committed to the vertical gesture: always prevent page scroll/rubber-band,
       // even on sub-step moves that didn't dispatch a wheel yet.
       return { prevent: true };
     },
 
-    onTouchEnd(
-      remainingTouches = 0,
-      timeStampMs?: number
-    ): TouchEndResult {
+    onTouchEnd(remainingTouches = 0, timeStampMs?: number): TouchEndResult {
       cancelMomentum();
 
       const caughtFling =
@@ -406,12 +394,6 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
     onTouchCancel(): void {
       cancelMomentum();
       resetGesture('undecided');
-      startX = 0;
-      startY = 0;
-      lastY = 0;
-      lastClientX = 0;
-      lastClientY = 0;
-      stepPx = FALLBACK_WHEEL_STEP_PX;
     },
   };
 }

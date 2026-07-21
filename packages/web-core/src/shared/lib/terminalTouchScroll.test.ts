@@ -515,9 +515,7 @@ describe('createTouchScrollController (momentum)', () => {
     harness.advance(16);
     harness.ctrl.onTouchMove({ touches: 1, clientX: 50, clientY: 170 });
     expect(
-      harness.wheels
-        .slice(wheelsBeforeCatch)
-        .map((wheel) => wheel.direction)
+      harness.wheels.slice(wheelsBeforeCatch).map((wheel) => wheel.direction)
     ).toEqual([1, 1]);
 
     expect(harness.ctrl.onTouchEnd()).toEqual({ caughtFling: false });
