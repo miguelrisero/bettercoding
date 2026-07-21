@@ -111,9 +111,6 @@
     "filesChanged_one": "{{count}} file changed",
     "filesChanged_other": "{{count}} files changed"
   },
-  "followUp": {
-    "queuedMessage": "Mensaje en cola - se ejecutará cuando finalice la ejecución actual"
-  },
   "git": {
     "branch": {
       "current": "actual"
@@ -386,6 +383,27 @@
     "retry": "Reintentar",
     "showMore": "Mostrar más",
     "showLess": "Mostrar menos",
+    "queue": {
+      "queued": "En cola — esperando al agente",
+      "pasting": "Enviando a la CLI…",
+      "pasted": "En cola en la CLI — aún no se ha enviado",
+      "failed": "Envío en pausa",
+      "sendAgain": "Enviar de nuevo",
+      "sendingAgain": "Enviando…",
+      "heldToast": "En espera — el agente está ocupado; tu mensaje está en cola y se enviará a continuación",
+      "deliveryFailedToast": "En espera — falló el envío; tu mensaje está en cola. Usa «Enviar de nuevo» para reintentarlo ahora.",
+      "routedToast": "Enviado a la CLI — esperando a que aparezca en la conversación",
+      "retryingToast": "Mensaje puesto de nuevo en cola — se reintentará a continuación",
+      "replaceTitle": "¿Reemplazar el mensaje en cola?",
+      "replaceUiMessage": "¿Reemplazar tu mensaje en cola: «{{message}}»?",
+      "replaceRecoveryMessage": "¿Reemplazar el mensaje recuperado de la CLI: «{{message}}»?",
+      "replaceConfirm": "Reemplazar y enviar",
+      "replaceInProgressToast": "Ese mensaje ya se está enviando. Espera a que termine antes de enviar otro.",
+      "replaceChangedToast": "El mensaje en cola cambió antes de que se pudiera reemplazar. Inténtalo de nuevo.",
+      "queueErrorToast": "No se pudo poner tu mensaje en cola. Inténtalo de nuevo.",
+      "retryErrorToast": "No se pudo volver a enviar el mensaje en cola. Inténtalo de nuevo.",
+      "dismissToast": "Cerrar notificación"
+    },
     "actions": {
       "cancel": "Cancelar",
       "submitFeedback": "Enviar comentarios",

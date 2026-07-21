@@ -108,9 +108,6 @@
     "copyLogs": "複製日誌",
     "logsCopied": "已複製！"
   },
-  "followUp": {
-    "queuedMessage": "訊息已加入佇列 - 會在目前執行完成後處理"
-  },
   "todoPopup": {
     "title": "任務",
     "progress": "{{completed}}/{{total}} 已完成",
@@ -386,6 +383,27 @@
     "retry": "重試",
     "showMore": "顯示更多",
     "showLess": "收起",
+    "queue": {
+      "queued": "已加入佇列 — 正在等待代理",
+      "pasting": "正在傳送至 CLI…",
+      "pasted": "已加入 CLI 佇列 — 尚未提交",
+      "failed": "傳送已暫停",
+      "sendAgain": "再次傳送",
+      "sendingAgain": "正在傳送…",
+      "heldToast": "已暫緩 — 代理正忙；您的訊息已加入佇列，將接著傳送",
+      "deliveryFailedToast": "已暫緩 — 傳送失敗；您的訊息仍在佇列中。使用「再次傳送」立即重試。",
+      "routedToast": "已傳送至 CLI — 正在等待訊息出現在對話中",
+      "retryingToast": "訊息已重新加入佇列 — 接下來將重試",
+      "replaceTitle": "要取代佇列中的訊息嗎？",
+      "replaceUiMessage": "要取代您已排入佇列的訊息「{{message}}」嗎？",
+      "replaceRecoveryMessage": "要取代已復原的 CLI 訊息「{{message}}」嗎？",
+      "replaceConfirm": "取代並傳送",
+      "replaceInProgressToast": "該訊息已在傳送中。請等待傳送完成後再傳送其他訊息。",
+      "replaceChangedToast": "佇列中的訊息在取代前發生了變更。請重試。",
+      "queueErrorToast": "無法將您的訊息加入佇列。請重試。",
+      "retryErrorToast": "無法再次傳送佇列中的訊息。請重試。",
+      "dismissToast": "關閉通知"
+    },
     "actions": {
       "cancel": "取消",
       "submitFeedback": "提交回饋",
