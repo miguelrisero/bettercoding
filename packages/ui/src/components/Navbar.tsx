@@ -271,9 +271,7 @@ export function Navbar({
                     key={tab.id}
                     type="button"
                     aria-label={
-                      tab.id === 'workspaces'
-                        ? 'Wksps (Workspaces)'
-                        : tab.label
+                      tab.id === 'workspaces' ? 'Wksps (Workspaces)' : tab.label
                     }
                     aria-current={isActive ? 'page' : undefined}
                     className={cn(
