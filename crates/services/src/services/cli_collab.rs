@@ -103,7 +103,16 @@ pub trait CliExecutorDispatcher: Send + Sync {
         session: &Session,
         prompt: &str,
         executor_config: &ExecutorConfig,
+        retry: Option<&RetryDispatchContext>,
     ) -> AnyhowResult<ExecutionProcess>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryDispatchContext {
+    pub process_id: Uuid,
+    pub force_when_dirty: bool,
+    pub perform_git_reset: bool,
+    pub reset_to_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,10 +344,50 @@ impl CliCollabService {
         source: QueuedMessageSource,
         replace: bool,
     ) -> Result<DispatchOutcome, CliCollabError> {
+        self.dispatch_gate_with_context(session, prompt, executor_config, source, replace, None)
+            .await
+    }
+
+    pub async fn dispatch_retry(
+        &self,
+        session: &Session,
+        prompt: String,
+        executor_config: ExecutorConfig,
+        source: QueuedMessageSource,
+        replace: bool,
+        retry: RetryDispatchContext,
+    ) -> Result<DispatchOutcome, CliCollabError> {
+        self.dispatch_gate_with_context(
+            session,
+            prompt,
+            executor_config,
+            source,
+            replace,
+            Some(retry),
+        )
+        .await
+    }
+
+    async fn dispatch_gate_with_context(
+        &self,
+        session: &Session,
+        prompt: String,
+        executor_config: ExecutorConfig,
+        source: QueuedMessageSource,
+        replace: bool,
+        dispatch_context: Option<RetryDispatchContext>,
+    ) -> Result<DispatchOutcome, CliCollabError> {
         let lock = self.session_lock(session.id).await;
         let _guard = lock.lock().await;
         let existing = self
-            .prepare_existing_slot(session.id, &prompt, &executor_config, source, replace)
+            .prepare_existing_slot(
+                session.id,
+                &prompt,
+                &executor_config,
+                dispatch_context.as_ref(),
+                source,
+                replace,
+            )
             .await?;
         if let PreparedSlot::Conflict(status) = existing {
             return Ok(DispatchOutcome::Conflict { status });
@@ -352,14 +401,32 @@ impl CliCollabService {
         let lease = self.derive_lease_locked(session).await;
         let outcome = match lease {
             WriterLease::Executor | WriterLease::CliAmbiguous | WriterLease::Busy => {
-                self.queue_or_status(session.id, &prompt, &executor_config, source, existing)
-                    .await?
+                self.queue_or_status(
+                    session.id,
+                    &prompt,
+                    &executor_config,
+                    dispatch_context.as_ref(),
+                    source,
+                    existing,
+                )
+                .await?
+            }
+            WriterLease::Cli { .. } if dispatch_context.is_some() => {
+                self.queue_or_status(
+                    session.id,
+                    &prompt,
+                    &executor_config,
+                    dispatch_context.as_ref(),
+                    source,
+                    existing,
+                )
+                .await?
             }
             WriterLease::Cli { claude_session_id } if !self.routing_disabled => {
                 let row = match existing {
                     Some(row) => row,
                     None => {
-                        self.store_slot(session.id, &prompt, &executor_config, source, false)
+                        self.store_slot(session.id, &prompt, &executor_config, None, source, false)
                             .await?
                     }
                 };
@@ -367,12 +434,26 @@ impl CliCollabService {
                     .await?
             }
             WriterLease::Cli { .. } => {
-                self.queue_or_status(session.id, &prompt, &executor_config, source, existing)
-                    .await?
+                self.queue_or_status(
+                    session.id,
+                    &prompt,
+                    &executor_config,
+                    dispatch_context.as_ref(),
+                    source,
+                    existing,
+                )
+                .await?
             }
             WriterLease::Free => {
-                self.dispatch_executor_locked(session, &prompt, &executor_config, source, existing)
-                    .await?
+                self.dispatch_executor_locked(
+                    session,
+                    &prompt,
+                    &executor_config,
+                    dispatch_context.as_ref(),
+                    source,
+                    existing,
+                )
+                .await?
             }
         };
         if matches!(outcome, DispatchOutcome::Queued { .. }) {
@@ -392,7 +473,7 @@ impl CliCollabService {
         let lock = self.session_lock(session.id).await;
         let _guard = lock.lock().await;
         let result = self
-            .store_slot_result(session.id, &prompt, &executor_config, source, replace)
+            .store_slot_result(session.id, &prompt, &executor_config, None, source, replace)
             .await?;
         let outcome = match result {
             StoreQueuedMessageResult::Stored(row) => {
@@ -439,6 +520,7 @@ impl CliCollabService {
         session_id: Uuid,
         prompt: &str,
         executor_config: &ExecutorConfig,
+        dispatch_context: Option<&RetryDispatchContext>,
         source: QueuedMessageSource,
         replace: bool,
     ) -> Result<PreparedSlot, CliCollabError> {
@@ -450,8 +532,15 @@ impl CliCollabService {
             return Ok(PreparedSlot::Conflict(Self::status_from_row(active)?));
         }
         Ok(PreparedSlot::Stored(
-            self.store_slot(session_id, prompt, executor_config, source, true)
-                .await?,
+            self.store_slot(
+                session_id,
+                prompt,
+                executor_config,
+                dispatch_context,
+                source,
+                true,
+            )
+            .await?,
         ))
     }
 
@@ -460,14 +549,22 @@ impl CliCollabService {
         session_id: Uuid,
         prompt: &str,
         executor_config: &ExecutorConfig,
+        dispatch_context: Option<&RetryDispatchContext>,
         source: QueuedMessageSource,
         existing: Option<SessionQueuedMessage>,
     ) -> Result<DispatchOutcome, CliCollabError> {
         let row = match existing {
             Some(row) => row,
             None => {
-                self.store_slot(session_id, prompt, executor_config, source, false)
-                    .await?
+                self.store_slot(
+                    session_id,
+                    prompt,
+                    executor_config,
+                    dispatch_context,
+                    source,
+                    false,
+                )
+                .await?
             }
         };
         Ok(DispatchOutcome::Queued {
@@ -480,11 +577,19 @@ impl CliCollabService {
         session_id: Uuid,
         prompt: &str,
         executor_config: &ExecutorConfig,
+        dispatch_context: Option<&RetryDispatchContext>,
         source: QueuedMessageSource,
         replace: bool,
     ) -> Result<SessionQueuedMessage, CliCollabError> {
         match self
-            .store_slot_result(session_id, prompt, executor_config, source, replace)
+            .store_slot_result(
+                session_id,
+                prompt,
+                executor_config,
+                dispatch_context,
+                source,
+                replace,
+            )
             .await?
         {
             StoreQueuedMessageResult::Stored(row) => Ok(row),
@@ -497,15 +602,18 @@ impl CliCollabService {
         session_id: Uuid,
         prompt: &str,
         executor_config: &ExecutorConfig,
+        dispatch_context: Option<&RetryDispatchContext>,
         source: QueuedMessageSource,
         replace: bool,
     ) -> Result<StoreQueuedMessageResult, CliCollabError> {
         let config = serde_json::to_string(executor_config)?;
-        Ok(SessionQueuedMessage::store(
+        let dispatch_context = dispatch_context.map(serde_json::to_string).transpose()?;
+        Ok(SessionQueuedMessage::store_with_context(
             &self.db.pool,
             session_id,
             prompt,
             Some(&config),
+            dispatch_context.as_deref(),
             source,
             replace,
         )
@@ -551,6 +659,7 @@ impl CliCollabService {
         session: &Session,
         prompt: &str,
         executor_config: &ExecutorConfig,
+        dispatch_context: Option<&RetryDispatchContext>,
         source: QueuedMessageSource,
         existing: Option<SessionQueuedMessage>,
     ) -> Result<DispatchOutcome, CliCollabError> {
@@ -564,13 +673,27 @@ impl CliCollabService {
             Ok(Some(reservation)) => reservation,
             Ok(None) => {
                 return self
-                    .queue_or_status(session.id, prompt, executor_config, source, existing)
+                    .queue_or_status(
+                        session.id,
+                        prompt,
+                        executor_config,
+                        dispatch_context,
+                        source,
+                        existing,
+                    )
                     .await;
             }
             Err(error) => {
                 tracing::warn!(?error, session_id = %session.id, "spawn reservation failed closed");
                 return self
-                    .queue_or_status(session.id, prompt, executor_config, source, existing)
+                    .queue_or_status(
+                        session.id,
+                        prompt,
+                        executor_config,
+                        dispatch_context,
+                        source,
+                        existing,
+                    )
                     .await;
             }
         };
@@ -602,7 +725,7 @@ impl CliCollabService {
 
         let dispatched = self
             .dispatcher
-            .dispatch(session, prompt, executor_config)
+            .dispatch(session, prompt, executor_config, dispatch_context)
             .await;
         if let Err(error) = WorkspaceSpawnReservation::release(
             &self.db.pool,
@@ -642,8 +765,15 @@ impl CliCollabService {
                         status: self.status(session.id).await?,
                     })
                 } else {
-                    self.queue_or_status(session.id, prompt, executor_config, source, None)
-                        .await
+                    self.queue_or_status(
+                        session.id,
+                        prompt,
+                        executor_config,
+                        dispatch_context,
+                        source,
+                        None,
+                    )
+                    .await
                 }
             }
         }
@@ -854,8 +984,27 @@ impl CliCollabService {
                 return Ok(false);
             }
         };
+        let dispatch_context = match row
+            .dispatch_context
+            .as_deref()
+            .map(serde_json::from_str::<RetryDispatchContext>)
+            .transpose()
+        {
+            Ok(context) => context,
+            Err(error) => {
+                SessionQueuedMessage::set_failure_reason(
+                    &self.db.pool,
+                    row.id,
+                    "queued message has invalid dispatch context",
+                )
+                .await?;
+                tracing::warn!(?error, queue_id = %row.id, "invalid durable queue dispatch context");
+                return Ok(false);
+            }
+        };
         match self.derive_lease_locked(&session).await {
             WriterLease::Executor | WriterLease::CliAmbiguous | WriterLease::Busy => Ok(false),
+            WriterLease::Cli { .. } if dispatch_context.is_some() => Ok(false),
             WriterLease::Cli { claude_session_id } => {
                 if self.original_paste_binding_is_active(&row).await? {
                     return Ok(false);
@@ -873,6 +1022,7 @@ impl CliCollabService {
                         &session,
                         &prompt,
                         &executor_config,
+                        dispatch_context.as_ref(),
                         source,
                         Some(row),
                     )
@@ -1330,6 +1480,7 @@ mod tests {
             _session: &Session,
             _prompt: &str,
             _executor_config: &ExecutorConfig,
+            _retry: Option<&RetryDispatchContext>,
         ) -> AnyhowResult<ExecutionProcess> {
             panic!("lease-only tests must not dispatch")
         }
@@ -1338,6 +1489,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct DispatcherState {
         prompts: Vec<String>,
+        retry_contexts: Vec<Option<RetryDispatchContext>>,
         reservation_seen: bool,
     }
 
@@ -1353,6 +1505,7 @@ mod tests {
             session: &Session,
             prompt: &str,
             _executor_config: &ExecutorConfig,
+            retry: Option<&RetryDispatchContext>,
         ) -> AnyhowResult<ExecutionProcess> {
             let reservation_seen =
                 WorkspaceSpawnReservation::find(&self.db.pool, session.workspace_id)
@@ -1361,6 +1514,7 @@ mod tests {
             {
                 let mut state = self.state.lock().unwrap();
                 state.prompts.push(prompt.to_string());
+                state.retry_contexts.push(retry.cloned());
                 state.reservation_seen = reservation_seen;
             }
             Ok(create_running_executor(&self.db, session.id, prompt).await)
@@ -1386,6 +1540,7 @@ mod tests {
             session: &Session,
             prompt: &str,
             _executor_config: &ExecutorConfig,
+            _retry: Option<&RetryDispatchContext>,
         ) -> AnyhowResult<ExecutionProcess> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.started.notify_one();
@@ -1401,6 +1556,7 @@ mod tests {
             session: &Session,
             prompt: &str,
             _executor_config: &ExecutorConfig,
+            _retry: Option<&RetryDispatchContext>,
         ) -> AnyhowResult<ExecutionProcess> {
             let reservation_seen =
                 WorkspaceSpawnReservation::find(&self.db.pool, session.workspace_id)
@@ -2051,6 +2207,94 @@ mod tests {
             .unwrap();
         assert_eq!(queued.state, QueuedMessageState::Queued);
         assert_eq!(queued.prompt, "preserve failed dispatch");
+    }
+
+    #[tokio::test]
+    async fn retry_conflict_never_invokes_destructive_dispatcher() {
+        let (db, _workspace, session) = fixture().await;
+        store_message(&db, session.id, "already queued", QueuedMessageSource::Ui).await;
+        let dispatcher_state = Arc::new(StdMutex::new(DispatcherState::default()));
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(false, Some(false), SidEvidence::Unknown),
+            Arc::new(FakeTransport),
+            Arc::new(RecordingDispatcher {
+                db,
+                state: dispatcher_state.clone(),
+            }),
+        );
+        let retry = RetryDispatchContext {
+            process_id: Uuid::new_v4(),
+            force_when_dirty: false,
+            perform_git_reset: true,
+            reset_to_message_id: Some("assistant-message".to_string()),
+        };
+
+        let outcome = service
+            .dispatch_retry(
+                &session,
+                "retry prompt".to_string(),
+                executor_config(),
+                QueuedMessageSource::Ui,
+                false,
+                retry,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, DispatchOutcome::Conflict { .. }));
+        assert!(dispatcher_state.lock().unwrap().prompts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_retry_preserves_reset_and_transcript_context_until_dispatch() {
+        let (db, _workspace, session) = fixture().await;
+        let blocker = create_running_executor(&db, session.id, "block retry").await;
+        let dispatcher_state = Arc::new(StdMutex::new(DispatcherState::default()));
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(false, Some(false), SidEvidence::Unknown),
+            Arc::new(FakeTransport),
+            Arc::new(RecordingDispatcher {
+                db,
+                state: dispatcher_state.clone(),
+            }),
+        );
+        let retry = RetryDispatchContext {
+            process_id: Uuid::new_v4(),
+            force_when_dirty: true,
+            perform_git_reset: true,
+            reset_to_message_id: Some("assistant-message".to_string()),
+        };
+
+        let outcome = service
+            .dispatch_retry(
+                &session,
+                "retry prompt".to_string(),
+                executor_config(),
+                QueuedMessageSource::Ui,
+                false,
+                retry.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, DispatchOutcome::Queued { .. }));
+        assert!(dispatcher_state.lock().unwrap().retry_contexts.is_empty());
+
+        ExecutionProcess::update_completion(
+            &service.db.pool,
+            blocker.id,
+            ExecutionProcessStatus::Completed,
+            Some(0),
+        )
+        .await
+        .unwrap();
+        assert!(service.drain_session(session.id).await.unwrap());
+        assert_eq!(
+            dispatcher_state.lock().unwrap().retry_contexts,
+            [Some(retry)]
+        );
     }
 
     #[tokio::test]

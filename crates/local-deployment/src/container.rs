@@ -12,7 +12,7 @@ use command_group::AsyncGroupChild;
 use db::{
     DBService,
     models::{
-        coding_agent_turn::CodingAgentTurn,
+        coding_agent_turn::{CodingAgentResumeInfo, CodingAgentTurn},
         execution_process::{
             ExecutionContext, ExecutionProcess, ExecutionProcessRunReason, ExecutionProcessStatus,
         },
@@ -42,7 +42,7 @@ use serde_json::json;
 use services::services::{
     analytics::AnalyticsContext,
     approvals::{Approvals, executor_approvals::ExecutorApprovalBridge},
-    cli_collab::{CliCollabService, CliExecutorDispatcher},
+    cli_collab::{CliCollabService, CliExecutorDispatcher, RetryDispatchContext},
     config::{Config, DEFAULT_COMMIT_REMINDER_PROMPT},
     container::{ContainerError, ContainerRef, ContainerService},
     diff_stream::{self, DiffStreamHandle},
@@ -62,6 +62,29 @@ use uuid::Uuid;
 use workspace_manager::{RepoWorkspaceInput, WorkspaceError, WorkspaceManager};
 
 use crate::{command, copy};
+
+fn queued_action_type(
+    queued_data: &DraftFollowUpData,
+    latest_session_info: Option<CodingAgentResumeInfo>,
+    working_dir: Option<String>,
+    reset_to_message_id: Option<String>,
+) -> ExecutorActionType {
+    if let Some(info) = latest_session_info {
+        ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
+            prompt: queued_data.message.clone(),
+            session_id: info.session_id,
+            reset_to_message_id,
+            executor_config: queued_data.executor_config.clone(),
+            working_dir,
+        })
+    } else {
+        ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
+            prompt: queued_data.message.clone(),
+            executor_config: queued_data.executor_config.clone(),
+            working_dir,
+        })
+    }
+}
 
 const WORKSPACE_TOUCH_DEBOUNCE: Duration = Duration::from_mins(2);
 
@@ -1121,6 +1144,7 @@ impl LocalContainerService {
         workspace: &Workspace,
         session: &Session,
         queued_data: &DraftFollowUpData,
+        reset_to_message_id: Option<String>,
     ) -> Result<ExecutionProcess, ContainerError> {
         let executor_profile_id = queued_data.executor_config.profile_id();
 
@@ -1160,21 +1184,12 @@ impl LocalContainerService {
             .filter(|dir| !dir.is_empty())
             .cloned();
 
-        let action_type = if let Some(info) = latest_session_info {
-            ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
-                prompt: queued_data.message.clone(),
-                session_id: info.session_id,
-                reset_to_message_id: None,
-                executor_config: queued_data.executor_config.clone(),
-                working_dir: working_dir.clone(),
-            })
-        } else {
-            ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
-                prompt: queued_data.message.clone(),
-                executor_config: queued_data.executor_config.clone(),
-                working_dir,
-            })
-        };
+        let action_type = queued_action_type(
+            queued_data,
+            latest_session_info,
+            working_dir,
+            reset_to_message_id,
+        );
 
         let action = ExecutorAction::new(action_type, cleanup_action.map(Box::new));
 
@@ -1195,6 +1210,7 @@ impl CliExecutorDispatcher for LocalContainerService {
         session: &Session,
         prompt: &str,
         executor_config: &executors::profile::ExecutorConfig,
+        retry: Option<&RetryDispatchContext>,
     ) -> anyhow::Result<ExecutionProcess> {
         let workspace = Workspace::find_by_id(&self.db.pool, session.workspace_id)
             .await?
@@ -1203,8 +1219,22 @@ impl CliExecutorDispatcher for LocalContainerService {
             message: prompt.to_string(),
             executor_config: executor_config.clone(),
         };
+        if let Some(retry) = retry {
+            self.reset_session_to_process(
+                session.id,
+                retry.process_id,
+                retry.perform_git_reset,
+                retry.force_when_dirty,
+            )
+            .await?;
+        }
         let process = self
-            .start_queued_follow_up(&workspace, session, &data)
+            .start_queued_follow_up(
+                &workspace,
+                session,
+                &data,
+                retry.and_then(|retry| retry.reset_to_message_id.clone()),
+            )
             .await?;
         if let Err(error) =
             Scratch::delete(&self.db.pool, session.id, &ScratchType::DraftFollowUp).await
@@ -1747,5 +1777,37 @@ fn success_exit_status() -> std::process::ExitStatus {
     {
         use std::os::windows::process::ExitStatusExt;
         ExitStatusExt::from_raw(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use executors::{executors::BaseCodingAgent, profile::ExecutorConfig};
+
+    use super::*;
+
+    #[test]
+    fn retry_threads_transcript_truncation_into_follow_up_action() {
+        let reset_to_message_id = "assistant-message-to-retry".to_string();
+        let action = queued_action_type(
+            &DraftFollowUpData {
+                message: "retry this prompt".to_string(),
+                executor_config: ExecutorConfig::new(BaseCodingAgent::ClaudeCode),
+            },
+            Some(CodingAgentResumeInfo {
+                session_id: "claude-session".to_string(),
+                message_id: Some(reset_to_message_id.clone()),
+            }),
+            None,
+            Some(reset_to_message_id.clone()),
+        );
+
+        let ExecutorActionType::CodingAgentFollowUpRequest(request) = action else {
+            panic!("a retry with session continuity must be a follow-up");
+        };
+        assert_eq!(
+            request.reset_to_message_id.as_deref(),
+            Some(reset_to_message_id.as_str())
+        );
     }
 }

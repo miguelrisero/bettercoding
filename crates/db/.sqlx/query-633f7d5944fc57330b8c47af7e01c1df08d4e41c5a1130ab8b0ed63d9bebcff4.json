@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO session_queued_messages\n                   (id, session_id, prompt, executor_config, dispatch_context, source, state)\n               VALUES ($1, $2, $3, $4, $5, $6, 'queued')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "633f7d5944fc57330b8c47af7e01c1df08d4e41c5a1130ab8b0ed63d9bebcff4"
+}

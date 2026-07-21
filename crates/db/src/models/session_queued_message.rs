@@ -51,6 +51,9 @@ pub struct SessionQueuedMessage {
     #[serde(skip)]
     #[ts(skip)]
     pub executor_claim_owner: Option<String>,
+    #[serde(skip)]
+    #[ts(skip)]
+    pub dispatch_context: Option<String>,
     pub pasted_at: Option<DateTime<Utc>>,
     pub acked_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -80,7 +83,8 @@ pub struct QueueReconciliation {
 impl SessionQueuedMessage {
     const SELECT_FIELDS: &'static str = r#"
         id, session_id, prompt, executor_config, source, state,
-        failure_reason, claude_session_id, executor_claim_owner, pasted_at, acked_at,
+        failure_reason, claude_session_id, executor_claim_owner, dispatch_context,
+        pasted_at, acked_at,
         created_at, updated_at
     "#;
 
@@ -144,6 +148,27 @@ impl SessionQueuedMessage {
         source: QueuedMessageSource,
         replace: bool,
     ) -> Result<StoreQueuedMessageResult, sqlx::Error> {
+        Self::store_with_context(
+            pool,
+            session_id,
+            prompt,
+            executor_config,
+            None,
+            source,
+            replace,
+        )
+        .await
+    }
+
+    pub async fn store_with_context(
+        pool: &SqlitePool,
+        session_id: Uuid,
+        prompt: &str,
+        executor_config: Option<&str>,
+        dispatch_context: Option<&str>,
+        source: QueuedMessageSource,
+        replace: bool,
+    ) -> Result<StoreQueuedMessageResult, sqlx::Error> {
         if replace {
             let sql = format!(
                 r#"UPDATE session_queued_messages SET
@@ -153,10 +178,11 @@ impl SessionQueuedMessage {
                        failure_reason = NULL,
                        claude_session_id = NULL,
                        executor_claim_owner = NULL,
+                       dispatch_context = $4,
                        pasted_at = NULL,
                        acked_at = NULL,
                        updated_at = datetime('now', 'subsec')
-                   WHERE session_id = $4 AND state = 'queued'
+                   WHERE session_id = $5 AND state = 'queued'
                    RETURNING {}"#,
                 Self::SELECT_FIELDS
             );
@@ -164,6 +190,7 @@ impl SessionQueuedMessage {
                 .bind(prompt)
                 .bind(executor_config)
                 .bind(source)
+                .bind(dispatch_context)
                 .bind(session_id)
                 .fetch_optional(pool)
                 .await?
@@ -179,12 +206,13 @@ impl SessionQueuedMessage {
         let id = Uuid::new_v4();
         sqlx::query!(
             r#"INSERT INTO session_queued_messages
-                   (id, session_id, prompt, executor_config, source, state)
-               VALUES ($1, $2, $3, $4, $5, 'queued')"#,
+                   (id, session_id, prompt, executor_config, dispatch_context, source, state)
+               VALUES ($1, $2, $3, $4, $5, $6, 'queued')"#,
             id,
             session_id,
             prompt,
             executor_config,
+            dispatch_context,
             source
         )
         .execute(pool)

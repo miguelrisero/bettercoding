@@ -1,6 +1,10 @@
 import { useMutation } from '@tanstack/react-query';
 import { sessionsApi } from '@/shared/lib/api';
 import {
+  DispatchReplacementCancelledError,
+  dispatchWithConflictResolution,
+} from '@/shared/lib/dispatchWithConflictResolution';
+import {
   RestoreLogsDialog,
   type RestoreLogsDialogResult,
 } from '@/shared/dialogs/tasks/RestoreLogsDialog';
@@ -8,6 +12,7 @@ import type {
   RepoBranchStatus,
   ExecutionProcess,
   ExecutorConfig,
+  QueueStatus,
 } from 'shared/types';
 
 export interface MessageEditRetryParams {
@@ -28,7 +33,8 @@ class EditDialogCancelledError extends Error {
 export function useMessageEditRetry(
   sessionId: string,
   onSuccess?: () => void,
-  onError?: (err: unknown) => void
+  onError?: (err: unknown) => void,
+  confirmReplacement?: (status: QueueStatus) => Promise<boolean>
 ) {
   return useMutation({
     mutationFn: async ({
@@ -53,22 +59,30 @@ export function useMessageEditRetry(
         throw new EditDialogCancelledError();
       }
 
-      // Send the retry request with the edited message
-      await sessionsApi.followUp(sessionId, {
-        prompt: message,
-        executor_config: executorConfig,
-        retry_process_id: executionProcessId,
-        force_when_dirty: modalResult.forceWhenDirty ?? false,
-        perform_git_reset: modalResult.performGitReset ?? true,
-        replace: false,
-      });
+      // A conflict is an explicit outcome, not a successful retry. Keep the
+      // destructive reset behind the server gate and ask before replacement.
+      await dispatchWithConflictResolution(
+        (replace) =>
+          sessionsApi.followUp(sessionId, {
+            prompt: message,
+            executor_config: executorConfig,
+            retry_process_id: executionProcessId,
+            force_when_dirty: modalResult.forceWhenDirty ?? false,
+            perform_git_reset: modalResult.performGitReset ?? true,
+            replace,
+          }),
+        confirmReplacement
+      );
     },
     onSuccess: () => {
       onSuccess?.();
     },
     onError: (err) => {
       // Don't report cancellation as an error
-      if (err instanceof EditDialogCancelledError) {
+      if (
+        err instanceof EditDialogCancelledError ||
+        err instanceof DispatchReplacementCancelledError
+      ) {
         return;
       }
       console.error('Failed to send edited message:', err);

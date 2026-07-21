@@ -78,6 +78,7 @@ import {
   type DispatchNoticeKind,
 } from '../model/collaborationUiState';
 import { useTransientToast } from '@/shared/hooks/useTransientToast';
+import { DispatchConflictError } from '@/shared/lib/dispatchWithConflictResolution';
 
 /** Compute execution status from boolean flags */
 function computeExecutionStatus(params: {
@@ -795,12 +796,22 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
   ]);
 
   // Message edit retry mutation
-  const editRetryMutation = useMessageEditRetry(sessionId ?? '', () => {
-    // On success, clear edit mode and reset editor
-    editContext.cancelEdit();
-    cancelDebouncedSave();
-    setLocalMessage('');
-  });
+  const editRetryMutation = useMessageEditRetry(
+    sessionId ?? '',
+    () => {
+      // On success, clear edit mode and reset editor
+      editContext.cancelEdit();
+      cancelDebouncedSave();
+      setLocalMessage('');
+    },
+    (error) => {
+      if (error instanceof DispatchConflictError) {
+        setQueueStatus(error.status);
+        showReplacementConflict(error.status);
+      }
+    },
+    confirmQueueReplacement
+  );
 
   const areAttachmentInputsDisabled =
     mode === 'placeholder' ||

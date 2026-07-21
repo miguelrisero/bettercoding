@@ -13,6 +13,7 @@ use axum::{
 };
 use db::models::{
     cli_native_record::CliNativeRecord,
+    coding_agent_turn::CodingAgentTurn,
     execution_process::{ExecutionProcess, ExecutionProcessRunReason},
     requests::UpdateSession,
     scratch::{Scratch, ScratchType},
@@ -28,7 +29,10 @@ use executors::{
     profile::ExecutorConfig,
 };
 use serde::Deserialize;
-use services::services::{cli_collab::DispatchOutcome, container::ContainerService};
+use services::services::{
+    cli_collab::{DispatchOutcome, RetryDispatchContext},
+    container::ContainerService,
+};
 use ts_rs::TS;
 use utils::response::ApiResponse;
 use uuid::Uuid;
@@ -187,26 +191,45 @@ pub async fn follow_up(
             .await?;
     }
 
-    if let Some(proc_id) = payload.retry_process_id {
-        let force_when_dirty = payload.force_when_dirty.unwrap_or(false);
-        let perform_git_reset = payload.perform_git_reset.unwrap_or(true);
-        deployment
-            .container()
-            .reset_session_to_process(session.id, proc_id, perform_git_reset, force_when_dirty)
-            .await?;
-    }
+    let retry = if let Some(process_id) = payload.retry_process_id {
+        let reset_to_message_id = CodingAgentTurn::find_latest_session_info(pool, session.id)
+            .await?
+            .and_then(|info| info.message_id);
+        Some(RetryDispatchContext {
+            process_id,
+            force_when_dirty: payload.force_when_dirty.unwrap_or(false),
+            perform_git_reset: payload.perform_git_reset.unwrap_or(true),
+            reset_to_message_id,
+        })
+    } else {
+        None
+    };
 
-    let outcome = match deployment
-        .cli_collab()
-        .dispatch_gate(
-            &session,
-            payload.prompt,
-            payload.executor_config,
-            QueuedMessageSource::Ui,
-            payload.replace,
-        )
-        .await
-    {
+    let dispatch = if let Some(retry) = retry {
+        deployment
+            .cli_collab()
+            .dispatch_retry(
+                &session,
+                payload.prompt,
+                payload.executor_config,
+                QueuedMessageSource::Ui,
+                payload.replace,
+                retry,
+            )
+            .await
+    } else {
+        deployment
+            .cli_collab()
+            .dispatch_gate(
+                &session,
+                payload.prompt,
+                payload.executor_config,
+                QueuedMessageSource::Ui,
+                payload.replace,
+            )
+            .await
+    };
+    let outcome = match dispatch {
         Ok(outcome) => outcome,
         Err(error) => {
             tracing::warn!(?error, session_id = %session.id, "follow-up dispatch gate failed closed");

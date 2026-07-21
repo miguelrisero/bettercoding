@@ -1,6 +1,10 @@
 import { useMutation } from '@tanstack/react-query';
 import { sessionsApi } from '@/shared/lib/api';
 import {
+  DispatchReplacementCancelledError,
+  dispatchWithConflictResolution,
+} from '@/shared/lib/dispatchWithConflictResolution';
+import {
   RestoreLogsDialog,
   type RestoreLogsDialogResult,
 } from '@/shared/dialogs/tasks/RestoreLogsDialog';
@@ -8,6 +12,7 @@ import type {
   RepoBranchStatus,
   ExecutionProcess,
   BaseCodingAgent,
+  QueueStatus,
 } from 'shared/types';
 
 export interface RetryProcessParams {
@@ -29,7 +34,8 @@ class RetryDialogCancelledError extends Error {
 export function useRetryProcess(
   sessionId: string,
   onSuccess?: () => void,
-  onError?: (err: unknown) => void
+  onError?: (err: unknown) => void,
+  confirmReplacement?: (status: QueueStatus) => Promise<boolean>
 ) {
   return useMutation({
     mutationFn: async ({
@@ -55,22 +61,28 @@ export function useRetryProcess(
         throw new RetryDialogCancelledError();
       }
 
-      // Send the retry request
-      await sessionsApi.followUp(sessionId, {
-        prompt: message,
-        executor_config: { executor, variant },
-        retry_process_id: executionProcessId,
-        force_when_dirty: modalResult.forceWhenDirty ?? false,
-        perform_git_reset: modalResult.performGitReset ?? true,
-        replace: false,
-      });
+      await dispatchWithConflictResolution(
+        (replace) =>
+          sessionsApi.followUp(sessionId, {
+            prompt: message,
+            executor_config: { executor, variant },
+            retry_process_id: executionProcessId,
+            force_when_dirty: modalResult.forceWhenDirty ?? false,
+            perform_git_reset: modalResult.performGitReset ?? true,
+            replace,
+          }),
+        confirmReplacement
+      );
     },
     onSuccess: () => {
       onSuccess?.();
     },
     onError: (err) => {
       // Don't report cancellation as an error
-      if (err instanceof RetryDialogCancelledError) {
+      if (
+        err instanceof RetryDialogCancelledError ||
+        err instanceof DispatchReplacementCancelledError
+      ) {
         return;
       }
       console.error('Failed to send retry:', err);

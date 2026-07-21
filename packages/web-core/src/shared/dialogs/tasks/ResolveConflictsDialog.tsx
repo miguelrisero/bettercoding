@@ -24,6 +24,8 @@ import { defineModal } from '@/shared/lib/modals';
 import { buildResolveConflictsInstructions } from '@/shared/lib/conflicts';
 import { useExecutionProcesses } from '@/shared/hooks/useExecutionProcesses';
 import { getLatestConfigFromProcesses } from '@/shared/lib/executor';
+import { dispatchWithConflictResolution } from '@/shared/lib/dispatchWithConflictResolution';
+import { ConfirmDialog } from '@vibe/ui/components/ConfirmDialog';
 import type {
   BaseCodingAgent,
   ExecutorProfileId,
@@ -164,18 +166,40 @@ const ResolveConflictsDialogImpl = create<ResolveConflictsDialogProps>(
           return;
         }
 
-        // Send follow-up with conflict resolution instructions
-        await sessionsApi.followUp(targetSessionId, {
-          prompt: conflictInstructions,
-          executor_config: {
-            executor: effectiveProfile.executor,
-            variant: effectiveProfile.variant,
-          },
-          retry_process_id: null,
-          force_when_dirty: null,
-          perform_git_reset: null,
-          replace: false,
-        });
+        // Send follow-up with conflict resolution instructions. An occupied
+        // durable slot requires explicit replacement instead of false success.
+        await dispatchWithConflictResolution(
+          (replace) =>
+            sessionsApi.followUp(targetSessionId!, {
+              prompt: conflictInstructions,
+              executor_config: {
+                executor: effectiveProfile.executor,
+                variant: effectiveProfile.variant,
+              },
+              retry_process_id: null,
+              force_when_dirty: null,
+              perform_git_reset: null,
+              replace,
+            }),
+          async (status) => {
+            if (status.status === 'empty') return false;
+            const result = await ConfirmDialog.show({
+              title: t('conversation.queue.replaceTitle'),
+              message:
+                status.message.source === 'recovery'
+                  ? t('conversation.queue.replaceRecoveryMessage', {
+                      message: status.message.data.message,
+                    })
+                  : t('conversation.queue.replaceUiMessage', {
+                      message: status.message.data.message,
+                    }),
+              confirmText: t('conversation.queue.replaceConfirm'),
+              cancelText: t('conversation.actions.cancel'),
+              variant: 'destructive',
+            });
+            return result === 'confirmed';
+          }
+        );
 
         // Invalidate queries and wait for them to complete
         await Promise.all([
