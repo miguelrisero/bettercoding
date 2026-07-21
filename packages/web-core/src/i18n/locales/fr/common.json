@@ -67,6 +67,19 @@
     "deniedByUser": "{{toolName}} refusé par l'utilisateur",
     "tool": "Outil",
     "thinking": "Réflexion",
+    "assistant": "Claude",
+    "viaCli": "via la CLI",
+    "cliSessionActive": "Session CLI active",
+    "quarantine": {
+      "affordance": "CLI non attribuées",
+      "openLabel": "Ouvrir {{count}} conversations CLI non attribuées",
+      "title": "Conversations CLI non attribuées",
+      "description": "Ces conversations ont été trouvées dans cet espace de travail, mais ne sont liées à aucune conversation de l'application. Attribuez-en une à la conversation ouverte.",
+      "noPreview": "Aucun aperçu du message disponible",
+      "assign": "Attribuer ici",
+      "assigning": "Attribution…",
+      "error": "Cette conversation n'a pas pu être attribuée. Réessayez."
+    },
     "toolSummary": {
       "read": "Lu {{path}}",
       "searched": "Recherché \"{{query}}\"",
@@ -77,6 +90,12 @@
     },
     "subagent": {
       "defaultType": "Sous-agent"
+    },
+    "fork": {
+      "explanation": "Certains messages ont suivi un chemin que l'agent ne suit plus.",
+      "branchLabel": "Branche {{index}}",
+      "resumeHint": "Claude reprend ici",
+      "emptyBranch": "Aucun message visible dans cette branche"
     },
     "loadingEarlierMessages": "Chargement des messages précédents",
     "cliEmptyTitle": "Cet espace de travail s'exécute généralement dans le terminal",

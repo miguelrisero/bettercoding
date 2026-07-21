@@ -80,6 +80,19 @@
     "plan": "계획",
     "tool": "도구",
     "thinking": "생각 중",
+    "assistant": "Claude",
+    "viaCli": "CLI를 통해",
+    "cliSessionActive": "CLI 세션 활성",
+    "quarantine": {
+      "affordance": "할당되지 않은 CLI",
+      "openLabel": "할당되지 않은 CLI 대화 {{count}}개 열기",
+      "title": "할당되지 않은 CLI 대화",
+      "description": "이 워크스페이스에서 발견되었지만 앱 대화에 연결되지 않은 대화입니다. 현재 열린 대화에 할당하세요.",
+      "noPreview": "프롬프트 미리보기가 없습니다",
+      "assign": "여기에 할당",
+      "assigning": "할당 중…",
+      "error": "이 대화를 할당할 수 없습니다. 다시 시도하세요."
+    },
     "toolSummary": {
       "read": "{{path}} 읽기",
       "searched": "\"{{query}}\" 검색",
@@ -90,6 +103,12 @@
     },
     "subagent": {
       "defaultType": "서브에이전트"
+    },
+    "fork": {
+      "explanation": "일부 메시지는 에이전트가 더 이상 따르지 않는 경로로 진행되었습니다.",
+      "branchLabel": "브랜치 {{index}}",
+      "resumeHint": "Claude가 여기서 재개",
+      "emptyBranch": "이 브랜치에 표시할 메시지가 없습니다"
     },
     "loadingEarlierMessages": "이전 메시지 불러오는 중",
     "cliEmptyTitle": "이 워크스페이스는 보통 터미널에서 실행됩니다",

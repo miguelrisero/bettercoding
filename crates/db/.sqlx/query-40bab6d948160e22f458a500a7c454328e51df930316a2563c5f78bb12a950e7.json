@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM cli_ingest_outbox\n               WHERE NOT EXISTS (\n                   SELECT 1\n                   FROM cli_native_records record\n                   JOIN cli_native_files file ON file.id = record.file_id\n                   JOIN claude_session_links link\n                     ON link.claude_session_id = record.claude_session_id\n                   WHERE record.file_id = cli_ingest_outbox.file_id\n                     AND record.line_seq = cli_ingest_outbox.line_seq\n                     AND link.session_id = cli_ingest_outbox.session_id\n                     AND file.generation = (\n                         SELECT MAX(newer.generation)\n                         FROM cli_native_files newer\n                         WHERE newer.dir_path = file.dir_path\n                           AND newer.file_name = file.file_name\n                     )\n               )",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "40bab6d948160e22f458a500a7c454328e51df930316a2563c5f78bb12a950e7"
+}

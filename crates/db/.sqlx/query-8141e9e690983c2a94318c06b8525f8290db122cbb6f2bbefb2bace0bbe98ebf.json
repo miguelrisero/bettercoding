@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT claude_session_id AS \"claude_session_id!\",\n                      session_id AS \"session_id!: Uuid\",\n                      workspace_id AS \"workspace_id!: Uuid\",\n                      cwd AS \"cwd!\",\n                      bound_via AS \"bound_via!: ClaudeSessionBoundVia\",\n                      created_at AS \"created_at!: DateTime<Utc>\"\n               FROM claude_session_links\n               WHERE claude_session_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "name": "claude_session_id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "session_id!: Uuid",
+        "ordinal": 1,
+        "type_info": "Blob"
+      },
+      {
+        "name": "workspace_id!: Uuid",
+        "ordinal": 2,
+        "type_info": "Blob"
+      },
+      {
+        "name": "cwd!",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "bound_via!: ClaudeSessionBoundVia",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at!: DateTime<Utc>",
+        "ordinal": 5,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8141e9e690983c2a94318c06b8525f8290db122cbb6f2bbefb2bace0bbe98ebf"
+}

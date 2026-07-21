@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO cli_ingest_outbox\n                   (session_id, seq, file_id, line_seq)\n               SELECT $1,\n                      $2 + ROW_NUMBER() OVER (\n                          ORDER BY f.created_at, f.generation, r.line_seq\n                      ) - 1,\n                      r.file_id,\n                      r.line_seq\n               FROM cli_native_records r\n               JOIN cli_native_files f ON f.id = r.file_id\n               WHERE r.claude_session_id = $3\n                 AND NOT EXISTS (\n                     SELECT 1 FROM cli_ingest_outbox published\n                     WHERE published.session_id = $1\n                       AND published.file_id = r.file_id\n                       AND published.line_seq = r.line_seq\n                 )\n               ORDER BY f.created_at, f.generation, r.line_seq",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "ebda447ad95f61ff6206791c3ac2d7afb11927bd7c41c5e9b75a33e573a95779"
+}

@@ -8,9 +8,11 @@ import type { PatchTypeWithKey } from '@/shared/hooks/useConversationHistory/typ
 import {
   deriveConversationTurns,
   type ConversationAgentTurn,
+  type ConversationNativeTurn,
   type ConversationScriptTurn,
   type ConversationTurn,
 } from './deriveConversationTurns';
+import { annotateExecutorEntriesWithNativeForks } from './deriveNativeForkGroups';
 
 export interface DerivedConversationEntriesResult {
   readonly entries: PatchTypeWithKey[];
@@ -137,6 +139,19 @@ function appendScriptTurnEntries(
   }
 }
 
+function appendNativeTurnEntry(
+  turn: ConversationNativeTurn,
+  turnEntries: PatchTypeWithKey[]
+) {
+  turnEntries.push({
+    type: 'NORMALIZED_ENTRY',
+    content: turn.entry.normalized_entry,
+    patchKey: turn.key,
+    executionProcessId: '',
+    nativeEntry: turn.entry,
+  });
+}
+
 function isAgentTurn(turn: ConversationTurn): turn is ConversationAgentTurn {
   return (
     turn.kind === 'agent_idle' ||
@@ -165,6 +180,11 @@ export function deriveConversationEntries({
 
   const entries = conversationTurns.turns.flatMap((turn, index) => {
     const turnEntries: PatchTypeWithKey[] = [];
+
+    if (turn.kind === 'native') {
+      appendNativeTurnEntry(turn, turnEntries);
+      return turnEntries;
+    }
 
     if (isAgentTurn(turn)) {
       if (turn.latestTokenUsageInfo) {
@@ -226,8 +246,12 @@ export function deriveConversationEntries({
     );
   }
 
+  const forkAwareEntries = source.nativeFeed
+    ? annotateExecutorEntriesWithNativeForks(entries, source.nativeFeed.entries)
+    : entries;
+
   return {
-    entries,
+    entries: forkAwareEntries,
     hasRunningProcess,
     hasSetupScriptRun,
     hasCleanupScriptRun,

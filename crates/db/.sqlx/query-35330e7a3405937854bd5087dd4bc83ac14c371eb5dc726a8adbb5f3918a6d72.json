@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT l.session_id AS \"session_id!: Uuid\"\n               FROM cli_native_files f\n               JOIN claude_session_links l\n                 ON l.claude_session_id = f.claude_session_id\n               WHERE f.id = $1",
+  "describe": {
+    "columns": [
+      {
+        "name": "session_id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "35330e7a3405937854bd5087dd4bc83ac14c371eb5dc726a8adbb5f3918a6d72"
+}

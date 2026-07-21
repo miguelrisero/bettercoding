@@ -4,11 +4,12 @@ import {
   UserIcon,
   ListChecksIcon,
   GearIcon,
+  RobotIcon,
   IconProps,
 } from '@phosphor-icons/react';
 import { cn } from '../lib/cn';
 
-type Variant = 'user' | 'plan' | 'plan_denied' | 'system';
+type Variant = 'user' | 'assistant' | 'plan' | 'plan_denied' | 'system';
 
 export interface ChatEntryStatusLike {
   status: string;
@@ -24,6 +25,12 @@ interface VariantConfig {
 const variantConfig: Record<Variant, VariantConfig> = {
   user: {
     icon: UserIcon,
+    border: 'border-border',
+    headerBg: '',
+    bg: '',
+  },
+  assistant: {
+    icon: RobotIcon,
     border: 'border-border',
     headerBg: '',
     bg: '',

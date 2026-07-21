@@ -17,6 +17,7 @@ use services::services::{
     analytics::AnalyticsService,
     approvals::Approvals,
     auth::AuthContext,
+    claude_transcript_ingest::ClaudeTranscriptIngest,
     config::{Config, ConfigError},
     container::{ContainerError, ContainerService},
     events::{EventError, EventService},
@@ -105,6 +106,8 @@ pub trait Deployment: Clone + Send + Sync + 'static {
     fn approvals(&self) -> &Approvals;
 
     fn queued_message_service(&self) -> &QueuedMessageService;
+
+    fn claude_transcript_ingest(&self) -> Option<&Arc<ClaudeTranscriptIngest>>;
 
     fn auth_context(&self) -> &AuthContext;
 

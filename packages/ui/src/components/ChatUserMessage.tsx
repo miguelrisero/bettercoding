@@ -18,6 +18,7 @@ interface ChatUserMessageProps {
   onEdit?: () => void;
   onReset?: () => void;
   isGreyed?: boolean;
+  attribution?: ReactNode;
   renderMarkdown: (props: ChatUserMessageRenderProps) => ReactNode;
 }
 
@@ -30,6 +31,7 @@ export function ChatUserMessage({
   onEdit,
   onReset,
   isGreyed,
+  attribution,
   renderMarkdown,
 }: ChatUserMessageProps) {
   const { t } = useTranslation('tasks');
@@ -69,6 +71,14 @@ export function ChatUserMessage({
         )}
       </div>
     ) : undefined;
+  const headerRight = attribution ? (
+    <div className="flex items-center gap-base">
+      {attribution}
+      {headerActions}
+    </div>
+  ) : (
+    headerActions
+  );
 
   return (
     <ChatEntryContainer
@@ -78,7 +88,7 @@ export function ChatUserMessage({
       onToggle={onToggle}
       className={className}
       isGreyed={isGreyed}
-      headerRight={headerActions}
+      headerRight={headerRight}
     >
       {renderMarkdown({ content, workspaceId })}
     </ChatEntryContainer>

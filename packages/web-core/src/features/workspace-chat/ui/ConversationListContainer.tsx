@@ -8,7 +8,11 @@ import {
   useState,
   type MouseEvent,
 } from 'react';
-import { SpinnerIcon, TerminalWindowIcon } from '@phosphor-icons/react';
+import {
+  CircleIcon,
+  SpinnerIcon,
+  TerminalWindowIcon,
+} from '@phosphor-icons/react';
 import { useTranslation } from 'react-i18next';
 
 import {
@@ -32,20 +36,26 @@ import type {
   AddEntryType,
   ConversationTimelineSource,
   DisplayEntry,
+  NativeForkDisplayGroup,
 } from '@/shared/hooks/useConversationHistory/types';
 import {
   isAggregatedGroup,
   isAggregatedDiffGroup,
   isAggregatedThinkingGroup,
+  isNativeForkDisplayGroup,
 } from '@/shared/hooks/useConversationHistory/types';
 import { useConversationHistory } from '../model/hooks/useConversationHistory';
+import { useUnassignedCliSessions } from '../model/hooks/useUnassignedCliSessions';
 import { useSetTokenUsageInfo } from '../model/contexts/EntriesContext';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
-import type { RepoWithTargetBranch } from 'shared/types';
+import type { NativeFeedOrigin, RepoWithTargetBranch } from 'shared/types';
 import { ChatEmptyState } from '@vibe/ui/components/ChatEmptyState';
 import { useUiPreferencesStore } from '@/shared/stores/useUiPreferencesStore';
 import { ChatScriptPlaceholder } from '@vibe/ui/components/ChatScriptPlaceholder';
 import { ScriptFixerDialog } from '@/shared/dialogs/scripts/ScriptFixerDialog';
+import { ChatForkBranches } from '@vibe/ui/components/ChatForkBranches';
+import { Badge } from '@vibe/ui/components/Badge';
+import { UnassignedCliSessions } from './UnassignedCliSessions';
 
 interface ConversationListProps {
   attempt: WorkspaceWithSession;
@@ -61,6 +71,8 @@ interface ConversationListProps {
    * no-op there.
    */
   cliAvailable?: boolean;
+  /** Coarse workspace status hint from the existing CLI activity stream. */
+  cliSessionActive?: boolean;
 }
 
 export interface ConversationListHandle {
@@ -75,12 +87,40 @@ export interface ConversationListHandle {
 const ALWAYS_UNVIRTUALIZED_TAIL_ROWS = 8;
 const STREAMING_UNVIRTUALIZED_BUFFER_ROWS = 24;
 
+function getDisplayEntryOrigin(
+  entry: DisplayEntry
+): NativeFeedOrigin | undefined {
+  if (
+    isAggregatedGroup(entry) ||
+    isAggregatedDiffGroup(entry) ||
+    isAggregatedThinkingGroup(entry)
+  ) {
+    return entry.entries.find((nestedEntry) => nestedEntry.nativeEntry)
+      ?.nativeEntry?.origin;
+  }
+
+  return entry.type === 'NORMALIZED_ENTRY'
+    ? entry.nativeEntry?.origin
+    : undefined;
+}
+
 function renderRowContent(
   entry: DisplayEntry,
   attempt: WorkspaceWithSession,
   resetAction: UseResetProcessResult,
   repos: RepoWithTargetBranch[]
 ): React.ReactNode {
+  if (isNativeForkDisplayGroup(entry)) {
+    return (
+      <NativeForkGroupEntry
+        group={entry}
+        attempt={attempt}
+        resetAction={resetAction}
+        repos={repos}
+      />
+    );
+  }
+
   if (isAggregatedGroup(entry)) {
     return (
       <DisplayConversationEntry
@@ -93,6 +133,7 @@ function renderRowContent(
         workspaceWithSession={attempt}
         resetAction={resetAction}
         repos={repos}
+        origin={getDisplayEntryOrigin(entry)}
       />
     );
   }
@@ -109,6 +150,7 @@ function renderRowContent(
         workspaceWithSession={attempt}
         resetAction={resetAction}
         repos={repos}
+        origin={getDisplayEntryOrigin(entry)}
       />
     );
   }
@@ -125,6 +167,7 @@ function renderRowContent(
         workspaceWithSession={attempt}
         resetAction={resetAction}
         repos={repos}
+        origin={getDisplayEntryOrigin(entry)}
       />
     );
   }
@@ -148,11 +191,53 @@ function renderRowContent(
         workspaceWithSession={attempt}
         resetAction={resetAction}
         repos={repos}
+        origin={getDisplayEntryOrigin(entry)}
       />
     );
   }
 
   return null;
+}
+
+function NativeForkGroupEntry({
+  group,
+  attempt,
+  resetAction,
+  repos,
+}: {
+  group: NativeForkDisplayGroup;
+  attempt: WorkspaceWithSession;
+  resetAction: UseResetProcessResult;
+  repos: RepoWithTargetBranch[];
+}) {
+  const { t } = useTranslation('common');
+
+  return (
+    <div className="px-double py-base">
+      <ChatForkBranches
+        explanation={t('conversation.fork.explanation')}
+        resumeHint={t('conversation.fork.resumeHint')}
+        emptyBranchLabel={t('conversation.fork.emptyBranch')}
+        branches={group.branches.map((branch, index) => ({
+          id: `${group.patchKey}:${index}:${branch.isDefault ? 'default' : 'alternate'}`,
+          label: t('conversation.fork.branchLabel', {
+            index: index + 1,
+          }),
+          isDefault: branch.isDefault,
+          content:
+            branch.entries.length > 0 ? (
+              <>
+                {branch.entries.map((entry) => (
+                  <div key={entry.patchKey}>
+                    {renderRowContent(entry, attempt, resetAction, repos)}
+                  </div>
+                ))}
+              </>
+            ) : null,
+        }))}
+      />
+    </div>
+  );
 }
 
 export const ConversationList = forwardRef<
@@ -165,11 +250,16 @@ export const ConversationList = forwardRef<
     onAtBottomChange,
     sessionScopeId,
     cliAvailable = false,
+    cliSessionActive = false,
   },
   ref
 ) {
   const { t } = useTranslation('common');
   const repos = reposProp;
+  const unassignedCliSessions = useUnassignedCliSessions(
+    cliAvailable ? attempt.id : undefined,
+    cliAvailable ? attempt.session?.id : undefined
+  );
   const setWorkspacePanelState = useUiPreferencesStore(
     (s) => s.setWorkspacePanelState
   );
@@ -376,7 +466,8 @@ export const ConversationList = forwardRef<
     const derivedTimeline = deriveConversationTimeline(
       derivedEntries.entries,
       prevEntriesRef.current,
-      prevRowsRef.current
+      prevRowsRef.current,
+      pending.source.nativeFeed?.forks
     );
 
     prevEntriesRef.current = derivedTimeline.displayEntries;
@@ -783,6 +874,30 @@ export const ConversationList = forwardRef<
   return (
     <ApprovalFormProvider>
       <div className="relative h-full overflow-hidden">
+        {(cliSessionActive || unassignedCliSessions.sessions.length > 0) && (
+          <div className="absolute right-double top-base z-20 flex max-w-[calc(100%_-_2rem)] flex-wrap justify-end gap-base">
+            <UnassignedCliSessions
+              sessions={unassignedCliSessions.sessions}
+              assigningSessionId={unassignedCliSessions.assigningSessionId}
+              error={unassignedCliSessions.error}
+              onAssign={unassignedCliSessions.assign}
+            />
+            {cliSessionActive && (
+              <Badge
+                role="status"
+                variant="outline"
+                className="pointer-events-none gap-half border-border bg-primary/90 font-normal text-normal shadow-sm backdrop-blur-sm"
+              >
+                <CircleIcon
+                  className="size-2 text-brand"
+                  weight="fill"
+                  aria-hidden="true"
+                />
+                {t('conversation.cliSessionActive')}
+              </Badge>
+            )}
+          </div>
+        )}
         {showLoader && (
           <div className="absolute inset-0 flex items-center justify-center z-10">
             <SpinnerIcon className="size-6 animate-spin text-low" />

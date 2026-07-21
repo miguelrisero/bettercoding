@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM cli_native_files\n               WHERE dir_path = $1 AND file_name = $2 AND id != $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "9f4a197e2c62231a7c757e9db1cd716559ef2d0867684e9670ee5fb22d6f167a"
+}

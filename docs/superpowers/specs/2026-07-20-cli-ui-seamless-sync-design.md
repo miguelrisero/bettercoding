@@ -2,9 +2,7 @@
 
 - **Date:** 2026-07-20
 - **Branch:** `chief/bc-cli-ui-design` (chief run `bc-lanes-2026-07-19`, lane D)
-- **Status:** DRAFT v2 (council-hardened) — awaiting owner approval; nothing
-  here is implemented. Council round: Codex seats (realtime-systems,
-  data-integrity) + Claude seat (product/UX); disposition in §11.
+- **Status (2026-07-20, `chief/bc-seamless-p1`):** Phase 1 implemented; Phases 2–3 pending.
 - **Scope:** local deployments, claude executor only (see Non-goals)
 
 ## 1. Goal

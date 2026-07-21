@@ -1,5 +1,6 @@
 // SDK submodules
 pub mod client;
+pub mod native;
 pub mod protocol;
 pub mod slash_commands;
 pub mod types;
@@ -1137,6 +1138,9 @@ pub enum HistoryStrategy {
     Default,
     // Amp threads format which includes logs from previous executions
     AmpResume,
+    // Claude's on-disk native store. Unlike executor history, it is the only
+    // source for CLI-authored user turns, so plain user content is renderable.
+    NativeClaude,
 }
 
 /// Default context window for models (used until we get actual value from result)
@@ -1194,6 +1198,7 @@ impl ClaudeLogProcessor {
             let mut processor = Self::new_with_strategy(strategy);
             // Track pending assistant UUID - only committed when we see a Result message
             let mut pending_assistant_uuid: Option<String> = None;
+            let mut last_native_uuid: Option<String> = None;
 
             while let Some(Ok(msg)) = stream.next().await {
                 let chunk = match msg {
@@ -1201,6 +1206,7 @@ impl ClaudeLogProcessor {
                     LogMsg::JsonPatch(_)
                     | LogMsg::SessionId(_)
                     | LogMsg::MessageId(_)
+                    | LogMsg::NativeUuid(_)
                     | LogMsg::Stderr(_)
                     | LogMsg::Ready => continue,
                     LogMsg::Finished => break,
@@ -1242,14 +1248,34 @@ impl ClaudeLogProcessor {
                             // - Assistant messages: may have incomplete tool calls, store as pending
                             // - Result messages: confirms assistant turn is complete, commit pending
                             match &claude_json {
-                                ClaudeJson::User { uuid, .. } => {
+                                ClaudeJson::User {
+                                    uuid, is_replay, ..
+                                } => {
                                     pending_assistant_uuid = None;
-                                    if let Some(uuid) = uuid {
+                                    if !*is_replay && let Some(uuid) = uuid {
+                                        if last_native_uuid.as_ref() != Some(uuid) {
+                                            msg_store.push_native_uuid(uuid.clone());
+                                            last_native_uuid = Some(uuid.clone());
+                                        }
                                         msg_store.push_message_id(uuid.clone());
                                     }
                                 }
                                 ClaudeJson::Assistant { uuid, .. } => {
+                                    if let Some(uuid) = uuid
+                                        && last_native_uuid.as_ref() != Some(uuid)
+                                    {
+                                        msg_store.push_native_uuid(uuid.clone());
+                                        last_native_uuid = Some(uuid.clone());
+                                    }
                                     pending_assistant_uuid = uuid.clone();
+                                }
+                                ClaudeJson::StreamEvent {
+                                    uuid: Some(uuid), ..
+                                } => {
+                                    if last_native_uuid.as_ref() != Some(uuid) {
+                                        msg_store.push_native_uuid(uuid.clone());
+                                        last_native_uuid = Some(uuid.clone());
+                                    }
                                 }
                                 ClaudeJson::Result { .. } => {
                                     if let Some(uuid) = pending_assistant_uuid.take() {
@@ -1921,6 +1947,33 @@ impl ClaudeLogProcessor {
                     }
                 }
 
+                if matches!(self.strategy, HistoryStrategy::NativeClaude) && !*is_synthetic {
+                    for item in message.content.items() {
+                        if let ClaudeContentItem::Text { text } = item {
+                            let entry = NormalizedEntry {
+                                timestamp: None,
+                                entry_type: NormalizedEntryType::UserMessage,
+                                content: text.clone(),
+                                metadata: Some(
+                                    serde_json::to_value(item).unwrap_or(serde_json::Value::Null),
+                                ),
+                            };
+                            let id = entry_index_provider.next();
+                            patches.push(ConversationPatch::add_normalized_entry(id, entry));
+                        }
+                    }
+                    if let Some(text) = message.content.as_text() {
+                        let entry = NormalizedEntry {
+                            timestamp: None,
+                            entry_type: NormalizedEntryType::UserMessage,
+                            content: text.clone(),
+                            metadata: Some(serde_json::Value::String(text.clone())),
+                        };
+                        let id = entry_index_provider.next();
+                        patches.push(ConversationPatch::add_normalized_entry(id, entry));
+                    }
+                }
+
                 if *is_synthetic {
                     for item in message.content.items() {
                         if let ClaudeContentItem::Text { text } = item {
@@ -1936,7 +1989,9 @@ impl ClaudeLogProcessor {
                     }
                 }
 
-                if let Some(mut text) = message.content.as_text().cloned() {
+                if !matches!(self.strategy, HistoryStrategy::NativeClaude)
+                    && let Some(mut text) = message.content.as_text().cloned()
+                {
                     if text.starts_with("<local-command-stdout>")
                         && text.ends_with("</local-command-stdout>")
                     {
@@ -3548,6 +3603,46 @@ mod tests {
         assert!(
             patch_count > 0,
             "Expected JsonPatch messages to be generated from streaming processing"
+        );
+    }
+
+    #[tokio::test]
+    async fn emits_each_consecutive_live_uuid_once_for_native_linking() {
+        let msg_store = Arc::new(MsgStore::new());
+        let processor = ClaudeLogProcessor::process_logs(
+            msg_store.clone(),
+            Path::new("/tmp/test-worktree"),
+            EntryIndexProvider::default(),
+            HistoryStrategy::Default,
+        );
+        msg_store.push_stdout(
+            concat!(
+                "{\"type\":\"user\",\"uuid\":\"replayed-uuid\",\"isReplay\":true,\"message\":{\"role\":\"user\",\"content\":\"history\"}}\n",
+                "{\"type\":\"user\",\"uuid\":\"user-uuid\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+                "{\"type\":\"assistant\",\"uuid\":\"assistant-uuid\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
+                "{\"type\":\"stream_event\",\"uuid\":\"assistant-uuid\",\"event\":{\"type\":\"message_stop\"}}\n",
+                "{\"type\":\"stream_event\",\"uuid\":\"event-uuid\",\"event\":{\"type\":\"message_stop\"}}\n",
+                "{\"type\":\"stream_event\",\"uuid\":\"event-uuid\",\"event\":{\"type\":\"message_stop\"}}\n"
+            )
+            .to_string(),
+        );
+        msg_store.push_finished();
+        processor.await.unwrap();
+
+        let native_uuids = msg_store
+            .get_history()
+            .into_iter()
+            .filter_map(|msg| match msg {
+                LogMsg::NativeUuid(uuid) => Some(uuid),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            native_uuids,
+            ["user-uuid", "assistant-uuid", "event-uuid"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
         );
     }
 

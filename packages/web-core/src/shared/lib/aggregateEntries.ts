@@ -1,6 +1,6 @@
 import type {
   PatchTypeWithKey,
-  DisplayEntry,
+  BaseDisplayEntry,
   AggregatedPatchGroup,
   AggregatedDiffGroup,
   AggregatedThinkingGroup,
@@ -21,6 +21,24 @@ function isUserMessage(entry: PatchTypeWithKey): boolean {
 function isThinkingEntry(entry: PatchTypeWithKey): boolean {
   if (entry.type !== 'NORMALIZED_ENTRY') return false;
   return entry.content.entry_type.type === 'thinking';
+}
+
+function sharesNativeBoundary(
+  left: PatchTypeWithKey,
+  right: PatchTypeWithKey
+): boolean {
+  const leftNative = left.nativeEntry;
+  const rightNative = right.nativeEntry;
+  if (!leftNative && !rightNative) return true;
+  if (!leftNative || !rightNative) return false;
+
+  return (
+    leftNative.origin === rightNative.origin &&
+    leftNative.claude_session_id === rightNative.claude_session_id &&
+    leftNative.branch?.fork_parent_uuid ===
+      rightNative.branch?.fork_parent_uuid &&
+    leftNative.branch?.branch_index === rightNative.branch?.branch_index
+  );
 }
 
 /**
@@ -146,6 +164,13 @@ function aggregateThinkingInPreviousTurns(
 
     // Only aggregate thinking entries in previous turns
     if (isInPreviousTurn && isThinkingEntry(entry)) {
+      const previousThinkingEntry = currentThinkingGroup.at(-1);
+      if (
+        previousThinkingEntry &&
+        !sharesNativeBoundary(previousThinkingEntry, entry)
+      ) {
+        flushThinkingGroup();
+      }
       currentThinkingGroup.push(entry);
     } else {
       // Flush any pending thinking group
@@ -177,14 +202,14 @@ function aggregateThinkingInPreviousTurns(
  */
 export function aggregateConsecutiveEntries(
   entries: PatchTypeWithKey[]
-): DisplayEntry[] {
+): BaseDisplayEntry[] {
   if (entries.length === 0) return [];
 
   // First pass: aggregate thinking entries in previous turns
   const entriesWithThinkingAggregated =
     aggregateThinkingInPreviousTurns(entries);
 
-  const result: DisplayEntry[] = [];
+  const result: BaseDisplayEntry[] = [];
 
   // State for tool aggregation (file_read, search, web_fetch, command_run_*)
   let currentToolGroup: PatchTypeWithKey[] = [];
@@ -248,7 +273,7 @@ export function aggregateConsecutiveEntries(
     ) {
       flushToolGroup();
       flushDiffGroup();
-      result.push(entry as unknown as DisplayEntry);
+      result.push(entry as unknown as BaseDisplayEntry);
       continue;
     }
 
@@ -264,7 +289,10 @@ export function aggregateConsecutiveEntries(
         // Start a new diff group
         currentDiffPath = fileEditPath;
         currentDiffGroup.push(entry);
-      } else if (fileEditPath === currentDiffPath) {
+      } else if (
+        fileEditPath === currentDiffPath &&
+        sharesNativeBoundary(currentDiffGroup[0], entry)
+      ) {
         // Same file - add to current diff group
         currentDiffGroup.push(entry);
       } else {
@@ -283,7 +311,10 @@ export function aggregateConsecutiveEntries(
         // Start a new tool group
         currentAggregationType = aggregationType;
         currentToolGroup.push(entry);
-      } else if (aggregationType === currentAggregationType) {
+      } else if (
+        aggregationType === currentAggregationType &&
+        sharesNativeBoundary(currentToolGroup[0], entry)
+      ) {
         // Same type - add to current group
         currentToolGroup.push(entry);
       } else {

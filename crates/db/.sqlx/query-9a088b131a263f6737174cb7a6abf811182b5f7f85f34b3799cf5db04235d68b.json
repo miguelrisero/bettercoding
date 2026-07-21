@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT session_id AS \"session_id!: Uuid\"\n               FROM claude_session_links\n               WHERE claude_session_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "name": "session_id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9a088b131a263f6737174cb7a6abf811182b5f7f85f34b3799cf5db04235d68b"
+}

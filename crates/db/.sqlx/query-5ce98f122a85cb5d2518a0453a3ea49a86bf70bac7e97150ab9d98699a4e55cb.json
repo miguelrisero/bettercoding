@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE cli_native_files SET\n                       discovered_workspace_id = COALESCE($1, discovered_workspace_id),\n                       observed_size = $2,\n                       observed_mtime_ms = $3,\n                       updated_at = datetime('now', 'subsec')\n                   WHERE id = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "5ce98f122a85cb5d2518a0453a3ea49a86bf70bac7e97150ab9d98699a4e55cb"
+}

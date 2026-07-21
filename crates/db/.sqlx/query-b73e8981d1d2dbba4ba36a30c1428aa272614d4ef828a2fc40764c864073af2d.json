@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT outbox.session_id AS \"session_id!: Uuid\",\n                      MAX(outbox.seq) AS \"max_seq!: i64\"\n               FROM cli_ingest_outbox outbox\n               LEFT JOIN cli_ingest_publisher_watermarks watermark\n                 ON watermark.session_id = outbox.session_id\n               WHERE outbox.seq > COALESCE(watermark.published_seq, 0)\n               GROUP BY outbox.session_id",
+  "describe": {
+    "columns": [
+      {
+        "name": "session_id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "max_seq!: i64",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "b73e8981d1d2dbba4ba36a30c1428aa272614d4ef828a2fc40764c864073af2d"
+}

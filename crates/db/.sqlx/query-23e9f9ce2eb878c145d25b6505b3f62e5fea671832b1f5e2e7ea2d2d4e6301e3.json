@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COALESCE(MAX(generation), -1) + 1 AS \"generation!: i64\"\n               FROM cli_native_files\n               WHERE dir_path = $1 AND file_name = $2",
+  "describe": {
+    "columns": [
+      {
+        "name": "generation!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "23e9f9ce2eb878c145d25b6505b3f62e5fea671832b1f5e2e7ea2d2d4e6301e3"
+}
