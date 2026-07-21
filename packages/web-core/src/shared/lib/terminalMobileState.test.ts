@@ -18,6 +18,8 @@ describe('terminal mobile state store', () => {
       ctrlLatched: false,
       selectMode: false,
       dpadActive: false,
+      flingCatch: false,
+      scrollOwned: false,
     });
   });
 

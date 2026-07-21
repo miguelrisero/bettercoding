@@ -424,7 +424,8 @@ export function createTouchGestureController(deps: GestureDeps) {
     onTouchEnd(
       remainingTouches: number,
       now: number,
-      flingCatch = false
+      flingCatch = false,
+      scrollOwned = false
     ): void {
       if (remainingTouches > 0) return; // wait for the last finger
       const wasPhase =
@@ -463,7 +464,10 @@ export function createTouchGestureController(deps: GestureDeps) {
         lastTap = null;
         return;
       }
-      if (flingCatch) return;
+      if (flingCatch || scrollOwned) {
+        lastTap = null;
+        return;
+      }
       // A clean quick tap. Second one in time + place = Tab.
       if (
         lastTap &&
@@ -782,6 +786,7 @@ export function installTerminalTouchGestures(
   };
   const onEnd = (e: TouchEvent) => {
     if (primaryTouchIdentifier === null) return;
+    const { flingCatch, scrollOwned } = getTerminalMobileState(terminal);
     const primaryStillOwned = touchWithIdentifier(
       e.targetTouches,
       primaryTouchIdentifier
@@ -791,17 +796,14 @@ export function installTerminalTouchGestures(
       // contain contacts that began on nav/key bars and will never emit an
       // event on this terminal, so waiting for the global last finger strands
       // D-pad suppression and its timer indefinitely.
-      controller.onTouchEnd(
-        0,
-        e.timeStamp,
-        getTerminalMobileState(terminal).flingCatch
-      );
+      controller.onTouchEnd(0, e.timeStamp, flingCatch, scrollOwned);
       releaseTouchOwnership();
     } else {
       controller.onTouchEnd(
         e.targetTouches.length,
         e.timeStamp,
-        getTerminalMobileState(terminal).flingCatch
+        flingCatch,
+        scrollOwned
       );
     }
     reschedule();

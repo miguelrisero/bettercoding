@@ -422,6 +422,7 @@ export function installTerminalTouchScroll(terminal: Terminal): () => void {
     (el.querySelector('.xterm-screen') as HTMLElement | null) ?? el;
   let lastKey = '';
   let lastPoint = { x: 0, y: 0 };
+  let scrollOwned = false;
 
   const controller = createTouchScrollController({
     getMouseTrackingMode: () =>
@@ -470,10 +471,16 @@ export function installTerminalTouchScroll(terminal: Terminal): () => void {
 
   const onStart = (e: TouchEvent) => {
     const { flingCatch } = controller.onTouchStart(toPoint(e));
-    patchTerminalMobileState(terminal, { flingCatch });
+    scrollOwned = false;
+    patchTerminalMobileState(terminal, { flingCatch, scrollOwned });
   };
   const onMove = (e: TouchEvent) => {
-    if (controller.onTouchMove(toPoint(e)).prevent && e.cancelable) {
+    const { prevent } = controller.onTouchMove(toPoint(e));
+    if (prevent && !scrollOwned) {
+      scrollOwned = true;
+      patchTerminalMobileState(terminal, { scrollOwned });
+    }
+    if (prevent && e.cancelable) {
       e.preventDefault();
     }
   };

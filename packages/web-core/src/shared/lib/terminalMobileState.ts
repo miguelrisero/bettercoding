@@ -20,13 +20,17 @@ export interface TerminalMobileState {
   /** A long-press D-pad gesture is running; the scroll bridge stands down. */
   dpadActive: boolean;
   /** The current touch sequence started by stopping live scroll momentum. */
-  flingCatch?: boolean;
+  flingCatch: boolean;
+  /** The scroll bridge committed vertical ownership during this sequence. */
+  scrollOwned: boolean;
 }
 
 const EMPTY_STATE: TerminalMobileState = {
   ctrlLatched: false,
   selectMode: false,
   dpadActive: false,
+  flingCatch: false,
+  scrollOwned: false,
 };
 
 interface Entry {

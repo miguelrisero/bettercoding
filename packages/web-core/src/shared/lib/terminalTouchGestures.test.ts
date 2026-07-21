@@ -500,6 +500,36 @@ describe('double-tap = Tab', () => {
     ctrl.onTouchEnd(0, 240);
     expect(events).toEqual(['tab']);
   });
+
+  it('clears prior double-tap history when a fling catch interrupts it', () => {
+    const { ctrl, events } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    ctrl.onTouchEnd(0, 40);
+
+    ctrl.onTouchStart(p(100, 100), 100);
+    ctrl.onTouchEnd(0, 140, true);
+
+    ctrl.onTouchStart(p(100, 100), 200);
+    ctrl.onTouchEnd(0, 240);
+    expect(events).toEqual([]);
+  });
+
+  it('does not let scroll-owned sequences seed or complete a double-tap', () => {
+    const { ctrl, events } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    ctrl.onTouchEnd(0, 40, false, true);
+
+    ctrl.onTouchStart(p(100, 100), 100);
+    ctrl.onTouchEnd(0, 140);
+    expect(events).toEqual([]);
+
+    ctrl.onTouchStart(p(100, 100), 200);
+    ctrl.onTouchEnd(0, 240, false, true);
+
+    ctrl.onTouchStart(p(100, 100), 300);
+    ctrl.onTouchEnd(0, 340);
+    expect(events).toEqual([]);
+  });
 });
 
 describe('three-finger tap = paste', () => {
