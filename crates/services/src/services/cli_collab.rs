@@ -615,9 +615,29 @@ impl CliCollabService {
             }
         };
         if let Some(binding) = binding
-            && let Some(sid) = binding.claude_session_id
             && self.transport.pane_alive(session.workspace_id).await
         {
+            let sid = match binding.claude_session_id.as_ref() {
+                Some(sid) => Some(sid.clone()),
+                None => match self.expected_sid(session_id).await {
+                    Ok(sid) => sid,
+                    Err(error) => {
+                        tracing::warn!(?error, %session_id, "finish hook sid lookup failed closed");
+                        return Ok(false);
+                    }
+                },
+            };
+            let Some(sid) = sid else {
+                return Ok(false);
+            };
+            if binding.bound_via == db::models::cli_pane_binding::CliPaneBoundVia::CliFresh
+                && binding.claude_session_id.is_none()
+                && let Err(error) =
+                    CliPaneBinding::bind_discovered_sid(&self.db.pool, binding.id, &sid).await
+            {
+                tracing::warn!(?error, %session_id, "finish hook pane sid update failed closed");
+                return Ok(false);
+            }
             self.transport
                 .signal_resume_ready(session.workspace_id, &sid)
                 .await;

@@ -19,6 +19,7 @@ use relay_hosts::{
 use relay_webrtc::WebRtcError;
 use services::services::{
     claude_transcript_ingest::ClaudeTranscriptIngestError,
+    cli_collab::CliCollabError,
     config::{ConfigError, EditorOpenError},
     container::ContainerError,
     file::FileError,
@@ -65,6 +66,8 @@ pub enum ApiError {
     File(#[from] FileError),
     #[error(transparent)]
     QueuedMessage(#[from] QueuedMessageError),
+    #[error(transparent)]
+    CliCollab(#[from] CliCollabError),
     #[error("Multipart error: {0}")]
     Multipart(#[from] MultipartError),
     #[error("IO error: {0}")]
@@ -464,6 +467,7 @@ impl IntoResponse for ApiError {
                 message: Some("Failed to process file. Please try again.".into()),
             },
             ApiError::QueuedMessage(_) => ErrorInfo::internal("QueuedMessageError"),
+            ApiError::CliCollab(_) => ErrorInfo::internal("CliCollabError"),
 
             ApiError::EditorOpen(EditorOpenError::LaunchFailed { .. }) => {
                 ErrorInfo::internal("EditorLaunchError")

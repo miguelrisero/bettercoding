@@ -1,17 +1,26 @@
 use std::{collections::HashSet, fs, path::Path, sync::Arc, time::Duration};
 
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
+use async_trait::async_trait;
 use db::{
     DBService,
     models::{
         claude_session_link::{ClaudeSessionBoundVia, ClaudeSessionLink},
+        cli_pane_binding::{CliPaneBinding, CliPaneBoundVia},
         cli_ingest_outbox::CliIngestOutbox,
-        cli_native_file::CliNativeFile,
-        cli_native_record::{CliNativeRecord, CliNativeRecordDisposition},
+        cli_native_file::{CliNativeFile, RegisterCliNativeFile},
+        cli_native_record::{
+            CliNativeRecord, CliNativeRecordDisposition, ImportedCursor, NativeImportContext,
+            NewCliNativeRecord,
+        },
         coding_agent_turn::{CodingAgentTurn, CreateCodingAgentTurn},
         execution_native_link::ExecutionNativeLink,
         execution_process::{CreateExecutionProcess, ExecutionProcess, ExecutionProcessRunReason},
         session::{CreateSession, Session},
+        session_queued_message::{
+            QueuedMessageSource, QueuedMessageState, SessionQueuedMessage,
+            StoreQueuedMessageResult,
+        },
         workspace::{CreateWorkspace, Workspace},
     },
 };
@@ -31,6 +40,22 @@ use super::{
     ClaudeTranscriptIngest, ClaudeTranscriptIngestError, DirectoryContext, NativeFeedOrigin,
     NativeFeedUpdate, claude_project_slug, first_prompt_snippet,
 };
+use crate::services::cli_collab::{CliWriterProbe, ProbeReport, SidEvidence};
+
+#[derive(Clone)]
+struct StaticWriterProbe(ProbeReport);
+
+#[async_trait]
+impl CliWriterProbe for StaticWriterProbe {
+    async fn probe(
+        &self,
+        _workspace_id: Uuid,
+        _effective_dir: &Path,
+        _expected_sid: Option<&str>,
+    ) -> ProbeReport {
+        self.0.clone()
+    }
+}
 
 fn effective_cwd(workspace: &Workspace, session: &Session) -> Option<std::path::PathBuf> {
     workspace
@@ -170,6 +195,88 @@ fn native_user_record(sid: &str, uuid: &str, text: &str, timestamp: &str) -> Str
             "message": { "role": "user", "content": text }
         })
     )
+}
+
+async fn register_native_file(
+    db: &DBService,
+    workspace_id: Uuid,
+    sid: &str,
+) -> CliNativeFile {
+    CliNativeFile::register(
+        &db.pool,
+        &RegisterCliNativeFile {
+            claude_session_id: sid,
+            dir_path: "/tmp/native-import-test",
+            file_name: &format!("{sid}.jsonl"),
+            discovered_workspace_id: Some(workspace_id),
+            dev: 1,
+            inode: sid.bytes().map(i64::from).sum(),
+            observed_size: 1,
+            observed_mtime_ms: None,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn pasted_slot(
+    db: &DBService,
+    session_id: Uuid,
+    sid: &str,
+    prompt: &str,
+) -> SessionQueuedMessage {
+    let config = serde_json::to_string(&ExecutorConfig::new(BaseCodingAgent::ClaudeCode)).unwrap();
+    let row = match SessionQueuedMessage::store(
+        &db.pool,
+        session_id,
+        prompt,
+        Some(&config),
+        QueuedMessageSource::Ui,
+        false,
+    )
+    .await
+    .unwrap()
+    {
+        StoreQueuedMessageResult::Stored(row) => row,
+        StoreQueuedMessageResult::Conflict(_) => panic!("fixture slot must be empty"),
+    };
+    SessionQueuedMessage::claim(&db.pool, row.id, Some(sid))
+        .await
+        .unwrap()
+        .unwrap();
+    SessionQueuedMessage::mark_pasted(&db.pool, row.id)
+        .await
+        .unwrap();
+    SessionQueuedMessage::find_by_id(&db.pool, row.id)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+fn import_record(sid: &str, line_seq: i64, uuid: &str, prompt: &str, at: chrono::DateTime<Utc>) -> NewCliNativeRecord {
+    NewCliNativeRecord {
+        line_seq,
+        claude_session_id: sid.to_string(),
+        uuid: Some(uuid.to_string()),
+        parent_uuid: None,
+        kind: "user".to_string(),
+        ts: Some(at.to_rfc3339()),
+        raw: native_user_record(sid, uuid, prompt, &at.to_rfc3339()).trim().to_string(),
+        disposition: CliNativeRecordDisposition::Renderable,
+        user_prompt: Some(prompt.to_string()),
+        recorded_at: Some(at),
+    }
+}
+
+fn cursor(next_line_seq: i64) -> ImportedCursor<'static> {
+    ImportedCursor {
+        cursor_offset: next_line_seq + 1,
+        next_line_seq,
+        last_line_offset: next_line_seq,
+        last_line_hash: None,
+        observed_size: next_line_seq + 1,
+        observed_mtime_ms: None,
+    }
 }
 
 #[test]

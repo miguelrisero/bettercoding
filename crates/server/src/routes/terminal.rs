@@ -11,8 +11,14 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use db::models::{
-    coding_agent_turn::CodingAgentTurn, execution_process::ExecutionProcess, session::Session,
-    workspace::Workspace, workspace_repo::WorkspaceRepo,
+    claude_session_link::{ClaudeSessionBoundVia, ClaudeSessionLink},
+    cli_pane_binding::{CliPaneBinding, CliPaneBoundVia},
+    coding_agent_turn::CodingAgentTurn,
+    execution_process::ExecutionProcess,
+    session::Session,
+    workspace::Workspace,
+    workspace_repo::WorkspaceRepo,
+    workspace_spawn_reservation::{SpawnReservationHolder, WorkspaceSpawnReservation},
 };
 use deployment::Deployment;
 use executors::{
@@ -22,8 +28,9 @@ use executors::{
 };
 use local_deployment::pty::{
     CLI_PROMPT_PARKED_NOTICE, CliPromptDelivery, CliPromptRouting, PtyCommand,
-    cli_pane_agent_running_at, cli_prompt_file_exists, cli_tmux_available, cli_tmux_session_exists,
-    cli_tmux_target_exists, locate_cli_tmux_target, remove_cli_prompt_file,
+    cli_pane_agent_running_at, cli_prompt_file_exists, cli_tmux_available,
+    cli_tmux_session_exists_checked, cli_tmux_target_exists, kill_cli_tmux_session,
+    locate_cli_tmux_target, remove_cli_prompt_file, remove_cli_resume_ready_file,
     resolved_cli_tmux_session_name, route_followup_prompt, route_initial_prompt, send_cli_keys_to,
 };
 use serde::{Deserialize, Serialize};
@@ -193,6 +200,7 @@ async fn terminal_ws(
     // Set inside the Cli arm when this attach carries the workspace's parked
     // prompt; consumed by handle_terminal_ws to confirm delivery and clear it.
     let mut prompt_delivery: Option<PromptDelivery> = None;
+    let mut cli_launch_registration: Option<CliLaunchRegistration> = None;
 
     let (working_dir, command) = match query.mode {
         TerminalMode::Cli => {
@@ -224,17 +232,12 @@ async fn terminal_ws(
             // latest session.
             let mut session = match query.session_id {
                 Some(session_id) => Session::find_by_id(pool, session_id)
-                    .await
-                    .ok()
-                    .flatten()
+                    .await?
                     .filter(|s| s.workspace_id == query.workspace_id),
                 None => None,
             };
             if session.is_none() {
-                session = Session::find_latest_by_workspace_id(pool, query.workspace_id)
-                    .await
-                    .ok()
-                    .flatten();
+                session = Session::find_latest_by_workspace_id(pool, query.workspace_id).await?;
             }
 
             // Run claude exactly where the coding agent runs: the workspace
@@ -260,24 +263,70 @@ async fn terminal_ws(
             // executor is actively RUNNING this session, never hand its id to
             // a second claude — resuming a session mid-write forks it and the
             // user ends up with chat and CLI doing the same work twice.
-            let resume_session_id = match &session {
+            let (executor_active, known_claude_session_id) = match &session {
                 Some(s) => {
                     let executor_active =
-                        ExecutionProcess::has_running_coding_agent_for_session(pool, s.id)
+                        match ExecutionProcess::has_running_coding_agent_for_session(pool, s.id)
                             .await
-                            .unwrap_or(false);
-                    if executor_active {
-                        None
-                    } else {
-                        CodingAgentTurn::find_latest_session_info(pool, s.id)
-                            .await
-                            .ok()
-                            .flatten()
-                            .map(|info| info.session_id)
-                    }
+                        {
+                            Ok(active) => active,
+                            Err(error) => {
+                                tracing::warn!(?error, session_id = %s.id, "terminal writer guard failed closed");
+                                true
+                            }
+                        };
+                    let sid = CodingAgentTurn::find_latest_session_info(pool, s.id)
+                        .await?
+                        .map(|info| info.session_id)
+                        .or(ClaudeSessionLink::find_latest_for_session(pool, s.id)
+                            .await?
+                            .map(|link| link.claude_session_id));
+                    (executor_active, sid)
                 }
-                None => None,
+                None => (false, None),
             };
+            let resume_session_id = (!executor_active)
+                .then(|| known_claude_session_id.clone())
+                .flatten();
+            let cli_session_exists = if cli_tmux_available() {
+                cli_tmux_session_exists_checked(query.workspace_id).await?
+            } else {
+                false
+            };
+            if cli_tmux_available() && !cli_session_exists {
+                let launch_session = session.as_ref().ok_or_else(|| {
+                    ApiError::BadRequest(
+                        "CLI mode requires a BetterCoding session for this workspace".to_string(),
+                    )
+                })?;
+                let reservation = WorkspaceSpawnReservation::acquire(
+                    pool,
+                    query.workspace_id,
+                    SpawnReservationHolder::Cli,
+                )
+                .await?
+                .ok_or_else(|| {
+                    ApiError::Conflict(
+                        "Another writer is starting for this workspace; retry the terminal attach"
+                            .to_string(),
+                    )
+                })?;
+                if executor_active {
+                    remove_cli_resume_ready_file(query.workspace_id);
+                }
+                cli_launch_registration = Some(CliLaunchRegistration {
+                    workspace_id: query.workspace_id,
+                    session_id: launch_session.id,
+                    claude_session_id: known_claude_session_id.clone(),
+                    bound_via: if known_claude_session_id.is_some() {
+                        CliPaneBoundVia::CliResume
+                    } else {
+                        CliPaneBoundVia::CliFresh
+                    },
+                    cwd: dir.to_string_lossy().into_owned(),
+                    fence: reservation.fence,
+                });
+            }
 
             // A parked prompt (CLI-first creation, or a re-parked loop wake-up)
             // is only ever PEEKED here (read, don't clear); the clear happens
@@ -367,8 +416,7 @@ async fn terminal_ws(
                 let resume_will_apply = resume_session_id
                     .as_deref()
                     .is_some_and(|id| Uuid::parse_str(id).is_ok());
-                let fresh_launch =
-                    !resume_will_apply && !cli_tmux_session_exists(query.workspace_id).await;
+                let fresh_launch = !resume_will_apply && !cli_session_exists;
                 let routed = if fresh_launch {
                     route_initial_prompt(Some(peeked.clone()), &spec.prompt_arg)
                 } else {
@@ -429,6 +477,7 @@ async fn terminal_ws(
                 PtyCommand::TmuxCli {
                     workspace_id: query.workspace_id,
                     resume_session_id,
+                    busy_wait_for_resume: executor_active,
                     initial_prompt: baked_prompt,
                     deferred_prompt_pending,
                     connect_hidden: query.hidden,
@@ -471,6 +520,7 @@ async fn terminal_ws(
             query.rows.unwrap_or(DEFAULT_ROWS),
             command,
             prompt_delivery,
+            cli_launch_registration,
         )
     }))
 }
@@ -500,6 +550,15 @@ struct PromptDelivery {
     claim: CliPromptDelivery,
 }
 
+struct CliLaunchRegistration {
+    workspace_id: Uuid,
+    session_id: Uuid,
+    claude_session_id: Option<String>,
+    bound_via: CliPaneBoundVia,
+    cwd: String,
+    fence: String,
+}
+
 async fn handle_terminal_ws(
     mut socket: MaybeSignedWebSocket,
     deployment: DeploymentImpl,
@@ -508,6 +567,7 @@ async fn handle_terminal_ws(
     rows: u16,
     command: PtyCommand,
     prompt_delivery: Option<PromptDelivery>,
+    cli_launch_registration: Option<CliLaunchRegistration>,
 ) {
     // FIX 4 tripwire label: the pty session name, captured before `command` is
     // moved into `create_session`. For CLI mode this is the actual current
@@ -535,10 +595,43 @@ async fn handle_terminal_ws(
             if let Some(delivery) = &prompt_delivery {
                 remove_cli_prompt_file(delivery.workspace_id);
             }
+            if let Some(registration) = &cli_launch_registration {
+                let _ = WorkspaceSpawnReservation::release(
+                    &deployment.db().pool,
+                    registration.workspace_id,
+                    &registration.fence,
+                )
+                .await;
+            }
             let _ = send_error(&mut socket, &e.to_string()).await;
             return;
         }
     };
+
+    if let Some(registration) = cli_launch_registration {
+        let registered = match wait_for_cli_session(registration.workspace_id).await {
+            Ok(true) => register_cli_launch(&deployment, &registration).await,
+            Ok(false) => Err(ApiError::Conflict(
+                "CLI tmux session did not become ready".to_string(),
+            )),
+            Err(error) => Err(ApiError::Pty(error)),
+        };
+        let _ = WorkspaceSpawnReservation::release(
+            &deployment.db().pool,
+            registration.workspace_id,
+            &registration.fence,
+        )
+        .await;
+        if let Err(error) = registered {
+            kill_cli_tmux_session(registration.workspace_id).await;
+            if let Some(delivery) = &prompt_delivery {
+                remove_cli_prompt_file(delivery.workspace_id);
+            }
+            let _ = send_error(&mut socket, &error.to_string()).await;
+            let _ = deployment.pty().close_session(session_id).await;
+            return;
+        }
+    }
 
     // FIX 4 input tripwire — bounds and rationale live on `AttachInputTripwire`.
     let mut tripwire = AttachInputTripwire::new(tripwire_session, session_id);
@@ -551,7 +644,7 @@ async fn handle_terminal_ws(
     // the user so, instead of silently destroying it.
     if let Some(delivery) = prompt_delivery {
         let workspace_id = delivery.workspace_id;
-        if wait_for_cli_session(workspace_id).await {
+        if matches!(wait_for_cli_session(workspace_id).await, Ok(true)) {
             // Confirm delivery and clear the parked prompt in the background so
             // the pane's output starts streaming immediately — the confirmation
             // polls below would otherwise hold the whole terminal blank.
@@ -687,16 +780,45 @@ async fn handle_terminal_ws(
 /// only spent when the launch is failing — and a window that's too short would
 /// false-negative on a heavily loaded machine, stranding a prompt that WAS
 /// delivered (the replay hazard the deferred clear exists to prevent).
-async fn wait_for_cli_session(workspace_id: Uuid) -> bool {
+async fn register_cli_launch(
+    deployment: &DeploymentImpl,
+    registration: &CliLaunchRegistration,
+) -> Result<(), ApiError> {
+    let binding = CliPaneBinding::record_launch(
+        &deployment.db().pool,
+        registration.workspace_id,
+        registration.session_id,
+        registration.claude_session_id.as_deref(),
+        registration.bound_via,
+    )
+    .await?;
+    if let Some(sid) = registration.claude_session_id.as_deref()
+        && let Err(error) = ClaudeSessionLink::assign_cli(
+            &deployment.db().pool,
+            sid,
+            registration.session_id,
+            registration.workspace_id,
+            &registration.cwd,
+            ClaudeSessionBoundVia::CliResume,
+        )
+        .await
+    {
+        let _ = CliPaneBinding::release(&deployment.db().pool, binding.id).await;
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+async fn wait_for_cli_session(workspace_id: Uuid) -> Result<bool, local_deployment::pty::PtyError> {
     for attempt in 0..10 {
-        if cli_tmux_session_exists(workspace_id).await {
-            return true;
+        if cli_tmux_session_exists_checked(workspace_id).await? {
+            return Ok(true);
         }
         if attempt < 9 {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
     }
-    false
+    Ok(false)
 }
 
 /// Confirm a baked prompt was actually handed to the agent: the staged file is

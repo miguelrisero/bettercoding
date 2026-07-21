@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE claude_session_links\n                           SET foreign_writer_seen_at = $1\n                           WHERE claude_session_id = $2 AND session_id = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "516436678641b5339d7c9e730617c81bf43a08ce4fc17a4ee781ea92f50b7c0d"
+}

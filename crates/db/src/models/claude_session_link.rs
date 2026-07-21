@@ -166,6 +166,43 @@ impl ClaudeSessionLink {
         Ok(Some(mutation))
     }
 
+    pub async fn assign_cli(
+        pool: &SqlitePool,
+        claude_session_id: &str,
+        session_id: Uuid,
+        workspace_id: Uuid,
+        cwd: &str,
+        bound_via: ClaudeSessionBoundVia,
+    ) -> Result<ClaudeSessionLinkMutation, sqlx::Error> {
+        debug_assert!(matches!(
+            bound_via,
+            ClaudeSessionBoundVia::CliResume | ClaudeSessionBoundVia::CliFresh
+        ));
+        Self::upsert(
+            pool,
+            claude_session_id,
+            session_id,
+            workspace_id,
+            cwd,
+            bound_via,
+        )
+        .await
+    }
+
+    pub async fn latest_foreign_writer_seen_for_session(
+        pool: &SqlitePool,
+        session_id: Uuid,
+    ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        sqlx::query_scalar!(
+            r#"SELECT MAX(foreign_writer_seen_at) AS "seen_at: DateTime<Utc>"
+               FROM claude_session_links
+               WHERE session_id = $1"#,
+            session_id
+        )
+        .fetch_one(pool)
+        .await
+    }
+
     async fn upsert(
         pool: &SqlitePool,
         claude_session_id: &str,

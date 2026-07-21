@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -42,12 +42,12 @@ use serde_json::json;
 use services::services::{
     analytics::AnalyticsContext,
     approvals::{Approvals, executor_approvals::ExecutorApprovalBridge},
+    cli_collab::{CliCollabService, CliExecutorDispatcher},
     config::{Config, DEFAULT_COMMIT_REMINDER_PROMPT},
     container::{ContainerError, ContainerRef, ContainerService},
     diff_stream::{self, DiffStreamHandle},
     file::FileService,
     notification::NotificationService,
-    queued_message::QueuedMessageService,
     remote_client::RemoteClient,
     remote_sync,
 };
@@ -82,7 +82,7 @@ pub struct LocalContainerService {
     file_service: FileService,
     analytics: Option<AnalyticsContext>,
     approvals: Approvals,
-    queued_message_service: QueuedMessageService,
+    cli_collab: Arc<OnceLock<Arc<CliCollabService>>>,
     notification_service: NotificationService,
     remote_client: Option<RemoteClient>,
 }
@@ -98,7 +98,6 @@ impl LocalContainerService {
         file_service: FileService,
         analytics: Option<AnalyticsContext>,
         approvals: Approvals,
-        queued_message_service: QueuedMessageService,
         remote_client: Option<RemoteClient>,
     ) -> Self {
         let child_store = Arc::new(RwLock::new(HashMap::new()));
@@ -122,7 +121,7 @@ impl LocalContainerService {
             file_service,
             analytics,
             approvals,
-            queued_message_service,
+            cli_collab: Arc::new(OnceLock::new()),
             notification_service,
             remote_client,
         };
@@ -130,6 +129,13 @@ impl LocalContainerService {
         container.spawn_workspace_cleanup();
 
         container
+    }
+
+    pub fn set_cli_collab(&self, cli_collab: Arc<CliCollabService>) {
+        assert!(
+            self.cli_collab.set(cli_collab).is_ok(),
+            "CLI collaboration service is initialized exactly once"
+        );
     }
 
     fn map_workspace_manager_error(err: WorkspaceError) -> ContainerError {
@@ -735,61 +741,23 @@ impl LocalContainerService {
                         .ok()
                         .and_then(|action| action.next_action())
                         .is_some();
-                    let mut started_queued_follow_up = false;
-
-                    // Only execute queued messages if the execution succeeded
-                    // If it failed or was killed, just clear the queue and finalize
-                    let should_execute_queued = !matches!(
-                        ctx.execution_process.status,
-                        ExecutionProcessStatus::Failed | ExecutionProcessStatus::Killed
-                    );
-
-                    if let Ok(Some(queued_msg)) = container
-                        .queued_message_service
-                        .take_queued(ctx.session.id)
-                        .await
-                    {
-                        if should_execute_queued {
-                            tracing::info!(
-                                "Found queued message for session {}, starting follow-up execution",
-                                ctx.session.id
-                            );
-
-                            // Delete the scratch since we're consuming the queued message
-                            if let Err(e) = Scratch::delete(
-                                &db.pool,
-                                ctx.session.id,
-                                &ScratchType::DraftFollowUp,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    "Failed to delete scratch after consuming queued message: {}",
-                                    e
-                                );
+                    let started_queued_follow_up = match container.cli_collab.get() {
+                        Some(cli_collab) => {
+                            match cli_collab.on_executor_finished(ctx.session.id).await {
+                                Ok(started) => started,
+                                Err(error) => {
+                                    tracing::error!(
+                                        ?error,
+                                        session_id = %ctx.session.id,
+                                        "CLI collaboration finish hook failed closed"
+                                    );
+                                    false
+                                }
                             }
-
-                            // Execute the queued follow-up
-                            if let Err(e) = container
-                                .start_queued_follow_up(&ctx, &queued_msg.data)
-                                .await
-                            {
-                                tracing::error!("Failed to start queued follow-up: {}", e);
-                                // Fall back to finalization if follow-up fails
-                                container.finalize_task(&ctx).await;
-                            } else {
-                                started_queued_follow_up = true;
-                            }
-                        } else {
-                            // Execution failed or was killed - discard the queued message and finalize
-                            tracing::info!(
-                                "Discarding queued message for session {} due to execution status {:?}",
-                                ctx.session.id,
-                                ctx.execution_process.status
-                            );
-                            container.finalize_task(&ctx).await;
                         }
-                    } else {
+                        None => false,
+                    };
+                    if !started_queued_follow_up {
                         container.finalize_task(&ctx).await;
                     }
 
@@ -829,35 +797,14 @@ impl LocalContainerService {
                     .unwrap_or(true);
 
                     if !has_running_agent
-                        && let Ok(Some(queued_msg)) = container
-                            .queued_message_service
-                            .take_queued(ctx.session.id)
-                            .await
+                        && let Some(cli_collab) = container.cli_collab.get()
+                        && let Err(error) = cli_collab.on_executor_finished(ctx.session.id).await
                     {
-                        tracing::info!(
-                            "Parallel setup script finished with queued message for session {}, starting follow-up",
-                            ctx.session.id
+                        tracing::error!(
+                            ?error,
+                            session_id = %ctx.session.id,
+                            "CLI collaboration setup completion hook failed closed"
                         );
-
-                        if let Err(e) =
-                            Scratch::delete(&db.pool, ctx.session.id, &ScratchType::DraftFollowUp)
-                                .await
-                        {
-                            tracing::warn!(
-                                "Failed to delete scratch after consuming queued message: {}",
-                                e
-                            );
-                        }
-
-                        if let Err(e) = container
-                            .start_queued_follow_up(&ctx, &queued_msg.data)
-                            .await
-                        {
-                            tracing::error!(
-                                "Failed to start queued follow-up from setup script completion: {}",
-                                e
-                            );
-                        }
                     }
                 }
 
@@ -1170,17 +1117,18 @@ impl LocalContainerService {
     /// Start a follow-up execution from a queued message
     async fn start_queued_follow_up(
         &self,
-        ctx: &ExecutionContext,
+        workspace: &Workspace,
+        session: &Session,
         queued_data: &DraftFollowUpData,
     ) -> Result<ExecutionProcess, ContainerError> {
         let executor_profile_id = queued_data.executor_config.profile_id();
 
         // Validate executor matches session if session has prior executions
         let expected_executor: Option<String> =
-            ExecutionProcess::latest_executor_profile_for_session(&self.db.pool, ctx.session.id)
+            ExecutionProcess::latest_executor_profile_for_session(&self.db.pool, session.id)
                 .await?
                 .map(|profile| profile.executor.to_string())
-                .or_else(|| ctx.session.executor.clone());
+                .or_else(|| session.executor.clone());
 
         if let Some(expected) = expected_executor {
             let actual = executor_profile_id.executor.to_string();
@@ -1189,10 +1137,10 @@ impl LocalContainerService {
             }
         }
 
-        if ctx.session.executor.is_none() {
+        if session.executor.is_none() {
             Session::update_executor(
                 &self.db.pool,
-                ctx.session.id,
+                session.id,
                 &executor_profile_id.executor.to_string(),
             )
             .await?;
@@ -1200,14 +1148,12 @@ impl LocalContainerService {
 
         // Get latest agent turn for session continuity (from coding agent turns)
         let latest_session_info =
-            CodingAgentTurn::find_latest_session_info(&self.db.pool, ctx.session.id).await?;
+            CodingAgentTurn::find_latest_session_info(&self.db.pool, session.id).await?;
 
-        let repos =
-            WorkspaceRepo::find_repos_for_workspace(&self.db.pool, ctx.workspace.id).await?;
+        let repos = WorkspaceRepo::find_repos_for_workspace(&self.db.pool, workspace.id).await?;
         let cleanup_action = self.cleanup_actions_for_repos(&repos);
 
-        let working_dir = ctx
-            .session
+        let working_dir = session
             .agent_working_dir
             .as_ref()
             .filter(|dir| !dir.is_empty())
@@ -1232,12 +1178,39 @@ impl LocalContainerService {
         let action = ExecutorAction::new(action_type, cleanup_action.map(Box::new));
 
         self.start_execution(
-            &ctx.workspace,
-            &ctx.session,
+            workspace,
+            session,
             &action,
             &ExecutionProcessRunReason::CodingAgent,
         )
         .await
+    }
+}
+
+#[async_trait]
+impl CliExecutorDispatcher for LocalContainerService {
+    async fn dispatch(
+        &self,
+        session: &Session,
+        prompt: &str,
+        executor_config: &executors::profile::ExecutorConfig,
+    ) -> anyhow::Result<ExecutionProcess> {
+        let workspace = Workspace::find_by_id(&self.db.pool, session.workspace_id)
+            .await?
+            .ok_or_else(|| anyhow!("workspace {} not found", session.workspace_id))?;
+        let data = DraftFollowUpData {
+            message: prompt.to_string(),
+            executor_config: executor_config.clone(),
+        };
+        let process = self
+            .start_queued_follow_up(&workspace, session, &data)
+            .await?;
+        if let Err(error) =
+            Scratch::delete(&self.db.pool, session.id, &ScratchType::DraftFollowUp).await
+        {
+            tracing::warn!(?error, session_id = %session.id, "failed to clear dispatched follow-up scratch");
+        }
+        Ok(process)
     }
 }
 

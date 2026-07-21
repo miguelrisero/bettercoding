@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO cli_native_records\n                       (file_id, line_seq, claude_session_id, uuid,\n                        parent_uuid, kind, ts, raw,\n                        disposition, bound_coding_agent_turn_id,\n                        bound_queued_message_id)\n                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": []
+  },
+  "hash": "e8168083a38882d5806b8b0cbb6419bafef6d2757d60b418780dbb849c0d19eb"
+}

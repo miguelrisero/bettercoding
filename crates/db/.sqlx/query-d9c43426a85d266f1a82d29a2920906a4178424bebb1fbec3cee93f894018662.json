@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT MAX(foreign_writer_seen_at) AS \"seen_at: DateTime<Utc>\"\n               FROM claude_session_links\n               WHERE session_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "name": "seen_at: DateTime<Utc>",
+        "ordinal": 0,
+        "type_info": "Null"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "d9c43426a85d266f1a82d29a2920906a4178424bebb1fbec3cee93f894018662"
+}

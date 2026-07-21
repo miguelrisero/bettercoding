@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE session_queued_messages SET\n                           state = 'imported',\n                           claude_session_id = COALESCE(claude_session_id, $1),\n                           acked_at = $2,\n                           updated_at = $2\n                       WHERE id = $3 AND state IN ('pasting', 'pasted')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "17e0e0cd01625e3dfd9ba9ffc994f89be9510689ae8256168ebd4d917f021b14"
+}

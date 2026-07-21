@@ -74,6 +74,14 @@ pub struct ImportBatchResult {
     pub last_seq: i64,
 }
 
+/// Fresh, deployment-owned evidence captured immediately before an import.
+/// `false` is the fail-closed default: an unreadable pane must never be
+/// classified as a foreign writer.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NativeImportContext {
+    pub app_pane_absent: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReplacedGenerationImport {
     pub file: CliNativeFile,
@@ -100,7 +108,69 @@ pub struct SessionNativeRecord {
     pub generation: i64,
 }
 
+#[derive(Debug, Clone, FromRow)]
+pub struct NativeBranchPathRecord {
+    pub claude_session_id: String,
+    pub uuid: Option<String>,
+    pub kind: String,
+    pub raw: String,
+    pub depth: i64,
+}
+
 impl CliNativeRecord {
+    pub async fn dropped_branch_path(
+        pool: &SqlitePool,
+        session_id: Uuid,
+        fork_parent_uuid: &str,
+        branch_leaf_uuid: &str,
+    ) -> Result<Option<Vec<NativeBranchPathRecord>>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, NativeBranchPathRecord>(
+            r#"WITH RECURSIVE path(
+                    file_id, claude_session_id, uuid, parent_uuid,
+                    kind, raw, depth
+                ) AS (
+                    SELECT r.file_id, r.claude_session_id, r.uuid,
+                           r.parent_uuid, r.kind, r.raw, 0
+                    FROM cli_native_records r
+                    JOIN cli_native_files f ON f.id = r.file_id
+                    JOIN claude_session_links l
+                      ON l.claude_session_id = r.claude_session_id
+                    WHERE l.session_id = ?
+                      AND r.uuid = ?
+                      AND f.generation = (
+                          SELECT MAX(newer.generation)
+                          FROM cli_native_files newer
+                          WHERE newer.dir_path = f.dir_path
+                            AND newer.file_name = f.file_name
+                      )
+                    UNION ALL
+                    SELECT parent.file_id, parent.claude_session_id,
+                           parent.uuid, parent.parent_uuid,
+                           parent.kind, parent.raw, child.depth + 1
+                    FROM cli_native_records parent
+                    JOIN path child
+                      ON parent.file_id = child.file_id
+                     AND parent.uuid = child.parent_uuid
+                    WHERE child.uuid != ? AND child.depth < 4096
+                )
+                SELECT claude_session_id, uuid, kind, raw, depth
+                FROM path
+                ORDER BY depth DESC"#,
+        )
+        .bind(session_id)
+        .bind(branch_leaf_uuid)
+        .bind(fork_parent_uuid)
+        .fetch_all(pool)
+        .await?;
+        if !rows
+            .iter()
+            .any(|record| record.uuid.as_deref() == Some(fork_parent_uuid))
+        {
+            return Ok(None);
+        }
+        Ok(Some(rows))
+    }
+
     pub async fn session_ids_for_uuid(
         pool: &SqlitePool,
         native_uuid: &str,
@@ -127,8 +197,30 @@ impl CliNativeRecord {
         cursor: &ImportedCursor<'_>,
     ) -> Result<ImportBatchResult, sqlx::Error> {
         let mut tx = pool.begin().await?;
+        let result = Self::import_batch_in_transaction(
+            &mut tx,
+            file_id,
+            records,
+            cursor,
+            None,
+            NativeImportContext::default(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    pub async fn import_batch_with_context(
+        pool: &SqlitePool,
+        file_id: Uuid,
+        records: &[NewCliNativeRecord],
+        cursor: &ImportedCursor<'_>,
+        context: NativeImportContext,
+    ) -> Result<ImportBatchResult, sqlx::Error> {
+        let mut tx = pool.begin().await?;
         let result =
-            Self::import_batch_in_transaction(&mut tx, file_id, records, cursor, None).await?;
+            Self::import_batch_in_transaction(&mut tx, file_id, records, cursor, None, context)
+                .await?;
         tx.commit().await?;
         Ok(result)
     }
@@ -202,11 +294,92 @@ impl CliNativeRecord {
         .execute(&mut *tx)
         .await?;
 
-        let imported =
-            Self::import_batch_in_transaction(&mut tx, file_id, records, cursor, next_outbox_seq)
-                .await?;
+        let imported = Self::import_batch_in_transaction(
+            &mut tx,
+            file_id,
+            records,
+            cursor,
+            next_outbox_seq,
+            NativeImportContext::default(),
+        )
+        .await?;
         tx.commit().await?;
 
+        let file = CliNativeFile::find_by_id(pool, file_id)
+            .await?
+            .expect("activated native generation exists");
+        Ok(ReplacedGenerationImport { file, imported })
+    }
+
+    pub async fn replace_generation_and_import_batch_with_context(
+        pool: &SqlitePool,
+        registration: &RegisterCliNativeFile<'_>,
+        records: &[NewCliNativeRecord],
+        cursor: &ImportedCursor<'_>,
+        context: NativeImportContext,
+    ) -> Result<ReplacedGenerationImport, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+        let next_generation = sqlx::query_scalar!(
+            r#"SELECT COALESCE(MAX(generation), -1) + 1 AS "generation!: i64"
+               FROM cli_native_files
+               WHERE dir_path = $1 AND file_name = $2"#,
+            registration.dir_path,
+            registration.file_name
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let session_id = sqlx::query_scalar!(
+            r#"SELECT session_id AS "session_id!: Uuid"
+               FROM claude_session_links
+               WHERE claude_session_id = $1"#,
+            registration.claude_session_id
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let next_outbox_seq = if let Some(session_id) = session_id {
+            Some(CliIngestOutbox::next_seq_in_transaction(&mut tx, session_id).await?)
+        } else {
+            None
+        };
+        let file_id = Uuid::new_v4();
+        sqlx::query!(
+            r#"INSERT INTO cli_native_files
+                   (id, claude_session_id, dir_path, file_name,
+                    discovered_workspace_id, dev, inode, generation,
+                    observed_size, observed_mtime_ms)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
+            file_id,
+            registration.claude_session_id,
+            registration.dir_path,
+            registration.file_name,
+            registration.discovered_workspace_id,
+            registration.dev,
+            registration.inode,
+            next_generation,
+            registration.observed_size,
+            registration.observed_mtime_ms
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            r#"DELETE FROM cli_native_files
+               WHERE dir_path = $1 AND file_name = $2 AND id != $3"#,
+            registration.dir_path,
+            registration.file_name,
+            file_id
+        )
+        .execute(&mut *tx)
+        .await?;
+        let imported = Self::import_batch_in_transaction(
+            &mut tx,
+            file_id,
+            records,
+            cursor,
+            next_outbox_seq,
+            context,
+        )
+        .await?;
+        tx.commit().await?;
         let file = CliNativeFile::find_by_id(pool, file_id)
             .await?
             .expect("activated native generation exists");
@@ -219,6 +392,7 @@ impl CliNativeRecord {
         records: &[NewCliNativeRecord],
         cursor: &ImportedCursor<'_>,
         minimum_next_outbox_seq: Option<i64>,
+        context: NativeImportContext,
     ) -> Result<ImportBatchResult, sqlx::Error> {
         let imported_at = Utc::now();
 
@@ -305,13 +479,48 @@ impl CliNativeRecord {
                 None
             };
 
+            let bound_queued_message_id =
+                if record.kind == "user" && !linked_to_execution && bound_turn_id.is_none() {
+                    match (record.user_prompt.as_deref(), session_id) {
+                        (Some(prompt), Some(session_id)) => {
+                            let reference_time = record.recorded_at.unwrap_or(imported_at);
+                            let earliest_paste = reference_time - chrono::Duration::minutes(15);
+                            let latest_paste = reference_time + chrono::Duration::seconds(5);
+                            sqlx::query_scalar!(
+                                r#"SELECT id AS "id!: Uuid"
+                               FROM session_queued_messages
+                               WHERE session_id = $1
+                                 AND state IN ('pasting', 'pasted')
+                                 AND prompt = $2
+                                 AND (claude_session_id IS NULL OR claude_session_id = $3)
+                                 AND pasted_at IS NOT NULL
+                                 AND pasted_at >= $4
+                                 AND pasted_at <= $5
+                               ORDER BY pasted_at DESC
+                               LIMIT 1"#,
+                                session_id,
+                                prompt,
+                                record.claude_session_id,
+                                earliest_paste,
+                                latest_paste
+                            )
+                            .fetch_optional(&mut **tx)
+                            .await?
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
             let disposition = record.disposition.as_str();
             let inserted = sqlx::query!(
                 r#"INSERT OR IGNORE INTO cli_native_records
                        (file_id, line_seq, claude_session_id, uuid,
                         parent_uuid, kind, ts, raw,
-                        disposition, bound_coding_agent_turn_id)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
+                        disposition, bound_coding_agent_turn_id,
+                        bound_queued_message_id)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"#,
                 file_id,
                 record.line_seq,
                 record.claude_session_id,
@@ -321,13 +530,59 @@ impl CliNativeRecord {
                 record.ts,
                 record.raw,
                 disposition,
-                bound_turn_id
+                bound_turn_id,
+                bound_queued_message_id
             )
             .execute(&mut **tx)
             .await?;
 
             if inserted.rows_affected() == 0 {
                 continue;
+            }
+
+            if let Some(queue_id) = bound_queued_message_id {
+                sqlx::query!(
+                    r#"UPDATE session_queued_messages SET
+                           state = 'imported',
+                           claude_session_id = COALESCE(claude_session_id, $1),
+                           acked_at = $2,
+                           updated_at = $2
+                       WHERE id = $3 AND state IN ('pasting', 'pasted')"#,
+                    record.claude_session_id,
+                    imported_at,
+                    queue_id
+                )
+                .execute(&mut **tx)
+                .await?;
+            } else if context.app_pane_absent
+                && record.kind == "user"
+                && !linked_to_execution
+                && bound_turn_id.is_none()
+                && let Some(session_id) = session_id
+            {
+                let executor_running = sqlx::query_scalar!(
+                    r#"SELECT EXISTS(
+                           SELECT 1 FROM execution_processes
+                           WHERE session_id = $1
+                             AND status = 'running'
+                             AND run_reason = 'codingagent'
+                       ) AS "running!: bool""#,
+                    session_id
+                )
+                .fetch_one(&mut **tx)
+                .await?;
+                if !executor_running {
+                    sqlx::query!(
+                        r#"UPDATE claude_session_links
+                           SET foreign_writer_seen_at = $1
+                           WHERE claude_session_id = $2 AND session_id = $3"#,
+                        imported_at,
+                        record.claude_session_id,
+                        session_id
+                    )
+                    .execute(&mut **tx)
+                    .await?;
+                }
             }
 
             result.inserted_records += 1;

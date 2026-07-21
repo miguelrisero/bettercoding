@@ -30,8 +30,10 @@ use db::{
         cli_ingest_outbox::CliIngestOutbox,
         cli_native_file::{CliNativeFile, RegisterCliNativeFile},
         cli_native_record::{
-            CliNativeRecord, CliNativeRecordDisposition, ImportedCursor, NewCliNativeRecord,
+            CliNativeRecord, CliNativeRecordDisposition, ImportedCursor, NativeImportContext,
+            NewCliNativeRecord,
         },
+        cli_pane_binding::{CliPaneBinding, CliPaneBoundVia},
         session::Session,
         workspace::{Workspace, WorkspaceError},
     },
@@ -61,7 +63,10 @@ use self::{
         ObservedFileState, StoredTailState, hash_bytes, read_complete_line_batch, rescan_reason,
     },
 };
-use crate::services::filesystem_watcher;
+use crate::services::{
+    cli_collab::{CliWriterProbe, SidEvidence},
+    filesystem_watcher,
+};
 
 const REGISTRY_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const OUTBOX_SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -134,9 +139,32 @@ struct ImportPathState {
     force_rescan: bool,
 }
 
+#[cfg(test)]
+struct TestNoPaneWriterProbe;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl CliWriterProbe for TestNoPaneWriterProbe {
+    async fn probe(
+        &self,
+        _workspace_id: Uuid,
+        _effective_dir: &Path,
+        _expected_sid: Option<&str>,
+    ) -> crate::services::cli_collab::ProbeReport {
+        crate::services::cli_collab::ProbeReport {
+            pane_session_exists: false,
+            agent_running: Some(false),
+            sid_evidence: SidEvidence::Unknown,
+            probe_failed: false,
+            only_active_claude_in_cwd: Some(false),
+        }
+    }
+}
+
 pub struct ClaudeTranscriptIngest {
     db: DBService,
     projects_dir: PathBuf,
+    writer_probe: Arc<dyn CliWriterProbe>,
     directories: RwLock<HashMap<PathBuf, DirectoryContext>>,
     watchers: tokio::sync::Mutex<HashMap<PathBuf, JoinHandle<()>>>,
     importing_paths: tokio::sync::Mutex<HashMap<PathBuf, ImportPathState>>,
@@ -157,13 +185,17 @@ pub struct ClaudeTranscriptIngest {
 impl ClaudeTranscriptIngest {
     /// Check the kill switch exactly once. A set value of any kind disables
     /// the entire service and no Claude-store watcher is created.
-    pub fn spawn(db: DBService, shutdown: CancellationToken) -> Option<Arc<Self>> {
+    pub fn spawn(
+        db: DBService,
+        writer_probe: Arc<dyn CliWriterProbe>,
+        shutdown: CancellationToken,
+    ) -> Option<Arc<Self>> {
         if std::env::var_os("DISABLE_CLI_TRANSCRIPT_INGEST").is_some() {
             tracing::info!("CLI transcript ingest disabled by environment");
             return None;
         }
         let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
-        let service = Arc::new(Self::new(db, projects_dir));
+        let service = Arc::new(Self::new_with_probe(db, projects_dir, writer_probe));
 
         tokio::spawn(service.clone().run_publisher(shutdown.child_token()));
         let native_link_updates = native_link_events().subscribe();
@@ -176,11 +208,16 @@ impl ClaudeTranscriptIngest {
         Some(service)
     }
 
-    fn new(db: DBService, projects_dir: PathBuf) -> Self {
+    fn new_with_probe(
+        db: DBService,
+        projects_dir: PathBuf,
+        writer_probe: Arc<dyn CliWriterProbe>,
+    ) -> Self {
         let (feed_updates, _) = broadcast::channel(4096);
         Self {
             db,
             projects_dir,
+            writer_probe,
             directories: RwLock::new(HashMap::new()),
             watchers: tokio::sync::Mutex::new(HashMap::new()),
             importing_paths: tokio::sync::Mutex::new(HashMap::new()),
@@ -197,6 +234,11 @@ impl ClaudeTranscriptIngest {
             #[cfg(test)]
             path_import_barrier: tokio::sync::Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    fn new(db: DBService, projects_dir: PathBuf) -> Self {
+        Self::new_with_probe(db, projects_dir, Arc::new(TestNoPaneWriterProbe))
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<NativeFeedUpdate> {
@@ -244,11 +286,17 @@ impl ClaudeTranscriptIngest {
                 .is_some_and(|context| context.workspace_id == session.workspace_id)
         });
         drop(directories);
+        let quarantined_files = self.quarantined_paths.lock().unwrap().len() as u64;
+        let foreign_writer_seen_at =
+            ClaudeSessionLink::latest_foreign_writer_seen_for_session(&self.db.pool, session_id)
+                .await?
+                .map(|time| time.to_rfc3339());
         let health = NativeIngestHealth {
             unknown_kinds: self.unknown_kinds.load(Ordering::Relaxed),
             rescans: self.rescans.load(Ordering::Relaxed),
-            quarantined_files: self.quarantined_paths.lock().unwrap().len() as u64,
+            quarantined_files,
             watch_degraded,
+            foreign_writer_seen_at,
             files,
         };
         Ok(build_projection(&rows, revision, seq, health))
@@ -682,12 +730,17 @@ impl ClaudeTranscriptIngest {
         };
         let mut native_file = CliNativeFile::register(&self.db.pool, &registration).await?;
 
-        let link = ClaudeSessionLink::resolve_or_bind_executor(
+        let mut link = ClaudeSessionLink::resolve_or_bind_executor(
             &self.db.pool,
             claude_session_id,
             &context.cwd.to_string_lossy(),
         )
         .await?;
+        if link.is_none() {
+            link = self
+                .try_auto_bind_cli_fresh(claude_session_id, context)
+                .await?;
+        }
         if let Some(mutation) = &link {
             self.apply_link_mutation(mutation).await;
         } else {
@@ -699,6 +752,19 @@ impl ClaudeTranscriptIngest {
         if link.is_some() {
             self.quarantined_paths.lock().unwrap().remove(path);
         }
+
+        let import_context = if link.is_some() {
+            let report = self
+                .writer_probe
+                .probe(context.workspace_id, &context.cwd, Some(claude_session_id))
+                .await;
+            NativeImportContext {
+                app_pane_absent: !report.probe_failed
+                    && !(report.pane_session_exists && report.agent_running == Some(true)),
+            }
+        } else {
+            NativeImportContext::default()
+        };
 
         let verified_hash = if observed_size >= native_file.cursor_offset {
             verify_last_line_hash(&mut file, &native_file)?
@@ -814,13 +880,15 @@ impl ClaudeTranscriptIngest {
                 observed_mtime_ms,
             };
             let imported = if activate_replacement {
-                let replacement = CliNativeRecord::replace_generation_and_import_batch(
-                    &self.db.pool,
-                    &registration,
-                    &records,
-                    &cursor,
-                )
-                .await?;
+                let replacement =
+                    CliNativeRecord::replace_generation_and_import_batch_with_context(
+                        &self.db.pool,
+                        &registration,
+                        &records,
+                        &cursor,
+                        import_context,
+                    )
+                    .await?;
                 native_file = replacement.file;
                 activate_replacement = false;
                 self.rescans.fetch_add(1, Ordering::Relaxed);
@@ -832,8 +900,14 @@ impl ClaudeTranscriptIngest {
                 tracing::info!(?reason, path = %path.display(), generation = native_file.generation, "rescanned native transcript generation");
                 replacement.imported
             } else {
-                CliNativeRecord::import_batch(&self.db.pool, native_file.id, &records, &cursor)
-                    .await?
+                CliNativeRecord::import_batch_with_context(
+                    &self.db.pool,
+                    native_file.id,
+                    &records,
+                    &cursor,
+                    import_context,
+                )
+                .await?
             };
             if imported.appended_outbox > 0 {
                 self.publisher_notify.notify_one();
@@ -848,6 +922,54 @@ impl ClaudeTranscriptIngest {
             }
         }
         Ok(())
+    }
+
+    async fn try_auto_bind_cli_fresh(
+        &self,
+        claude_session_id: &str,
+        context: &DirectoryContext,
+    ) -> Result<Option<ClaudeSessionLinkMutation>, ClaudeTranscriptIngestError> {
+        let Some(binding) =
+            CliPaneBinding::find_active_for_workspace(&self.db.pool, context.workspace_id).await?
+        else {
+            return Ok(None);
+        };
+        if binding.bound_via != CliPaneBoundVia::CliFresh
+            || binding
+                .claude_session_id
+                .as_deref()
+                .is_some_and(|sid| sid != claude_session_id)
+        {
+            return Ok(None);
+        }
+        let report = self
+            .writer_probe
+            .probe(context.workspace_id, &context.cwd, None)
+            .await;
+        if report.probe_failed
+            || !report.pane_session_exists
+            || report.agent_running != Some(true)
+            || report.sid_evidence != SidEvidence::NoResumeArg
+            || report.only_active_claude_in_cwd != Some(true)
+        {
+            return Ok(None);
+        }
+        if binding.claude_session_id.is_none()
+            && !CliPaneBinding::bind_discovered_sid(&self.db.pool, binding.id, claude_session_id)
+                .await?
+        {
+            return Ok(None);
+        }
+        let mutation = ClaudeSessionLink::assign_cli(
+            &self.db.pool,
+            claude_session_id,
+            binding.session_id,
+            binding.workspace_id,
+            &context.cwd.to_string_lossy(),
+            db::models::claude_session_link::ClaudeSessionBoundVia::CliFresh,
+        )
+        .await?;
+        Ok(Some(mutation))
     }
 
     async fn apply_link_mutation(&self, mutation: &ClaudeSessionLinkMutation) {
