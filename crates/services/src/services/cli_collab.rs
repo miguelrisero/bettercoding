@@ -1064,6 +1064,30 @@ mod tests {
         }
     }
 
+    struct FailingDispatcher {
+        db: DBService,
+        state: Arc<StdMutex<DispatcherState>>,
+    }
+
+    #[async_trait]
+    impl CliExecutorDispatcher for FailingDispatcher {
+        async fn dispatch(
+            &self,
+            session: &Session,
+            prompt: &str,
+            _executor_config: &ExecutorConfig,
+        ) -> AnyhowResult<ExecutionProcess> {
+            let reservation_seen =
+                WorkspaceSpawnReservation::find(&self.db.pool, session.workspace_id)
+                    .await?
+                    .is_some();
+            let mut state = self.state.lock().unwrap();
+            state.prompts.push(prompt.to_string());
+            state.reservation_seen = reservation_seen;
+            Err(anyhow::anyhow!("intentional dispatcher failure"))
+        }
+    }
+
     async fn fixture() -> (DBService, Workspace, Session) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1454,6 +1478,59 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_error_releases_reservation_and_requeues_prompt() {
+        let (db, _workspace, session) = fixture().await;
+        let dispatcher_state = Arc::new(StdMutex::new(DispatcherState::default()));
+        let dispatcher = Arc::new(FailingDispatcher {
+            db: db.clone(),
+            state: dispatcher_state.clone(),
+        });
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(false, Some(false), SidEvidence::Unknown),
+            Arc::new(FakeTransport),
+            dispatcher,
+        );
+
+        let outcome = service
+            .dispatch_gate(
+                &session,
+                "preserve failed dispatch".to_string(),
+                executor_config(),
+                QueuedMessageSource::Ui,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let DispatchOutcome::Queued { status } = outcome else {
+            panic!("dispatcher failure must return the prompt to the queue");
+        };
+        assert_eq!(
+            status.message().unwrap().data.message,
+            "preserve failed dispatch"
+        );
+        let (prompts, reservation_seen) = {
+            let state = dispatcher_state.lock().unwrap();
+            (state.prompts.clone(), state.reservation_seen)
+        };
+        assert_eq!(prompts, ["preserve failed dispatch"]);
+        assert!(reservation_seen);
+        assert!(
+            WorkspaceSpawnReservation::find(&db.pool, session.workspace_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let queued = SessionQueuedMessage::find_active(&db.pool, session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.state, QueuedMessageState::Queued);
+        assert_eq!(queued.prompt, "preserve failed dispatch");
     }
 
     #[tokio::test]
