@@ -232,6 +232,11 @@ export function WorkspacesLayout() {
   );
 
   // ── Mobile layout ──────────────────────────────────────────────────
+  // These seven panes must stay in lockstep with MobileTabId
+  // (packages/ui/src/components/Navbar.tsx) and MobileTab
+  // (packages/web-core/src/shared/stores/useUiPreferencesStore.ts). Adding a
+  // tab to those unions without a matching pane here compiles cleanly but
+  // silently renders a dead tab button.
   // Uses `hidden` CSS class (NOT conditional rendering) to preserve
   // WebSocket connections and scroll positions across tab switches.
   if (isMobile) {
