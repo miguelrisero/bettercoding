@@ -9,13 +9,17 @@ export const RIGHT_MAIN_PANEL_MODES = {
   PREVIEW: 'preview',
 } as const;
 
-// RightMainPanelMode must stay a subset of MobileTab. The assignments below intentionally rely on structural typing (no cast), so adding a mode without a matching mobile tab fails to compile.
+// RightMainPanelMode must stay a subset of MobileTab. The assignments below
+// intentionally rely on structural typing (no cast), so adding a mode without
+// a matching mobile tab fails to compile.
 export type RightMainPanelMode =
   (typeof RIGHT_MAIN_PANEL_MODES)[keyof typeof RIGHT_MAIN_PANEL_MODES];
 
 export type LayoutMode = 'workspaces' | 'kanban';
 
-// Keep in lockstep with MobileTabId in packages/ui/src/components/Navbar.tsx — web-core can't be imported by ui, so these two unions are intentionally duplicated.
+// Keep in lockstep with MobileTabId in
+// packages/ui/src/components/Navbar.tsx — web-core can't be imported by ui,
+// so these two unions are intentionally duplicated.
 export type MobileTab =
   | 'workspaces'
   | 'chat'
