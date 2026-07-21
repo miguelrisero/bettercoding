@@ -1,0 +1,1011 @@
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Weak},
+    time::Duration,
+};
+
+use anyhow::Result as AnyhowResult;
+use async_trait::async_trait;
+use chrono::{Duration as ChronoDuration, Utc};
+use db::{
+    DBService,
+    models::{
+        claude_session_link::ClaudeSessionLink,
+        cli_pane_binding::CliPaneBinding,
+        coding_agent_turn::CodingAgentTurn,
+        execution_process::{ExecutionProcess, ExecutionProcessRunReason},
+        session::Session,
+        session_queued_message::{
+            QueuedMessageSource, QueuedMessageState, SessionQueuedMessage, StoreQueuedMessageResult,
+        },
+        workspace::Workspace,
+        workspace_spawn_reservation::{SpawnReservationHolder, WorkspaceSpawnReservation},
+    },
+};
+use executors::profile::ExecutorConfig;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::{Mutex, Notify};
+use tokio_util::sync::CancellationToken;
+use ts_rs::TS;
+use uuid::Uuid;
+
+use super::{
+    claude_transcript_ingest::ClaudeTranscriptIngest,
+    queued_message::{QueueStatus, QueuedMessage, QueuedMessageError},
+};
+
+const DRAIN_INTERVAL: Duration = Duration::from_secs(1);
+const PASTING_STARTUP_GRACE: ChronoDuration = ChronoDuration::seconds(5);
+const PASTE_ACK_TIMEOUT: ChronoDuration = ChronoDuration::seconds(30);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidEvidence {
+    ConfirmedResume(String),
+    NoResumeArg,
+    Ambiguous,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeReport {
+    pub pane_session_exists: bool,
+    pub agent_running: Option<bool>,
+    pub sid_evidence: SidEvidence,
+    /// True when any authoritative tmux/process/DB component of the probe was
+    /// unreadable. Lease derivation treats this as busy.
+    pub probe_failed: bool,
+    /// Used by cli-fresh discovery: `Some(true)` means exactly one live Claude
+    /// process has `effective_dir` as its cwd.
+    pub only_active_claude_in_cwd: Option<bool>,
+}
+
+impl ProbeReport {
+    pub fn failed() -> Self {
+        Self {
+            pane_session_exists: false,
+            agent_running: None,
+            sid_evidence: SidEvidence::Unknown,
+            probe_failed: true,
+            only_active_claude_in_cwd: None,
+        }
+    }
+}
+
+#[async_trait]
+pub trait CliWriterProbe: Send + Sync {
+    async fn probe(
+        &self,
+        workspace_id: Uuid,
+        effective_dir: &Path,
+        expected_sid: Option<&str>,
+    ) -> ProbeReport;
+}
+
+#[async_trait]
+pub trait CliPasteTransport: Send + Sync {
+    async fn paste_and_submit(&self, workspace_id: Uuid, text: &str) -> bool;
+    async fn pane_alive(&self, workspace_id: Uuid) -> bool;
+    async fn agent_running(&self, workspace_id: Uuid) -> Option<bool>;
+    async fn signal_resume_ready(&self, workspace_id: Uuid, sid: &str);
+}
+
+/// Deployment-owned executor bridge. The trait lives in services so
+/// `CliCollabService` never imports local-deployment; the local implementation
+/// reuses `ContainerService::start_execution` and its normal bookkeeping.
+#[async_trait]
+pub trait CliExecutorDispatcher: Send + Sync {
+    async fn dispatch(
+        &self,
+        session: &Session,
+        prompt: &str,
+        executor_config: &ExecutorConfig,
+    ) -> AnyhowResult<ExecutionProcess>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriterLease {
+    Executor,
+    Cli { claude_session_id: Option<String> },
+    CliAmbiguous,
+    Free,
+    Busy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum DispatchOutcome {
+    Started { execution_process: ExecutionProcess },
+    Queued { status: QueueStatus },
+    RoutedToCli { delivery: QueueStatus },
+    Conflict { status: QueueStatus },
+}
+
+#[derive(Debug, Error)]
+pub enum CliCollabError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+    #[error(transparent)]
+    Queue(#[from] QueuedMessageError),
+    #[error(transparent)]
+    Serialize(#[from] serde_json::Error),
+    #[error("session {0} has no workspace")]
+    WorkspaceMissing(Uuid),
+}
+
+pub struct CliCollabService {
+    db: DBService,
+    probe: Arc<dyn CliWriterProbe>,
+    transport: Arc<dyn CliPasteTransport>,
+    dispatcher: Arc<dyn CliExecutorDispatcher>,
+    ingest: Option<Arc<ClaudeTranscriptIngest>>,
+    session_locks: Mutex<HashMap<Uuid, Weak<Mutex<()>>>>,
+    notify: Notify,
+    routing_disabled: bool,
+    shutdown: CancellationToken,
+}
+
+impl CliCollabService {
+    pub fn spawn(
+        db: DBService,
+        probe: Arc<dyn CliWriterProbe>,
+        transport: Arc<dyn CliPasteTransport>,
+        dispatcher: Arc<dyn CliExecutorDispatcher>,
+        ingest: Option<Arc<ClaudeTranscriptIngest>>,
+        shutdown: CancellationToken,
+    ) -> Arc<Self> {
+        let service = Arc::new(Self {
+            db,
+            probe,
+            transport,
+            dispatcher,
+            ingest,
+            session_locks: Mutex::new(HashMap::new()),
+            notify: Notify::new(),
+            routing_disabled: std::env::var_os("DISABLE_CLI_COLLAB_ROUTING").is_some(),
+            shutdown,
+        });
+        tokio::spawn(service.clone().run_drain());
+        if let Some(ingest) = &service.ingest {
+            let updates = ingest.subscribe();
+            tokio::spawn(service.clone().run_ingest_wakeup(updates));
+        }
+        service
+    }
+
+    async fn session_lock(&self, session_id: Uuid) -> Arc<Mutex<()>> {
+        let mut locks = self.session_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&session_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(session_id, Arc::downgrade(&lock));
+        lock
+    }
+
+    pub fn wake_drain(&self) {
+        self.notify.notify_one();
+    }
+
+    pub async fn derive_lease(&self, session: &Session) -> WriterLease {
+        let lock = self.session_lock(session.id).await;
+        let _guard = lock.lock().await;
+        self.derive_lease_locked(session).await
+    }
+
+    async fn derive_lease_locked(&self, session: &Session) -> WriterLease {
+        match ExecutionProcess::has_running_coding_agent_for_session(&self.db.pool, session.id)
+            .await
+        {
+            Ok(true) => return WriterLease::Executor,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(?error, session_id = %session.id, "executor lease probe failed closed");
+                return WriterLease::Busy;
+            }
+        }
+
+        let binding = match CliPaneBinding::find_active_for_workspace(
+            &self.db.pool,
+            session.workspace_id,
+        )
+        .await
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                tracing::warn!(?error, session_id = %session.id, "pane binding probe failed closed");
+                return WriterLease::Busy;
+            }
+        };
+        let workspace = match Workspace::find_by_id(&self.db.pool, session.workspace_id).await {
+            Ok(Some(workspace)) => workspace,
+            Ok(None) => return WriterLease::Busy,
+            Err(error) => {
+                tracing::warn!(?error, session_id = %session.id, "workspace lease probe failed closed");
+                return WriterLease::Busy;
+            }
+        };
+        let Some(effective_dir) = workspace
+            .container_ref
+            .as_deref()
+            .and_then(|root| session.effective_working_dir(Path::new(root)))
+        else {
+            return WriterLease::Busy;
+        };
+        let expected_sid = match self.expected_sid(session.id).await {
+            Ok(sid) => sid,
+            Err(error) => {
+                tracing::warn!(?error, session_id = %session.id, "sid lease probe failed closed");
+                return WriterLease::Busy;
+            }
+        };
+        let report = self
+            .probe
+            .probe(
+                session.workspace_id,
+                &effective_dir,
+                expected_sid.as_deref(),
+            )
+            .await;
+        if report.probe_failed {
+            return WriterLease::Busy;
+        }
+        if !report.pane_session_exists {
+            return WriterLease::Free;
+        }
+        match report.agent_running {
+            None => return WriterLease::Busy,
+            Some(false) => return WriterLease::Free,
+            Some(true) => {}
+        }
+
+        let Some(binding) = binding.filter(|binding| binding.session_id == session.id) else {
+            return WriterLease::CliAmbiguous;
+        };
+        match (expected_sid.as_deref(), &report.sid_evidence) {
+            (Some(expected), SidEvidence::ConfirmedResume(observed)) if expected == observed => {
+                WriterLease::Cli {
+                    claude_session_id: Some(expected.to_string()),
+                }
+            }
+            (None, SidEvidence::NoResumeArg) if binding.claude_session_id.is_none() => {
+                WriterLease::Cli {
+                    claude_session_id: None,
+                }
+            }
+            _ => WriterLease::CliAmbiguous,
+        }
+    }
+
+    async fn expected_sid(&self, session_id: Uuid) -> Result<Option<String>, sqlx::Error> {
+        if let Some(info) =
+            CodingAgentTurn::find_latest_session_info(&self.db.pool, session_id).await?
+        {
+            return Ok(Some(info.session_id));
+        }
+        Ok(
+            ClaudeSessionLink::find_latest_for_session(&self.db.pool, session_id)
+                .await?
+                .map(|link| link.claude_session_id),
+        )
+    }
+
+    pub async fn dispatch_gate(
+        &self,
+        session: &Session,
+        prompt: String,
+        executor_config: ExecutorConfig,
+        source: QueuedMessageSource,
+        replace: bool,
+    ) -> Result<DispatchOutcome, CliCollabError> {
+        let lock = self.session_lock(session.id).await;
+        let _guard = lock.lock().await;
+        let existing = self
+            .prepare_existing_slot(session.id, &prompt, &executor_config, source, replace)
+            .await?;
+        if let PreparedSlot::Conflict(status) = existing {
+            return Ok(DispatchOutcome::Conflict { status });
+        }
+        let existing = match existing {
+            PreparedSlot::None => None,
+            PreparedSlot::Stored(row) => Some(row),
+            PreparedSlot::Conflict(_) => unreachable!(),
+        };
+
+        let lease = self.derive_lease_locked(session).await;
+        let outcome = match lease {
+            WriterLease::Executor | WriterLease::CliAmbiguous | WriterLease::Busy => {
+                self.queue_or_status(session.id, &prompt, &executor_config, source, existing)
+                    .await?
+            }
+            WriterLease::Cli { claude_session_id } if !self.routing_disabled => {
+                let row = match existing {
+                    Some(row) => row,
+                    None => {
+                        self.store_slot(session.id, &prompt, &executor_config, source, false)
+                            .await?
+                    }
+                };
+                self.paste_slot(session, row, claude_session_id.as_deref())
+                    .await?
+            }
+            WriterLease::Cli { .. } => {
+                self.queue_or_status(session.id, &prompt, &executor_config, source, existing)
+                    .await?
+            }
+            WriterLease::Free => {
+                self.dispatch_executor_locked(session, &prompt, &executor_config, source, existing)
+                    .await?
+            }
+        };
+        if matches!(outcome, DispatchOutcome::Queued { .. }) {
+            self.notify.notify_one();
+        }
+        Ok(outcome)
+    }
+
+    pub async fn queue_only(
+        &self,
+        session: &Session,
+        prompt: String,
+        executor_config: ExecutorConfig,
+        source: QueuedMessageSource,
+        replace: bool,
+    ) -> Result<DispatchOutcome, CliCollabError> {
+        let lock = self.session_lock(session.id).await;
+        let _guard = lock.lock().await;
+        let result = self
+            .store_slot_result(session.id, &prompt, &executor_config, source, replace)
+            .await?;
+        let outcome = match result {
+            StoreQueuedMessageResult::Stored(row) => DispatchOutcome::Queued {
+                status: Self::status_from_row(row)?,
+            },
+            StoreQueuedMessageResult::Conflict(row) => DispatchOutcome::Conflict {
+                status: Self::status_from_row(row)?,
+            },
+        };
+        self.notify.notify_one();
+        Ok(outcome)
+    }
+
+    pub async fn cancel_queued(&self, session_id: Uuid) -> Result<QueueStatus, CliCollabError> {
+        let lock = self.session_lock(session_id).await;
+        let _guard = lock.lock().await;
+        match db::models::session_queued_message::SessionQueuedMessage::cancel_queued(
+            &self.db.pool,
+            session_id,
+        )
+        .await?
+        {
+            db::models::session_queued_message::CancelQueuedMessageResult::Empty
+            | db::models::session_queued_message::CancelQueuedMessageResult::Cancelled(_) => {
+                Ok(QueueStatus::Empty)
+            }
+            db::models::session_queued_message::CancelQueuedMessageResult::Conflict(row) => {
+                Self::status_from_row(row)
+            }
+        }
+    }
+
+    pub async fn status(&self, session_id: Uuid) -> Result<QueueStatus, CliCollabError> {
+        match SessionQueuedMessage::find_active(&self.db.pool, session_id).await? {
+            Some(row) => Self::status_from_row(row),
+            None => Ok(QueueStatus::Empty),
+        }
+    }
+
+    async fn prepare_existing_slot(
+        &self,
+        session_id: Uuid,
+        prompt: &str,
+        executor_config: &ExecutorConfig,
+        source: QueuedMessageSource,
+        replace: bool,
+    ) -> Result<PreparedSlot, CliCollabError> {
+        let Some(active) = SessionQueuedMessage::find_active(&self.db.pool, session_id).await?
+        else {
+            return Ok(PreparedSlot::None);
+        };
+        if !replace || active.state != QueuedMessageState::Queued {
+            return Ok(PreparedSlot::Conflict(Self::status_from_row(active)?));
+        }
+        Ok(PreparedSlot::Stored(
+            self.store_slot(session_id, prompt, executor_config, source, true)
+                .await?,
+        ))
+    }
+
+    async fn queue_or_status(
+        &self,
+        session_id: Uuid,
+        prompt: &str,
+        executor_config: &ExecutorConfig,
+        source: QueuedMessageSource,
+        existing: Option<SessionQueuedMessage>,
+    ) -> Result<DispatchOutcome, CliCollabError> {
+        let row = match existing {
+            Some(row) => row,
+            None => {
+                self.store_slot(session_id, prompt, executor_config, source, false)
+                    .await?
+            }
+        };
+        Ok(DispatchOutcome::Queued {
+            status: Self::status_from_row(row)?,
+        })
+    }
+
+    async fn store_slot(
+        &self,
+        session_id: Uuid,
+        prompt: &str,
+        executor_config: &ExecutorConfig,
+        source: QueuedMessageSource,
+        replace: bool,
+    ) -> Result<SessionQueuedMessage, CliCollabError> {
+        match self
+            .store_slot_result(session_id, prompt, executor_config, source, replace)
+            .await?
+        {
+            StoreQueuedMessageResult::Stored(row) => Ok(row),
+            StoreQueuedMessageResult::Conflict(row) => Ok(row),
+        }
+    }
+
+    async fn store_slot_result(
+        &self,
+        session_id: Uuid,
+        prompt: &str,
+        executor_config: &ExecutorConfig,
+        source: QueuedMessageSource,
+        replace: bool,
+    ) -> Result<StoreQueuedMessageResult, CliCollabError> {
+        let config = serde_json::to_string(executor_config)?;
+        Ok(SessionQueuedMessage::store(
+            &self.db.pool,
+            session_id,
+            prompt,
+            Some(&config),
+            source,
+            replace,
+        )
+        .await?)
+    }
+
+    async fn paste_slot(
+        &self,
+        session: &Session,
+        row: SessionQueuedMessage,
+        claude_session_id: Option<&str>,
+    ) -> Result<DispatchOutcome, CliCollabError> {
+        let Some(claimed) =
+            SessionQueuedMessage::claim(&self.db.pool, row.id, claude_session_id).await?
+        else {
+            return Ok(DispatchOutcome::Conflict {
+                status: self.status(session.id).await?,
+            });
+        };
+        if self
+            .transport
+            .paste_and_submit(session.workspace_id, &claimed.prompt)
+            .await
+        {
+            SessionQueuedMessage::mark_pasted(&self.db.pool, claimed.id).await?;
+            let status = self.status(session.id).await?;
+            Ok(DispatchOutcome::RoutedToCli { delivery: status })
+        } else {
+            SessionQueuedMessage::requeue(
+                &self.db.pool,
+                claimed.id,
+                Some("CLI paste failed; queued for retry"),
+            )
+            .await?;
+            Ok(DispatchOutcome::Queued {
+                status: self.status(session.id).await?,
+            })
+        }
+    }
+
+    async fn dispatch_executor_locked(
+        &self,
+        session: &Session,
+        prompt: &str,
+        executor_config: &ExecutorConfig,
+        source: QueuedMessageSource,
+        existing: Option<SessionQueuedMessage>,
+    ) -> Result<DispatchOutcome, CliCollabError> {
+        let reservation = match WorkspaceSpawnReservation::acquire(
+            &self.db.pool,
+            session.workspace_id,
+            SpawnReservationHolder::Executor,
+        )
+        .await
+        {
+            Ok(Some(reservation)) => reservation,
+            Ok(None) => {
+                return self
+                    .queue_or_status(session.id, prompt, executor_config, source, existing)
+                    .await;
+            }
+            Err(error) => {
+                tracing::warn!(?error, session_id = %session.id, "spawn reservation failed closed");
+                return self
+                    .queue_or_status(session.id, prompt, executor_config, source, existing)
+                    .await;
+            }
+        };
+
+        let claimed = if let Some(row) = existing {
+            match SessionQueuedMessage::claim(&self.db.pool, row.id, None).await? {
+                Some(row) => Some(row),
+                None => {
+                    let _ = WorkspaceSpawnReservation::release(
+                        &self.db.pool,
+                        session.workspace_id,
+                        &reservation.fence,
+                    )
+                    .await;
+                    return Ok(DispatchOutcome::Conflict {
+                        status: self.status(session.id).await?,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
+        let dispatched = self
+            .dispatcher
+            .dispatch(session, prompt, executor_config)
+            .await;
+        if let Err(error) = WorkspaceSpawnReservation::release(
+            &self.db.pool,
+            session.workspace_id,
+            &reservation.fence,
+        )
+        .await
+        {
+            tracing::warn!(?error, workspace_id = %session.workspace_id, "failed to release executor spawn reservation");
+        }
+
+        match dispatched {
+            Ok(execution_process) => {
+                if let Some(row) = claimed {
+                    SessionQueuedMessage::mark_consumed(&self.db.pool, row.id).await?;
+                }
+                Ok(DispatchOutcome::Started { execution_process })
+            }
+            Err(error) => {
+                tracing::warn!(?error, session_id = %session.id, "executor dispatch failed; preserving prompt in queue");
+                if let Some(row) = claimed {
+                    SessionQueuedMessage::requeue(
+                        &self.db.pool,
+                        row.id,
+                        Some("executor start failed; queued for retry"),
+                    )
+                    .await?;
+                    Ok(DispatchOutcome::Queued {
+                        status: self.status(session.id).await?,
+                    })
+                } else {
+                    self.queue_or_status(session.id, prompt, executor_config, source, None)
+                        .await
+                }
+            }
+        }
+    }
+
+    fn status_from_row(row: SessionQueuedMessage) -> Result<QueueStatus, CliCollabError> {
+        Ok(QueueStatus::from_message(QueuedMessage::try_from(row)?))
+    }
+
+    pub async fn on_executor_finished(&self, session_id: Uuid) -> Result<bool, CliCollabError> {
+        let session = Session::find_by_id(&self.db.pool, session_id)
+            .await?
+            .ok_or(CliCollabError::WorkspaceMissing(session_id))?;
+        let binding = match CliPaneBinding::find_active_for_session(&self.db.pool, session_id).await
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                tracing::warn!(?error, %session_id, "finish hook pane lookup failed closed");
+                return Ok(false);
+            }
+        };
+        if let Some(binding) = binding
+            && let Some(sid) = binding.claude_session_id
+            && self.transport.pane_alive(session.workspace_id).await
+        {
+            self.transport
+                .signal_resume_ready(session.workspace_id, &sid)
+                .await;
+            // Give the 1 s bootstrap poll a chance to exec the resumed TUI;
+            // the durable queue remains untouched during this transition.
+            self.notify.notify_one();
+            return Ok(false);
+        }
+        let started = self.drain_session(session_id).await?;
+        self.notify.notify_one();
+        Ok(started)
+    }
+
+    async fn drain_session(&self, session_id: Uuid) -> Result<bool, CliCollabError> {
+        if self.routing_disabled {
+            return Ok(false);
+        }
+        let lock = self.session_lock(session_id).await;
+        let _guard = lock.lock().await;
+        let Some(row) = SessionQueuedMessage::find_active(&self.db.pool, session_id).await? else {
+            return Ok(false);
+        };
+        if row.state != QueuedMessageState::Queued {
+            return Ok(false);
+        }
+        let session = Session::find_by_id(&self.db.pool, session_id)
+            .await?
+            .ok_or(CliCollabError::WorkspaceMissing(session_id))?;
+        let executor_config = match row.parsed_executor_config() {
+            Ok(Some(config)) => config,
+            Ok(None) => {
+                SessionQueuedMessage::set_failure_reason(
+                    &self.db.pool,
+                    row.id,
+                    "queued message has no executor configuration",
+                )
+                .await?;
+                return Ok(false);
+            }
+            Err(error) => {
+                SessionQueuedMessage::set_failure_reason(
+                    &self.db.pool,
+                    row.id,
+                    "queued message has invalid executor configuration",
+                )
+                .await?;
+                tracing::warn!(?error, queue_id = %row.id, "invalid durable queue executor config");
+                return Ok(false);
+            }
+        };
+        match self.derive_lease_locked(&session).await {
+            WriterLease::Executor | WriterLease::CliAmbiguous | WriterLease::Busy => Ok(false),
+            WriterLease::Cli { claude_session_id } => {
+                let routed = self
+                    .paste_slot(&session, row, claude_session_id.as_deref())
+                    .await?;
+                Ok(matches!(routed, DispatchOutcome::RoutedToCli { .. }))
+            }
+            WriterLease::Free => {
+                let prompt = row.prompt.clone();
+                let source = row.source;
+                let outcome = self
+                    .dispatch_executor_locked(
+                        &session,
+                        &prompt,
+                        &executor_config,
+                        source,
+                        Some(row),
+                    )
+                    .await?;
+                Ok(matches!(outcome, DispatchOutcome::Started { .. }))
+            }
+        }
+    }
+
+    async fn reconcile_delivery_state(&self) {
+        match SessionQueuedMessage::reconcile(
+            &self.db.pool,
+            Utc::now(),
+            PASTING_STARTUP_GRACE,
+            PASTE_ACK_TIMEOUT,
+        )
+        .await
+        {
+            Ok(reconciled)
+                if reconciled.imported > 0
+                    || reconciled.requeued_pasting > 0
+                    || reconciled.requeued_pasted > 0 =>
+            {
+                tracing::info!(
+                    imported = reconciled.imported,
+                    requeued_pasting = reconciled.requeued_pasting,
+                    requeued_pasted = reconciled.requeued_pasted,
+                    "reconciled durable CLI delivery state"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(?error, "failed to reconcile CLI delivery state"),
+        }
+    }
+
+    async fn drain_all(&self) {
+        self.reconcile_delivery_state().await;
+        if self.routing_disabled {
+            return;
+        }
+        let rows = match SessionQueuedMessage::list_active(&self.db.pool).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(?error, "durable CLI queue scan failed closed");
+                return;
+            }
+        };
+        for session_id in rows
+            .into_iter()
+            .filter(|row| row.state == QueuedMessageState::Queued)
+            .map(|row| row.session_id)
+        {
+            if let Err(error) = self.drain_session(session_id).await {
+                tracing::warn!(?error, %session_id, "durable CLI queue drain failed");
+            }
+        }
+    }
+
+    async fn run_drain(self: Arc<Self>) {
+        self.reconcile_delivery_state().await;
+        let mut interval = tokio::time::interval(DRAIN_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = self.shutdown.cancelled() => break,
+                _ = interval.tick() => self.drain_all().await,
+                _ = self.notify.notified() => self.drain_all().await,
+            }
+        }
+    }
+
+    async fn run_ingest_wakeup(
+        self: Arc<Self>,
+        mut updates: tokio::sync::broadcast::Receiver<
+            super::claude_transcript_ingest::NativeFeedUpdate,
+        >,
+    ) {
+        loop {
+            tokio::select! {
+                _ = self.shutdown.cancelled() => break,
+                update = updates.recv() => match update {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        self.notify.notify_one();
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+}
+
+enum PreparedSlot {
+    None,
+    Stored(SessionQueuedMessage),
+    Conflict(QueueStatus),
+}
+
+/// Build the executor's effective cwd without importing deployment code.
+pub async fn effective_dir_for_session(
+    db: &DBService,
+    session: &Session,
+) -> Result<Option<PathBuf>, sqlx::Error> {
+    let Some(workspace) = Workspace::find_by_id(&db.pool, session.workspace_id).await? else {
+        return Ok(None);
+    };
+    Ok(workspace
+        .container_ref
+        .as_deref()
+        .and_then(|root| session.effective_working_dir(Path::new(root))))
+}
+
+/// Kept here so local dispatcher implementations and server validation use the
+/// same run reason without restating its storage spelling.
+pub const COLLAB_RUN_REASON: ExecutionProcessRunReason = ExecutionProcessRunReason::CodingAgent;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex as StdMutex;
+
+    use db::models::{
+        claude_session_link::ClaudeSessionLink,
+        cli_pane_binding::{CliPaneBinding, CliPaneBoundVia},
+        execution_process::{CreateExecutionProcess, ExecutionProcessRunReason},
+        session::CreateSession,
+        workspace::CreateWorkspace,
+    };
+    use executors::{
+        actions::{
+            ExecutorAction, ExecutorActionType, coding_agent_initial::CodingAgentInitialRequest,
+        },
+        executors::BaseCodingAgent,
+    };
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct FakeProbe(Arc<StdMutex<ProbeReport>>);
+
+    #[async_trait]
+    impl CliWriterProbe for FakeProbe {
+        async fn probe(
+            &self,
+            _workspace_id: Uuid,
+            _effective_dir: &Path,
+            _expected_sid: Option<&str>,
+        ) -> ProbeReport {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    struct FakeTransport;
+
+    #[async_trait]
+    impl CliPasteTransport for FakeTransport {
+        async fn paste_and_submit(&self, _workspace_id: Uuid, _text: &str) -> bool {
+            true
+        }
+
+        async fn pane_alive(&self, _workspace_id: Uuid) -> bool {
+            true
+        }
+
+        async fn agent_running(&self, _workspace_id: Uuid) -> Option<bool> {
+            Some(true)
+        }
+
+        async fn signal_resume_ready(&self, _workspace_id: Uuid, _sid: &str) {}
+    }
+
+    struct NeverDispatcher;
+
+    #[async_trait]
+    impl CliExecutorDispatcher for NeverDispatcher {
+        async fn dispatch(
+            &self,
+            _session: &Session,
+            _prompt: &str,
+            _executor_config: &ExecutorConfig,
+        ) -> AnyhowResult<ExecutionProcess> {
+            panic!("lease-only tests must not dispatch")
+        }
+    }
+
+    async fn fixture() -> (DBService, Workspace, Session) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations_for_tests(&pool).await.unwrap();
+        let db = DBService { pool };
+        let workspace_id = Uuid::new_v4();
+        Workspace::create(
+            &db.pool,
+            &CreateWorkspace {
+                branch: "main".to_string(),
+                name: Some("collaboration fixture".to_string()),
+            },
+            workspace_id,
+        )
+        .await
+        .unwrap();
+        Workspace::update_container_ref(&db.pool, workspace_id, "/tmp/collab-fixture")
+            .await
+            .unwrap();
+        let workspace = Workspace::find_by_id(&db.pool, workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let session = Session::create(
+            &db.pool,
+            &CreateSession {
+                executor: Some("CLAUDE_CODE".to_string()),
+                name: None,
+            },
+            Uuid::new_v4(),
+            workspace_id,
+        )
+        .await
+        .unwrap();
+        (db, workspace, session)
+    }
+
+    fn service(db: DBService, report: ProbeReport) -> (CliCollabService, FakeProbe) {
+        let probe = FakeProbe(Arc::new(StdMutex::new(report)));
+        (
+            CliCollabService {
+                db,
+                probe: Arc::new(probe.clone()),
+                transport: Arc::new(FakeTransport),
+                dispatcher: Arc::new(NeverDispatcher),
+                ingest: None,
+                session_locks: Mutex::new(HashMap::new()),
+                notify: Notify::new(),
+                routing_disabled: false,
+                shutdown: CancellationToken::new(),
+            },
+            probe,
+        )
+    }
+
+    fn report(
+        pane_session_exists: bool,
+        agent_running: Option<bool>,
+        sid_evidence: SidEvidence,
+    ) -> ProbeReport {
+        ProbeReport {
+            pane_session_exists,
+            agent_running,
+            sid_evidence,
+            probe_failed: false,
+            only_active_claude_in_cwd: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_derivation_covers_executor_cli_ambiguous_free_and_db_failure() {
+        let (db, workspace, session) = fixture().await;
+        let (service, probe) =
+            service(db.clone(), report(false, Some(false), SidEvidence::Unknown));
+        assert_eq!(service.derive_lease(&session).await, WriterLease::Free);
+
+        CliPaneBinding::record_launch(
+            &db.pool,
+            workspace.id,
+            session.id,
+            Some("11111111-1111-4111-8111-111111111111"),
+            CliPaneBoundVia::CliResume,
+        )
+        .await
+        .unwrap();
+        ClaudeSessionLink::assign_manual(
+            &db.pool,
+            "11111111-1111-4111-8111-111111111111",
+            session.id,
+            "/tmp/collab-fixture",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        *probe.0.lock().unwrap() = report(
+            true,
+            Some(true),
+            SidEvidence::ConfirmedResume("11111111-1111-4111-8111-111111111111".to_string()),
+        );
+        assert_eq!(
+            service.derive_lease(&session).await,
+            WriterLease::Cli {
+                claude_session_id: Some("11111111-1111-4111-8111-111111111111".to_string())
+            }
+        );
+
+        *probe.0.lock().unwrap() = report(true, Some(true), SidEvidence::Ambiguous);
+        assert_eq!(
+            service.derive_lease(&session).await,
+            WriterLease::CliAmbiguous
+        );
+
+        let action = ExecutorAction::new(
+            ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
+                prompt: "running".to_string(),
+                executor_config: ExecutorConfig::new(BaseCodingAgent::ClaudeCode),
+                working_dir: None,
+            }),
+            None,
+        );
+        ExecutionProcess::create(
+            &db.pool,
+            &CreateExecutionProcess {
+                session_id: session.id,
+                executor_action: action,
+                run_reason: ExecutionProcessRunReason::CodingAgent,
+            },
+            Uuid::new_v4(),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(service.derive_lease(&session).await, WriterLease::Executor);
+
+        db.pool.close().await;
+        assert_eq!(service.derive_lease(&session).await, WriterLease::Busy);
+    }
+}

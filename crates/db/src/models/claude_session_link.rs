@@ -68,6 +68,29 @@ impl ClaudeSessionLink {
         .await
     }
 
+    pub async fn find_latest_for_session(
+        pool: &SqlitePool,
+        session_id: Uuid,
+    ) -> Result<Option<Self>, sqlx::Error> {
+        sqlx::query_as!(
+            ClaudeSessionLink,
+            r#"SELECT claude_session_id AS "claude_session_id!",
+                      session_id AS "session_id!: Uuid",
+                      workspace_id AS "workspace_id!: Uuid",
+                      cwd AS "cwd!",
+                      bound_via AS "bound_via!: ClaudeSessionBoundVia",
+                      created_at AS "created_at!: DateTime<Utc>",
+                      foreign_writer_seen_at AS "foreign_writer_seen_at: DateTime<Utc>"
+               FROM claude_session_links
+               WHERE session_id = $1
+               ORDER BY created_at DESC
+               LIMIT 1"#,
+            session_id
+        )
+        .fetch_optional(pool)
+        .await
+    }
+
     /// Executor evidence has precedence over a stale/manual association.
     /// When no executor has reported this sid, an existing link is returned;
     /// otherwise the caller must quarantine the file.

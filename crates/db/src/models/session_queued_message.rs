@@ -252,6 +252,24 @@ impl SessionQueuedMessage {
         Ok(result.rows_affected() > 0)
     }
 
+    pub async fn set_failure_reason(
+        pool: &SqlitePool,
+        id: Uuid,
+        failure_reason: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query!(
+            r#"UPDATE session_queued_messages SET
+                   failure_reason = $1,
+                   updated_at = datetime('now', 'subsec')
+               WHERE id = $2 AND state = 'queued'"#,
+            failure_reason,
+            id
+        )
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn mark_consumed(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
         let result = sqlx::query!(
             r#"UPDATE session_queued_messages SET
