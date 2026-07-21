@@ -19,7 +19,10 @@ import { getTerminalMobileState } from './terminalMobileState';
  * 5.5; this DOM surface is not covered by the unit tests): the wheel listener is
  * on `terminal.element`; `deltaMode: 1` (DOM_DELTA_LINE) + `deltaY: ±1` bypasses
  * xterm's private pixel→row accumulator and deterministically scrolls exactly one
- * line; the pointer coords must land inside `.xterm-screen` or xterm drops the report.
+ * line; the pointer coords must land inside `.xterm-screen` or xterm drops the
+ * report. The adapter's `el.isConnected` gate is part of this untested DOM
+ * surface too: it must stay ahead of every `terminal.modes` read so detach or
+ * dispose cancels momentum without touching a disposed terminal API.
  *
  * During an owned vertical drag, the bridge samples the rendered row height once
  * and dispatches one line-wheel per row of finger travel for roughly 1:1 content
@@ -56,6 +59,8 @@ const MOMENTUM_STOP_PX_PER_MS = 0.05;
 const MOMENTUM_TIME_CONSTANT_MS = 325;
 const MAX_MOMENTUM_WHEELS = 150;
 const MAX_WHEELS_PER_FRAME = 6;
+export const MOMENTUM_MAX_FRAME_GAP_MS = 250;
+const VELOCITY_DIRECTION_EPSILON_PX = 1;
 
 export function decideAxis(
   dx: number,
@@ -82,6 +87,8 @@ export interface TouchPoint {
   touches: number;
   clientX: number;
   clientY: number;
+  /** Event occurrence time; falls back to handler-delivery time when omitted. */
+  timeStampMs?: number;
 }
 
 export interface TouchScrollDeps {
@@ -176,7 +183,12 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
       return;
     }
 
-    const dt = Math.min(Math.max(nowT - momentumPrevT, 1), 64);
+    const elapsed = nowT - momentumPrevT;
+    if (!Number.isFinite(elapsed) || elapsed > MOMENTUM_MAX_FRAME_GAP_MS) {
+      cancelMomentum();
+      return;
+    }
+    const dt = Math.max(elapsed, 1);
     momentumPrevT = nowT;
     momentumVelocity *= Math.exp(-dt / MOMENTUM_TIME_CONSTANT_MS);
     momentumCarry += momentumVelocity * dt;
@@ -223,11 +235,32 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
     }
   }
 
-  function getExitVelocity(): number | undefined {
+  function getExitVelocity(releaseAt: number): number | undefined {
     if (velocitySamples.length < 2) return undefined;
-    const oldest = velocitySamples[0];
-    const newest = velocitySamples[velocitySamples.length - 1];
-    if (readNow() - newest.t > MOMENTUM_RELEASE_MAX_AGE_MS) return undefined;
+    const newestIndex = velocitySamples.length - 1;
+    const newest = velocitySamples[newestIndex];
+    if (releaseAt - newest.t > MOMENTUM_RELEASE_MAX_AGE_MS) return undefined;
+
+    // Estimate only the final consistent-direction run. A reversal is a new
+    // intent, not noise to average together with the preceding drag. Sub-pixel
+    // deltas are neutral and stay inside whichever run surrounds them.
+    let oldestIndex = newestIndex;
+    let direction = 0;
+    for (let index = newestIndex; index > 0; index -= 1) {
+      const delta = velocitySamples[index].y - velocitySamples[index - 1].y;
+      const nextDirection =
+        Math.abs(delta) < VELOCITY_DIRECTION_EPSILON_PX
+          ? 0
+          : Math.sign(delta);
+      if (nextDirection !== 0) {
+        if (direction !== 0 && nextDirection !== direction) break;
+        direction = nextDirection;
+      }
+      oldestIndex = index - 1;
+    }
+    if (direction === 0) return undefined;
+
+    const oldest = velocitySamples[oldestIndex];
     const dt = newest.t - oldest.t;
     if (dt < MIN_VELOCITY_WINDOW_MS) return undefined;
 
@@ -265,7 +298,7 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
         // Pinch / multi-touch — leave it to the browser.
         return;
       }
-      appendVelocitySample(readNow(), p.clientY);
+      appendVelocitySample(p.timeStampMs ?? readNow(), p.clientY);
     },
 
     onTouchMove(p: TouchPoint): TouchMoveResult {
@@ -291,7 +324,7 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
 
       lastClientX = p.clientX;
       lastClientY = p.clientY;
-      appendVelocitySample(readNow(), p.clientY);
+      appendVelocitySample(p.timeStampMs ?? readNow(), p.clientY);
 
       const deltaY = lastY - p.clientY;
       lastY = p.clientY;
@@ -318,7 +351,7 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
       return { prevent: true };
     },
 
-    onTouchEnd(remainingTouches = 0): void {
+    onTouchEnd(remainingTouches = 0, timeStampMs?: number): void {
       cancelMomentum();
 
       const exitVelocity =
@@ -326,7 +359,7 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
         axis === 'vertical' &&
         !deps.isSuppressed?.() &&
         deps.getMouseTrackingMode() !== 'none'
-          ? getExitVelocity()
+          ? getExitVelocity(timeStampMs ?? readNow())
           : undefined;
 
       // Only re-arm once every finger is up; a partial lift from a pinch must
@@ -358,6 +391,9 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
  * terminal (in the creation branch) and do NOT remove on React unmount — the
  * listeners live on `terminal.element` and tear down with it on
  * `terminal.dispose()`, mirroring the existing `contextmenu`/selection handlers.
+ * `installTerminalTouchLayers` deliberately discards the disposer, so the
+ * connectivity gate below enforces the detach/dispose leg of the cancellation
+ * invariant: the next momentum tick stops before touching any terminal API.
  * Returns a disposer for tests and explicit teardown.
  */
 export function installTerminalTouchScroll(terminal: Terminal): () => void {
@@ -374,7 +410,8 @@ export function installTerminalTouchScroll(terminal: Terminal): () => void {
   let lastPoint = { x: 0, y: 0 };
 
   const controller = createTouchScrollController({
-    getMouseTrackingMode: () => terminal.modes.mouseTrackingMode,
+    getMouseTrackingMode: () =>
+      el.isConnected ? terminal.modes.mouseTrackingMode : 'none',
     getLineHeightPx: () =>
       screen.getBoundingClientRect().height / Math.max(1, terminal.rows),
     now: () => performance.now(),
@@ -413,6 +450,7 @@ export function installTerminalTouchScroll(terminal: Terminal): () => void {
       touches: e.touches.length,
       clientX: t?.clientX ?? 0,
       clientY: t?.clientY ?? 0,
+      timeStampMs: e.timeStamp,
     };
   };
 
@@ -422,7 +460,8 @@ export function installTerminalTouchScroll(terminal: Terminal): () => void {
       e.preventDefault();
     }
   };
-  const onEnd = (e: TouchEvent) => controller.onTouchEnd(e.touches.length);
+  const onEnd = (e: TouchEvent) =>
+    controller.onTouchEnd(e.touches.length, e.timeStamp);
   const onCancel = () => controller.onTouchCancel();
 
   el.addEventListener('touchstart', onStart, { passive: true });

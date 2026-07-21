@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   AXIS_LOCK_THRESHOLD_PX,
   FALLBACK_WHEEL_STEP_PX,
+  MOMENTUM_MAX_FRAME_GAP_MS,
   clampToRect,
   createTouchScrollController,
   decideAxis,
@@ -503,6 +504,150 @@ describe('createTouchScrollController (momentum)', () => {
     expect(harness.pendingFrames()).toBe(0);
     harness.pumpFrame();
     expect(harness.wheels).toHaveLength(wheelsBeforeModeChange);
+  });
+
+  it('kills momentum instead of resuming after a stalled frame', () => {
+    const harness = createHarness();
+    startFlick(harness);
+    harness.pumpFrame();
+    harness.pumpFrame();
+    const wheelsBeforeStall = harness.wheels.length;
+
+    expect(harness.pumpFrame(10_000)).toBe(0);
+    expect(harness.wheels).toHaveLength(wheelsBeforeStall);
+    expect(harness.pendingFrames()).toBe(0);
+    expect(MOMENTUM_MAX_FRAME_GAP_MS).toBe(250);
+  });
+
+  it('never flings opposite the final motion after a direction reversal', () => {
+    const harness = createHarness();
+    harness.ctrl.onTouchStart({
+      touches: 1,
+      clientX: 0,
+      clientY: 300,
+      timeStampMs: 0,
+    });
+    harness.advance(60);
+    harness.ctrl.onTouchMove({
+      touches: 1,
+      clientX: 0,
+      clientY: 180,
+      timeStampMs: 60,
+    });
+    harness.advance(60);
+    harness.ctrl.onTouchMove({
+      touches: 1,
+      clientX: 0,
+      clientY: 240,
+      timeStampMs: 120,
+    });
+    const dragWheelCount = harness.wheels.length;
+
+    harness.ctrl.onTouchEnd(0, 120);
+    harness.pumpFrame();
+
+    expect(
+      harness.wheels
+        .slice(dragWheelCount)
+        .every((wheel) => wheel.direction === -1)
+    ).toBe(true);
+  });
+
+  it('launches momentum in the direction of a substantial reverse flick', () => {
+    const harness = createHarness();
+    harness.ctrl.onTouchStart({
+      touches: 1,
+      clientX: 0,
+      clientY: 300,
+      timeStampMs: 0,
+    });
+    harness.advance(40);
+    harness.ctrl.onTouchMove({
+      touches: 1,
+      clientX: 0,
+      clientY: 180,
+      timeStampMs: 40,
+    });
+    harness.advance(30);
+    harness.ctrl.onTouchMove({
+      touches: 1,
+      clientX: 0,
+      clientY: 220,
+      timeStampMs: 70,
+    });
+    harness.advance(30);
+    harness.ctrl.onTouchMove({
+      touches: 1,
+      clientX: 0,
+      clientY: 260,
+      timeStampMs: 100,
+    });
+    const dragWheelCount = harness.wheels.length;
+
+    harness.ctrl.onTouchEnd(0, 100);
+    harness.pumpFrame();
+    const tail = harness.wheels.slice(dragWheelCount);
+
+    expect(tail.length).toBeGreaterThan(0);
+    expect(tail.every((wheel) => wheel.direction === -1)).toBe(true);
+  });
+
+  it('uses event timestamps when jank burst-delivers velocity samples', () => {
+    const harness = createHarness();
+    harness.advance(1_000);
+    harness.ctrl.onTouchStart({
+      touches: 1,
+      clientX: 0,
+      clientY: 300,
+      timeStampMs: 0,
+    });
+    harness.ctrl.onTouchMove({
+      touches: 1,
+      clientX: 0,
+      clientY: 200,
+      timeStampMs: 50,
+    });
+    harness.ctrl.onTouchMove({
+      touches: 1,
+      clientX: 0,
+      clientY: 100,
+      timeStampMs: 100,
+    });
+    const dragWheelCount = harness.wheels.length;
+
+    harness.ctrl.onTouchEnd(0, 100);
+    harness.pumpFrame();
+
+    expect(harness.wheels.length).toBeGreaterThan(dragWheelCount);
+  });
+
+  it('uses the touchend event time to reject a stale queued flick', () => {
+    const harness = createHarness();
+    harness.advance(1_000);
+    harness.ctrl.onTouchStart({
+      touches: 1,
+      clientX: 0,
+      clientY: 300,
+      timeStampMs: 0,
+    });
+    harness.ctrl.onTouchMove({
+      touches: 1,
+      clientX: 0,
+      clientY: 200,
+      timeStampMs: 50,
+    });
+    harness.ctrl.onTouchMove({
+      touches: 1,
+      clientX: 0,
+      clientY: 100,
+      timeStampMs: 100,
+    });
+    const wheelsAtLift = harness.wheels.length;
+
+    harness.ctrl.onTouchEnd(0, 201);
+
+    expect(harness.pendingFrames()).toBe(0);
+    expect(harness.wheels).toHaveLength(wheelsAtLift);
   });
 
   it('clamps absurd velocity, drains at most six wheels per tick, and respects the cap', () => {
