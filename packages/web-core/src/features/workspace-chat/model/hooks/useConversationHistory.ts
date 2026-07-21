@@ -22,6 +22,8 @@ export interface UseConversationHistoryResult {
   isFirstTurn: boolean;
   /** Whether background batches are still loading older history entries */
   isLoadingHistory: boolean;
+  /** Latest native turn attributed to a writer outside app-managed surfaces. */
+  foreignWriterSeenAt: string | null;
 }
 import {
   MIN_INITIAL_ENTRIES,
@@ -576,5 +578,10 @@ export const useConversationHistory = ({
     }
   }, [scopeKey, idListKey, executionProcessesRaw]);
 
-  return { isFirstTurn, isLoadingHistory: isLoadingHistoryState };
+  return {
+    isFirstTurn,
+    isLoadingHistory: isLoadingHistoryState,
+    foreignWriterSeenAt:
+      nativeFeed.snapshot?.health.foreign_writer_seen_at ?? null,
+  };
 };

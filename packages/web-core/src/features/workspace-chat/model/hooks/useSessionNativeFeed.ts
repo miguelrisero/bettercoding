@@ -29,6 +29,7 @@ function createEmptyNativeFeedSnapshot(): NativeFeedSnapshot {
       rescans: 0n,
       quarantined_files: 0n,
       watch_degraded: false,
+      foreign_writer_seen_at: null,
       files: [],
     },
   };
