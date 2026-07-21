@@ -26,6 +26,8 @@ pub enum QueuedMessageError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("queued message {0} lost its executor claim before consumption")]
+    ExecutorClaimLost(Uuid),
 }
 
 /// Durable frontend-facing representation of the session's collaboration
@@ -193,13 +195,21 @@ impl QueuedMessageService {
             return Ok(None);
         };
         if row.state != QueuedMessageState::Queued
-            || SessionQueuedMessage::claim(&self.db.pool, row.id, None)
-                .await?
-                .is_none()
+            || SessionQueuedMessage::claim_for_executor(
+                &self.db.pool,
+                row.id,
+                "queued-message-service",
+            )
+            .await?
+            .is_none()
         {
             return Ok(None);
         }
-        SessionQueuedMessage::mark_consumed(&self.db.pool, row.id).await?;
+        if !SessionQueuedMessage::mark_consumed(&self.db.pool, row.id, "queued-message-service")
+            .await?
+        {
+            return Err(QueuedMessageError::ExecutorClaimLost(row.id));
+        }
         Ok(Some(row.try_into()?))
     }
 

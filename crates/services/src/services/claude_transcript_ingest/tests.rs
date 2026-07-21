@@ -235,7 +235,7 @@ async fn pasted_slot(
         StoreQueuedMessageResult::Stored(row) => row,
         StoreQueuedMessageResult::Conflict(_) => panic!("fixture slot must be empty"),
     };
-    SessionQueuedMessage::claim(&db.pool, row.id, Some(sid))
+    SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid))
         .await
         .unwrap()
         .unwrap();
@@ -632,7 +632,7 @@ async fn late_paste_ack_imports_requeued_slot_and_blocks_duplicate_claim() {
     assert_eq!(imported.state, QueuedMessageState::Imported);
     assert!(imported.acked_at.is_some());
     assert!(
-        SessionQueuedMessage::claim(&db.pool, slot.id, None)
+        SessionQueuedMessage::claim_for_executor(&db.pool, slot.id, "test-owner")
             .await
             .unwrap()
             .is_none()

@@ -134,6 +134,8 @@ pub enum CliCollabError {
     Serialize(#[from] serde_json::Error),
     #[error("session {0} has no workspace")]
     WorkspaceMissing(Uuid),
+    #[error("queued message {0} lost its executor dispatch claim")]
+    ExecutorClaimLost(Uuid),
     #[error("CLI transport failed for workspace {workspace_id}: {source}")]
     Transport {
         workspace_id: Uuid,
@@ -150,6 +152,7 @@ pub struct CliCollabService {
     ingest: Option<Arc<ClaudeTranscriptIngest>>,
     session_locks: Mutex<HashMap<Uuid, Weak<Mutex<()>>>>,
     resume_signaled_bindings: Mutex<HashSet<Uuid>>,
+    executor_claim_owner: String,
     notify: Notify,
     routing_disabled: bool,
     shutdown: CancellationToken,
@@ -172,6 +175,7 @@ impl CliCollabService {
             ingest,
             session_locks: Mutex::new(HashMap::new()),
             resume_signaled_bindings: Mutex::new(HashSet::new()),
+            executor_claim_owner: Uuid::new_v4().to_string(),
             notify: Notify::new(),
             routing_disabled: std::env::var_os("DISABLE_CLI_COLLAB_ROUTING").is_some(),
             shutdown,
@@ -513,7 +517,7 @@ impl CliCollabService {
         claude_session_id: Option<&str>,
     ) -> Result<DispatchOutcome, CliCollabError> {
         let Some(claimed) =
-            SessionQueuedMessage::claim(&self.db.pool, row.id, claude_session_id).await?
+            SessionQueuedMessage::claim_for_paste(&self.db.pool, row.id, claude_session_id).await?
         else {
             return Ok(DispatchOutcome::Conflict {
                 status: self.status(session.id).await?,
@@ -570,7 +574,13 @@ impl CliCollabService {
         };
 
         let claimed = if let Some(row) = existing {
-            match SessionQueuedMessage::claim(&self.db.pool, row.id, None).await? {
+            match SessionQueuedMessage::claim_for_executor(
+                &self.db.pool,
+                row.id,
+                &self.executor_claim_owner,
+            )
+            .await?
+            {
                 Some(row) => Some(row),
                 None => {
                     let _ = WorkspaceSpawnReservation::release(
@@ -605,7 +615,15 @@ impl CliCollabService {
         match dispatched {
             Ok(execution_process) => {
                 if let Some(row) = claimed {
-                    SessionQueuedMessage::mark_consumed(&self.db.pool, row.id).await?;
+                    if !SessionQueuedMessage::mark_consumed(
+                        &self.db.pool,
+                        row.id,
+                        &self.executor_claim_owner,
+                    )
+                    .await?
+                    {
+                        return Err(CliCollabError::ExecutorClaimLost(row.id));
+                    }
                 }
                 Ok(DispatchOutcome::Started { execution_process })
             }
@@ -941,6 +959,7 @@ impl CliCollabService {
             Utc::now(),
             PASTING_STARTUP_GRACE,
             PASTE_ACK_HARD_CAP,
+            Some(&self.executor_claim_owner),
         )
         .await
         {
@@ -1164,7 +1183,10 @@ pub const COLLAB_RUN_REASON: ExecutionProcessRunReason = ExecutionProcessRunReas
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{
+        Mutex as StdMutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use db::models::{
         claude_session_link::ClaudeSessionLink,
@@ -1348,6 +1370,28 @@ mod tests {
         state: Arc<StdMutex<DispatcherState>>,
     }
 
+    struct SlowDispatcher {
+        db: DBService,
+        calls: Arc<AtomicUsize>,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl CliExecutorDispatcher for SlowDispatcher {
+        async fn dispatch(
+            &self,
+            session: &Session,
+            prompt: &str,
+            _executor_config: &ExecutorConfig,
+        ) -> AnyhowResult<ExecutionProcess> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(create_running_executor(&self.db, session.id, prompt).await)
+        }
+    }
+
     #[async_trait]
     impl CliExecutorDispatcher for FailingDispatcher {
         async fn dispatch(
@@ -1423,6 +1467,7 @@ mod tests {
                 ingest: None,
                 session_locks: Mutex::new(HashMap::new()),
                 resume_signaled_bindings: Mutex::new(HashSet::new()),
+                executor_claim_owner: Uuid::new_v4().to_string(),
                 notify: Notify::new(),
                 routing_disabled: false,
                 shutdown: CancellationToken::new(),
@@ -2007,6 +2052,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_executor_dispatch_is_not_reconciled_or_run_twice() {
+        let (db, _workspace, session) = fixture().await;
+        let row = store_message(&db, session.id, "run exactly once", QueuedMessageSource::Ui).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(false, Some(false), SidEvidence::Unknown),
+            Arc::new(FakeTransport),
+            Arc::new(SlowDispatcher {
+                db: db.clone(),
+                calls: calls.clone(),
+                started: started.clone(),
+                release: release.clone(),
+            }),
+        );
+        let service = Arc::new(service);
+        let draining = {
+            let service = service.clone();
+            tokio::spawn(async move { service.drain_session(session.id).await })
+        };
+
+        started.notified().await;
+        let older_than_paste_grace =
+            Utc::now() - PASTING_STARTUP_GRACE - ChronoDuration::seconds(1);
+        sqlx::query("UPDATE session_queued_messages SET updated_at = ? WHERE id = ?")
+            .bind(older_than_paste_grace)
+            .bind(row.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let reconciled = SessionQueuedMessage::reconcile(
+            &db.pool,
+            Utc::now(),
+            PASTING_STARTUP_GRACE,
+            PASTE_ACK_HARD_CAP,
+            Some(&service.executor_claim_owner),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reconciled.requeued_pasting, 0);
+        assert_eq!(
+            SessionQueuedMessage::find_by_id(&db.pool, row.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            QueuedMessageState::Pasting
+        );
+
+        release.notify_one();
+        assert!(draining.await.unwrap().unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            SessionQueuedMessage::find_by_id(&db.pool, row.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            QueuedMessageState::Consumed
+        );
+
+        let execution = ExecutionProcess::find_running(&db.pool)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        ExecutionProcess::update_completion(
+            &db.pool,
+            execution.id,
+            ExecutionProcessStatus::Completed,
+            Some(0),
+        )
+        .await
+        .unwrap();
+        assert!(!service.on_executor_finished(session.id).await.unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn replace_contract_preserves_conflict_details_and_rejects_in_flight_replace() {
         let (db, _workspace, session) = fixture().await;
         let (service, _) = service(db.clone(), report(false, Some(false), SidEvidence::Unknown));
@@ -2062,7 +2188,7 @@ mod tests {
         assert_eq!(replaced_message.data.message, "new UI prompt");
         assert_eq!(replaced_message.source, QueuedMessageSource::Ui);
 
-        SessionQueuedMessage::claim(&db.pool, first_id, Some("sid"))
+        SessionQueuedMessage::claim_for_paste(&db.pool, first_id, Some("sid"))
             .await
             .unwrap()
             .unwrap();
@@ -2102,7 +2228,7 @@ mod tests {
             QueuedMessageSource::Ui,
         )
         .await;
-        SessionQueuedMessage::claim(&db.pool, row.id, Some(sid))
+        SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid))
             .await
             .unwrap()
             .unwrap();
@@ -2168,7 +2294,7 @@ mod tests {
             QueuedMessageSource::Recovery,
         )
         .await;
-        SessionQueuedMessage::claim(&db.pool, row.id, Some(sid))
+        SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid))
             .await
             .unwrap()
             .unwrap();
@@ -2216,7 +2342,7 @@ mod tests {
             QueuedMessageSource::Ui,
         )
         .await;
-        SessionQueuedMessage::claim(&db.pool, row.id, Some(sid))
+        SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid))
             .await
             .unwrap()
             .unwrap();
@@ -2284,7 +2410,7 @@ mod tests {
             QueuedMessageSource::Ui,
         )
         .await;
-        SessionQueuedMessage::claim(&db.pool, row.id, Some(sid))
+        SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid))
             .await
             .unwrap()
             .unwrap();
@@ -2361,7 +2487,7 @@ mod tests {
             QueuedMessageSource::Recovery,
         )
         .await;
-        SessionQueuedMessage::claim(&db.pool, interrupted.id, Some("interrupted-sid"))
+        SessionQueuedMessage::claim_for_paste(&db.pool, interrupted.id, Some("interrupted-sid"))
             .await
             .unwrap()
             .unwrap();
@@ -2381,7 +2507,7 @@ mod tests {
             QueuedMessageSource::Ui,
         )
         .await;
-        SessionQueuedMessage::claim(&db.pool, acknowledged.id, Some("acknowledged-sid"))
+        SessionQueuedMessage::claim_for_paste(&db.pool, acknowledged.id, Some("acknowledged-sid"))
             .await
             .unwrap()
             .unwrap();
