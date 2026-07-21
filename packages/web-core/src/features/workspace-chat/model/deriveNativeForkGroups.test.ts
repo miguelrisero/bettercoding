@@ -128,15 +128,18 @@ describe('deriveNativeForkEntrySections', () => {
     expect(
       section.branches.map((branch) => ({
         isDefault: branch.isDefault,
+        branchLeafUuid: branch.branchLeafUuid,
         entries: branch.entries.map((entry) => entry.patchKey),
       }))
     ).toEqual([
       {
         isDefault: false,
+        branchLeafUuid: 'branch-1-root',
         entries: ['native:branch-1-root'],
       },
       {
         isDefault: true,
+        branchLeafUuid: 'branch-2-root',
         entries: ['native:branch-2-root'],
       },
     ]);

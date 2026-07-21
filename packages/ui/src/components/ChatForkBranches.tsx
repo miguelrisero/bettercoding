@@ -1,19 +1,27 @@
 import { useState, type ReactNode, type SyntheticEvent } from 'react';
-import { GitBranchIcon } from '@phosphor-icons/react';
+import {
+  ArrowCounterClockwiseIcon,
+  GitBranchIcon,
+} from '@phosphor-icons/react';
 
 import { Badge } from './Badge';
+import { PrimaryButton } from './PrimaryButton';
 
 export interface ChatForkBranch {
   id: string;
   label: string;
   isDefault: boolean;
   content: ReactNode;
+  onBringBack?: () => void;
+  isBringingBack?: boolean;
 }
 
 interface ChatForkBranchesProps {
   explanation: string;
   resumeHint: string;
   emptyBranchLabel: string;
+  bringBackLabel: string;
+  bringingBackLabel: string;
   branches: ChatForkBranch[];
 }
 
@@ -21,10 +29,14 @@ function ForkBranch({
   branch,
   resumeHint,
   emptyBranchLabel,
+  bringBackLabel,
+  bringingBackLabel,
 }: {
   branch: ChatForkBranch;
   resumeHint: string;
   emptyBranchLabel: string;
+  bringBackLabel: string;
+  bringingBackLabel: string;
 }) {
   const [open, setOpen] = useState(branch.isDefault);
   const handleToggle = (event: SyntheticEvent<HTMLDetailsElement>) => {
@@ -52,6 +64,20 @@ function ForkBranch({
             {emptyBranchLabel}
           </p>
         )}
+        {!branch.isDefault && branch.onBringBack && (
+          <div className="mt-base flex justify-end border-t border-border px-double pt-base">
+            <PrimaryButton
+              variant="secondary"
+              onClick={branch.onBringBack}
+              disabled={branch.isBringingBack}
+              actionIcon={
+                branch.isBringingBack ? 'spinner' : ArrowCounterClockwiseIcon
+              }
+              value={branch.isBringingBack ? bringingBackLabel : bringBackLabel}
+              className="min-h-10"
+            />
+          </div>
+        )}
       </div>
     </details>
   );
@@ -61,6 +87,8 @@ export function ChatForkBranches({
   explanation,
   resumeHint,
   emptyBranchLabel,
+  bringBackLabel,
+  bringingBackLabel,
   branches,
 }: ChatForkBranchesProps) {
   return (
@@ -76,6 +104,8 @@ export function ChatForkBranches({
             branch={branch}
             resumeHint={resumeHint}
             emptyBranchLabel={emptyBranchLabel}
+            bringBackLabel={bringBackLabel}
+            bringingBackLabel={bringingBackLabel}
           />
         ))}
       </div>

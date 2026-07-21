@@ -8,6 +8,7 @@ import type {
 
 export interface NativeForkEntryBranch {
   isDefault: boolean;
+  branchLeafUuid: string;
   entries: PatchTypeWithKey[];
   entryIndices: number[];
 }
@@ -98,6 +99,10 @@ export function deriveNativeForkEntrySections(
 
       return {
         isDefault: feedFork.fork.default_branch === branchIndex,
+        branchLeafUuid:
+          branch.leaf_uuids[branch.leaf_uuids.length - 1] ??
+          branch.node_uuids[branch.node_uuids.length - 1] ??
+          branch.root_uuid,
         entries: branchEntries,
         entryIndices,
       };

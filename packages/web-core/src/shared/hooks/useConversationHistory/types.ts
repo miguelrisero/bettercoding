@@ -81,6 +81,7 @@ export type BaseDisplayEntry =
 
 export interface NativeForkDisplayBranch {
   isDefault: boolean;
+  branchLeafUuid: string;
   entries: BaseDisplayEntry[];
 }
 

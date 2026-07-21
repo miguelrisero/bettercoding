@@ -8,10 +8,13 @@ import {
   useState,
   type MouseEvent,
 } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import {
   CircleIcon,
   SpinnerIcon,
   TerminalWindowIcon,
+  WarningIcon,
+  XIcon,
 } from '@phosphor-icons/react';
 import { useTranslation } from 'react-i18next';
 
@@ -56,6 +59,12 @@ import { ScriptFixerDialog } from '@/shared/dialogs/scripts/ScriptFixerDialog';
 import { ChatForkBranches } from '@vibe/ui/components/ChatForkBranches';
 import { Badge } from '@vibe/ui/components/Badge';
 import { UnassignedCliSessions } from './UnassignedCliSessions';
+import { shouldShowForeignWriterBanner } from '../model/foreignWriterBanner';
+import { sessionsApi } from '@/shared/lib/api';
+import { mapDispatchOutcomeToUiState } from '../model/collaborationUiState';
+import { sessionQueueKeys } from '../model/hooks/useSessionQueueInteraction';
+import { useTransientToast } from '@/shared/hooks/useTransientToast';
+import { Toast } from '@vibe/ui/components/Toast';
 
 interface ConversationListProps {
   attempt: WorkspaceWithSession;
@@ -108,7 +117,9 @@ function renderRowContent(
   entry: DisplayEntry,
   attempt: WorkspaceWithSession,
   resetAction: UseResetProcessResult,
-  repos: RepoWithTargetBranch[]
+  repos: RepoWithTargetBranch[],
+  onRecoverFork: (forkParentUuid: string, branchLeafUuid: string) => void,
+  recoveringForkKey: string | null
 ): React.ReactNode {
   if (isNativeForkDisplayGroup(entry)) {
     return (
@@ -117,6 +128,8 @@ function renderRowContent(
         attempt={attempt}
         resetAction={resetAction}
         repos={repos}
+        onRecoverFork={onRecoverFork}
+        recoveringForkKey={recoveringForkKey}
       />
     );
   }
@@ -204,11 +217,15 @@ function NativeForkGroupEntry({
   attempt,
   resetAction,
   repos,
+  onRecoverFork,
+  recoveringForkKey,
 }: {
   group: NativeForkDisplayGroup;
   attempt: WorkspaceWithSession;
   resetAction: UseResetProcessResult;
   repos: RepoWithTargetBranch[];
+  onRecoverFork: (forkParentUuid: string, branchLeafUuid: string) => void;
+  recoveringForkKey: string | null;
 }) {
   const { t } = useTranslation('common');
 
@@ -218,18 +235,33 @@ function NativeForkGroupEntry({
         explanation={t('conversation.fork.explanation')}
         resumeHint={t('conversation.fork.resumeHint')}
         emptyBranchLabel={t('conversation.fork.emptyBranch')}
+        bringBackLabel={t('conversation.fork.bringBack')}
+        bringingBackLabel={t('conversation.fork.bringingBack')}
         branches={group.branches.map((branch, index) => ({
           id: `${group.patchKey}:${index}:${branch.isDefault ? 'default' : 'alternate'}`,
           label: t('conversation.fork.branchLabel', {
             index: index + 1,
           }),
           isDefault: branch.isDefault,
+          onBringBack: branch.isDefault
+            ? undefined
+            : () => onRecoverFork(group.forkParentUuid, branch.branchLeafUuid),
+          isBringingBack:
+            recoveringForkKey ===
+            `${group.forkParentUuid}:${branch.branchLeafUuid}`,
           content:
             branch.entries.length > 0 ? (
               <>
                 {branch.entries.map((entry) => (
                   <div key={entry.patchKey}>
-                    {renderRowContent(entry, attempt, resetAction, repos)}
+                    {renderRowContent(
+                      entry,
+                      attempt,
+                      resetAction,
+                      repos,
+                      onRecoverFork,
+                      recoveringForkKey
+                    )}
                   </div>
                 ))}
               </>
@@ -255,6 +287,12 @@ export const ConversationList = forwardRef<
   ref
 ) {
   const { t } = useTranslation('common');
+  const queryClient = useQueryClient();
+  const {
+    toast: recoveryToast,
+    showToast: showRecoveryToast,
+    dismissToast: dismissRecoveryToast,
+  } = useTransientToast();
   const repos = reposProp;
   const unassignedCliSessions = useUnassignedCliSessions(
     cliAvailable ? attempt.id : undefined,
@@ -277,6 +315,13 @@ export const ConversationList = forwardRef<
   const [hasSetupScriptRun, setHasSetupScriptRun] = useState(false);
   const [hasCleanupScriptRun, setHasCleanupScriptRun] = useState(false);
   const [hasRunningProcess, setHasRunningProcess] = useState(false);
+  const [dismissedForeignWriter, setDismissedForeignWriter] = useState<{
+    scopeKey: string;
+    seenAt: string;
+  } | null>(null);
+  const [recoveringForkKey, setRecoveringForkKey] = useState<string | null>(
+    null
+  );
   const lastSettledTailStartIndexRef = useRef<number | null>(null);
   const { setEntries, reset } = useEntriesActions();
   const setTokenUsageInfo = useSetTokenUsageInfo();
@@ -501,11 +546,82 @@ export const ConversationList = forwardRef<
     }
   };
 
-  const { isFirstTurn, isLoadingHistory } = useConversationHistory({
-    attempt,
-    onTimelineUpdated,
-    scopeKey: conversationScopeKey,
-  });
+  const { isFirstTurn, isLoadingHistory, foreignWriterSeenAt } =
+    useConversationHistory({
+      attempt,
+      onTimelineUpdated,
+      scopeKey: conversationScopeKey,
+    });
+  const dismissedForeignWriterAt =
+    dismissedForeignWriter?.scopeKey === conversationScopeKey
+      ? dismissedForeignWriter.seenAt
+      : null;
+  const showForeignWriterBanner = shouldShowForeignWriterBanner(
+    foreignWriterSeenAt,
+    dismissedForeignWriterAt
+  );
+  const dismissForeignWriterBanner = useCallback(() => {
+    if (foreignWriterSeenAt) {
+      setDismissedForeignWriter({
+        scopeKey: conversationScopeKey,
+        seenAt: foreignWriterSeenAt,
+      });
+    }
+  }, [conversationScopeKey, foreignWriterSeenAt]);
+  const handleRecoverFork = useCallback(
+    async (forkParentUuid: string, branchLeafUuid: string) => {
+      const sessionId = attempt.session?.id;
+      if (!sessionId) return;
+
+      const recoveryKey = `${forkParentUuid}:${branchLeafUuid}`;
+      setRecoveringForkKey(recoveryKey);
+      try {
+        const outcome = await sessionsApi.forkRecovery(sessionId, {
+          fork_parent_uuid: forkParentUuid,
+          branch_leaf_uuid: branchLeafUuid,
+        });
+        const uiState = mapDispatchOutcomeToUiState(outcome);
+        queryClient.setQueryData(
+          sessionQueueKeys.status(sessionId),
+          uiState.queueStatus
+        );
+
+        switch (uiState.kind) {
+          case 'started':
+            showRecoveryToast(
+              t('conversation.fork.recoveryStartedToast'),
+              'success'
+            );
+            break;
+          case 'queued':
+            showRecoveryToast(
+              t('conversation.fork.recoveryQueuedToast'),
+              'warning'
+            );
+            break;
+          case 'routed-to-cli':
+            showRecoveryToast(
+              t('conversation.fork.recoveryRoutedToast'),
+              'info'
+            );
+            break;
+          case 'conflict':
+            showRecoveryToast(
+              t('conversation.fork.recoveryConflictToast'),
+              'warning'
+            );
+            break;
+        }
+      } catch {
+        showRecoveryToast(t('conversation.fork.recoveryErrorToast'), 'error');
+      } finally {
+        setRecoveringForkKey((current) =>
+          current === recoveryKey ? null : current
+        );
+      }
+    },
+    [attempt.session?.id, queryClient, showRecoveryToast, t]
+  );
 
   const prevEntriesRef = useRef<DisplayEntry[]>([]);
   const prevRowsRef = useRef<ConversationRow[]>([]);
@@ -874,29 +990,72 @@ export const ConversationList = forwardRef<
   return (
     <ApprovalFormProvider>
       <div className="relative h-full overflow-hidden">
-        {(cliSessionActive || unassignedCliSessions.sessions.length > 0) && (
-          <div className="absolute right-double top-base z-20 flex max-w-[calc(100%_-_2rem)] flex-wrap justify-end gap-base">
-            <UnassignedCliSessions
-              sessions={unassignedCliSessions.sessions}
-              assigningSessionId={unassignedCliSessions.assigningSessionId}
-              error={unassignedCliSessions.error}
-              onAssign={unassignedCliSessions.assign}
-            />
-            {cliSessionActive && (
-              <Badge
+        {(showForeignWriterBanner ||
+          cliSessionActive ||
+          unassignedCliSessions.sessions.length > 0) && (
+          <div className="pointer-events-none absolute inset-x-double top-base z-20 flex flex-col gap-base">
+            {showForeignWriterBanner && (
+              <div
                 role="status"
-                variant="outline"
-                className="pointer-events-none gap-half border-border bg-primary/90 font-normal text-normal shadow-sm backdrop-blur-sm"
+                aria-live="polite"
+                className="pointer-events-auto flex min-h-10 items-center gap-base rounded-sm border border-warning/50 bg-panel/95 pl-base text-sm text-normal shadow-sm backdrop-blur-sm"
               >
-                <CircleIcon
-                  className="size-2 text-brand"
-                  weight="fill"
+                <WarningIcon
+                  className="size-icon-base shrink-0 text-warning"
                   aria-hidden="true"
                 />
-                {t('conversation.cliSessionActive')}
-              </Badge>
+                <p className="min-w-0 flex-1 py-half text-pretty">
+                  {t('conversation.foreignWriter.message')}
+                </p>
+                <button
+                  type="button"
+                  onClick={dismissForeignWriterBanner}
+                  aria-label={t('conversation.foreignWriter.dismiss')}
+                  className="flex size-10 shrink-0 items-center justify-center rounded-sm text-low transition-colors hover:bg-secondary hover:text-normal focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-brand"
+                >
+                  <XIcon
+                    className="size-icon-sm"
+                    weight="bold"
+                    aria-hidden="true"
+                  />
+                </button>
+              </div>
+            )}
+            {(cliSessionActive ||
+              unassignedCliSessions.sessions.length > 0) && (
+              <div className="pointer-events-auto ml-auto flex max-w-full flex-wrap justify-end gap-base">
+                <UnassignedCliSessions
+                  sessions={unassignedCliSessions.sessions}
+                  assigningSessionId={unassignedCliSessions.assigningSessionId}
+                  error={unassignedCliSessions.error}
+                  onAssign={unassignedCliSessions.assign}
+                />
+                {cliSessionActive && (
+                  <Badge
+                    role="status"
+                    variant="outline"
+                    className="pointer-events-none gap-half border-border bg-primary/90 font-normal text-normal shadow-sm backdrop-blur-sm"
+                  >
+                    <CircleIcon
+                      className="size-2 text-brand"
+                      weight="fill"
+                      aria-hidden="true"
+                    />
+                    {t('conversation.cliSessionActive')}
+                  </Badge>
+                )}
+              </div>
             )}
           </div>
+        )}
+        {recoveryToast && (
+          <Toast
+            message={recoveryToast.message}
+            tone={recoveryToast.tone}
+            onDismiss={dismissRecoveryToast}
+            dismissLabel={t('conversation.fork.dismissToast')}
+            className="pointer-events-auto absolute bottom-base left-base right-base z-30 mx-auto"
+          />
         )}
         {showLoader && (
           <div className="absolute inset-0 flex items-center justify-center z-10">
@@ -1008,7 +1167,14 @@ export const ConversationList = forwardRef<
                       transform: `translateY(${virtualItem.start}px)`,
                     }}
                   >
-                    {renderRowContent(row.entry, attempt, resetAction, repos)}
+                    {renderRowContent(
+                      row.entry,
+                      attempt,
+                      resetAction,
+                      repos,
+                      handleRecoverFork,
+                      recoveringForkKey
+                    )}
                   </div>
                 );
               })}
@@ -1023,7 +1189,14 @@ export const ConversationList = forwardRef<
                 data-row-index={rowIndex}
                 data-semantic-key={row.semanticKey}
               >
-                {renderRowContent(row.entry, attempt, resetAction, repos)}
+                {renderRowContent(
+                  row.entry,
+                  attempt,
+                  resetAction,
+                  repos,
+                  handleRecoverFork,
+                  recoveringForkKey
+                )}
               </div>
             );
           })}
