@@ -1578,6 +1578,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_database_sid_never_overrides_live_resume_evidence() {
+        let (db, workspace, session) = fixture().await;
+        let expected = "11111111-1111-4111-8111-111111111111";
+        bind_confirmed_cli(&db, &workspace, &session, expected).await;
+        let (service, probe) = service(
+            db,
+            report(
+                true,
+                Some(true),
+                SidEvidence::ConfirmedResume("22222222-2222-4222-8222-222222222222".to_string()),
+            ),
+        );
+
+        assert_eq!(
+            service.derive_lease(&session).await,
+            WriterLease::CliAmbiguous
+        );
+
+        *probe.0.lock().unwrap() = report(true, Some(true), SidEvidence::NoResumeArg);
+        assert_eq!(
+            service.derive_lease(&session).await,
+            WriterLease::CliAmbiguous
+        );
+    }
+
+    #[tokio::test]
     async fn lease_derivation_fails_closed_on_database_and_probe_errors() {
         let (db, _workspace, session) = fixture().await;
         let (service, probe) =

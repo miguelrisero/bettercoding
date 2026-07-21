@@ -5,7 +5,7 @@ use db::{DBService, models::cli_pane_binding::CliPaneBinding};
 use services::services::cli_collab::{CliWriterProbe, ProbeReport, SidEvidence};
 use uuid::Uuid;
 
-use crate::pty::{cli_pane_agent_processes, cli_tmux_session_exists_checked};
+use crate::pty::{CliPaneAgentProcess, cli_pane_agent_processes, cli_tmux_session_exists_checked};
 
 #[derive(Clone)]
 pub struct LocalCliWriterProbe {
@@ -54,6 +54,28 @@ fn resume_evidence(cmdlines: &[String]) -> SidEvidence {
         SidEvidence::Ambiguous
     } else {
         SidEvidence::NoResumeArg
+    }
+}
+
+fn live_process_report(
+    processes: &[CliPaneAgentProcess],
+    only_active_claude_in_cwd: Option<bool>,
+) -> ProbeReport {
+    let agent_running = !processes.is_empty();
+    let cmdlines: Vec<_> = processes
+        .iter()
+        .map(|process| process.cmdline.clone())
+        .collect();
+    ProbeReport {
+        pane_session_exists: true,
+        agent_running: Some(agent_running),
+        sid_evidence: if agent_running {
+            resume_evidence(&cmdlines)
+        } else {
+            SidEvidence::Unknown
+        },
+        probe_failed: false,
+        only_active_claude_in_cwd,
     }
 }
 
@@ -118,7 +140,7 @@ impl CliWriterProbe for LocalCliWriterProbe {
         &self,
         workspace_id: Uuid,
         effective_dir: &Path,
-        expected_sid: Option<&str>,
+        _expected_sid: Option<&str>,
     ) -> ProbeReport {
         let binding =
             match CliPaneBinding::find_active_for_workspace(&self.db.pool, workspace_id).await {
@@ -156,33 +178,15 @@ impl CliWriterProbe for LocalCliWriterProbe {
             None => return ProbeReport::failed(),
         };
         let agent_running = !processes.is_empty();
-        let cmdlines: Vec<_> = processes
-            .iter()
-            .map(|process| process.cmdline.clone())
-            .collect();
-        let mut sid_evidence = if agent_running {
-            resume_evidence(&cmdlines)
-        } else {
-            SidEvidence::Unknown
-        };
-        if agent_running
-            && let (Some(expected), Some(binding)) = (expected_sid, binding.as_ref())
-            && binding.claude_session_id.as_deref() == Some(expected)
-        {
-            sid_evidence = SidEvidence::ConfirmedResume(expected.to_string());
-        }
         let pane_pids = processes.iter().map(|process| process.pid).collect();
-        ProbeReport {
-            pane_session_exists: true,
-            agent_running: Some(agent_running),
-            sid_evidence,
-            probe_failed: false,
-            only_active_claude_in_cwd: if agent_running {
+        live_process_report(
+            &processes,
+            if agent_running {
                 only_active_claude_in_cwd(effective_dir, &pane_pids)
             } else {
                 Some(false)
             },
-        }
+        )
     }
 }
 
@@ -206,6 +210,41 @@ mod tests {
         assert_eq!(
             resume_evidence(&["claude --model opus".into()]),
             SidEvidence::NoResumeArg
+        );
+    }
+
+    #[test]
+    fn live_probe_report_never_fabricates_database_resume_evidence() {
+        let expected = "11111111-1111-4111-8111-111111111111";
+        let observed = "22222222-2222-4222-8222-222222222222";
+
+        let mismatched = live_process_report(
+            &[CliPaneAgentProcess {
+                pid: 42,
+                cmdline: format!("claude --resume {observed}"),
+            }],
+            None,
+        );
+        assert_eq!(
+            mismatched.sid_evidence,
+            SidEvidence::ConfirmedResume(observed.to_string())
+        );
+        assert_ne!(
+            mismatched.sid_evidence,
+            SidEvidence::ConfirmedResume(expected.to_string())
+        );
+
+        let no_resume = live_process_report(
+            &[CliPaneAgentProcess {
+                pid: 43,
+                cmdline: "claude --model opus".to_string(),
+            }],
+            None,
+        );
+        assert_eq!(no_resume.sid_evidence, SidEvidence::NoResumeArg);
+        assert_ne!(
+            no_resume.sid_evidence,
+            SidEvidence::ConfirmedResume(expected.to_string())
         );
     }
 }
