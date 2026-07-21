@@ -421,7 +421,11 @@ export function createTouchGestureController(deps: GestureDeps) {
       return { prevent: true };
     },
 
-    onTouchEnd(remainingTouches: number, now: number): void {
+    onTouchEnd(
+      remainingTouches: number,
+      now: number,
+      flingCatch = false
+    ): void {
       if (remainingTouches > 0) return; // wait for the last finger
       const wasPhase =
         phase === 'dpad' &&
@@ -459,6 +463,7 @@ export function createTouchGestureController(deps: GestureDeps) {
         lastTap = null;
         return;
       }
+      if (flingCatch) return;
       // A clean quick tap. Second one in time + place = Tab.
       if (
         lastTap &&
@@ -786,10 +791,18 @@ export function installTerminalTouchGestures(
       // contain contacts that began on nav/key bars and will never emit an
       // event on this terminal, so waiting for the global last finger strands
       // D-pad suppression and its timer indefinitely.
-      controller.onTouchEnd(0, e.timeStamp);
+      controller.onTouchEnd(
+        0,
+        e.timeStamp,
+        getTerminalMobileState(terminal).flingCatch
+      );
       releaseTouchOwnership();
     } else {
-      controller.onTouchEnd(e.targetTouches.length, e.timeStamp);
+      controller.onTouchEnd(
+        e.targetTouches.length,
+        e.timeStamp,
+        getTerminalMobileState(terminal).flingCatch
+      );
     }
     reschedule();
   };

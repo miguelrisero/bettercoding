@@ -486,6 +486,20 @@ describe('double-tap = Tab', () => {
     ctrl.onTouchEnd(0, LONG_PRESS_MS + 90);
     expect(events).toEqual([]);
   });
+
+  it('does not count a fling catch toward the double-tap sequence', () => {
+    const { ctrl, events } = harness();
+    ctrl.onTouchStart(p(100, 100), 0);
+    ctrl.onTouchEnd(0, 40, true);
+
+    ctrl.onTouchStart(p(100, 100), 100);
+    ctrl.onTouchEnd(0, 140);
+    expect(events).toEqual([]);
+
+    ctrl.onTouchStart(p(100, 100), 200);
+    ctrl.onTouchEnd(0, 240);
+    expect(events).toEqual(['tab']);
+  });
 });
 
 describe('three-finger tap = paste', () => {

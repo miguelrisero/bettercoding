@@ -1,6 +1,9 @@
 import type { Terminal } from '@xterm/xterm';
 
-import { getTerminalMobileState } from './terminalMobileState';
+import {
+  getTerminalMobileState,
+  patchTerminalMobileState,
+} from './terminalMobileState';
 
 /**
  * Touch → wheel scroll bridge for xterm.js 5.5.
@@ -117,6 +120,16 @@ export interface TouchMoveResult {
   prevent: boolean;
 }
 
+export interface TouchStartResult {
+  /** Whether this touchstart stopped a live momentum tail. */
+  flingCatch: boolean;
+}
+
+export interface TouchEndResult {
+  /** A live tail was caught and this sequence remained a tap. */
+  caughtFling: boolean;
+}
+
 interface VelocitySample {
   t: number;
   y: number;
@@ -143,6 +156,8 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
   let stepPx = FALLBACK_WHEEL_STEP_PX;
   let accumulated = 0;
   let velocitySamples: VelocitySample[] = [];
+  let sequenceBeganAsCatch = false;
+  let verticalTravelOccurred = false;
 
   let momentumFrameId: number | undefined;
   let momentumGeneration = 0;
@@ -284,7 +299,10 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
   }
 
   return {
-    onTouchStart(p: TouchPoint): void {
+    onTouchStart(p: TouchPoint): TouchStartResult {
+      sequenceBeganAsCatch =
+        p.touches === 1 && momentumFrameId !== undefined;
+      verticalTravelOccurred = false;
       cancelMomentum();
       resetGesture(p.touches === 1 ? 'undecided' : 'ignore');
       stepPx = sanitizeWheelStep(deps.getLineHeightPx?.());
@@ -296,9 +314,10 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
 
       if (p.touches !== 1) {
         // Pinch / multi-touch — leave it to the browser.
-        return;
+        return { flingCatch: sequenceBeganAsCatch };
       }
       appendVelocitySample(p.timeStampMs ?? readNow(), p.clientY);
+      return { flingCatch: sequenceBeganAsCatch };
     },
 
     onTouchMove(p: TouchPoint): TouchMoveResult {
@@ -319,6 +338,7 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
 
       if (axis === 'undecided') {
         axis = decideAxis(p.clientX - startX, p.clientY - startY);
+        if (axis === 'vertical') verticalTravelOccurred = true;
         if (axis !== 'vertical') return { prevent: false };
       }
 
@@ -351,8 +371,16 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
       return { prevent: true };
     },
 
-    onTouchEnd(remainingTouches = 0, timeStampMs?: number): void {
+    onTouchEnd(
+      remainingTouches = 0,
+      timeStampMs?: number
+    ): TouchEndResult {
       cancelMomentum();
+
+      const caughtFling =
+        remainingTouches === 0 &&
+        sequenceBeganAsCatch &&
+        !verticalTravelOccurred;
 
       const exitVelocity =
         remainingTouches === 0 &&
@@ -371,6 +399,8 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
         momentumPrevT = readNow();
         scheduleMomentumFrame();
       }
+
+      return { caughtFling };
     },
 
     onTouchCancel(): void {
@@ -454,19 +484,27 @@ export function installTerminalTouchScroll(terminal: Terminal): () => void {
     };
   };
 
-  const onStart = (e: TouchEvent) => controller.onTouchStart(toPoint(e));
+  const onStart = (e: TouchEvent) => {
+    const { flingCatch } = controller.onTouchStart(toPoint(e));
+    patchTerminalMobileState(terminal, { flingCatch });
+  };
   const onMove = (e: TouchEvent) => {
     if (controller.onTouchMove(toPoint(e)).prevent && e.cancelable) {
       e.preventDefault();
     }
   };
-  const onEnd = (e: TouchEvent) =>
-    controller.onTouchEnd(e.touches.length, e.timeStamp);
+  const onEnd = (e: TouchEvent) => {
+    const { caughtFling } = controller.onTouchEnd(
+      e.touches.length,
+      e.timeStamp
+    );
+    if (caughtFling && e.cancelable) e.preventDefault();
+  };
   const onCancel = () => controller.onTouchCancel();
 
   el.addEventListener('touchstart', onStart, { passive: true });
   el.addEventListener('touchmove', onMove, { passive: false });
-  el.addEventListener('touchend', onEnd, { passive: true });
+  el.addEventListener('touchend', onEnd, { passive: false });
   el.addEventListener('touchcancel', onCancel, { passive: true });
 
   return () => {

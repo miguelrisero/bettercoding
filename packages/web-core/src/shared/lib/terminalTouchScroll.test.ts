@@ -476,6 +476,53 @@ describe('createTouchScrollController (momentum)', () => {
     expect(harness.wheels).toHaveLength(wheelsBeforeGrab + 1);
   });
 
+  it('reports a stationary re-grab as a caught fling tap', () => {
+    const harness = createHarness();
+    startFlick(harness);
+
+    const start = harness.ctrl.onTouchStart({
+      touches: 1,
+      clientX: 50,
+      clientY: 200,
+    });
+    const end = harness.ctrl.onTouchEnd();
+
+    expect(start).toEqual({ flingCatch: true });
+    expect(end).toEqual({ caughtFling: true });
+    expect(harness.pendingFrames()).toBe(0);
+  });
+
+  it('reports a normal stationary tap as not catching a fling', () => {
+    const harness = createHarness();
+
+    const start = harness.ctrl.onTouchStart({
+      touches: 1,
+      clientX: 50,
+      clientY: 200,
+    });
+    const end = harness.ctrl.onTouchEnd();
+
+    expect(start).toEqual({ flingCatch: false });
+    expect(end).toEqual({ caughtFling: false });
+  });
+
+  it('turns a fling catch into a 1:1 drag instead of a caught tap', () => {
+    const harness = createHarness({ getLineHeightPx: () => 15 });
+    startFlick(harness);
+    const wheelsBeforeCatch = harness.wheels.length;
+
+    harness.ctrl.onTouchStart({ touches: 1, clientX: 50, clientY: 200 });
+    harness.advance(16);
+    harness.ctrl.onTouchMove({ touches: 1, clientX: 50, clientY: 170 });
+    expect(
+      harness.wheels
+        .slice(wheelsBeforeCatch)
+        .map((wheel) => wheel.direction)
+    ).toEqual([1, 1]);
+
+    expect(harness.ctrl.onTouchEnd()).toEqual({ caughtFling: false });
+  });
+
   it('halts mid-tail when suppression becomes active', () => {
     const harness = createHarness();
     startFlick(harness);

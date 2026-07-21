@@ -19,6 +19,8 @@ export interface TerminalMobileState {
   selectMode: boolean;
   /** A long-press D-pad gesture is running; the scroll bridge stands down. */
   dpadActive: boolean;
+  /** The current touch sequence started by stopping live scroll momentum. */
+  flingCatch?: boolean;
 }
 
 const EMPTY_STATE: TerminalMobileState = {
