@@ -1,10 +1,6 @@
 import { useCallback, useEffect, useMemo, type ReactNode } from "react";
 import { useLocation, useNavigate, useParams } from "@tanstack/react-router";
-import {
-  MOBILE_TABS,
-  Navbar,
-  type MobileTabId,
-} from "@vibe/ui/components/Navbar";
+import { MOBILE_TABS, Navbar } from "@vibe/ui/components/Navbar";
 import { SettingsDialog } from "@/shared/dialogs/settings/SettingsDialog";
 import { CommandBarDialog } from "@/shared/dialogs/command-bar/CommandBarDialog";
 import { useMobileActiveTab } from "@/shared/stores/useUiPreferencesStore";
@@ -27,7 +23,9 @@ export function RemoteNavbarContainer({
 
   const remoteMobileTabs = useMemo(
     () =>
-      MOBILE_TABS.filter((t) => t.id !== "preview" && t.id !== "workspaces"),
+      MOBILE_TABS.filter(
+        (t) => t.id !== "preview" && t.id !== "workspaces" && t.id !== "files",
+      ),
     [],
   );
 
@@ -83,7 +81,7 @@ export function RemoteNavbarContainer({
       mobileShowBack={mobileShowBack}
       onOpenSettings={handleOpenSettings}
       onOpenCommandBar={handleOpenCommandBar}
-      mobileActiveTab={mobileActiveTab as MobileTabId}
+      mobileActiveTab={mobileActiveTab}
       onMobileTabChange={(tab) => setMobileActiveTab(tab)}
       mobileTabs={remoteMobileTabs}
       showMobileTabs={isOnWorkspaceView}

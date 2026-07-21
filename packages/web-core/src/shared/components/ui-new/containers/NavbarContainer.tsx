@@ -6,9 +6,10 @@ import { useSyncErrorContext } from '@/shared/hooks/useSyncErrorContext';
 import { useUserOrganizations } from '@/shared/hooks/useUserOrganizations';
 import { useOrganizationStore } from '@/shared/stores/useOrganizationStore';
 import {
+  MOBILE_TABS,
   Navbar,
-  type NavbarSectionItem,
   type MobileTabId,
+  type NavbarSectionItem,
 } from '@vibe/ui/components/Navbar';
 import { Tooltip } from '@vibe/ui/components/Tooltip';
 import { AppBarUserPopoverContainer } from './AppBarUserPopoverContainer';
@@ -37,6 +38,7 @@ import { CommandBarDialog } from '@/shared/dialogs/command-bar/CommandBarDialog'
 import { SettingsDialog } from '@/shared/dialogs/settings/SettingsDialog';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
 import { getRemoteAuthDegradedMessage } from '@/shared/lib/auth/remoteAuthDegraded';
+import { useHostId } from '@/shared/providers/HostIdProvider';
 
 /**
  * Check if a NavbarItem is a divider
@@ -117,6 +119,7 @@ export function NavbarContainer({
   mobileMode?: boolean;
 }) {
   const { t } = useTranslation('common');
+  const hostId = useHostId();
   const { executeAction } = useActions();
   const { workspace: selectedWorkspace, isCreateMode } = useWorkspaceContext();
   const syncErrorContext = useSyncErrorContext();
@@ -126,6 +129,10 @@ export function NavbarContainer({
   const { isSignedIn } = useAuth();
   const appNavigation = useAppNavigation();
   const [mobileActiveTab, setMobileActiveTab] = useMobileActiveTab();
+  const mobileTabs = useMemo(
+    () => (hostId ? MOBILE_TABS.filter((t) => t.id !== 'files') : MOBILE_TABS),
+    [hostId]
+  );
 
   const { data: orgsData } = useUserOrganizations();
   const organizations = useMemo(
@@ -327,8 +334,9 @@ export function NavbarContainer({
       onOpenCommandBar={handleOpenCommandBar}
       onOpenSettings={handleOpenSettings}
       onNavigateBack={handleNavigateBack}
-      mobileActiveTab={mobileActiveTab as MobileTabId}
-      onMobileTabChange={(tab) => setMobileActiveTab(tab)}
+      mobileActiveTab={mobileActiveTab}
+      onMobileTabChange={(tab: MobileTabId) => setMobileActiveTab(tab)}
+      mobileTabs={mobileTabs}
     />
   );
 }

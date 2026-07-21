@@ -9,18 +9,25 @@ export const RIGHT_MAIN_PANEL_MODES = {
   PREVIEW: 'preview',
 } as const;
 
+// RightMainPanelMode must stay a subset of MobileTab. The assignments below
+// intentionally rely on structural typing (no cast), so adding a mode without
+// a matching mobile tab fails to compile.
 export type RightMainPanelMode =
   (typeof RIGHT_MAIN_PANEL_MODES)[keyof typeof RIGHT_MAIN_PANEL_MODES];
 
 export type LayoutMode = 'workspaces' | 'kanban';
 
+// Keep in lockstep with MobileTabId in
+// packages/ui/src/components/Navbar.tsx — web-core can't be imported by ui,
+// so these two unions are intentionally duplicated.
 export type MobileTab =
   | 'workspaces'
   | 'chat'
   | 'changes'
   | 'logs'
   | 'preview'
-  | 'git';
+  | 'git'
+  | 'files';
 
 export type MobileFontScale = 'default' | 'small' | 'smaller';
 export const DEFAULT_CREATE_DRAFT_WORKSPACE_BY_DEFAULT = false;
@@ -490,7 +497,7 @@ export const useUiPreferencesStore = create<State>()((set, get) => ({
   listViewStatusFilter: null,
 
   // Mobile tab state
-  mobileActiveTab: 'chat' as MobileTab,
+  mobileActiveTab: 'chat',
 
   // Mobile font scale
   mobileFontScale: loadMobileFontScale(),
@@ -581,8 +588,7 @@ export const useUiPreferencesStore = create<State>()((set, get) => ({
         : isWideScreen()
           ? state.isLeftSidebarVisible
           : false,
-      ...(isMobile &&
-        !isCurrentlyActive && { mobileActiveTab: mode as MobileTab }),
+      ...(isMobile && !isCurrentlyActive && { mobileActiveTab: mode }),
     });
   },
 
@@ -605,7 +611,7 @@ export const useUiPreferencesStore = create<State>()((set, get) => ({
           ? state.isLeftSidebarVisible
           : false,
       }),
-      ...(isMobile && mode !== null && { mobileActiveTab: mode as MobileTab }),
+      ...(isMobile && mode !== null && { mobileActiveTab: mode }),
     });
   },
 

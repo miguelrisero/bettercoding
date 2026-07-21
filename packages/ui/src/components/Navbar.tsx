@@ -7,6 +7,7 @@ import {
   Terminal as TerminalIcon,
   Desktop as DesktopIcon,
   GitFork as GitForkIcon,
+  FolderSimple as FolderIcon,
   List as ListIcon,
   Gear as GearIcon,
   CaretLeft as CaretLeftIcon,
@@ -90,13 +91,17 @@ function NavbarIconButton({
   );
 }
 
+// Keep in lockstep with MobileTab in
+// packages/web-core/src/shared/stores/useUiPreferencesStore.ts — ui can't
+// depend on web-core, so these two unions are intentionally duplicated.
 export type MobileTabId =
   | 'workspaces'
   | 'chat'
   | 'changes'
   | 'logs'
   | 'preview'
-  | 'git';
+  | 'git'
+  | 'files';
 
 export const MOBILE_TABS: { id: MobileTabId; icon: Icon; label: string }[] = [
   { id: 'workspaces', icon: LayoutIcon, label: 'Wksps' },
@@ -105,6 +110,7 @@ export const MOBILE_TABS: { id: MobileTabId; icon: Icon; label: string }[] = [
   { id: 'logs', icon: TerminalIcon, label: 'Logs' },
   { id: 'preview', icon: DesktopIcon, label: 'Preview' },
   { id: 'git', icon: GitForkIcon, label: 'Git' },
+  { id: 'files', icon: FolderIcon, label: 'Files' },
 ];
 
 export interface NavbarBreadcrumbItem {
@@ -264,6 +270,10 @@ export function Navbar({
                   <button
                     key={tab.id}
                     type="button"
+                    aria-label={
+                      tab.id === 'workspaces' ? 'Wksps (Workspaces)' : tab.label
+                    }
+                    aria-current={isActive ? 'page' : undefined}
                     className={cn(
                       'flex items-center gap-1 px-1.5 py-1 text-xs whitespace-nowrap transition-colors',
                       isActive
@@ -276,7 +286,7 @@ export function Navbar({
                       className="size-icon-sm"
                       weight={isActive ? 'fill' : 'regular'}
                     />
-                    <span className="hidden min-[480px]:inline">
+                    <span className={isActive ? 'inline' : 'hidden'}>
                       {tab.label}
                     </span>
                   </button>

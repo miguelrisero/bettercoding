@@ -12,6 +12,7 @@ import type { CreateModeInitialState } from '@/shared/types/createMode';
 import { useWorkspaceContext } from '@/shared/hooks/useWorkspaceContext';
 import { usePageTitle } from '@/shared/hooks/usePageTitle';
 import { useIsMobile } from '@/shared/hooks/useIsMobile';
+import { useHostId } from '@/shared/providers/HostIdProvider';
 import { useMobileActiveTab } from '@/shared/stores/useUiPreferencesStore';
 import { cn } from '@/shared/lib/utils';
 import { CreateModeProvider } from '@/features/create-mode/model/CreateModeProvider';
@@ -30,6 +31,7 @@ import {
   type WorkspacesMainContainerHandle,
 } from './WorkspacesMainContainer';
 import { RightSidebar } from './RightSidebar';
+import { WorkspaceFilesContainer } from './WorkspaceFilesContainer';
 import { ChangesPanelContainer } from './ChangesPanelContainer';
 import { CreateChatBoxContainer } from '@/shared/components/CreateChatBoxContainer';
 import { PreviewBrowserContainer } from './PreviewBrowserContainer';
@@ -120,6 +122,7 @@ export function WorkspacesLayout() {
 
   const isMobile = useIsMobile();
   const [mobileTab] = useMobileActiveTab();
+  const hostId = useHostId();
   const mainContainerRef = useRef<WorkspacesMainContainerHandle>(null);
 
   useLayoutEffect(() => {
@@ -229,6 +232,11 @@ export function WorkspacesLayout() {
   );
 
   // ── Mobile layout ──────────────────────────────────────────────────
+  // These seven panes must stay in lockstep with MobileTabId
+  // (packages/ui/src/components/Navbar.tsx) and MobileTab
+  // (packages/web-core/src/shared/stores/useUiPreferencesStore.ts). Adding a
+  // tab to those unions without a matching pane here compiles cleanly but
+  // silently renders a dead tab button.
   // Uses `hidden` CSS class (NOT conditional rendering) to preserve
   // WebSocket connections and scroll positions across tab switches.
   if (isMobile) {
@@ -353,6 +361,18 @@ export function WorkspacesLayout() {
                   selectedWorkspace={selectedWorkspace}
                   repos={repos}
                 />
+              )}
+            </div>
+
+            {/* Files tab */}
+            <div
+              className={cn(
+                'flex-1 min-h-0 overflow-hidden',
+                mobileTab !== 'files' && 'hidden'
+              )}
+            >
+              {selectedWorkspace?.id && !hostId && (
+                <WorkspaceFilesContainer workspaceId={selectedWorkspace.id} />
               )}
             </div>
           </div>
