@@ -91,7 +91,9 @@ function NavbarIconButton({
   );
 }
 
-// Keep in lockstep with MobileTab in packages/web-core/src/shared/stores/useUiPreferencesStore.ts — ui can't depend on web-core, so these two unions are intentionally duplicated.
+// Keep in lockstep with MobileTab in
+// packages/web-core/src/shared/stores/useUiPreferencesStore.ts — ui can't
+// depend on web-core, so these two unions are intentionally duplicated.
 export type MobileTabId =
   | 'workspaces'
   | 'chat'
@@ -268,7 +270,12 @@ export function Navbar({
                   <button
                     key={tab.id}
                     type="button"
-                    aria-label={tab.label}
+                    aria-label={
+                      tab.id === 'workspaces'
+                        ? 'Wksps (Workspaces)'
+                        : tab.label
+                    }
+                    aria-current={isActive ? 'page' : undefined}
                     className={cn(
                       'flex items-center gap-1 px-1.5 py-1 text-xs whitespace-nowrap transition-colors',
                       isActive
