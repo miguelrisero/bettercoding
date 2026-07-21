@@ -6,6 +6,7 @@ use uuid::Uuid;
 use super::{
     cli_ingest_outbox::CliIngestOutbox,
     cli_native_file::{CliNativeFile, RegisterCliNativeFile},
+    session_queued_message::PASTED_REQUEUE_FAILURE_REASON,
 };
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -490,7 +491,13 @@ impl CliNativeRecord {
                                 r#"SELECT id AS "id!: Uuid"
                                FROM session_queued_messages
                                WHERE session_id = $1
-                                 AND state IN ('pasting', 'pasted')
+                                 AND (
+                                     state IN ('pasting', 'pasted')
+                                     OR (
+                                         state = 'queued'
+                                         AND failure_reason = $6
+                                     )
+                                 )
                                  AND prompt = $2
                                  AND (claude_session_id IS NULL OR claude_session_id = $3)
                                  AND pasted_at IS NOT NULL
@@ -502,7 +509,8 @@ impl CliNativeRecord {
                                 prompt,
                                 record.claude_session_id,
                                 earliest_paste,
-                                latest_paste
+                                latest_paste,
+                                PASTED_REQUEUE_FAILURE_REASON
                             )
                             .fetch_optional(&mut **tx)
                             .await?
@@ -547,10 +555,19 @@ impl CliNativeRecord {
                            claude_session_id = COALESCE(claude_session_id, $1),
                            acked_at = $2,
                            updated_at = $2
-                       WHERE id = $3 AND state IN ('pasting', 'pasted')"#,
+                       WHERE id = $3
+                         AND (
+                             state IN ('pasting', 'pasted')
+                             OR (
+                                 state = 'queued'
+                                 AND failure_reason = $4
+                                 AND pasted_at IS NOT NULL
+                             )
+                         )"#,
                     record.claude_session_id,
                     imported_at,
-                    queue_id
+                    queue_id,
+                    PASTED_REQUEUE_FAILURE_REASON
                 )
                 .execute(&mut **tx)
                 .await?;

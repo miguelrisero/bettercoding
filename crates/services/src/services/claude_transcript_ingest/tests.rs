@@ -580,6 +580,72 @@ async fn paste_ack_binding_and_slot_import_are_atomic_and_project_as_app_origin(
 }
 
 #[tokio::test]
+async fn late_paste_ack_imports_requeued_slot_and_blocks_duplicate_claim() {
+    let temp = TempDir::new().unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, temp.path()).await;
+    let sid = "45454545-4545-4545-8545-454545454545";
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    ClaudeSessionLink::assign_manual(&db.pool, sid, session.id, &cwd.to_string_lossy())
+        .await
+        .unwrap()
+        .unwrap();
+    let native_file = register_native_file(&db, workspace.id, sid).await;
+    let slot = pasted_slot(&db, session.id, sid, "late CLI submission").await;
+    let pasted_at = slot.pasted_at.unwrap();
+
+    assert!(
+        SessionQueuedMessage::requeue_pasted(&db.pool, slot.id)
+            .await
+            .unwrap()
+    );
+    let requeued = SessionQueuedMessage::find_by_id(&db.pool, slot.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(requeued.was_requeued_from_pasted());
+    assert_eq!(requeued.pasted_at, Some(pasted_at));
+
+    CliNativeRecord::import_batch(
+        &db.pool,
+        native_file.id,
+        &[import_record(
+            sid,
+            0,
+            "late-delivery-bound-user",
+            "late CLI submission",
+            pasted_at + ChronoDuration::seconds(31),
+        )],
+        &cursor(1),
+    )
+    .await
+    .unwrap();
+
+    let rows = CliNativeRecord::list_for_session(&db.pool, session.id)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].bound_queued_message_id, Some(slot.id));
+    let imported = SessionQueuedMessage::find_by_id(&db.pool, slot.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(imported.state, QueuedMessageState::Imported);
+    assert!(imported.acked_at.is_some());
+    assert!(
+        SessionQueuedMessage::claim(&db.pool, slot.id, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        SessionQueuedMessage::find_active(&db.pool, session.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn paste_ack_matcher_enforces_paste_window_bounds() {
     let temp = TempDir::new().unwrap();
     let db = test_db().await;

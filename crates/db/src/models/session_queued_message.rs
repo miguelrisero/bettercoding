@@ -5,6 +5,9 @@ use sqlx::{FromRow, SqlitePool, Type};
 use ts_rs::TS;
 use uuid::Uuid;
 
+pub const PASTED_REQUEUE_FAILURE_REASON: &str =
+    "CLI submission was not acknowledged; queued for retry";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, TS)]
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
@@ -83,6 +86,12 @@ impl SessionQueuedMessage {
             .as_deref()
             .map(serde_json::from_str)
             .transpose()
+    }
+
+    pub fn was_requeued_from_pasted(&self) -> bool {
+        self.state == QueuedMessageState::Queued
+            && self.pasted_at.is_some()
+            && self.failure_reason.as_deref() == Some(PASTED_REQUEUE_FAILURE_REASON)
     }
 
     pub async fn find_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<Self>, sqlx::Error> {
@@ -239,8 +248,14 @@ impl SessionQueuedMessage {
             r#"UPDATE session_queued_messages SET
                    state = 'queued',
                    failure_reason = $1,
-                   claude_session_id = NULL,
-                   pasted_at = NULL,
+                   claude_session_id = CASE
+                       WHEN state = 'pasted' THEN claude_session_id
+                       ELSE NULL
+                   END,
+                   pasted_at = CASE
+                       WHEN state = 'pasted' THEN pasted_at
+                       ELSE NULL
+                   END,
                    acked_at = NULL,
                    updated_at = datetime('now', 'subsec')
                WHERE id = $2 AND state IN ('pasting', 'pasted')"#,
@@ -250,6 +265,13 @@ impl SessionQueuedMessage {
         .execute(pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Return a paste with missing delivery evidence to the persisted slot.
+    /// The original timestamp and sid stay attached so a delayed native user
+    /// record can still acknowledge this exact delivery.
+    pub async fn requeue_pasted(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+        Self::requeue(pool, id, Some(PASTED_REQUEUE_FAILURE_REASON)).await
     }
 
     pub async fn set_failure_reason(
@@ -323,11 +345,19 @@ impl SessionQueuedMessage {
                    state = 'imported',
                    acked_at = COALESCE(acked_at, datetime('now', 'subsec')),
                    updated_at = datetime('now', 'subsec')
-               WHERE state IN ('pasting', 'pasted')
+               WHERE (
+                     state IN ('pasting', 'pasted')
+                     OR (
+                         state = 'queued'
+                         AND failure_reason = $1
+                         AND pasted_at IS NOT NULL
+                     )
+                 )
                  AND EXISTS (
                      SELECT 1 FROM cli_native_records record
                      WHERE record.bound_queued_message_id = session_queued_messages.id
-                 )"#
+                 )"#,
+            PASTED_REQUEUE_FAILURE_REASON
         )
         .execute(pool)
         .await?
@@ -353,13 +383,12 @@ impl SessionQueuedMessage {
         let requeued_pasted = sqlx::query!(
             r#"UPDATE session_queued_messages SET
                    state = 'queued',
-                   failure_reason = 'CLI submission was not acknowledged; queued for retry',
-                   claude_session_id = NULL,
-                   pasted_at = NULL,
+                   failure_reason = $2,
                    updated_at = datetime('now', 'subsec')
                WHERE state = 'pasted'
                  AND julianday(pasted_at) <= julianday($1)"#,
-            pasted_cutoff
+            pasted_cutoff,
+            PASTED_REQUEUE_FAILURE_REASON
         )
         .execute(pool)
         .await?
@@ -489,7 +518,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_reconciliation_requeues_interrupted_and_unacked_rows() {
+    async fn delivery_reconciliation_recovers_pasting_but_only_hard_caps_pasted_rows() {
         let (pool, session_id) = session_fixture().await;
         let row = match SessionQueuedMessage::store(
             &pool,
@@ -550,7 +579,32 @@ mod tests {
             &pool,
             Utc::now(),
             Duration::seconds(5),
-            Duration::seconds(30),
+            Duration::minutes(15),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.requeued_pasted, 0);
+        assert_eq!(
+            SessionQueuedMessage::find_by_id(&pool, row.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            QueuedMessageState::Pasted
+        );
+
+        let hard_capped_at = Utc::now() - Duration::minutes(16);
+        sqlx::query("UPDATE session_queued_messages SET pasted_at = ? WHERE id = ?")
+            .bind(hard_capped_at)
+            .bind(row.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let recovered = SessionQueuedMessage::reconcile(
+            &pool,
+            Utc::now(),
+            Duration::seconds(5),
+            Duration::minutes(15),
         )
         .await
         .unwrap();
@@ -560,6 +614,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(active.state, QueuedMessageState::Queued);
-        assert!(active.failure_reason.unwrap().contains("not acknowledged"));
+        assert!(active.was_requeued_from_pasted());
+        assert_eq!(active.pasted_at, Some(hard_capped_at));
+        assert_eq!(active.claude_session_id.as_deref(), Some("sid"));
+        assert_eq!(
+            active.failure_reason.as_deref(),
+            Some(PASTED_REQUEUE_FAILURE_REASON)
+        );
     }
 }
