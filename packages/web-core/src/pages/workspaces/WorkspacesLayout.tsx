@@ -12,6 +12,7 @@ import type { CreateModeInitialState } from '@/shared/types/createMode';
 import { useWorkspaceContext } from '@/shared/hooks/useWorkspaceContext';
 import { usePageTitle } from '@/shared/hooks/usePageTitle';
 import { useIsMobile } from '@/shared/hooks/useIsMobile';
+import { useHostId } from '@/shared/providers/HostIdProvider';
 import { useMobileActiveTab } from '@/shared/stores/useUiPreferencesStore';
 import { cn } from '@/shared/lib/utils';
 import { CreateModeProvider } from '@/features/create-mode/model/CreateModeProvider';
@@ -30,6 +31,7 @@ import {
   type WorkspacesMainContainerHandle,
 } from './WorkspacesMainContainer';
 import { RightSidebar } from './RightSidebar';
+import { WorkspaceFilesContainer } from './WorkspaceFilesContainer';
 import { ChangesPanelContainer } from './ChangesPanelContainer';
 import { CreateChatBoxContainer } from '@/shared/components/CreateChatBoxContainer';
 import { PreviewBrowserContainer } from './PreviewBrowserContainer';
@@ -120,6 +122,7 @@ export function WorkspacesLayout() {
 
   const isMobile = useIsMobile();
   const [mobileTab] = useMobileActiveTab();
+  const hostId = useHostId();
   const mainContainerRef = useRef<WorkspacesMainContainerHandle>(null);
 
   useLayoutEffect(() => {
@@ -353,6 +356,18 @@ export function WorkspacesLayout() {
                   selectedWorkspace={selectedWorkspace}
                   repos={repos}
                 />
+              )}
+            </div>
+
+            {/* Files tab */}
+            <div
+              className={cn(
+                'flex-1 min-h-0 overflow-hidden',
+                mobileTab !== 'files' && 'hidden'
+              )}
+            >
+              {selectedWorkspace?.id && !hostId && (
+                <WorkspaceFilesContainer workspaceId={selectedWorkspace.id} />
               )}
             </div>
           </div>
