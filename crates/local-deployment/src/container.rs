@@ -240,7 +240,7 @@ impl LocalContainerService {
 
     async fn cleanup_workspace(&self, workspace: &Workspace) {
         // The workspace's CLI tmux session (if any) must not outlive its
-        // worktree. Best-effort; only ever targets the vk_ namespace.
+        // worktree. Best-effort; targets current `bc_` and legacy `vk_` namespaces.
         crate::pty::kill_cli_tmux_session(workspace.id).await;
 
         let Some(container_ref) = &workspace.container_ref else {
@@ -319,7 +319,16 @@ impl LocalContainerService {
         if std::env::var("DISABLE_CLI_SESSION_REAP").is_ok() {
             return;
         }
-        let sessions = crate::pty::list_cli_tmux_sessions().await;
+        let sessions = match crate::pty::list_cli_tmux_sessions().await {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(
+                    error,
+                    "Reaper: aborting CLI tmux round because the dual-socket snapshot is incomplete"
+                );
+                return;
+            }
+        };
         if sessions.is_empty() {
             return;
         }
@@ -383,26 +392,23 @@ impl LocalContainerService {
                 }
             }
 
-            // Pre-kill recheck against fresh tmux state (TOCTOU): a user may
-            // have attached or the pane may have become active since listing.
-            match crate::pty::cli_tmux_session_liveness(workspace_id).await {
-                Some((now_attached, now_idle)) => {
-                    if now_attached || (!terminal && now_idle < ACTIVITY_GRACE_SECS) {
-                        continue;
-                    }
-                }
-                None => continue, // already gone
+            // Pre-kill recheck against fresh tmux state (TOCTOU): make the
+            // decision independently for each home. A user may have attached,
+            // activity may be fresh, or one socket may now be unreadable.
+            let killed =
+                crate::pty::reap_cli_tmux_session_if_inactive(workspace_id, ACTIVITY_GRACE_SECS)
+                    .await;
+            if killed == 0 {
+                continue;
             }
-
-            crate::pty::kill_cli_tmux_session(workspace_id).await;
-            reaped += 1;
+            reaped += killed;
             tracing::info!(
-                "Reaped CLI tmux session for workspace {workspace_id} (reason={reason}, idle_secs={idle_secs})"
+                "Reaped {killed} CLI tmux home(s) for workspace {workspace_id} (reason={reason}, idle_secs={idle_secs})"
             );
         }
 
         if reaped > 0 {
-            tracing::info!("CLI session reaper killed {reaped} session(s)");
+            tracing::info!("CLI session reaper killed {reaped} home(s)");
         }
     }
 

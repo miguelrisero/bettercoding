@@ -22,9 +22,9 @@ use executors::{
 };
 use local_deployment::pty::{
     CLI_PROMPT_PARKED_NOTICE, CliPromptDelivery, CliPromptRouting, PtyCommand,
-    cli_pane_agent_running, cli_prompt_file_exists, cli_tmux_available, cli_tmux_session_exists,
-    cli_tmux_session_name, remove_cli_prompt_file, route_followup_prompt, route_initial_prompt,
-    send_cli_keys,
+    cli_pane_agent_running_at, cli_prompt_file_exists, cli_tmux_available, cli_tmux_session_exists,
+    cli_tmux_target_exists, locate_cli_tmux_target, remove_cli_prompt_file,
+    resolved_cli_tmux_session_name, route_followup_prompt, route_initial_prompt, send_cli_keys_to,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -59,7 +59,7 @@ struct TerminalQuery {
     pub rows: Option<u16>,
     #[serde(default)]
     mode: TerminalMode,
-    /// VibeKanban session whose claude conversation CLI mode should resume,
+    /// BetterCoding session whose claude conversation CLI mode should resume,
     /// so the terminal joins the exact chat the UI is showing (handover).
     #[serde(default)]
     session_id: Option<Uuid>,
@@ -510,12 +510,14 @@ async fn handle_terminal_ws(
     prompt_delivery: Option<PromptDelivery>,
 ) {
     // FIX 4 tripwire label: the pty session name, captured before `command` is
-    // moved into `create_session`. For CLI mode this is the tmux `vk_<uuid>`
-    // name, so the logged bytes line up with tmux server logs.
+    // moved into `create_session`. For CLI mode this is the actual current
+    // `bc_<uuid>` or legacy `vk_<uuid>` name, so the bytes line up with tmux logs.
     let tripwire_session = match &command {
-        // #30 carries the workspace id on TmuxCli (the tmux session name is
-        // derived from it); recover the `vk_<uuid>` name for the tripwire label.
-        PtyCommand::TmuxCli { workspace_id, .. } => cli_tmux_session_name(*workspace_id),
+        // Resolve the workspace-derived name through both homes so legacy
+        // attaches carry their real `vk_<uuid>` label rather than a `bc_` guess.
+        PtyCommand::TmuxCli { workspace_id, .. } => {
+            resolved_cli_tmux_session_name(*workspace_id).await
+        }
         PtyCommand::Shell => "shell".to_string(),
     };
 
@@ -705,6 +707,8 @@ async fn wait_for_cli_session(workspace_id: Uuid) -> bool {
 /// would clear a prompt no agent ever received. An unconfirmed launch leaves
 /// the parked DB prompt for the next attach's paste/fresh-launch retry — and
 /// drops the never-consumed file so a later launch can't half-consume it.
+/// The tmux target is pinned before polling so a double-home change cannot
+/// satisfy the process check from a different session than the recipient.
 ///
 /// Note: a prompt stranded by a losing racing first-attach that won
 /// `new-session -A` with a promptless bootstrap is deliberately NOT recovered
@@ -714,9 +718,13 @@ async fn wait_for_cli_session(workspace_id: Uuid) -> bool {
 /// prompt. Leaving it parked means the next attach delivers it as a follow-up
 /// paste into the live agent: slower in that rare race, but never lost.
 async fn confirm_baked_prompt_consumed(workspace_id: Uuid, program: &str) -> bool {
+    let Some(target) = locate_cli_tmux_target(workspace_id).await else {
+        remove_cli_prompt_file(workspace_id);
+        return false;
+    };
     for _ in 0..30 {
         if !cli_prompt_file_exists(workspace_id)
-            && cli_pane_agent_running(workspace_id, program).await == Some(true)
+            && cli_pane_agent_running_at(&target, program).await == Some(true)
         {
             return true;
         }
@@ -735,29 +743,34 @@ async fn confirm_baked_prompt_consumed(workspace_id: Uuid, program: &str) -> boo
 /// failed resume attempt — and the pane fall back to a shell) and re-checked
 /// after it (an agent that exited immediately after the paste discarded the
 /// text with its tty; delivery must not be confirmed). Bounded at ~15s; an
-/// unready pane leaves the prompt parked for the next attach's retry.
+/// unready pane leaves the prompt parked for the next attach's retry. The tmux
+/// target is located once before polling and reused through the post-paste ack,
+/// so a mid-delivery home flip cannot redirect any step to the other session.
 async fn deliver_deferred_prompt(workspace_id: Uuid, text: &str, program: &str) -> bool {
+    let Some(target) = locate_cli_tmux_target(workspace_id).await else {
+        return false;
+    };
     let mut stable = 0u32;
     for _ in 0..60 {
-        match cli_pane_agent_running(workspace_id, program).await {
+        match cli_pane_agent_running_at(&target, program).await {
             Some(true) => {
                 stable += 1;
                 if stable >= 2 {
                     // Grace for the TUI to enter raw mode, then re-verify the
                     // agent still owns the pane immediately before pasting.
                     tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-                    if cli_pane_agent_running(workspace_id, program).await != Some(true) {
+                    if cli_pane_agent_running_at(&target, program).await != Some(true) {
                         stable = 0;
                         continue;
                     }
-                    if !send_cli_keys(workspace_id, text).await {
+                    if !send_cli_keys_to(&target, text).await {
                         return false;
                     }
                     // Post-paste ack: the agent must have survived receiving
                     // it. A process that died right after the paste (doomed
                     // resume leg, instant crash) never processed the text.
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    return cli_pane_agent_running(workspace_id, program).await == Some(true);
+                    return cli_pane_agent_running_at(&target, program).await == Some(true);
                 }
             }
             Some(false) => stable = 0,
@@ -765,7 +778,7 @@ async fn deliver_deferred_prompt(workspace_id: Uuid, text: &str, program: &str) 
                 // Pane unreadable: if the session is really gone, give up and
                 // leave the prompt parked; a transient probe failure (ps/pgrep
                 // hiccup) just resets the stability counter.
-                if !cli_tmux_session_exists(workspace_id).await {
+                if !cli_tmux_target_exists(&target).await {
                     return false;
                 }
                 stable = 0;
@@ -788,8 +801,8 @@ async fn deliver_deferred_prompt(workspace_id: Uuid, text: &str, program: &str) 
 /// integer compare with no allocation, so it is permanently safe to leave
 /// enabled.
 struct AttachInputTripwire {
-    /// The pty session name (tmux `vk_<uuid>` for CLI mode) so the logged
-    /// bytes line up with tmux server logs.
+    /// The pty session name (current `bc_<uuid>` or legacy `vk_<uuid>` in CLI
+    /// mode) so the logged bytes line up with tmux server logs.
     session: String,
     /// The per-attach PTY session id.
     attach_id: Uuid,
@@ -1034,7 +1047,7 @@ mod tripwire_tests {
     use super::{AttachInputTripwire, hex_dump};
 
     fn tripwire() -> AttachInputTripwire {
-        AttachInputTripwire::new("vk_test".to_string(), Uuid::new_v4())
+        AttachInputTripwire::new("bc_test".to_string(), Uuid::new_v4())
     }
 
     /// The byte budget: chunks are truncated to the remaining budget, and a
