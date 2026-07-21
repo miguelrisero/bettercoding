@@ -49,6 +49,7 @@ const MAX_WHEEL_STEP_PX = 48;
 const VELOCITY_WINDOW_MS = 120;
 const VELOCITY_SAMPLE_CAPACITY = 32;
 const MIN_VELOCITY_WINDOW_MS = 8;
+const MOMENTUM_RELEASE_MAX_AGE_MS = 100;
 const MIN_MOMENTUM_START_PX_PER_MS = 0.3;
 const MAX_MOMENTUM_PX_PER_MS = 3.5;
 const MOMENTUM_STOP_PX_PER_MS = 0.05;
@@ -226,6 +227,7 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
     if (velocitySamples.length < 2) return undefined;
     const oldest = velocitySamples[0];
     const newest = velocitySamples[velocitySamples.length - 1];
+    if (readNow() - newest.t > MOMENTUM_RELEASE_MAX_AGE_MS) return undefined;
     const dt = newest.t - oldest.t;
     if (dt < MIN_VELOCITY_WINDOW_MS) return undefined;
 

@@ -375,6 +375,39 @@ describe('createTouchScrollController (gesture ownership)', () => {
 });
 
 describe('createTouchScrollController (momentum)', () => {
+  it('does not start momentum after a fast drag is held still for 200ms', () => {
+    const harness = createHarness();
+    harness.ctrl.onTouchStart({ touches: 1, clientX: 0, clientY: 300 });
+    harness.advance(16);
+    harness.ctrl.onTouchMove({ touches: 1, clientX: 0, clientY: 240 });
+    harness.advance(16);
+    harness.ctrl.onTouchMove({ touches: 1, clientX: 0, clientY: 180 });
+    const wheelsAtLift = harness.wheels.length;
+
+    harness.advance(200);
+    harness.ctrl.onTouchEnd();
+    for (let frame = 0; frame < 10; frame += 1) harness.pumpFrame();
+
+    expect(harness.wheels).toHaveLength(wheelsAtLift);
+    expect(harness.pendingFrames()).toBe(0);
+  });
+
+  it('starts momentum when the latest fast-drag sample is 99ms old', () => {
+    const harness = createHarness();
+    harness.ctrl.onTouchStart({ touches: 1, clientX: 0, clientY: 300 });
+    harness.advance(16);
+    harness.ctrl.onTouchMove({ touches: 1, clientX: 0, clientY: 240 });
+    harness.advance(16);
+    harness.ctrl.onTouchMove({ touches: 1, clientX: 0, clientY: 180 });
+    const dragWheelCount = harness.wheels.length;
+
+    harness.advance(99);
+    harness.ctrl.onTouchEnd();
+    harness.pumpFrame();
+
+    expect(harness.wheels.length).toBeGreaterThan(dragWheelCount);
+  });
+
   it('does not start momentum after a slow 0.2px/ms release', () => {
     const harness = createHarness();
     harness.ctrl.onTouchStart({ touches: 1, clientX: 0, clientY: 100 });
