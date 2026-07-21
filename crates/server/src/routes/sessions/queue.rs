@@ -1,83 +1,102 @@
 use axum::{
-    Extension, Json, Router, extract::State, middleware::from_fn_with_state,
+    Extension, Json, Router, extract::State, http::StatusCode, middleware::from_fn_with_state,
     response::Json as ResponseJson, routing::get,
 };
-use db::models::{scratch::DraftFollowUpData, session::Session};
+use db::models::{
+    scratch::DraftFollowUpData, session::Session, session_queued_message::QueuedMessageSource,
+};
 use deployment::Deployment;
 use executors::profile::ExecutorConfig;
 use serde::Deserialize;
-use services::services::queued_message::QueueStatus;
+use services::services::queued_message::{QueueMutation, QueueStatus};
 use ts_rs::TS;
 use utils::response::ApiResponse;
 
 use crate::{DeploymentImpl, error::ApiError, middleware::load_session_middleware};
 
-/// Request body for queueing a follow-up message
 #[derive(Debug, Deserialize, TS)]
-struct QueueMessageRequest {
+pub struct QueueMessageRequest {
     pub message: String,
     pub executor_config: ExecutorConfig,
+    #[serde(default)]
+    pub replace: bool,
 }
 
-/// Queue a follow-up message to be executed when the current execution finishes
+type QueueResponse = (
+    StatusCode,
+    ResponseJson<ApiResponse<QueueStatus, QueueStatus>>,
+);
+
+fn mutation_response(result: QueueMutation) -> QueueResponse {
+    match result {
+        QueueMutation::Stored(status) => {
+            (StatusCode::OK, ResponseJson(ApiResponse::success(status)))
+        }
+        QueueMutation::Conflict(status) => (
+            StatusCode::CONFLICT,
+            ResponseJson(ApiResponse::error_with_data(status)),
+        ),
+    }
+}
+
 async fn queue_message(
     Extension(session): Extension<Session>,
     State(deployment): State<DeploymentImpl>,
     Json(payload): Json<QueueMessageRequest>,
-) -> Result<ResponseJson<ApiResponse<QueueStatus>>, ApiError> {
+) -> Result<QueueResponse, ApiError> {
     let data = DraftFollowUpData {
         message: payload.message,
         executor_config: payload.executor_config,
     };
-
-    let queued = deployment
+    let result = deployment
         .queued_message_service()
-        .queue_message(session.id, data);
+        .queue_message(session.id, data, QueuedMessageSource::Ui, payload.replace)
+        .await?;
 
-    deployment
-        .track_if_analytics_allowed(
-            "follow_up_queued",
-            serde_json::json!({
-                "session_id": session.id.to_string(),
-                "workspace_id": session.workspace_id.to_string(),
-            }),
-        )
-        .await;
-
-    Ok(ResponseJson(ApiResponse::success(QueueStatus::Queued {
-        message: queued,
-    })))
+    if matches!(result, QueueMutation::Stored(_)) {
+        deployment
+            .track_if_analytics_allowed(
+                "follow_up_queued",
+                serde_json::json!({
+                    "session_id": session.id.to_string(),
+                    "workspace_id": session.workspace_id.to_string(),
+                }),
+            )
+            .await;
+    }
+    Ok(mutation_response(result))
 }
 
-/// Cancel a queued follow-up message
 async fn cancel_queued_message(
     Extension(session): Extension<Session>,
     State(deployment): State<DeploymentImpl>,
-) -> Result<ResponseJson<ApiResponse<QueueStatus>>, ApiError> {
-    deployment
+) -> Result<QueueResponse, ApiError> {
+    let result = deployment
         .queued_message_service()
-        .cancel_queued(session.id);
-
-    deployment
-        .track_if_analytics_allowed(
-            "follow_up_queue_cancelled",
-            serde_json::json!({
-                "session_id": session.id.to_string(),
-                "workspace_id": session.workspace_id.to_string(),
-            }),
-        )
-        .await;
-
-    Ok(ResponseJson(ApiResponse::success(QueueStatus::Empty)))
+        .cancel_queued(session.id)
+        .await?;
+    if matches!(result, QueueMutation::Stored(_)) {
+        deployment
+            .track_if_analytics_allowed(
+                "follow_up_queue_cancelled",
+                serde_json::json!({
+                    "session_id": session.id.to_string(),
+                    "workspace_id": session.workspace_id.to_string(),
+                }),
+            )
+            .await;
+    }
+    Ok(mutation_response(result))
 }
 
-/// Get the current queue status for a session's workspace
 async fn get_queue_status(
     Extension(session): Extension<Session>,
     State(deployment): State<DeploymentImpl>,
 ) -> Result<ResponseJson<ApiResponse<QueueStatus>>, ApiError> {
-    let status = deployment.queued_message_service().get_status(session.id);
-
+    let status = deployment
+        .queued_message_service()
+        .get_status(session.id)
+        .await?;
     Ok(ResponseJson(ApiResponse::success(status)))
 }
 
@@ -93,4 +112,26 @@ pub(super) fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
             deployment.clone(),
             load_session_middleware,
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replace_conflict_returns_409_with_slot_status_body() {
+        let (status, ResponseJson(body)) =
+            mutation_response(QueueMutation::Conflict(QueueStatus::Empty));
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            serde_json::json!({
+                "success": false,
+                "data": null,
+                "error_data": { "status": "empty" },
+                "message": null
+            })
+        );
+    }
 }

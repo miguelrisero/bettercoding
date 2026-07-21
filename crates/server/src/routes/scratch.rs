@@ -48,7 +48,7 @@ pub async fn create_scratch(
 ) -> Result<ResponseJson<ApiResponse<Scratch>>, ApiError> {
     // Reject edits to draft_follow_up if a message is queued for this workspace
     if matches!(scratch_type, ScratchType::DraftFollowUp)
-        && deployment.queued_message_service().has_queued(id)
+        && deployment.queued_message_service().has_queued(id).await?
     {
         return Err(ApiError::BadRequest(
             "Cannot edit scratch while a message is queued".to_string(),
@@ -72,7 +72,7 @@ pub async fn update_scratch(
 ) -> Result<ResponseJson<ApiResponse<Scratch>>, ApiError> {
     // Reject edits to draft_follow_up if a message is queued for this workspace
     if matches!(scratch_type, ScratchType::DraftFollowUp)
-        && deployment.queued_message_service().has_queued(id)
+        && deployment.queued_message_service().has_queued(id).await?
     {
         return Err(ApiError::BadRequest(
             "Cannot edit scratch while a message is queued".to_string(),

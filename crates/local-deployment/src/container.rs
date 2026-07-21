@@ -744,8 +744,10 @@ impl LocalContainerService {
                         ExecutionProcessStatus::Failed | ExecutionProcessStatus::Killed
                     );
 
-                    if let Some(queued_msg) =
-                        container.queued_message_service.take_queued(ctx.session.id)
+                    if let Ok(Some(queued_msg)) = container
+                        .queued_message_service
+                        .take_queued(ctx.session.id)
+                        .await
                     {
                         if should_execute_queued {
                             tracing::info!(
@@ -827,8 +829,10 @@ impl LocalContainerService {
                     .unwrap_or(true);
 
                     if !has_running_agent
-                        && let Some(queued_msg) =
-                            container.queued_message_service.take_queued(ctx.session.id)
+                        && let Ok(Some(queued_msg)) = container
+                            .queued_message_service
+                            .take_queued(ctx.session.id)
+                            .await
                     {
                         tracing::info!(
                             "Parallel setup script finished with queued message for session {}, starting follow-up",

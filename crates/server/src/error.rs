@@ -22,6 +22,7 @@ use services::services::{
     config::{ConfigError, EditorOpenError},
     container::ContainerError,
     file::FileError,
+    queued_message::QueuedMessageError,
     remote_client::RemoteClientError,
     repo::RepoError as RepoServiceError,
 };
@@ -62,6 +63,8 @@ pub enum ApiError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     File(#[from] FileError),
+    #[error(transparent)]
+    QueuedMessage(#[from] QueuedMessageError),
     #[error("Multipart error: {0}")]
     Multipart(#[from] MultipartError),
     #[error("IO error: {0}")]
@@ -460,6 +463,7 @@ impl IntoResponse for ApiError {
                 error_type: "FileError",
                 message: Some("Failed to process file. Please try again.".into()),
             },
+            ApiError::QueuedMessage(_) => ErrorInfo::internal("QueuedMessageError"),
 
             ApiError::EditorOpen(EditorOpenError::LaunchFailed { .. }) => {
                 ErrorInfo::internal("EditorLaunchError")
