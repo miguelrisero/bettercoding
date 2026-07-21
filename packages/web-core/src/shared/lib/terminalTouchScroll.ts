@@ -21,6 +21,11 @@ import { getTerminalMobileState } from './terminalMobileState';
  * xterm's private pixel→row accumulator and deterministically scrolls exactly one
  * line; the pointer coords must land inside `.xterm-screen` or xterm drops the report.
  *
+ * During an owned vertical drag, the bridge samples the rendered row height once
+ * and dispatches one line-wheel per row of finger travel for roughly 1:1 content
+ * tracking. On release, velocity from the trailing 120ms of touch samples drives
+ * an interruptible exponential-decay tail (tau = 325ms) for native-style momentum.
+ *
  * The DOM-free `createTouchScrollController` is the unit-tested seam;
  * `installTerminalTouchScroll` is a thin adapter that wires real touch events to it.
  */
@@ -34,10 +39,22 @@ export interface Rect {
   bottom: number;
 }
 
-/** Accumulated finger travel (px) per dispatched line-wheel. */
-export const WHEEL_STEP_PX = 24;
+/** Finger travel (px) per dispatched line-wheel when row height is unavailable. */
+export const FALLBACK_WHEEL_STEP_PX = 16;
 /** Finger travel (px) before the gesture locks to an axis. */
 export const AXIS_LOCK_THRESHOLD_PX = 8;
+
+const MIN_WHEEL_STEP_PX = 8;
+const MAX_WHEEL_STEP_PX = 48;
+const VELOCITY_WINDOW_MS = 120;
+const VELOCITY_SAMPLE_CAPACITY = 32;
+const MIN_VELOCITY_WINDOW_MS = 8;
+const MIN_MOMENTUM_START_PX_PER_MS = 0.3;
+const MAX_MOMENTUM_PX_PER_MS = 3.5;
+const MOMENTUM_STOP_PX_PER_MS = 0.05;
+const MOMENTUM_TIME_CONSTANT_MS = 325;
+const MAX_MOMENTUM_WHEELS = 150;
+const MAX_WHEELS_PER_FRAME = 6;
 
 export function decideAxis(
   dx: number,
@@ -71,10 +88,18 @@ export interface TouchScrollDeps {
   getMouseTrackingMode: () => string;
   /** Dispatch one line-wheel: +1 = scroll down (toward newer), -1 = scroll up. */
   dispatchWheel: (direction: 1 | -1, clientX: number, clientY: number) => void;
+  /** Rendered terminal row height, sampled once at the start of each gesture. */
+  getLineHeightPx?: () => number;
+  /** Monotonic clock used for release-velocity samples. */
+  now?: () => number;
+  /** Frame scheduler used by the momentum tail. */
+  scheduleFrame?: (cb: (t: number) => void) => number;
+  /** Cancels a frame scheduled by `scheduleFrame`. */
+  cancelFrame?: (id: number) => void;
   /**
    * Another touch consumer owns the gesture (D-pad after a long-press, select
-   * mode). Checked per move; once true the bridge stands down for the rest of
-   * the touch sequence.
+   * mode). Checked per move and momentum tick; once true during a touch the
+   * bridge stands down for the rest of that sequence.
    */
   isSuppressed?: () => boolean;
 }
@@ -84,35 +109,168 @@ export interface TouchMoveResult {
   prevent: boolean;
 }
 
+interface VelocitySample {
+  t: number;
+  y: number;
+}
+
+function sanitizeWheelStep(stepPx: number | undefined): number {
+  if (stepPx === undefined || !Number.isFinite(stepPx) || stepPx <= 0) {
+    return FALLBACK_WHEEL_STEP_PX;
+  }
+  return Math.min(Math.max(stepPx, MIN_WHEEL_STEP_PX), MAX_WHEEL_STEP_PX);
+}
+
 /**
  * Pure, DOM-free gesture controller — the testable seam.
  */
 export function createTouchScrollController(deps: TouchScrollDeps) {
+  const readNow = deps.now ?? (() => 0);
   let axis: Axis = 'undecided';
   let startX = 0;
   let startY = 0;
   let lastY = 0;
+  let lastClientX = 0;
+  let lastClientY = 0;
+  let stepPx = FALLBACK_WHEEL_STEP_PX;
   let accumulated = 0;
+  let velocitySamples: VelocitySample[] = [];
+
+  let momentumFrameId: number | undefined;
+  let momentumGeneration = 0;
+  let momentumVelocity = 0;
+  let momentumCarry = 0;
+  let momentumWheelCount = 0;
+  let momentumPrevT = 0;
+
+  function cancelMomentum(): void {
+    momentumGeneration += 1;
+    if (momentumFrameId !== undefined) {
+      deps.cancelFrame?.(momentumFrameId);
+    }
+    momentumFrameId = undefined;
+    momentumVelocity = 0;
+    momentumCarry = 0;
+    momentumWheelCount = 0;
+    momentumPrevT = 0;
+  }
+
+  function scheduleMomentumFrame(): void {
+    if (!deps.scheduleFrame) {
+      cancelMomentum();
+      return;
+    }
+
+    const generation = momentumGeneration;
+    momentumFrameId = deps.scheduleFrame((nowT) => {
+      if (generation !== momentumGeneration) return;
+      momentumFrameId = undefined;
+      runMomentumFrame(nowT);
+    });
+  }
+
+  function runMomentumFrame(nowT: number): void {
+    if (deps.isSuppressed?.() || deps.getMouseTrackingMode() === 'none') {
+      cancelMomentum();
+      return;
+    }
+
+    const dt = Math.min(Math.max(nowT - momentumPrevT, 1), 64);
+    momentumPrevT = nowT;
+    momentumVelocity *= Math.exp(-dt / MOMENTUM_TIME_CONSTANT_MS);
+    momentumCarry += momentumVelocity * dt;
+
+    let frameWheelCount = 0;
+    while (
+      momentumCarry >= stepPx &&
+      frameWheelCount < MAX_WHEELS_PER_FRAME &&
+      momentumWheelCount < MAX_MOMENTUM_WHEELS
+    ) {
+      deps.dispatchWheel(1, lastClientX, lastClientY);
+      momentumCarry -= stepPx;
+      frameWheelCount += 1;
+      momentumWheelCount += 1;
+    }
+    while (
+      momentumCarry <= -stepPx &&
+      frameWheelCount < MAX_WHEELS_PER_FRAME &&
+      momentumWheelCount < MAX_MOMENTUM_WHEELS
+    ) {
+      deps.dispatchWheel(-1, lastClientX, lastClientY);
+      momentumCarry += stepPx;
+      frameWheelCount += 1;
+      momentumWheelCount += 1;
+    }
+
+    if (
+      Math.abs(momentumVelocity) < MOMENTUM_STOP_PX_PER_MS ||
+      momentumWheelCount >= MAX_MOMENTUM_WHEELS
+    ) {
+      cancelMomentum();
+      return;
+    }
+
+    scheduleMomentumFrame();
+  }
+
+  function appendVelocitySample(t: number, y: number): void {
+    velocitySamples.push({ t, y });
+    const cutoff = t - VELOCITY_WINDOW_MS;
+    while (velocitySamples[0]?.t < cutoff) velocitySamples.shift();
+    while (velocitySamples.length > VELOCITY_SAMPLE_CAPACITY) {
+      velocitySamples.shift();
+    }
+  }
+
+  function getExitVelocity(): number | undefined {
+    if (velocitySamples.length < 2) return undefined;
+    const oldest = velocitySamples[0];
+    const newest = velocitySamples[velocitySamples.length - 1];
+    const dt = newest.t - oldest.t;
+    if (dt < MIN_VELOCITY_WINDOW_MS) return undefined;
+
+    const velocity = (oldest.y - newest.y) / dt;
+    if (
+      !Number.isFinite(velocity) ||
+      Math.abs(velocity) < MIN_MOMENTUM_START_PX_PER_MS
+    ) {
+      return undefined;
+    }
+
+    return (
+      Math.sign(velocity) * Math.min(Math.abs(velocity), MAX_MOMENTUM_PX_PER_MS)
+    );
+  }
+
+  function resetGesture(nextAxis: Axis): void {
+    axis = nextAxis;
+    accumulated = 0;
+    velocitySamples = [];
+  }
 
   return {
     onTouchStart(p: TouchPoint): void {
-      accumulated = 0;
-      if (p.touches !== 1) {
-        axis = 'ignore'; // pinch / multi-touch — leave it to the browser
-        return;
-      }
-      axis = 'undecided';
+      cancelMomentum();
+      resetGesture(p.touches === 1 ? 'undecided' : 'ignore');
+      stepPx = sanitizeWheelStep(deps.getLineHeightPx?.());
       startX = p.clientX;
       startY = p.clientY;
       lastY = p.clientY;
+      lastClientX = p.clientX;
+      lastClientY = p.clientY;
+
+      if (p.touches !== 1) {
+        // Pinch / multi-touch — leave it to the browser.
+        return;
+      }
+      appendVelocitySample(readNow(), p.clientY);
     },
 
     onTouchMove(p: TouchPoint): TouchMoveResult {
       if (p.touches !== 1) {
         // A second finger landed mid-gesture — abandon scrolling for the rest
         // of this touch sequence so a pinch never bridges to wheel scrolling.
-        axis = 'ignore';
-        accumulated = 0;
+        resetGesture('ignore');
         return { prevent: false };
       }
       if (axis === 'ignore') return { prevent: false };
@@ -120,8 +278,7 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
       if (deps.isSuppressed?.()) {
         // The gesture layer (D-pad) or select mode took this touch sequence —
         // never turn its drag into wheel scrolling.
-        axis = 'ignore';
-        accumulated = 0;
+        resetGesture('ignore');
         return { prevent: false };
       }
 
@@ -130,22 +287,28 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
         if (axis !== 'vertical') return { prevent: false };
       }
 
+      lastClientX = p.clientX;
+      lastClientY = p.clientY;
+      appendVelocitySample(readNow(), p.clientY);
+
+      const deltaY = lastY - p.clientY;
+      lastY = p.clientY;
+
       // Only bridge when xterm's own touch scroll is disabled (mouse tracking on).
       // Otherwise let xterm scroll its scrollback natively — avoids double-scroll.
       if (deps.getMouseTrackingMode() === 'none') return { prevent: false };
 
       // Natural scrolling: finger up (clientY decreases) reveals newer content
       // (scroll down, +1); finger down reveals history (scroll up, -1).
-      accumulated += lastY - p.clientY;
-      lastY = p.clientY;
+      accumulated += deltaY;
 
-      while (accumulated >= WHEEL_STEP_PX) {
+      while (accumulated >= stepPx) {
         deps.dispatchWheel(1, p.clientX, p.clientY);
-        accumulated -= WHEEL_STEP_PX;
+        accumulated -= stepPx;
       }
-      while (accumulated <= -WHEEL_STEP_PX) {
+      while (accumulated <= -stepPx) {
         deps.dispatchWheel(-1, p.clientX, p.clientY);
-        accumulated += WHEEL_STEP_PX;
+        accumulated += stepPx;
       }
 
       // We've committed to the vertical gesture: always prevent page scroll/rubber-band,
@@ -154,10 +317,36 @@ export function createTouchScrollController(deps: TouchScrollDeps) {
     },
 
     onTouchEnd(remainingTouches = 0): void {
-      accumulated = 0;
+      cancelMomentum();
+
+      const exitVelocity =
+        remainingTouches === 0 &&
+        axis === 'vertical' &&
+        !deps.isSuppressed?.() &&
+        deps.getMouseTrackingMode() !== 'none'
+          ? getExitVelocity()
+          : undefined;
+
       // Only re-arm once every finger is up; a partial lift from a pinch must
       // not let the remaining finger resume a bridged scroll from stale state.
-      axis = remainingTouches === 0 ? 'undecided' : 'ignore';
+      resetGesture(remainingTouches === 0 ? 'undecided' : 'ignore');
+
+      if (exitVelocity !== undefined) {
+        momentumVelocity = exitVelocity;
+        momentumPrevT = readNow();
+        scheduleMomentumFrame();
+      }
+    },
+
+    onTouchCancel(): void {
+      cancelMomentum();
+      resetGesture('undecided');
+      startX = 0;
+      startY = 0;
+      lastY = 0;
+      lastClientX = 0;
+      lastClientY = 0;
+      stepPx = FALLBACK_WHEEL_STEP_PX;
     },
   };
 }
@@ -184,6 +373,11 @@ export function installTerminalTouchScroll(terminal: Terminal): () => void {
 
   const controller = createTouchScrollController({
     getMouseTrackingMode: () => terminal.modes.mouseTrackingMode,
+    getLineHeightPx: () =>
+      screen.getBoundingClientRect().height / Math.max(1, terminal.rows),
+    now: () => performance.now(),
+    scheduleFrame: (cb) => requestAnimationFrame(cb),
+    cancelFrame: (id) => cancelAnimationFrame(id),
     isSuppressed: () => {
       const state = getTerminalMobileState(terminal);
       return state.dpadActive || state.selectMode;
@@ -227,16 +421,18 @@ export function installTerminalTouchScroll(terminal: Terminal): () => void {
     }
   };
   const onEnd = (e: TouchEvent) => controller.onTouchEnd(e.touches.length);
+  const onCancel = () => controller.onTouchCancel();
 
   el.addEventListener('touchstart', onStart, { passive: true });
   el.addEventListener('touchmove', onMove, { passive: false });
   el.addEventListener('touchend', onEnd, { passive: true });
-  el.addEventListener('touchcancel', onEnd, { passive: true });
+  el.addEventListener('touchcancel', onCancel, { passive: true });
 
   return () => {
+    controller.onTouchCancel();
     el.removeEventListener('touchstart', onStart);
     el.removeEventListener('touchmove', onMove);
     el.removeEventListener('touchend', onEnd);
-    el.removeEventListener('touchcancel', onEnd);
+    el.removeEventListener('touchcancel', onCancel);
   };
 }
