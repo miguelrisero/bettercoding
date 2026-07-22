@@ -26,6 +26,15 @@ pub struct DeleteWorkspaceQuery {
     pub delete_branches: bool,
 }
 
+const RUNNING_PROCESSES_DELETE_MESSAGE: &str =
+    "Cannot delete workspace while processes are running. Stop all processes first.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteWorkspaceOutcome {
+    Deleted,
+    SkippedRunningProcesses,
+}
+
 pub async fn get_workspaces(
     State(deployment): State<DeploymentImpl>,
 ) -> Result<ResponseJson<ApiResponse<Vec<Workspace>>>, ApiError> {
@@ -101,6 +110,29 @@ pub async fn delete_workspace(
     State(deployment): State<DeploymentImpl>,
     Query(query): Query<DeleteWorkspaceQuery>,
 ) -> Result<(StatusCode, ResponseJson<ApiResponse<()>>), ApiError> {
+    match delete_workspace_core(
+        &deployment,
+        workspace,
+        query.delete_remote,
+        query.delete_branches,
+    )
+    .await?
+    {
+        DeleteWorkspaceOutcome::Deleted => {
+            Ok((StatusCode::ACCEPTED, ResponseJson(ApiResponse::success(()))))
+        }
+        DeleteWorkspaceOutcome::SkippedRunningProcesses => Err(ApiError::Conflict(
+            RUNNING_PROCESSES_DELETE_MESSAGE.to_string(),
+        )),
+    }
+}
+
+pub async fn delete_workspace_core(
+    deployment: &DeploymentImpl,
+    workspace: Workspace,
+    delete_remote: bool,
+    delete_branches: bool,
+) -> Result<DeleteWorkspaceOutcome, ApiError> {
     let pool = &deployment.db().pool;
     let workspace_manager = deployment.workspace_manager();
     let workspace_id = workspace.id;
@@ -108,10 +140,7 @@ pub async fn delete_workspace(
     if ExecutionProcess::has_running_non_dev_server_processes_for_workspace(pool, workspace_id)
         .await?
     {
-        return Err(ApiError::Conflict(
-            "Cannot delete workspace while processes are running. Stop all processes first."
-                .to_string(),
-        ));
+        return Ok(DeleteWorkspaceOutcome::SkippedRunningProcesses);
     }
 
     let dev_servers =
@@ -163,7 +192,7 @@ pub async fn delete_workspace(
         )
         .await;
 
-    if query.delete_remote {
+    if delete_remote {
         if let Ok(client) = deployment.remote_client() {
             match client.delete_workspace(workspace_id).await {
                 Ok(()) => {
@@ -185,9 +214,9 @@ pub async fn delete_workspace(
         }
     }
 
-    WorkspaceManager::spawn_workspace_deletion_cleanup(deletion_context, query.delete_branches);
+    WorkspaceManager::spawn_workspace_deletion_cleanup(deletion_context, delete_branches);
 
-    Ok((StatusCode::ACCEPTED, ResponseJson(ApiResponse::success(()))))
+    Ok(DeleteWorkspaceOutcome::Deleted)
 }
 
 #[axum::debug_handler]
