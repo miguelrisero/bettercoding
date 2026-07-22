@@ -3,7 +3,11 @@ import { useParams } from '@tanstack/react-router';
 import { useTranslation } from 'react-i18next';
 import { useWorkspaceContext } from '@/shared/hooks/useWorkspaceContext';
 import { useScratch } from '@/shared/hooks/useScratch';
-import { ScratchType, type DraftWorkspaceData } from 'shared/types';
+import {
+  ScratchType,
+  type ArchiveBucket,
+  type DraftWorkspaceData,
+} from 'shared/types';
 import { splitMessageToTitleDescription } from '@/shared/lib/string';
 import { cn } from '@/shared/lib/utils';
 import { useIsMobile } from '@/shared/hooks/useIsMobile';
@@ -22,6 +26,10 @@ import {
   WorkspacesSidebar,
   type WorkspacesSidebarPersistKeys,
 } from '@vibe/ui/components/WorkspacesSidebar';
+import type {
+  BulkDeleteDialogBranchStatus,
+  BulkDeleteDialogItemResult,
+} from '@vibe/ui/components/BulkDeleteArchivedWorkspacesDialog';
 import { PropertyDropdown } from '@vibe/ui/components/PropertyDropdown';
 import { PrimaryButton } from '@vibe/ui/components/PrimaryButton';
 import { IconButton } from '@vibe/ui/components/IconButton';
@@ -44,6 +52,7 @@ import {
   XIcon,
 } from '@phosphor-icons/react';
 import { useRemoteCloudHostsAppBarModel } from '@/shared/hooks/useRemoteCloudHosts';
+import { workspacesApi } from '@/shared/lib/api';
 
 export type WorkspaceLayoutMode = 'flat' | 'accordion';
 
@@ -381,6 +390,11 @@ export function WorkspacesSidebarContainer({
     [filteredArchivedWorkspaces, sortWorkspaces]
   );
 
+  const allSortedArchivedWorkspaces = useMemo(
+    () => sortWorkspaces(archivedWorkspaces),
+    [archivedWorkspaces, sortWorkspaces]
+  );
+
   // Apply pagination (only when not searching)
   const paginatedActiveWorkspaces = useMemo(
     () =>
@@ -396,6 +410,11 @@ export function WorkspacesSidebarContainer({
         ? sortedArchivedWorkspaces
         : sortedArchivedWorkspaces.slice(0, displayLimit),
     [sortedArchivedWorkspaces, displayLimit, isSearching]
+  );
+
+  const visibleArchivedWorkspaceIds = useMemo(
+    () => new Set(paginatedArchivedWorkspaces.map((workspace) => workspace.id)),
+    [paginatedArchivedWorkspaces]
   );
 
   // Check if there are more workspaces to load
@@ -464,6 +483,31 @@ export function WorkspacesSidebarContainer({
       workspaceId,
     });
   }, []);
+
+  const inspectArchivedWorkspace = useCallback(
+    async (workspaceId: string): Promise<BulkDeleteDialogBranchStatus[]> => {
+      const statuses = await workspacesApi.getBranchStatus(workspaceId);
+      return statuses.map((status) => ({
+        commitsAhead: status.commits_ahead,
+      }));
+    },
+    []
+  );
+
+  const bulkDeleteArchivedBucket = useCallback(
+    async (bucket: ArchiveBucket): Promise<BulkDeleteDialogItemResult[]> => {
+      const response = await workspacesApi.bulkDeleteArchived({
+        bucket,
+        delete_branches: true,
+      });
+      return response.results.map((result) => ({
+        workspaceId: result.workspace_id,
+        workspaceName: result.workspace_name,
+        outcome: result.outcome,
+      }));
+    },
+    []
+  );
 
   const sidebarPersistKeys: WorkspacesSidebarPersistKeys = {
     raisedHand: PERSIST_KEYS.workspacesSidebarRaisedHand,
@@ -540,7 +584,8 @@ export function WorkspacesSidebarContainer({
     <WorkspacesSidebar
       workspaces={paginatedActiveWorkspaces}
       totalWorkspacesCount={activeWorkspaces.length}
-      archivedWorkspaces={paginatedArchivedWorkspaces}
+      archivedWorkspaces={allSortedArchivedWorkspaces}
+      visibleArchivedWorkspaceIds={visibleArchivedWorkspaceIds}
       isLoading={isWorkspacesListLoading}
       selectedWorkspaceId={selectedWorkspaceId ?? null}
       onSelectWorkspace={handleSelectWorkspace}
@@ -558,6 +603,8 @@ export function WorkspacesSidebarContainer({
       hasMoreWorkspaces={hasMoreWorkspaces && !isSearching}
       searchControls={searchControls}
       onOpenWorkspaceActions={handleOpenWorkspaceActions}
+      inspectArchivedWorkspace={inspectArchivedWorkspace}
+      onBulkDeleteArchivedBucket={bulkDeleteArchivedBucket}
       persistKeys={sidebarPersistKeys}
       activeRemoteHost={activeRemoteHost}
       onOpenRemoteHostSettings={handleOpenRemoteHostSettings}
