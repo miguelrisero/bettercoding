@@ -47,6 +47,9 @@ pub struct SessionQueuedMessage {
     pub executor_claim_owner: Option<String>,
     #[serde(skip)]
     #[ts(skip)]
+    pub paste_claim_owner: Option<String>,
+    #[serde(skip)]
+    #[ts(skip)]
     pub dispatch_context: Option<String>,
     pub pasted_at: Option<DateTime<Utc>>,
     pub acked_at: Option<DateTime<Utc>>,
@@ -77,7 +80,8 @@ pub struct QueueReconciliation {
 impl SessionQueuedMessage {
     const SELECT_FIELDS: &'static str = r#"
         id, session_id, prompt, executor_config, source, state,
-        failure_reason, claude_session_id, executor_claim_owner, dispatch_context,
+        failure_reason, claude_session_id, executor_claim_owner, paste_claim_owner,
+        dispatch_context,
         pasted_at, acked_at,
         created_at, updated_at
     "#;
@@ -172,6 +176,7 @@ impl SessionQueuedMessage {
                        failure_reason = NULL,
                        claude_session_id = NULL,
                        executor_claim_owner = NULL,
+                       paste_claim_owner = NULL,
                        dispatch_context = $4,
                        pasted_at = NULL,
                        acked_at = NULL,
@@ -222,20 +227,23 @@ impl SessionQueuedMessage {
         id: Uuid,
         claude_session_id: Option<&str>,
         executor_claim_owner: Option<&str>,
+        paste_claim_owner: Option<&str>,
     ) -> Result<Option<Self>, sqlx::Error> {
         let result = sqlx::query!(
             r#"UPDATE session_queued_messages SET
                    state = 'pasting',
                    claude_session_id = $1,
                    executor_claim_owner = $2,
-                   pasted_at = CASE WHEN $2 IS NULL
+                   paste_claim_owner = $3,
+                   pasted_at = CASE WHEN $3 IS NOT NULL
                                     THEN datetime('now', 'subsec')
                                     ELSE NULL END,
                    failure_reason = NULL,
                    updated_at = datetime('now', 'subsec')
-               WHERE id = $3 AND state = 'queued'"#,
+               WHERE id = $4 AND state = 'queued'"#,
             claude_session_id,
             executor_claim_owner,
+            paste_claim_owner,
             id
         )
         .execute(pool)
@@ -251,8 +259,9 @@ impl SessionQueuedMessage {
         pool: &SqlitePool,
         id: Uuid,
         claude_session_id: Option<&str>,
+        owner: &str,
     ) -> Result<Option<Self>, sqlx::Error> {
-        Self::claim(pool, id, claude_session_id, None).await
+        Self::claim(pool, id, claude_session_id, None, Some(owner)).await
     }
 
     /// Claim a queued row for executor delivery. The process-scoped owner is
@@ -262,17 +271,24 @@ impl SessionQueuedMessage {
         id: Uuid,
         owner: &str,
     ) -> Result<Option<Self>, sqlx::Error> {
-        Self::claim(pool, id, None, Some(owner)).await
+        Self::claim(pool, id, None, Some(owner), None).await
     }
 
-    pub async fn mark_pasted(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+    pub async fn mark_pasted(
+        pool: &SqlitePool,
+        id: Uuid,
+        owner: &str,
+    ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query!(
             r#"UPDATE session_queued_messages SET
                    state = 'pasted',
+                   paste_claim_owner = NULL,
                    updated_at = datetime('now', 'subsec')
                WHERE id = $1 AND state = 'pasting'
-                 AND executor_claim_owner IS NULL"#,
-            id
+                 AND executor_claim_owner IS NULL
+                 AND paste_claim_owner = $2"#,
+            id,
+            owner
         )
         .execute(pool)
         .await?;
@@ -289,6 +305,7 @@ impl SessionQueuedMessage {
                    state = 'queued',
                    failure_reason = $1,
                    executor_claim_owner = NULL,
+                   paste_claim_owner = NULL,
                    claude_session_id = CASE
                        WHEN state = 'pasted' THEN claude_session_id
                        ELSE NULL
@@ -386,6 +403,7 @@ impl SessionQueuedMessage {
         pasting_grace: Duration,
         paste_ack_timeout: Duration,
         active_executor_claim_owner: Option<&str>,
+        active_paste_claim_owner: Option<&str>,
     ) -> Result<QueueReconciliation, sqlx::Error> {
         let imported = sqlx::query!(
             r#"UPDATE session_queued_messages SET
@@ -414,20 +432,31 @@ impl SessionQueuedMessage {
         let requeued_pasting = sqlx::query!(
             r#"UPDATE session_queued_messages SET
                    state = 'queued',
-                   failure_reason = 'delivery interrupted; queued for retry',
-                   claude_session_id = NULL,
+                   failure_reason = CASE
+                       WHEN pasted_at IS NOT NULL THEN $3
+                       ELSE 'delivery interrupted; queued for retry'
+                   END,
+                   claude_session_id = CASE
+                       WHEN pasted_at IS NOT NULL THEN claude_session_id
+                       ELSE NULL
+                   END,
                    executor_claim_owner = NULL,
-                   pasted_at = NULL,
+                   paste_claim_owner = NULL,
                    updated_at = datetime('now', 'subsec')
                WHERE state = 'pasting'
                  AND (
                      (executor_claim_owner IS NULL
+                      AND paste_claim_owner IS NULL
                       AND julianday(updated_at) <= julianday($1))
                      OR (executor_claim_owner IS NOT NULL
                          AND ($2 IS NULL OR executor_claim_owner != $2))
+                     OR (paste_claim_owner IS NOT NULL
+                         AND ($4 IS NULL OR paste_claim_owner != $4))
                  )"#,
             pasting_cutoff,
-            active_executor_claim_owner
+            active_executor_claim_owner,
+            PASTED_REQUEUE_FAILURE_REASON,
+            active_paste_claim_owner
         )
         .execute(pool)
         .await?
@@ -462,6 +491,11 @@ mod tests {
 
     use super::*;
     use crate::models::{
+        claude_session_link::ClaudeSessionLink,
+        cli_native_file::{CliNativeFile, RegisterCliNativeFile},
+        cli_native_record::{
+            CliNativeRecord, CliNativeRecordDisposition, ImportedCursor, NewCliNativeRecord,
+        },
         session::{CreateSession, Session},
         workspace::{CreateWorkspace, Workspace},
     };
@@ -550,7 +584,7 @@ mod tests {
                     && row.source == QueuedMessageSource::Recovery
         ));
 
-        SessionQueuedMessage::claim_for_paste(&pool, first.id, Some("sid"))
+        SessionQueuedMessage::claim_for_paste(&pool, first.id, Some("sid"), "paste-owner")
             .await
             .unwrap()
             .unwrap();
@@ -669,7 +703,7 @@ mod tests {
             StoreQueuedMessageResult::Stored(row) => row,
             StoreQueuedMessageResult::Conflict(_) => unreachable!(),
         };
-        SessionQueuedMessage::claim_for_paste(&pool, row.id, Some("sid"))
+        SessionQueuedMessage::claim_for_paste(&pool, row.id, Some("sid"), "paste-owner")
             .await
             .unwrap();
         let old = Utc::now() - Duration::seconds(10);
@@ -685,6 +719,7 @@ mod tests {
             Duration::seconds(5),
             Duration::seconds(30),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -698,10 +733,10 @@ mod tests {
             QueuedMessageState::Queued
         );
 
-        SessionQueuedMessage::claim_for_paste(&pool, row.id, Some("sid"))
+        SessionQueuedMessage::claim_for_paste(&pool, row.id, Some("sid"), "paste-owner")
             .await
             .unwrap();
-        SessionQueuedMessage::mark_pasted(&pool, row.id)
+        SessionQueuedMessage::mark_pasted(&pool, row.id, "paste-owner")
             .await
             .unwrap();
         let old = Utc::now() - Duration::seconds(31);
@@ -716,6 +751,7 @@ mod tests {
             Utc::now(),
             Duration::seconds(5),
             Duration::minutes(15),
+            None,
             None,
         )
         .await
@@ -742,6 +778,7 @@ mod tests {
             Utc::now(),
             Duration::seconds(5),
             Duration::minutes(15),
+            None,
             None,
         )
         .await
@@ -796,6 +833,7 @@ mod tests {
             Duration::seconds(5),
             Duration::minutes(15),
             Some("runtime-a"),
+            None,
         )
         .await
         .unwrap();
@@ -807,6 +845,7 @@ mod tests {
             Duration::seconds(5),
             Duration::minutes(15),
             Some("runtime-b"),
+            None,
         )
         .await
         .unwrap();
@@ -819,5 +858,130 @@ mod tests {
                 .state,
             QueuedMessageState::Queued
         );
+    }
+
+    #[tokio::test]
+    async fn abandoned_pasting_requeue_preserves_evidence_for_late_ack() {
+        let (pool, session_id) = session_fixture().await;
+        let sid = "43434343-4343-4343-8343-434343434343";
+        let prompt = "ack an abandoned paste";
+        ClaudeSessionLink::assign_manual(&pool, sid, session_id, "/tmp/abandoned-paste")
+            .await
+            .unwrap()
+            .unwrap();
+        let row = match SessionQueuedMessage::store(
+            &pool,
+            session_id,
+            prompt,
+            None,
+            QueuedMessageSource::Ui,
+            false,
+        )
+        .await
+        .unwrap()
+        {
+            StoreQueuedMessageResult::Stored(row) => row,
+            StoreQueuedMessageResult::Conflict(_) => unreachable!(),
+        };
+        let claimed =
+            SessionQueuedMessage::claim_for_paste(&pool, row.id, Some(sid), "abandoned-owner")
+                .await
+                .unwrap()
+                .unwrap();
+        let pasted_at = claimed.pasted_at.unwrap();
+        let old = Utc::now() - Duration::seconds(10);
+        sqlx::query("UPDATE session_queued_messages SET updated_at = ? WHERE id = ?")
+            .bind(old)
+            .bind(row.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let recovered = SessionQueuedMessage::reconcile(
+            &pool,
+            Utc::now(),
+            Duration::seconds(5),
+            Duration::minutes(15),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.requeued_pasting, 1);
+        let requeued = SessionQueuedMessage::find_by_id(&pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(requeued.was_requeued_from_pasted());
+        assert_eq!(requeued.pasted_at, Some(pasted_at));
+        assert_eq!(requeued.claude_session_id.as_deref(), Some(sid));
+        assert_eq!(
+            requeued.failure_reason.as_deref(),
+            Some(PASTED_REQUEUE_FAILURE_REASON)
+        );
+
+        let workspace_id = Session::find_by_id(&pool, session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .workspace_id;
+        let native_file = CliNativeFile::register(
+            &pool,
+            &RegisterCliNativeFile {
+                claude_session_id: sid,
+                dir_path: "/tmp/abandoned-paste-native",
+                file_name: "abandoned-paste.jsonl",
+                discovered_workspace_id: Some(workspace_id),
+                dev: 1,
+                inode: 43,
+                observed_size: 1,
+                observed_mtime_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        let recorded_at = pasted_at + Duration::seconds(1);
+        CliNativeRecord::import_batch(
+            &pool,
+            native_file.id,
+            &[NewCliNativeRecord {
+                line_seq: 0,
+                claude_session_id: sid.to_string(),
+                uuid: Some("late-user-ack".to_string()),
+                parent_uuid: None,
+                kind: "user".to_string(),
+                ts: Some(recorded_at.to_rfc3339()),
+                raw: "{}".to_string(),
+                disposition: CliNativeRecordDisposition::Renderable,
+                user_prompt: Some(prompt.to_string()),
+                recorded_at: Some(recorded_at),
+            }],
+            &ImportedCursor {
+                cursor_offset: 1,
+                next_line_seq: 1,
+                last_line_offset: 0,
+                last_line_hash: None,
+                observed_size: 1,
+                observed_mtime_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let acknowledged = SessionQueuedMessage::find_by_id(&pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(acknowledged.state, QueuedMessageState::Imported);
+        assert!(acknowledged.acked_at.is_some());
+        let bound_queue_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT bound_queued_message_id FROM cli_native_records \
+             WHERE file_id = ? AND line_seq = 0",
+        )
+        .bind(native_file.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bound_queue_id, Some(row.id));
     }
 }

@@ -149,6 +149,8 @@ pub enum CliCollabError {
     WorkspaceMissing(Uuid),
     #[error("queued message {0} lost its executor dispatch claim")]
     ExecutorClaimLost(Uuid),
+    #[error("queued message {0} lost its CLI paste claim")]
+    PasteClaimLost(Uuid),
     #[error("CLI transport failed for workspace {workspace_id}: {source}")]
     Transport {
         workspace_id: Uuid,
@@ -166,6 +168,7 @@ pub struct CliCollabService {
     session_locks: Mutex<HashMap<Uuid, Weak<Mutex<()>>>>,
     resume_signaled_bindings: Mutex<HashSet<Uuid>>,
     executor_claim_owner: String,
+    paste_claim_owner: String,
     notify: Notify,
     routing_disabled: bool,
     shutdown: CancellationToken,
@@ -189,6 +192,7 @@ impl CliCollabService {
             session_locks: Mutex::new(HashMap::new()),
             resume_signaled_bindings: Mutex::new(HashSet::new()),
             executor_claim_owner: Uuid::new_v4().to_string(),
+            paste_claim_owner: Uuid::new_v4().to_string(),
             notify: Notify::new(),
             routing_disabled: std::env::var_os("DISABLE_CLI_COLLAB_ROUTING").is_some(),
             shutdown,
@@ -629,8 +633,13 @@ impl CliCollabService {
         row: SessionQueuedMessage,
         claude_session_id: Option<&str>,
     ) -> Result<DispatchOutcome, CliCollabError> {
-        let Some(claimed) =
-            SessionQueuedMessage::claim_for_paste(&self.db.pool, row.id, claude_session_id).await?
+        let Some(claimed) = SessionQueuedMessage::claim_for_paste(
+            &self.db.pool,
+            row.id,
+            claude_session_id,
+            &self.paste_claim_owner,
+        )
+        .await?
         else {
             return Ok(DispatchOutcome::Conflict {
                 status: self.status(session.id).await?,
@@ -641,7 +650,15 @@ impl CliCollabService {
             .paste_and_submit(session.workspace_id, &claimed.prompt)
             .await
         {
-            SessionQueuedMessage::mark_pasted(&self.db.pool, claimed.id).await?;
+            if !SessionQueuedMessage::mark_pasted(
+                &self.db.pool,
+                claimed.id,
+                &self.paste_claim_owner,
+            )
+            .await?
+            {
+                return Err(CliCollabError::PasteClaimLost(claimed.id));
+            }
             let status = self.status(session.id).await?;
             Ok(DispatchOutcome::RoutedToCli { delivery: status })
         } else {
@@ -1163,6 +1180,7 @@ impl CliCollabService {
             PASTING_STARTUP_GRACE,
             PASTE_ACK_HARD_CAP,
             Some(&self.executor_claim_owner),
+            Some(&self.paste_claim_owner),
         )
         .await
         {
@@ -1504,6 +1522,36 @@ mod tests {
         }
     }
 
+    struct SlowPasteTransport {
+        calls: Arc<AtomicUsize>,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl CliPasteTransport for SlowPasteTransport {
+        async fn paste_and_submit(&self, _workspace_id: Uuid, _text: &str) -> bool {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            true
+        }
+
+        async fn pane_alive(&self, _workspace_id: Uuid) -> AnyhowResult<bool> {
+            Ok(true)
+        }
+
+        async fn agent_running(&self, _workspace_id: Uuid) -> Option<bool> {
+            Some(true)
+        }
+
+        async fn signal_resume_ready(&self, _workspace_id: Uuid, _sid: &str) -> AnyhowResult<()> {
+            Ok(())
+        }
+    }
+
     #[derive(Debug, Default)]
     struct ResumeTransportState {
         signals: Vec<(Uuid, String)>,
@@ -1694,6 +1742,7 @@ mod tests {
                 session_locks: Mutex::new(HashMap::new()),
                 resume_signaled_bindings: Mutex::new(HashSet::new()),
                 executor_claim_owner: Uuid::new_v4().to_string(),
+                paste_claim_owner: Uuid::new_v4().to_string(),
                 notify: Notify::new(),
                 routing_disabled: false,
                 shutdown: CancellationToken::new(),
@@ -2509,6 +2558,7 @@ mod tests {
             PASTING_STARTUP_GRACE,
             PASTE_ACK_HARD_CAP,
             Some(&service.executor_claim_owner),
+            Some(&service.paste_claim_owner),
         )
         .await
         .unwrap();
@@ -2554,6 +2604,148 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn slow_paste_is_not_reconciled_or_submitted_twice() {
+        let (db, workspace, session) = fixture().await;
+        let sid = "41414141-4141-4141-8141-414141414141";
+        bind_confirmed_cli(&db, &workspace, &session, sid).await;
+        let row = store_message(
+            &db,
+            session.id,
+            "paste exactly once",
+            QueuedMessageSource::Ui,
+        )
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(
+                true,
+                Some(true),
+                SidEvidence::ConfirmedResume(sid.to_string()),
+            ),
+            Arc::new(SlowPasteTransport {
+                calls: calls.clone(),
+                started: started.clone(),
+                release: release.clone(),
+            }),
+            Arc::new(NeverDispatcher),
+        );
+        let service = Arc::new(service);
+        let draining = {
+            let service = service.clone();
+            tokio::spawn(async move { service.drain_session(session.id).await })
+        };
+
+        started.notified().await;
+        let older_than_paste_grace =
+            Utc::now() - PASTING_STARTUP_GRACE - ChronoDuration::seconds(1);
+        sqlx::query("UPDATE session_queued_messages SET updated_at = ? WHERE id = ?")
+            .bind(older_than_paste_grace)
+            .bind(row.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        service.reconcile_delivery_state_from_db().await;
+
+        release.notify_one();
+        assert!(draining.await.unwrap().unwrap());
+        let _ = service.drain_session(session.id).await.unwrap();
+
+        let native_file = CliNativeFile::register(
+            &db.pool,
+            &RegisterCliNativeFile {
+                claude_session_id: sid,
+                dir_path: "/tmp/slow-paste-native",
+                file_name: "slow-paste.jsonl",
+                discovered_workspace_id: Some(workspace.id),
+                dev: 1,
+                inode: 41,
+                observed_size: 1,
+                observed_mtime_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO cli_native_records \
+                 (file_id, line_seq, claude_session_id, uuid, kind, raw, \
+                  disposition, bound_queued_message_id) \
+             VALUES (?, 0, ?, ?, 'user', '{}', 'renderable', ?)",
+        )
+        .bind(native_file.id)
+        .bind(sid)
+        .bind("slow-paste-user")
+        .bind(row.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        service.reconcile_delivery_state_from_db().await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let delivered = SessionQueuedMessage::find_by_id(&db.pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.state, QueuedMessageState::Imported);
+        assert!(delivered.acked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn paste_slot_does_not_report_delivery_after_losing_its_claim() {
+        let (db, workspace, session) = fixture().await;
+        let sid = "42424242-4242-4242-8242-424242424242";
+        bind_confirmed_cli(&db, &workspace, &session, sid).await;
+        let row = store_message(&db, session.id, "lose paste claim", QueuedMessageSource::Ui).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(
+                true,
+                Some(true),
+                SidEvidence::ConfirmedResume(sid.to_string()),
+            ),
+            Arc::new(SlowPasteTransport {
+                calls: calls.clone(),
+                started: started.clone(),
+                release: release.clone(),
+            }),
+            Arc::new(NeverDispatcher),
+        );
+        let service = Arc::new(service);
+        let draining = {
+            let service = service.clone();
+            tokio::spawn(async move { service.drain_session(session.id).await })
+        };
+
+        started.notified().await;
+        assert!(
+            SessionQueuedMessage::requeue(&db.pool, row.id, Some("claim cancelled"))
+                .await
+                .unwrap()
+        );
+        release.notify_one();
+
+        let result = draining.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(CliCollabError::PasteClaimLost(id)) if id == row.id
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            SessionQueuedMessage::find_by_id(&db.pool, row.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            QueuedMessageState::Queued
+        );
     }
 
     #[tokio::test]
@@ -2612,12 +2804,12 @@ mod tests {
         assert_eq!(replaced_message.data.message, "new UI prompt");
         assert_eq!(replaced_message.source, QueuedMessageSource::Ui);
 
-        SessionQueuedMessage::claim_for_paste(&db.pool, first_id, Some("sid"))
+        SessionQueuedMessage::claim_for_paste(&db.pool, first_id, Some("sid"), "test-paste-owner")
             .await
             .unwrap()
             .unwrap();
         assert!(
-            SessionQueuedMessage::mark_pasted(&db.pool, first_id)
+            SessionQueuedMessage::mark_pasted(&db.pool, first_id, "test-paste-owner")
                 .await
                 .unwrap()
         );
@@ -2652,11 +2844,11 @@ mod tests {
             QueuedMessageSource::Ui,
         )
         .await;
-        SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid))
+        SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid), "test-paste-owner")
             .await
             .unwrap()
             .unwrap();
-        SessionQueuedMessage::mark_pasted(&db.pool, row.id)
+        SessionQueuedMessage::mark_pasted(&db.pool, row.id, "test-paste-owner")
             .await
             .unwrap();
         sqlx::query(
@@ -2718,11 +2910,11 @@ mod tests {
             QueuedMessageSource::Recovery,
         )
         .await;
-        SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid))
+        SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid), "test-paste-owner")
             .await
             .unwrap()
             .unwrap();
-        SessionQueuedMessage::mark_pasted(&db.pool, row.id)
+        SessionQueuedMessage::mark_pasted(&db.pool, row.id, "test-paste-owner")
             .await
             .unwrap();
         let pasted_at = SessionQueuedMessage::find_by_id(&db.pool, row.id)
@@ -2766,11 +2958,11 @@ mod tests {
             QueuedMessageSource::Ui,
         )
         .await;
-        SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid))
+        SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid), "test-paste-owner")
             .await
             .unwrap()
             .unwrap();
-        SessionQueuedMessage::mark_pasted(&db.pool, row.id)
+        SessionQueuedMessage::mark_pasted(&db.pool, row.id, "test-paste-owner")
             .await
             .unwrap();
         sqlx::query(
@@ -2834,11 +3026,11 @@ mod tests {
             QueuedMessageSource::Ui,
         )
         .await;
-        SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid))
+        SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid), "test-paste-owner")
             .await
             .unwrap()
             .unwrap();
-        SessionQueuedMessage::mark_pasted(&db.pool, row.id)
+        SessionQueuedMessage::mark_pasted(&db.pool, row.id, "test-paste-owner")
             .await
             .unwrap();
         SessionQueuedMessage::requeue_pasted(&db.pool, row.id)
@@ -2911,10 +3103,15 @@ mod tests {
             QueuedMessageSource::Recovery,
         )
         .await;
-        SessionQueuedMessage::claim_for_paste(&db.pool, interrupted.id, Some("interrupted-sid"))
-            .await
-            .unwrap()
-            .unwrap();
+        SessionQueuedMessage::claim_for_paste(
+            &db.pool,
+            interrupted.id,
+            Some("interrupted-sid"),
+            "crashed-paste-owner",
+        )
+        .await
+        .unwrap()
+        .unwrap();
         sqlx::query(
             "UPDATE session_queued_messages \
              SET updated_at = datetime('now', '-6 seconds') WHERE id = ?",
@@ -2931,11 +3128,16 @@ mod tests {
             QueuedMessageSource::Ui,
         )
         .await;
-        SessionQueuedMessage::claim_for_paste(&db.pool, acknowledged.id, Some("acknowledged-sid"))
-            .await
-            .unwrap()
-            .unwrap();
-        SessionQueuedMessage::mark_pasted(&db.pool, acknowledged.id)
+        SessionQueuedMessage::claim_for_paste(
+            &db.pool,
+            acknowledged.id,
+            Some("acknowledged-sid"),
+            "test-paste-owner",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        SessionQueuedMessage::mark_pasted(&db.pool, acknowledged.id, "test-paste-owner")
             .await
             .unwrap();
         let native_file = CliNativeFile::register(

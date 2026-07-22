@@ -267,11 +267,11 @@ async fn pasted_slot(
         StoreQueuedMessageResult::Stored(row) => row,
         StoreQueuedMessageResult::Conflict(_) => panic!("fixture slot must be empty"),
     };
-    SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid))
+    SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid), "test-paste-owner")
         .await
         .unwrap()
         .unwrap();
-    SessionQueuedMessage::mark_pasted(&db.pool, row.id)
+    SessionQueuedMessage::mark_pasted(&db.pool, row.id, "test-paste-owner")
         .await
         .unwrap();
     SessionQueuedMessage::find_by_id(&db.pool, row.id)
