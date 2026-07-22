@@ -25,6 +25,7 @@ import { buildResolveConflictsInstructions } from '@/shared/lib/conflicts';
 import { useExecutionProcesses } from '@/shared/hooks/useExecutionProcesses';
 import { getLatestConfigFromProcesses } from '@/shared/lib/executor';
 import { dispatchWithConflictResolution } from '@/shared/lib/dispatchWithConflictResolution';
+import { shouldReportResolveConflictsError } from './resolveConflictsError';
 import { ConfirmDialog } from '@vibe/ui/components/ConfirmDialog';
 import type {
   BaseCodingAgent,
@@ -226,6 +227,7 @@ const ResolveConflictsDialogImpl = create<ResolveConflictsDialogProps>(
         } as ResolveConflictsDialogResult);
         modal.hide();
       } catch (err) {
+        if (!shouldReportResolveConflictsError(err)) return;
         console.error('Failed to resolve conflicts:', err);
         setError('Failed to start conflict resolution. Please try again.');
       } finally {
