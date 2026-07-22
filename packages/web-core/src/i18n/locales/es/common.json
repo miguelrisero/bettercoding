@@ -83,6 +83,10 @@
     "assistant": "Claude",
     "viaCli": "vía CLI",
     "cliSessionActive": "Sesión CLI activa",
+    "foreignWriter": {
+      "message": "Esta conversación se está editando fuera de la aplicación.",
+      "dismiss": "Cerrar aviso de edición externa"
+    },
     "quarantine": {
       "affordance": "CLI sin asignar",
       "openLabel": "Abrir {{count}} conversaciones CLI sin asignar",
@@ -108,7 +112,15 @@
       "explanation": "Algunos mensajes siguieron un camino que el agente ya no está siguiendo.",
       "branchLabel": "Rama {{index}}",
       "resumeHint": "Claude continúa aquí",
-      "emptyBranch": "No hay mensajes visibles en esta rama"
+      "emptyBranch": "No hay mensajes visibles en esta rama",
+      "bringBack": "Recuperar estos mensajes",
+      "bringingBack": "Recuperando estos mensajes…",
+      "recoveryStartedToast": "Los mensajes recuperados se enviaron al agente",
+      "recoveryQueuedToast": "Recuperación en espera — el agente está ocupado; estos mensajes se enviarán a continuación",
+      "recoveryRoutedToast": "Recuperación enviada a la CLI — esperando a que aparezca en la conversación",
+      "recoveryConflictToast": "No se envió la recuperación — ya hay otro mensaje en cola",
+      "recoveryErrorToast": "No se pudieron recuperar estos mensajes. Inténtalo de nuevo.",
+      "dismissToast": "Cerrar notificación de recuperación"
     },
     "loadingEarlierMessages": "Cargando mensajes anteriores",
     "cliEmptyTitle": "Este workspace normalmente se ejecuta en la terminal",

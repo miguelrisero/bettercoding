@@ -1,31 +1,37 @@
 pub mod queue;
 pub mod review;
 
+use std::str::FromStr;
+
 use axum::{
     Extension, Json, Router,
     extract::{Query, State},
+    http::StatusCode,
     middleware::from_fn_with_state,
     response::Json as ResponseJson,
     routing::{get, post},
 };
 use db::models::{
+    cli_native_record::CliNativeRecord,
     coding_agent_turn::CodingAgentTurn,
     execution_process::{ExecutionProcess, ExecutionProcessRunReason},
     requests::UpdateSession,
     scratch::{Scratch, ScratchType},
     session::{CreateSession, Session, SessionError},
+    session_queued_message::QueuedMessageSource,
     workspace::{Workspace, WorkspaceError},
     workspace_repo::WorkspaceRepo,
 };
 use deployment::Deployment;
 use executors::{
-    actions::{
-        ExecutorAction, ExecutorActionType, coding_agent_follow_up::CodingAgentFollowUpRequest,
-    },
+    executors::{BaseCodingAgent, claude::native::adapt_native_claude_line},
     profile::ExecutorConfig,
 };
 use serde::Deserialize;
-use services::services::container::ContainerService;
+use services::services::{
+    cli_collab::{DispatchOutcome, RetryDispatchContext},
+    container::ContainerService,
+};
 use ts_rs::TS;
 use utils::response::ApiResponse;
 use uuid::Uuid;
@@ -112,6 +118,8 @@ pub struct CreateFollowUpAttempt {
     pub retry_process_id: Option<Uuid>,
     pub force_when_dirty: Option<bool>,
     pub perform_git_reset: Option<bool>,
+    #[serde(default)]
+    pub replace: bool,
 }
 
 #[derive(Debug, Deserialize, TS)]
@@ -121,11 +129,27 @@ pub struct ResetProcessRequest {
     pub perform_git_reset: Option<bool>,
 }
 
+type DispatchResponse = (
+    StatusCode,
+    ResponseJson<ApiResponse<DispatchOutcome, DispatchOutcome>>,
+);
+
+fn dispatch_response(outcome: DispatchOutcome) -> DispatchResponse {
+    if matches!(&outcome, DispatchOutcome::Conflict { .. }) {
+        (
+            StatusCode::CONFLICT,
+            ResponseJson(ApiResponse::error_with_data(outcome)),
+        )
+    } else {
+        (StatusCode::OK, ResponseJson(ApiResponse::success(outcome)))
+    }
+}
+
 pub async fn follow_up(
     Extension(session): Extension<Session>,
     State(deployment): State<DeploymentImpl>,
     Json(payload): Json<CreateFollowUpAttempt>,
-) -> Result<ResponseJson<ApiResponse<ExecutionProcess>>, ApiError> {
+) -> Result<DispatchResponse, ApiError> {
     let pool = &deployment.db().pool;
 
     // Load workspace from session
@@ -166,62 +190,60 @@ pub async fn follow_up(
             .await?;
     }
 
-    if let Some(proc_id) = payload.retry_process_id {
-        let force_when_dirty = payload.force_when_dirty.unwrap_or(false);
-        let perform_git_reset = payload.perform_git_reset.unwrap_or(true);
-        deployment
-            .container()
-            .reset_session_to_process(session.id, proc_id, perform_git_reset, force_when_dirty)
-            .await?;
-    }
-
-    let latest_session_info = CodingAgentTurn::find_latest_session_info(pool, session.id).await?;
-
-    let prompt = payload.prompt;
-
-    let repos = WorkspaceRepo::find_repos_for_workspace(pool, workspace.id).await?;
-    let cleanup_action = deployment.container().cleanup_actions_for_repos(&repos);
-
-    let working_dir = session
-        .agent_working_dir
-        .as_ref()
-        .filter(|dir| !dir.is_empty())
-        .cloned();
-
-    let action_type = if let Some(info) = latest_session_info {
-        let is_reset = payload.retry_process_id.is_some();
-        ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
-            prompt: prompt.clone(),
-            session_id: info.session_id,
-            reset_to_message_id: if is_reset { info.message_id } else { None },
-            executor_config: payload.executor_config.clone(),
-            working_dir: working_dir.clone(),
+    let retry = if let Some(process_id) = payload.retry_process_id {
+        let reset_to_message_id = CodingAgentTurn::find_latest_session_info(pool, session.id)
+            .await?
+            .and_then(|info| info.message_id);
+        Some(RetryDispatchContext {
+            process_id,
+            force_when_dirty: payload.force_when_dirty.unwrap_or(false),
+            perform_git_reset: payload.perform_git_reset.unwrap_or(true),
+            reset_to_message_id,
         })
     } else {
-        ExecutorActionType::CodingAgentInitialRequest(
-            executors::actions::coding_agent_initial::CodingAgentInitialRequest {
-                prompt,
-                executor_config: payload.executor_config.clone(),
-                working_dir,
-            },
-        )
+        None
     };
 
-    let action = ExecutorAction::new(action_type, cleanup_action.map(Box::new));
-
-    let execution_process = deployment
-        .container()
-        .start_execution(
-            &workspace,
-            &session,
-            &action,
-            &ExecutionProcessRunReason::CodingAgent,
-        )
-        .await?;
+    let dispatch = if let Some(retry) = retry {
+        deployment
+            .cli_collab()
+            .dispatch_retry(
+                &session,
+                payload.prompt,
+                payload.executor_config,
+                QueuedMessageSource::Ui,
+                payload.replace,
+                retry,
+            )
+            .await
+    } else {
+        deployment
+            .cli_collab()
+            .dispatch_gate(
+                &session,
+                payload.prompt,
+                payload.executor_config,
+                QueuedMessageSource::Ui,
+                payload.replace,
+            )
+            .await
+    };
+    let outcome = match dispatch {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(?error, session_id = %session.id, "follow-up dispatch gate failed closed");
+            return Err(ApiError::Conflict(
+                "Writer state could not be verified; the message was not dispatched".to_string(),
+            ));
+        }
+    };
+    let conflict = matches!(&outcome, DispatchOutcome::Conflict { .. });
 
     // Clear the draft follow-up scratch on successful spawn
     // This ensures the scratch is wiped even if the user navigates away quickly
-    if let Err(e) = Scratch::delete(pool, session.id, &ScratchType::DraftFollowUp).await {
+    if !conflict
+        && let Err(e) = Scratch::delete(pool, session.id, &ScratchType::DraftFollowUp).await
+    {
         // Log but don't fail the request - scratch deletion is best-effort
         tracing::debug!(
             "Failed to delete draft follow-up scratch for session {}: {}",
@@ -230,7 +252,104 @@ pub async fn follow_up(
         );
     }
 
-    Ok(ResponseJson(ApiResponse::success(execution_process)))
+    Ok(dispatch_response(outcome))
+}
+
+#[derive(Debug, Deserialize, TS)]
+pub struct ForkRecoveryRequest {
+    pub fork_parent_uuid: String,
+    pub branch_leaf_uuid: String,
+}
+
+async fn latest_executor_config(
+    pool: &sqlx::SqlitePool,
+    session: &Session,
+) -> Result<ExecutorConfig, ApiError> {
+    if let Some(config) =
+        ExecutionProcess::latest_executor_config_for_session(pool, session.id).await?
+    {
+        return Ok(config);
+    }
+    let executor = session
+        .executor
+        .as_deref()
+        .and_then(|executor| BaseCodingAgent::from_str(executor).ok())
+        .ok_or_else(|| {
+            ApiError::BadRequest("No executor configuration exists for this session".to_string())
+        })?;
+    Ok(ExecutorConfig::new(executor))
+}
+
+pub async fn fork_recovery(
+    Extension(session): Extension<Session>,
+    State(deployment): State<DeploymentImpl>,
+    Json(payload): Json<ForkRecoveryRequest>,
+) -> Result<DispatchResponse, ApiError> {
+    let pool = &deployment.db().pool;
+    let workspace = Workspace::find_by_id(pool, session.workspace_id)
+        .await?
+        .ok_or(ApiError::Workspace(WorkspaceError::ValidationError(
+            "Workspace not found".to_string(),
+        )))?;
+    deployment
+        .container()
+        .ensure_container_exists(&workspace)
+        .await?;
+    let path = CliNativeRecord::dropped_branch_path(
+        pool,
+        session.id,
+        &payload.fork_parent_uuid,
+        &payload.branch_leaf_uuid,
+    )
+    .await?
+    .ok_or_else(|| ApiError::BadRequest("The requested fork branch was not found".to_string()))?;
+    let mut prompts = Vec::new();
+    for record in path {
+        if record.uuid.as_deref() == Some(payload.fork_parent_uuid.as_str())
+            || record.kind != "user"
+        {
+            continue;
+        }
+        if let Ok(line) = adapt_native_claude_line(&record.raw, &record.claude_session_id)
+            && let Some(prompt) = line.plain_user_text()
+        {
+            prompts.push(prompt);
+        }
+    }
+    if prompts.is_empty() {
+        return Err(ApiError::BadRequest(
+            "The requested fork branch has no recoverable user messages".to_string(),
+        ));
+    }
+    let prompt = if prompts.len() == 1 {
+        prompts.pop().expect("one prompt exists")
+    } else {
+        format!(
+            "Recovered messages from an alternate CLI branch:\n\n{}",
+            prompts.join("\n\n--- recovered message ---\n\n")
+        )
+    };
+    let executor_config = latest_executor_config(pool, &session).await?;
+    let outcome = match deployment
+        .cli_collab()
+        .dispatch_gate(
+            &session,
+            prompt,
+            executor_config,
+            QueuedMessageSource::Recovery,
+            false,
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(?error, session_id = %session.id, "fork recovery dispatch failed closed");
+            return Err(ApiError::Conflict(
+                "Writer state could not be verified; recovery was not dispatched".to_string(),
+            ));
+        }
+    };
+    Ok(dispatch_response(outcome))
 }
 
 pub async fn reset_process(
@@ -315,6 +434,7 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
     let session_id_router = Router::new()
         .route("/", get(get_session).put(update_session))
         .route("/follow-up", post(follow_up))
+        .route("/fork-recovery", post(fork_recovery))
         .route("/reset", post(reset_process))
         .route("/setup", post(run_setup_script))
         .route("/review", post(review::start_review))

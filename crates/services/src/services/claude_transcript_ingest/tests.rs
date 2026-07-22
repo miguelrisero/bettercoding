@@ -1,17 +1,31 @@
-use std::{collections::HashSet, fs, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    fs,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
+use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use db::{
     DBService,
     models::{
         claude_session_link::{ClaudeSessionBoundVia, ClaudeSessionLink},
         cli_ingest_outbox::CliIngestOutbox,
-        cli_native_file::CliNativeFile,
-        cli_native_record::{CliNativeRecord, CliNativeRecordDisposition},
+        cli_native_file::{CliNativeFile, RegisterCliNativeFile},
+        cli_native_record::{
+            CliNativeRecord, CliNativeRecordDisposition, ImportedCursor, NativeImportContext,
+            NewCliNativeRecord,
+        },
+        cli_pane_binding::{CliPaneBinding, CliPaneBoundVia},
         coding_agent_turn::{CodingAgentTurn, CreateCodingAgentTurn},
         execution_native_link::ExecutionNativeLink,
         execution_process::{CreateExecutionProcess, ExecutionProcess, ExecutionProcessRunReason},
         session::{CreateSession, Session},
+        session_queued_message::{
+            QueuedMessageSource, QueuedMessageState, SessionQueuedMessage, StoreQueuedMessageResult,
+        },
         workspace::{CreateWorkspace, Workspace},
     },
 };
@@ -31,6 +45,48 @@ use super::{
     ClaudeTranscriptIngest, ClaudeTranscriptIngestError, DirectoryContext, NativeFeedOrigin,
     NativeFeedUpdate, claude_project_slug, first_prompt_snippet,
 };
+use crate::services::cli_collab::{CliWriterProbe, ProbeReport, SidEvidence};
+
+#[derive(Clone)]
+struct StaticWriterProbe(ProbeReport);
+
+#[async_trait]
+impl CliWriterProbe for StaticWriterProbe {
+    async fn probe(
+        &self,
+        _workspace_id: Uuid,
+        _effective_dir: &Path,
+        _expected_sid: Option<&str>,
+        _binding: Option<&CliPaneBinding>,
+        _check_cwd_uniqueness: bool,
+    ) -> ProbeReport {
+        self.0.clone()
+    }
+}
+
+#[derive(Clone)]
+struct RecordingWriterProbe {
+    report: ProbeReport,
+    uniqueness_checks: Arc<Mutex<Vec<bool>>>,
+}
+
+#[async_trait]
+impl CliWriterProbe for RecordingWriterProbe {
+    async fn probe(
+        &self,
+        _workspace_id: Uuid,
+        _effective_dir: &Path,
+        _expected_sid: Option<&str>,
+        _binding: Option<&CliPaneBinding>,
+        check_cwd_uniqueness: bool,
+    ) -> ProbeReport {
+        self.uniqueness_checks
+            .lock()
+            .unwrap()
+            .push(check_cwd_uniqueness);
+        self.report.clone()
+    }
+}
 
 fn effective_cwd(workspace: &Workspace, session: &Session) -> Option<std::path::PathBuf> {
     workspace
@@ -170,6 +226,609 @@ fn native_user_record(sid: &str, uuid: &str, text: &str, timestamp: &str) -> Str
             "message": { "role": "user", "content": text }
         })
     )
+}
+
+async fn register_native_file(db: &DBService, workspace_id: Uuid, sid: &str) -> CliNativeFile {
+    CliNativeFile::register(
+        &db.pool,
+        &RegisterCliNativeFile {
+            claude_session_id: sid,
+            dir_path: "/tmp/native-import-test",
+            file_name: &format!("{sid}.jsonl"),
+            discovered_workspace_id: Some(workspace_id),
+            dev: 1,
+            inode: sid.bytes().map(i64::from).sum(),
+            observed_size: 1,
+            observed_mtime_ms: None,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn pasted_slot(
+    db: &DBService,
+    session_id: Uuid,
+    sid: &str,
+    prompt: &str,
+) -> SessionQueuedMessage {
+    let config = serde_json::to_string(&ExecutorConfig::new(BaseCodingAgent::ClaudeCode)).unwrap();
+    let row = match SessionQueuedMessage::store(
+        &db.pool,
+        session_id,
+        prompt,
+        Some(&config),
+        QueuedMessageSource::Ui,
+        false,
+    )
+    .await
+    .unwrap()
+    {
+        StoreQueuedMessageResult::Stored(row) => row,
+        StoreQueuedMessageResult::Conflict(_) => panic!("fixture slot must be empty"),
+    };
+    SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid), "test-paste-owner")
+        .await
+        .unwrap()
+        .unwrap();
+    SessionQueuedMessage::mark_pasted(&db.pool, row.id, "test-paste-owner")
+        .await
+        .unwrap();
+    SessionQueuedMessage::find_by_id(&db.pool, row.id)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+fn import_record(
+    sid: &str,
+    line_seq: i64,
+    uuid: &str,
+    prompt: &str,
+    at: chrono::DateTime<Utc>,
+) -> NewCliNativeRecord {
+    NewCliNativeRecord {
+        line_seq,
+        claude_session_id: sid.to_string(),
+        uuid: Some(uuid.to_string()),
+        parent_uuid: None,
+        kind: "user".to_string(),
+        ts: Some(at.to_rfc3339()),
+        raw: native_user_record(sid, uuid, prompt, &at.to_rfc3339())
+            .trim()
+            .to_string(),
+        disposition: CliNativeRecordDisposition::Renderable,
+        user_prompt: Some(prompt.to_string()),
+        recorded_at: Some(at),
+    }
+}
+
+fn cursor(next_line_seq: i64) -> ImportedCursor<'static> {
+    ImportedCursor {
+        cursor_offset: next_line_seq + 1,
+        next_line_seq,
+        last_line_offset: next_line_seq,
+        last_line_hash: None,
+        observed_size: next_line_seq + 1,
+        observed_mtime_ms: None,
+    }
+}
+
+fn writer_report(
+    pane_session_exists: bool,
+    agent_running: Option<bool>,
+    sid_evidence: SidEvidence,
+    only_active_claude_in_cwd: Option<bool>,
+) -> ProbeReport {
+    ProbeReport {
+        pane_session_exists,
+        agent_running,
+        sid_evidence,
+        probe_failed: false,
+        only_active_claude_in_cwd,
+    }
+}
+
+async fn import_foreign_writer_case(report: ProbeReport, executor_running: bool) -> (bool, bool) {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, &workspace_root).await;
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    let sid = "45454545-4545-4545-8545-454545454545";
+    ClaudeSessionLink::assign_manual(&db.pool, sid, session.id, &cwd.to_string_lossy())
+        .await
+        .unwrap()
+        .unwrap();
+    if executor_running {
+        create_coding_turn(&db, session.id, "unrelated running prompt").await;
+    }
+    fs::write(
+        native_dir.join(format!("{sid}.jsonl")),
+        native_user_record(
+            sid,
+            "foreign-user",
+            "written elsewhere",
+            "2026-07-21T12:00:00Z",
+        ),
+    )
+    .unwrap();
+
+    let service = Arc::new(ClaudeTranscriptIngest::new_with_probe(
+        db.clone(),
+        projects_dir,
+        Arc::new(StaticWriterProbe(report)),
+    ));
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let rows = CliNativeRecord::list_for_session(&db.pool, session.id)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].linked_execution_process_id, None);
+    assert_eq!(rows[0].bound_turn_execution_process_id, None);
+    assert_eq!(rows[0].bound_queued_message_id, None);
+    let link = ClaudeSessionLink::find(&db.pool, sid)
+        .await
+        .unwrap()
+        .unwrap();
+    let health = service.snapshot(session.id).await.unwrap().health;
+    (
+        link.foreign_writer_seen_at.is_some(),
+        health.foreign_writer_seen_at.is_some(),
+    )
+}
+
+async fn import_cli_fresh_case(
+    release_binding: bool,
+    report: ProbeReport,
+) -> (Option<ClaudeSessionLink>, CliPaneBinding, u64, Vec<bool>) {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("worktree");
+    let projects_dir = temp.path().join("projects");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, &workspace_root).await;
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    let native_dir = store_dir(&projects_dir, &cwd);
+    fs::create_dir_all(&native_dir).unwrap();
+    let sid = "46464646-4646-4646-8646-464646464646";
+    let binding = CliPaneBinding::record_launch(
+        &db.pool,
+        workspace.id,
+        session.id,
+        None,
+        CliPaneBoundVia::CliFresh,
+    )
+    .await
+    .unwrap();
+    if release_binding {
+        assert!(CliPaneBinding::release(&db.pool, binding.id).await.unwrap());
+    }
+    fs::write(
+        native_dir.join(format!("{sid}.jsonl")),
+        native_user_record(
+            sid,
+            "cli-fresh-user",
+            "new CLI conversation",
+            "2026-07-21T12:00:00Z",
+        ),
+    )
+    .unwrap();
+
+    let uniqueness_checks = Arc::new(Mutex::new(Vec::new()));
+    let service = Arc::new(ClaudeTranscriptIngest::new_with_probe(
+        db.clone(),
+        projects_dir,
+        Arc::new(RecordingWriterProbe {
+            report,
+            uniqueness_checks: uniqueness_checks.clone(),
+        }),
+    ));
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let link = ClaudeSessionLink::find(&db.pool, sid).await.unwrap();
+    let binding = CliPaneBinding::find_by_id(&db.pool, binding.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let quarantined_files = service
+        .snapshot(session.id)
+        .await
+        .unwrap()
+        .health
+        .quarantined_files;
+    let uniqueness_checks = uniqueness_checks.lock().unwrap().clone();
+    (link, binding, quarantined_files, uniqueness_checks)
+}
+
+#[tokio::test]
+async fn foreign_writer_is_recorded_and_surfaced_when_no_app_writer_is_live() {
+    let observed = import_foreign_writer_case(
+        writer_report(false, Some(false), SidEvidence::Unknown, Some(false)),
+        false,
+    )
+    .await;
+    assert_eq!(observed, (true, true));
+}
+
+#[tokio::test]
+async fn foreign_writer_classifier_fails_safe_for_executor_pane_and_probe_failure() {
+    let executor_running = import_foreign_writer_case(
+        writer_report(false, Some(false), SidEvidence::Unknown, Some(false)),
+        true,
+    )
+    .await;
+    assert_eq!(executor_running, (false, false));
+
+    let live_pane = import_foreign_writer_case(
+        writer_report(true, Some(true), SidEvidence::Unknown, Some(true)),
+        false,
+    )
+    .await;
+    assert_eq!(live_pane, (false, false));
+
+    let probe_failure = import_foreign_writer_case(ProbeReport::failed(), false).await;
+    assert_eq!(probe_failure, (false, false));
+}
+
+#[tokio::test]
+async fn cli_fresh_file_auto_binds_to_the_only_live_unreleased_pane() {
+    let (link, binding, quarantined_files, _) = import_cli_fresh_case(
+        false,
+        writer_report(true, Some(true), SidEvidence::NoResumeArg, Some(true)),
+    )
+    .await;
+    let link = link.unwrap();
+    assert_eq!(link.session_id, binding.session_id);
+    assert_eq!(link.bound_via, ClaudeSessionBoundVia::CliFresh);
+    assert_eq!(
+        binding.claude_session_id.as_deref(),
+        Some(link.claude_session_id.as_str())
+    );
+    assert!(binding.released_at.is_none());
+    assert_eq!(quarantined_files, 0);
+}
+
+#[tokio::test]
+async fn cwd_uniqueness_is_requested_only_for_cli_fresh_auto_binding() {
+    let (_, _, _, uniqueness_checks) = import_cli_fresh_case(
+        false,
+        writer_report(true, Some(true), SidEvidence::NoResumeArg, Some(true)),
+    )
+    .await;
+
+    assert_eq!(uniqueness_checks, vec![true, false]);
+}
+
+#[tokio::test]
+async fn cli_fresh_file_quarantines_for_released_dead_or_nonexclusive_panes() {
+    let healthy_report = || writer_report(true, Some(true), SidEvidence::NoResumeArg, Some(true));
+    let cases = [
+        (true, healthy_report()),
+        (
+            false,
+            writer_report(false, Some(false), SidEvidence::NoResumeArg, Some(true)),
+        ),
+        (
+            false,
+            writer_report(true, Some(true), SidEvidence::NoResumeArg, Some(false)),
+        ),
+    ];
+
+    for (release_binding, report) in cases {
+        let (link, binding, quarantined_files, _) =
+            import_cli_fresh_case(release_binding, report).await;
+        assert!(link.is_none());
+        assert!(binding.claude_session_id.is_none());
+        assert_eq!(quarantined_files, 1);
+    }
+}
+
+#[tokio::test]
+async fn paste_ack_binding_and_slot_import_are_atomic_and_project_as_app_origin() {
+    let temp = TempDir::new().unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, temp.path()).await;
+    let sid = "41414141-4141-4141-8141-414141414141";
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    ClaudeSessionLink::assign_manual(&db.pool, sid, session.id, &cwd.to_string_lossy())
+        .await
+        .unwrap()
+        .unwrap();
+    let native_file = register_native_file(&db, workspace.id, sid).await;
+    let slot = pasted_slot(&db, session.id, sid, "deliver through CLI").await;
+    let recorded_at = slot.pasted_at.unwrap() + ChronoDuration::seconds(1);
+    let record = import_record(
+        sid,
+        0,
+        "delivery-bound-user",
+        "deliver through CLI",
+        recorded_at,
+    );
+
+    sqlx::query(
+        "CREATE TRIGGER fail_native_cursor BEFORE UPDATE ON cli_native_files \
+         BEGIN SELECT RAISE(ABORT, 'cursor failure'); END",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        CliNativeRecord::import_batch_with_context(
+            &db.pool,
+            native_file.id,
+            std::slice::from_ref(&record),
+            &cursor(1),
+            NativeImportContext::default(),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        CliNativeRecord::count_for_file(&db.pool, native_file.id)
+            .await
+            .unwrap(),
+        0
+    );
+    let rolled_back_slot = SessionQueuedMessage::find_by_id(&db.pool, slot.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rolled_back_slot.state, QueuedMessageState::Pasted);
+    assert!(rolled_back_slot.acked_at.is_none());
+
+    sqlx::query("DROP TRIGGER fail_native_cursor")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    CliNativeRecord::import_batch_with_context(
+        &db.pool,
+        native_file.id,
+        &[record],
+        &cursor(1),
+        NativeImportContext::default(),
+    )
+    .await
+    .unwrap();
+
+    let rows = CliNativeRecord::list_for_session(&db.pool, session.id)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].bound_queued_message_id, Some(slot.id));
+    let imported_slot = SessionQueuedMessage::find_by_id(&db.pool, slot.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(imported_slot.state, QueuedMessageState::Imported);
+    assert!(imported_slot.acked_at.is_some());
+    assert_eq!(imported_slot.prompt, "deliver through CLI");
+
+    let service = ClaudeTranscriptIngest::new(db, temp.path().join("projects"));
+    let entry = service
+        .snapshot(session.id)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.uuid.as_deref() == Some("delivery-bound-user"))
+        .unwrap();
+    assert_eq!(entry.origin, NativeFeedOrigin::App);
+}
+
+#[tokio::test]
+async fn late_paste_ack_imports_requeued_slot_and_blocks_duplicate_claim() {
+    let temp = TempDir::new().unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, temp.path()).await;
+    let sid = "45454545-4545-4545-8545-454545454545";
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    ClaudeSessionLink::assign_manual(&db.pool, sid, session.id, &cwd.to_string_lossy())
+        .await
+        .unwrap()
+        .unwrap();
+    let native_file = register_native_file(&db, workspace.id, sid).await;
+    let slot = pasted_slot(&db, session.id, sid, "late CLI submission").await;
+    let pasted_at = slot.pasted_at.unwrap();
+
+    assert!(
+        SessionQueuedMessage::requeue_pasted(&db.pool, slot.id)
+            .await
+            .unwrap()
+    );
+    let requeued = SessionQueuedMessage::find_by_id(&db.pool, slot.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(requeued.was_requeued_from_pasted());
+    assert_eq!(requeued.pasted_at, Some(pasted_at));
+
+    CliNativeRecord::import_batch(
+        &db.pool,
+        native_file.id,
+        &[import_record(
+            sid,
+            0,
+            "late-delivery-bound-user",
+            "late CLI submission",
+            pasted_at + ChronoDuration::seconds(31),
+        )],
+        &cursor(1),
+    )
+    .await
+    .unwrap();
+
+    let rows = CliNativeRecord::list_for_session(&db.pool, session.id)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].bound_queued_message_id, Some(slot.id));
+    let imported = SessionQueuedMessage::find_by_id(&db.pool, slot.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(imported.state, QueuedMessageState::Imported);
+    assert!(imported.acked_at.is_some());
+    assert!(
+        SessionQueuedMessage::claim_for_executor(&db.pool, slot.id, "test-owner")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        SessionQueuedMessage::find_active(&db.pool, session.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn paste_ack_matcher_enforces_paste_window_bounds() {
+    let temp = TempDir::new().unwrap();
+    let db = test_db().await;
+    let (workspace, early_session) = create_workspace_and_session(&db, temp.path()).await;
+    let cwd = effective_cwd(&workspace, &early_session).unwrap();
+
+    let early_sid = "42424242-4242-4242-8242-424242424242";
+    ClaudeSessionLink::assign_manual(
+        &db.pool,
+        early_sid,
+        early_session.id,
+        &cwd.to_string_lossy(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let early_file = register_native_file(&db, workspace.id, early_sid).await;
+    let early_slot = pasted_slot(&db, early_session.id, early_sid, "same prompt").await;
+    let before_skew = early_slot.pasted_at.unwrap() - ChronoDuration::seconds(6);
+    CliNativeRecord::import_batch(
+        &db.pool,
+        early_file.id,
+        &[import_record(
+            early_sid,
+            0,
+            "before-paste-skew",
+            "same prompt",
+            before_skew,
+        )],
+        &cursor(1),
+    )
+    .await
+    .unwrap();
+    let early_rows = CliNativeRecord::list_for_session(&db.pool, early_session.id)
+        .await
+        .unwrap();
+    assert_eq!(early_rows[0].bound_queued_message_id, None);
+    assert_eq!(
+        SessionQueuedMessage::find_by_id(&db.pool, early_slot.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        QueuedMessageState::Pasted
+    );
+
+    let stale_session = create_session(&db, workspace.id).await;
+    let stale_sid = "43434343-4343-4343-8343-434343434343";
+    ClaudeSessionLink::assign_manual(
+        &db.pool,
+        stale_sid,
+        stale_session.id,
+        &cwd.to_string_lossy(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let stale_file = register_native_file(&db, workspace.id, stale_sid).await;
+    let stale_slot = pasted_slot(&db, stale_session.id, stale_sid, "same prompt").await;
+    let after_timeout =
+        stale_slot.pasted_at.unwrap() + ChronoDuration::minutes(15) + ChronoDuration::seconds(1);
+    CliNativeRecord::import_batch(
+        &db.pool,
+        stale_file.id,
+        &[import_record(
+            stale_sid,
+            0,
+            "after-paste-window",
+            "same prompt",
+            after_timeout,
+        )],
+        &cursor(1),
+    )
+    .await
+    .unwrap();
+    let stale_rows = CliNativeRecord::list_for_session(&db.pool, stale_session.id)
+        .await
+        .unwrap();
+    assert_eq!(stale_rows[0].bound_queued_message_id, None);
+    assert_eq!(
+        SessionQueuedMessage::find_by_id(&db.pool, stale_slot.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        QueuedMessageState::Pasted
+    );
+}
+
+#[tokio::test]
+async fn paste_ack_matcher_excludes_executor_linked_native_records() {
+    let temp = TempDir::new().unwrap();
+    let db = test_db().await;
+    let (workspace, session) = create_workspace_and_session(&db, temp.path()).await;
+    let sid = "44444444-4444-4444-8444-444444444444";
+    let cwd = effective_cwd(&workspace, &session).unwrap();
+    ClaudeSessionLink::assign_manual(&db.pool, sid, session.id, &cwd.to_string_lossy())
+        .await
+        .unwrap()
+        .unwrap();
+    let native_file = register_native_file(&db, workspace.id, sid).await;
+    let slot = pasted_slot(&db, session.id, sid, "linked prompt").await;
+    let process_id = create_coding_turn(&db, session.id, "linked prompt").await;
+    ExecutionNativeLink::insert(&db.pool, process_id, "executor-linked-user")
+        .await
+        .unwrap();
+    let recorded_at = slot.pasted_at.unwrap() + ChronoDuration::seconds(1);
+
+    CliNativeRecord::import_batch(
+        &db.pool,
+        native_file.id,
+        &[import_record(
+            sid,
+            0,
+            "executor-linked-user",
+            "linked prompt",
+            recorded_at,
+        )],
+        &cursor(1),
+    )
+    .await
+    .unwrap();
+
+    let rows = CliNativeRecord::list_for_session(&db.pool, session.id)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].linked_execution_process_id, Some(process_id));
+    assert_eq!(rows[0].bound_queued_message_id, None);
+    let unacked_slot = SessionQueuedMessage::find_by_id(&db.pool, slot.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unacked_slot.state, QueuedMessageState::Pasted);
+    assert!(unacked_slot.acked_at.is_none());
 }
 
 #[test]

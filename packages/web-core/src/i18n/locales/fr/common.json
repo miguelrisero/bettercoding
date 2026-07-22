@@ -70,6 +70,10 @@
     "assistant": "Claude",
     "viaCli": "via la CLI",
     "cliSessionActive": "Session CLI active",
+    "foreignWriter": {
+      "message": "Cette conversation est en cours de modification en dehors de l'application.",
+      "dismiss": "Fermer l'avis de modification externe"
+    },
     "quarantine": {
       "affordance": "CLI non attribuées",
       "openLabel": "Ouvrir {{count}} conversations CLI non attribuées",
@@ -95,7 +99,15 @@
       "explanation": "Certains messages ont suivi un chemin que l'agent ne suit plus.",
       "branchLabel": "Branche {{index}}",
       "resumeHint": "Claude reprend ici",
-      "emptyBranch": "Aucun message visible dans cette branche"
+      "emptyBranch": "Aucun message visible dans cette branche",
+      "bringBack": "Récupérer ces messages",
+      "bringingBack": "Récupération des messages…",
+      "recoveryStartedToast": "Messages récupérés envoyés à l'agent",
+      "recoveryQueuedToast": "Récupération en attente — l'agent est occupé ; ces messages seront envoyés ensuite",
+      "recoveryRoutedToast": "Récupération envoyée à la CLI — en attente de son affichage dans la conversation",
+      "recoveryConflictToast": "Récupération non envoyée — un autre message est déjà en file d'attente",
+      "recoveryErrorToast": "Ces messages n'ont pas pu être récupérés. Réessayez.",
+      "dismissToast": "Fermer la notification de récupération"
     },
     "loadingEarlierMessages": "Chargement des messages précédents",
     "cliEmptyTitle": "Cet espace de travail s'exécute généralement dans le terminal",

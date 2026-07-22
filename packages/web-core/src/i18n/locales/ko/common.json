@@ -83,6 +83,10 @@
     "assistant": "Claude",
     "viaCli": "CLI를 통해",
     "cliSessionActive": "CLI 세션 활성",
+    "foreignWriter": {
+      "message": "이 대화는 앱 외부에서 편집 중입니다.",
+      "dismiss": "외부 편집 알림 닫기"
+    },
     "quarantine": {
       "affordance": "할당되지 않은 CLI",
       "openLabel": "할당되지 않은 CLI 대화 {{count}}개 열기",
@@ -108,7 +112,15 @@
       "explanation": "일부 메시지는 에이전트가 더 이상 따르지 않는 경로로 진행되었습니다.",
       "branchLabel": "브랜치 {{index}}",
       "resumeHint": "Claude가 여기서 재개",
-      "emptyBranch": "이 브랜치에 표시할 메시지가 없습니다"
+      "emptyBranch": "이 브랜치에 표시할 메시지가 없습니다",
+      "bringBack": "이 메시지들을 복구하기",
+      "bringingBack": "메시지 복구 중…",
+      "recoveryStartedToast": "복구된 메시지를 에이전트에게 보냈습니다",
+      "recoveryQueuedToast": "복구 보류 — 에이전트가 작업 중이므로 이 메시지들은 다음에 전송됩니다",
+      "recoveryRoutedToast": "복구 메시지를 CLI로 보냈습니다 — 대화에 표시되기를 기다리는 중입니다",
+      "recoveryConflictToast": "복구 메시지가 전송되지 않았습니다 — 다른 메시지가 이미 대기열에 있습니다",
+      "recoveryErrorToast": "이 메시지들을 복구할 수 없습니다. 다시 시도하세요.",
+      "dismissToast": "복구 알림 닫기"
     },
     "loadingEarlierMessages": "이전 메시지 불러오는 중",
     "cliEmptyTitle": "이 워크스페이스는 보통 터미널에서 실행됩니다",

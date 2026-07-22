@@ -70,6 +70,10 @@
     "assistant": "Claude",
     "viaCli": "通过 CLI",
     "cliSessionActive": "CLI 会话活跃",
+    "foreignWriter": {
+      "message": "此对话正在应用外进行编辑。",
+      "dismiss": "关闭外部编辑提示"
+    },
     "quarantine": {
       "affordance": "未分配的 CLI",
       "openLabel": "打开 {{count}} 个未分配的 CLI 对话",
@@ -95,7 +99,15 @@
       "explanation": "部分消息进入了代理不再继续的路径。",
       "branchLabel": "分支 {{index}}",
       "resumeHint": "Claude 将从这里继续",
-      "emptyBranch": "此分支中没有可见消息"
+      "emptyBranch": "此分支中没有可见消息",
+      "bringBack": "恢复这些消息",
+      "bringingBack": "正在恢复这些消息…",
+      "recoveryStartedToast": "已将恢复的消息发送给代理",
+      "recoveryQueuedToast": "恢复消息已加入队列 — 代理正忙；这些消息将接着发送",
+      "recoveryRoutedToast": "恢复消息已发送至 CLI — 正在等待其出现在对话中",
+      "recoveryConflictToast": "未发送恢复消息 — 已有另一条消息在队列中",
+      "recoveryErrorToast": "无法恢复这些消息。请重试。",
+      "dismissToast": "关闭恢复通知"
     },
     "loadingEarlierMessages": "正在加载早期消息",
     "cliEmptyTitle": "此工作区通常在终端中运行",

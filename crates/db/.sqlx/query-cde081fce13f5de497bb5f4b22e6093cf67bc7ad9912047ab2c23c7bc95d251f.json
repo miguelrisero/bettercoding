@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO workspace_spawn_reservations\n                   (workspace_id, holder, fence, created_at, expires_at)\n               VALUES ($1, $2, $3, $4, $5)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "cde081fce13f5de497bb5f4b22e6093cf67bc7ad9912047ab2c23c7bc95d251f"
+}

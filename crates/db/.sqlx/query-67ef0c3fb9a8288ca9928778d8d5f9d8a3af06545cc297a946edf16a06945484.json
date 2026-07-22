@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT EXISTS(\n                           SELECT 1 FROM execution_processes\n                           WHERE session_id = $1\n                             AND status = 'running'\n                             AND run_reason = 'codingagent'\n                       ) AS \"running!: bool\"",
+  "describe": {
+    "columns": [
+      {
+        "name": "running!: bool",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "67ef0c3fb9a8288ca9928778d8d5f9d8a3af06545cc297a946edf16a06945484"
+}

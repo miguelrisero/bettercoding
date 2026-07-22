@@ -18,6 +18,7 @@ use services::services::{
     approvals::Approvals,
     auth::AuthContext,
     claude_transcript_ingest::ClaudeTranscriptIngest,
+    cli_collab::CliCollabService,
     config::{Config, ConfigError},
     container::{ContainerError, ContainerService},
     events::{EventError, EventService},
@@ -108,6 +109,8 @@ pub trait Deployment: Clone + Send + Sync + 'static {
     fn queued_message_service(&self) -> &QueuedMessageService;
 
     fn claude_transcript_ingest(&self) -> Option<&Arc<ClaudeTranscriptIngest>>;
+
+    fn cli_collab(&self) -> &Arc<CliCollabService>;
 
     fn auth_context(&self) -> &AuthContext;
 

@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT claude_session_id AS \"claude_session_id!\",\n                      session_id AS \"session_id!: Uuid\",\n                      workspace_id AS \"workspace_id!: Uuid\",\n                      cwd AS \"cwd!\",\n                      bound_via AS \"bound_via!: ClaudeSessionBoundVia\",\n                      created_at AS \"created_at!: DateTime<Utc>\"\n               FROM claude_session_links\n               WHERE claude_session_id = $1",
+  "query": "SELECT claude_session_id AS \"claude_session_id!\",\n                      session_id AS \"session_id!: Uuid\",\n                      workspace_id AS \"workspace_id!: Uuid\",\n                      cwd AS \"cwd!\",\n                      bound_via AS \"bound_via!: ClaudeSessionBoundVia\",\n                      created_at AS \"created_at!: DateTime<Utc>\",\n                      foreign_writer_seen_at AS \"foreign_writer_seen_at: DateTime<Utc>\"\n               FROM claude_session_links\n               WHERE session_id = $1\n               ORDER BY created_at DESC\n               LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -32,6 +32,11 @@
         "name": "created_at!: DateTime<Utc>",
         "ordinal": 5,
         "type_info": "Text"
+      },
+      {
+        "name": "foreign_writer_seen_at: DateTime<Utc>",
+        "ordinal": 6,
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -43,8 +48,9 @@
       false,
       false,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "8141e9e690983c2a94318c06b8525f8290db122cbb6f2bbefb2bace0bbe98ebf"
+  "hash": "d9eefd7888d06ec1ec905ee90164d1749da7b665614d2678e19f67d6f4e5a01f"
 }

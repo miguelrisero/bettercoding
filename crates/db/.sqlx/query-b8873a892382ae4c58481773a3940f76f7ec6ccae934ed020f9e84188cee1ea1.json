@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE session_queued_messages SET\n                   failure_reason = $1,\n                   updated_at = datetime('now', 'subsec')\n               WHERE id = $2 AND state = 'queued'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "b8873a892382ae4c58481773a3940f76f7ec6ccae934ed020f9e84188cee1ea1"
+}

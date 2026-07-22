@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use executors::executors::cli::{CliContinue, CliLaunchSpec, CliPromptArg, CliResume};
@@ -40,6 +40,10 @@ pub enum PtyCommand {
         /// mode joins the *exact* conversation the chat UI is showing, and
         /// follow-ups from either side share one transcript.
         resume_session_id: Option<String>,
+        /// The matching headless executor still owns the conversation. A new
+        /// pane shows a durable busy notice and waits for the server-owned
+        /// resume-ready file instead of launching `--continue` or a fresh TUI.
+        busy_wait_for_resume: bool,
         /// The workspace's initial prompt (CLI-first creation): handed to the
         /// interactive agent as its argument so the run happens visibly in
         /// the terminal instead of a headless executor. Ignored when
@@ -89,6 +93,7 @@ fn cli_bootstrap(
     resume_session_id: Option<&str>,
     prompt_file: Option<&Path>,
     deferred_prompt_pending: bool,
+    busy_resume_file: Option<&Path>,
 ) -> String {
     // The program is a bare binary name from our own code; quote it anyway so
     // it can never be anything but a single command word.
@@ -115,7 +120,31 @@ fn cli_bootstrap(
         CliContinue::Fresh => base.clone(),
     };
 
-    let launch = if let Some(id) = active_resume_id(resume_session_id) {
+    let launch = if let Some(file) = busy_resume_file {
+        let qfile = shell_single_quote(&file.to_string_lossy());
+        let resume = match &spec.resume {
+            CliResume::Flag(flag) => format!("{base} {flag} \"$bc_sid\""),
+            CliResume::Subcommand(sub) => format!("{prog} {sub} \"$bc_sid\""),
+            CliResume::Unsupported => base.clone(),
+        };
+        format!(
+            "printf '\\nagent busy in UI — this pane will resume the conversation when it finishes\\n\\n'; \
+             while :; do \
+               if [ -f {qfile} ]; then \
+                 bc_ready=0; bc_sid=''; IFS=' ' read -r bc_ready bc_sid < {qfile} || true; \
+                 bc_now=$(date +%s); \
+                 case \"$bc_ready\" in ''|*[!0-9]*) bc_ready=0;; esac; \
+                 if [ \"$bc_ready\" -gt 0 ] && [ \"$bc_now\" -ge \"$bc_ready\" ] \
+                    && [ $((bc_now-bc_ready)) -le {RESUME_READY_TTL_SECS} ] \
+                    && [ -n \"$bc_sid\" ]; then \
+                   rm -f -- {qfile}; exec {resume}; \
+                 fi; \
+                 rm -f -- {qfile}; \
+               fi; \
+               sleep 1; \
+             done"
+        )
+    } else if let Some(id) = active_resume_id(resume_session_id) {
         match &spec.resume {
             // `<base> --resume <id>` — flags still apply (claude).
             CliResume::Flag(flag) => format!("{base} {flag} {id}"),
@@ -332,16 +361,18 @@ fn cli_prompt_file_path(workspace_id: Uuid) -> PathBuf {
         .join(format!("{}.txt", workspace_id.simple()))
 }
 
-/// Write a workspace's CLI initial prompt to its private (0600) file for the
-/// bootstrap to read. Returns the path on success. The file self-deletes once
-/// the bootstrap consumes it; [`remove_cli_prompt_file`] and
-/// [`kill_cli_tmux_session`] clean up the never-consumed case.
-fn write_cli_prompt_file(workspace_id: Uuid, content: &str) -> std::io::Result<PathBuf> {
-    let path = cli_prompt_file_path(workspace_id);
+const RESUME_READY_TTL_SECS: u64 = 60;
+
+/// A busy pane's resume hand-off file. It lives beside other backend-owned
+/// transient assets, never in the Claude native store.
+pub fn cli_resume_ready_file_path(workspace_id: Uuid) -> PathBuf {
+    utils::assets::asset_dir()
+        .join("cli-resume-ready")
+        .join(format!("{}.ready", workspace_id.simple()))
+}
+
+fn write_private_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
-        // Owner-only dir: the files inside are already 0600, but a 0700 dir
-        // also keeps prompt-file names (workspace ids + staging times) from
-        // being enumerable by other local users.
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
@@ -356,24 +387,51 @@ fn write_cli_prompt_file(workspace_id: Uuid, content: &str) -> std::io::Result<P
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(&path)?;
-        // `.mode()` only applies when the file is CREATED; if a looser-perm file
-        // pre-existed at this path (stale from an older build, or same-user
-        // tampering) `create(true)` reuses it without re-chmod'ing. Force 0600
-        // so the prompt is never readable at wider perms. (The 0700 dir already
-        // blocks other users; this is defense in depth.)
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f.write_all(content.as_bytes())?;
+            .open(path)?;
+        // `.mode()` only applies when the file is created. Force the mode on
+        // every write so a pre-existing, same-user file cannot stay broader.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(content)?;
     }
     #[cfg(not(unix))]
-    {
-        std::fs::write(&path, content.as_bytes())?;
-    }
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
+fn write_cli_resume_ready_file_at(path: &Path, sid: &str, now: SystemTime) -> std::io::Result<()> {
+    let _ = Uuid::parse_str(sid)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let timestamp = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_secs();
+    write_private_file(path, format!("{timestamp} {sid}\n").as_bytes())
+}
+
+pub fn write_cli_resume_ready_file(workspace_id: Uuid, sid: &str) -> std::io::Result<()> {
+    write_cli_resume_ready_file_at(
+        &cli_resume_ready_file_path(workspace_id),
+        sid,
+        SystemTime::now(),
+    )
+}
+
+pub fn remove_cli_resume_ready_file(workspace_id: Uuid) {
+    let _ = std::fs::remove_file(cli_resume_ready_file_path(workspace_id));
+}
+
+/// Write a workspace's CLI initial prompt to its private (0600) file for the
+/// bootstrap to read. Returns the path on success. The file self-deletes once
+/// the bootstrap consumes it; [`remove_cli_prompt_file`] and
+/// [`kill_cli_tmux_session`] clean up the never-consumed case.
+fn write_cli_prompt_file(workspace_id: Uuid, content: &str) -> std::io::Result<PathBuf> {
+    let path = cli_prompt_file_path(workspace_id);
+    write_private_file(&path, content.as_bytes())?;
     Ok(path)
 }
 
@@ -1362,6 +1420,7 @@ pub async fn resolved_cli_tmux_session_name(workspace_id: Uuid) -> String {
     cli_tmux_target(home, workspace_id).1
 }
 
+#[cfg(test)]
 async fn cli_tmux_session_exists_on(
     workspace_id: Uuid,
     current_socket: &str,
@@ -1387,16 +1446,20 @@ async fn cli_tmux_session_exists_on(
 /// prompt and the bootstrap's `--continue` fallback takes over instead of
 /// replaying the prompt. `=` forces exact-name matching.
 pub async fn cli_tmux_session_exists(workspace_id: Uuid) -> bool {
+    cli_tmux_session_exists_checked(workspace_id)
+        .await
+        .unwrap_or(false)
+}
+
+/// Fallible counterpart used by writer-lease and spawn decisions. Unlike the
+/// legacy bool helper, an unreadable socket is never collapsed into absence.
+pub async fn cli_tmux_session_exists_checked(workspace_id: Uuid) -> Result<bool, PtyError> {
     if !tmux_available() {
-        return false;
+        return Ok(false);
     }
-    cli_tmux_session_exists_on(
-        workspace_id,
-        cli_tmux_socket(),
-        legacy_cli_tmux_socket(),
-        is_legacy_home_enabled(),
-    )
-    .await
+    locate_cli_tmux_session(workspace_id)
+        .await
+        .map(|location| location.present)
 }
 
 /// Whether CLI mode can actually run claude in a tmux session (vs. degrading
@@ -1439,6 +1502,11 @@ pub async fn cli_pane_agent_running(workspace_id: Uuid, program: &str) -> Option
 /// Check agent ownership at one already-located target without re-running the
 /// dual-home locator. The tmux pane probe is bounded like the locator probes.
 pub async fn cli_pane_agent_running_at(target: &CliTmuxTarget, program: &str) -> Option<bool> {
+    let (pane_pid, listing) = pane_process_listing(target).await?;
+    Some(pane_subtree_has_program(&listing, pane_pid, program))
+}
+
+async fn pane_process_listing(target: &CliTmuxTarget) -> Option<(u32, String)> {
     let output = run_cli_tmux(&[
         "-L",
         &target.socket,
@@ -1468,8 +1536,47 @@ pub async fn cli_pane_agent_running_at(target: &CliTmuxTarget, program: &str) ->
     if !snapshot.status.success() {
         return None;
     }
-    let listing = String::from_utf8_lossy(&snapshot.stdout);
-    Some(pane_subtree_has_program(&listing, pane_pid, program))
+    Some((
+        pane_pid,
+        String::from_utf8_lossy(&snapshot.stdout).into_owned(),
+    ))
+}
+
+/// One matching process from the live pane subtree. The PID is exposed so the
+/// authoritative writer probe can compare `/proc/<pid>/cwd` without taking a
+/// second, potentially different process-tree snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliPaneAgentProcess {
+    pub pid: u32,
+    pub cmdline: String,
+}
+
+/// Fresh command lines for every matching agent process in the pane subtree.
+/// `None` means tmux, the pane PID, the process snapshot, or a command line was
+/// unreadable and callers must fail closed.
+pub async fn cli_pane_agent_processes(
+    workspace_id: Uuid,
+    program: &str,
+) -> Option<Vec<CliPaneAgentProcess>> {
+    let target = locate_cli_tmux_target(workspace_id).await?;
+    let (pane_pid, listing) = pane_process_listing(&target).await?;
+    let mut processes = Vec::new();
+    for pid in pane_subtree_program_pids(&listing, pane_pid, program) {
+        let output = tokio::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "args="])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        processes.push(CliPaneAgentProcess {
+            pid,
+            cmdline: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        });
+    }
+    Some(processes)
 }
 
 /// Whether `program` runs anywhere in the process subtree rooted at `root_pid`
@@ -1477,6 +1584,10 @@ pub async fn cli_pane_agent_running_at(target: &CliTmuxTarget, program: &str) ->
 /// walk — the part that decides whether a node-wrapped agent grandchild counts
 /// — is unit testable without a live process tree.
 fn pane_subtree_has_program(ps_listing: &str, root_pid: u32, program: &str) -> bool {
+    !pane_subtree_program_pids(ps_listing, root_pid, program).is_empty()
+}
+
+fn pane_subtree_program_pids(ps_listing: &str, root_pid: u32, program: &str) -> Vec<u32> {
     let mut comm_by_pid: HashMap<u32, &str> = HashMap::new();
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for line in ps_listing.lines() {
@@ -1503,6 +1614,7 @@ fn pane_subtree_has_program(ps_listing: &str, root_pid: u32, program: &str) -> b
     // torn read must not spin.
     let mut stack = vec![root_pid];
     let mut visited = HashSet::new();
+    let mut matches = Vec::new();
     while let Some(pid) = stack.pop() {
         if !visited.insert(pid) {
             continue;
@@ -1511,13 +1623,13 @@ fn pane_subtree_has_program(ps_listing: &str, root_pid: u32, program: &str) -> b
             .get(&pid)
             .is_some_and(|comm| comm_matches_program(comm, program))
         {
-            return true;
+            matches.push(pid);
         }
         if let Some(kids) = children.get(&pid) {
             stack.extend(kids);
         }
     }
-    false
+    matches
 }
 
 /// Whether a `ps`/`pgrep` process name is the expected agent binary. The
@@ -2454,24 +2566,28 @@ impl PtyService {
 
             // CLI mode rides tmux when present; otherwise (and for the
             // default side terminal) spawn the user's shell directly.
-            let (
-                tmux_workspace,
-                tmux_resume_id,
-                tmux_initial_prompt,
-                tmux_deferred,
-                tmux_connect_hidden,
-                tmux_spec,
-            ): (
+            type CliTmuxCommandParts = (
                 Option<Uuid>,
                 Option<String>,
                 Option<String>,
                 bool,
                 bool,
+                bool,
                 Option<CliLaunchSpec>,
-            ) = match &command {
+            );
+            let (
+                tmux_workspace,
+                tmux_resume_id,
+                tmux_initial_prompt,
+                tmux_deferred,
+                tmux_busy_wait,
+                tmux_connect_hidden,
+                tmux_spec,
+            ): CliTmuxCommandParts = match &command {
                 PtyCommand::TmuxCli {
                     workspace_id,
                     resume_session_id,
+                    busy_wait_for_resume,
                     initial_prompt,
                     deferred_prompt_pending,
                     connect_hidden,
@@ -2481,10 +2597,11 @@ impl PtyService {
                     resume_session_id.clone(),
                     initial_prompt.clone(),
                     *deferred_prompt_pending,
+                    *busy_wait_for_resume,
                     *connect_hidden,
                     Some(spec.clone()),
                 ),
-                _ => (None, None, None, false, false, None),
+                _ => (None, None, None, false, false, false, None),
             };
             // Client flags are the release valve that makes smallest sizing
             // safe. The cached client-flags capability gates the entire
@@ -2583,6 +2700,7 @@ impl PtyService {
                             tmux_resume_id.as_deref(),
                             prompt_file.as_deref(),
                             tmux_deferred,
+                            tmux_busy_wait.then(|| cli_resume_ready_file_path(workspace_id)).as_deref(),
                         );
                         (conf, bootstrap)
                     }
@@ -3158,7 +3276,7 @@ mod tests {
 
     #[test]
     fn cli_bootstrap_runs_program_then_drops_to_shell() {
-        let b = cli_bootstrap(&claude_spec(&[]), None, None, false);
+        let b = cli_bootstrap(&claude_spec(&[]), None, None, false, None);
         assert!(b.contains("command -v 'claude'"));
         assert!(
             b.ends_with(r#"exec "${SHELL:-/bin/sh}""#),
@@ -3239,7 +3357,7 @@ mod tests {
     fn cli_bootstrap_warns_with_install_hint_when_agent_missing() {
         // A not-installed agent must explain itself instead of silently dropping
         // to a bare shell.
-        let b = cli_bootstrap(&claude_spec(&[]), None, None, false);
+        let b = cli_bootstrap(&claude_spec(&[]), None, None, false, None);
         assert!(b.contains("if command -v 'claude'"));
         assert!(b.contains("is not installed or not on PATH"));
         assert!(
@@ -3260,6 +3378,7 @@ mod tests {
             Some(id),
             Some(Path::new("/tmp/vk/prompt.txt")),
             false,
+            None,
         );
         assert!(b.contains(&format!("--resume {id}")));
         // The prompt file is ignored entirely when resuming.
@@ -3267,7 +3386,7 @@ mod tests {
         assert!(!b.contains("bc_p="));
         // Non-UUID (injection attempt) is rejected and never interpolated.
         let evil = "x; rm -rf ~";
-        let b = cli_bootstrap(&claude_spec(&[]), Some(evil), None, false);
+        let b = cli_bootstrap(&claude_spec(&[]), Some(evil), None, false, None);
         assert!(!b.contains("rm -rf"));
         assert!(!b.contains("--resume"));
     }
@@ -3278,14 +3397,14 @@ mod tests {
         // settings, so the model/sandbox/approval flags are NOT replayed.
         let id = "28b98f08-5f5f-4b1e-8c4e-41ae87c0c706";
         let spec = codex_spec(&["-m", "gpt-5.5", "-s", "danger-full-access"]);
-        let b = cli_bootstrap(&spec, Some(id), None, false);
+        let b = cli_bootstrap(&spec, Some(id), None, false, None);
         assert!(b.contains(&format!("'codex' resume {id}")));
         assert!(
             !b.contains("-m"),
             "base flags must not ride the resume: {b}"
         );
         // Continue fallback uses `resume --last`, falling back to a fresh TUI.
-        let cont = cli_bootstrap(&spec, None, None, false);
+        let cont = cli_bootstrap(&spec, None, None, false, None);
         assert!(cont.contains("'codex' resume --last || 'codex'"));
     }
 
@@ -3298,7 +3417,7 @@ mod tests {
         // word-split or parsed as shell (injection-safe by construction).
         let spec = claude_spec(&["--dangerously-skip-permissions"]);
         let file = Path::new("/tmp/vk/cli-prompts/abc.txt");
-        let b = cli_bootstrap(&spec, None, Some(file), false);
+        let b = cli_bootstrap(&spec, None, Some(file), false, None);
         assert!(
             b.len() < 2048,
             "bootstrap must stay small regardless of prompt size: {} bytes",
@@ -3317,7 +3436,7 @@ mod tests {
         // embedded quote is POSIX-escaped as `'\''`, so the dangerous run stays
         // inert data inside the quoting rather than terminating it.
         let evil = Path::new("/tmp/'; rm -rf ~; echo '.txt");
-        let b = cli_bootstrap(&spec, None, Some(evil), false);
+        let b = cli_bootstrap(&spec, None, Some(evil), false, None);
         assert!(
             b.contains(r"'\''; rm -rf ~; echo '\''"),
             "path quote must be escaped, not terminated: {b}"
@@ -3338,7 +3457,7 @@ mod tests {
         // the flag itself is quoted like every other word we emit.
         let flag_spec = CliLaunchSpec::new("gemini", vec![])
             .with_prompt_arg(CliPromptArg::Flag("-i".to_string()));
-        let b = cli_bootstrap(&flag_spec, None, Some(file), false);
+        let b = cli_bootstrap(&flag_spec, None, Some(file), false, None);
         assert!(b.contains("rm -f -- '/tmp/vk/p.txt'; 'gemini' '-i' \"$bc_p\""));
 
         // StdinPipe agents pipe the file into the program — no argv ceiling.
@@ -3346,7 +3465,7 @@ mod tests {
         // the file, so consumption is acknowledged (file gone) immediately —
         // not when the agent eventually exits.
         let pipe_spec = CliLaunchSpec::new("amp", vec![]).with_prompt_arg(CliPromptArg::StdinPipe);
-        let b = cli_bootstrap(&pipe_spec, None, Some(file), false);
+        let b = cli_bootstrap(&pipe_spec, None, Some(file), false, None);
         assert!(b.contains("{ cat '/tmp/vk/p.txt'; rm -f -- '/tmp/vk/p.txt'; } | 'amp'"));
     }
 
@@ -3355,7 +3474,7 @@ mod tests {
         // No prompt file (blank prompt filtered out by the caller) -> the
         // no-prompt continue/fresh path, exactly as before.
         let spec = claude_spec(&["--dangerously-skip-permissions"]);
-        let b = cli_bootstrap(&spec, None, None, false);
+        let b = cli_bootstrap(&spec, None, None, false, None);
         assert!(b.contains("--continue || 'claude'"));
         assert!(!b.contains("bc_p="));
     }
@@ -3366,13 +3485,64 @@ mod tests {
         // first leg on a brand-new workspace would live just long enough to
         // swallow the paste and exit), just the bare agent TUI.
         let spec = claude_spec(&["--dangerously-skip-permissions"]);
-        let b = cli_bootstrap(&spec, None, None, true);
+        let b = cli_bootstrap(&spec, None, None, true, None);
         assert!(!b.contains("--continue"), "no doomed continue leg: {b}");
         assert!(b.contains("'claude' '--dangerously-skip-permissions'"));
         // Resume still wins over a pending deferred paste at launch time.
         let id = "28b98f08-5f5f-4b1e-8c4e-41ae87c0c706";
-        let b = cli_bootstrap(&spec, Some(id), None, true);
+        let b = cli_bootstrap(&spec, Some(id), None, true, None);
         assert!(b.contains(&format!("--resume {id}")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn busy_notice_resume_ready_file_lifecycle() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(
+            &claude,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$BC_TEST_OUTPUT\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let ready = temp.path().join("resume.ready");
+        let sid = "28b98f08-5f5f-4b1e-8c4e-41ae87c0c706";
+        write_cli_resume_ready_file_at(&ready, sid, SystemTime::now()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&ready).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let bootstrap = cli_bootstrap(&claude_spec(&[]), None, None, false, Some(&ready));
+        assert!(bootstrap.contains(
+            "agent busy in UI — this pane will resume the conversation when it finishes"
+        ));
+        assert!(!bootstrap.contains("--continue"));
+
+        let output = temp.path().join("args.txt");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(bootstrap)
+            .env("PATH", path)
+            .env("BC_TEST_OUTPUT", &output)
+            .env("SHELL", "/bin/true")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(output).unwrap().trim(),
+            format!("--resume {sid}")
+        );
+        assert!(!ready.exists(), "ready file must be consumed before exec");
     }
 
     #[test]
@@ -3658,6 +3828,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
         assert!(b.contains(
             "'claude' '--dangerously-skip-permissions' --continue || 'claude' '--dangerously-skip-permissions'"
@@ -3667,7 +3838,13 @@ mod tests {
     #[test]
     fn cli_bootstrap_shell_quotes_agent_args_on_every_form() {
         // Glob/metacharacters in a model id stay inert (single-quoted)...
-        let b = cli_bootstrap(&claude_spec(&["--model", "opus[1m]"]), None, None, false);
+        let b = cli_bootstrap(
+            &claude_spec(&["--model", "opus[1m]"]),
+            None,
+            None,
+            false,
+            None,
+        );
         assert!(b.contains("'--model' 'opus[1m]'"));
         // ...and the flags ride the continue/fresh fallback too.
         assert!(b.contains("'opus[1m]' --continue"));
@@ -4001,6 +4178,7 @@ mod tests {
         let command = PtyCommand::TmuxCli {
             workspace_id,
             resume_session_id: None,
+            busy_wait_for_resume: false,
             initial_prompt: None,
             deferred_prompt_pending: false,
             connect_hidden: false,

@@ -15,6 +15,8 @@ import { useVariant } from '@/shared/hooks/useVariant';
 import { useRetryProcess } from '@/shared/hooks/useRetryProcess';
 import { executorConfigFromAction } from '@/shared/lib/executor';
 import { buildWorkspaceAttachmentMarkdown } from '@/shared/lib/workspaceAttachments';
+import { ConfirmDialog } from '@vibe/ui/components/ConfirmDialog';
+import type { QueueStatus } from 'shared/types';
 
 export function RetryEditorInline({
   attempt,
@@ -27,7 +29,7 @@ export function RetryEditorInline({
   initialContent: string;
   onCancelled?: () => void;
 }) {
-  const { t } = useTranslation(['common']);
+  const { t } = useTranslation(['common', 'tasks']);
   const workspaceId = attempt.id;
   const { isAttemptRunning, attemptData } = useWorkspaceExecution(workspaceId);
   const { data: branchStatus } = useBranchStatus(workspaceId);
@@ -53,10 +55,33 @@ export function RetryEditorInline({
     scratchVariant: undefined,
   });
 
+  const confirmQueueReplacement = useCallback(
+    async (status: QueueStatus) => {
+      if (status.status === 'empty') return false;
+      const result = await ConfirmDialog.show({
+        title: t('tasks:conversation.queue.replaceTitle'),
+        message:
+          status.message.source === 'recovery'
+            ? t('tasks:conversation.queue.replaceRecoveryMessage', {
+                message: status.message.data.message,
+              })
+            : t('tasks:conversation.queue.replaceUiMessage', {
+                message: status.message.data.message,
+              }),
+        confirmText: t('tasks:conversation.queue.replaceConfirm'),
+        cancelText: t('tasks:conversation.actions.cancel'),
+        variant: 'destructive',
+      });
+      return result === 'confirmed';
+    },
+    [t]
+  );
+
   const retryMutation = useRetryProcess(
     sessionId ?? '',
     () => onCancelled?.(),
-    (err) => setSendError((err as Error)?.message || 'Failed to send retry')
+    (err) => setSendError((err as Error)?.message || 'Failed to send retry'),
+    confirmQueueReplacement
   );
 
   const isSending = retryMutation.isPending;

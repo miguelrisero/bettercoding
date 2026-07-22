@@ -5,6 +5,7 @@ import { workspaceSessionKeys } from '@/shared/hooks/workspaceSessionKeys';
 import type {
   Session,
   CreateFollowUpAttempt,
+  DispatchOutcome,
   ExecutorConfig,
 } from 'shared/types';
 
@@ -12,6 +13,11 @@ interface CreateSessionParams {
   workspaceId: string;
   prompt: string;
   executorConfig: ExecutorConfig;
+}
+
+interface CreatedSessionDispatch {
+  session: Session;
+  outcome: DispatchOutcome;
 }
 
 /**
@@ -27,7 +33,7 @@ export function useCreateSession() {
       workspaceId,
       prompt,
       executorConfig,
-    }: CreateSessionParams): Promise<Session> => {
+    }: CreateSessionParams): Promise<CreatedSessionDispatch> => {
       const session = await sessionsApi.create({
         workspace_id: workspaceId,
       });
@@ -38,12 +44,13 @@ export function useCreateSession() {
         retry_process_id: null,
         force_when_dirty: null,
         perform_git_reset: null,
+        replace: false,
       };
-      await sessionsApi.followUp(session.id, body);
+      const outcome = await sessionsApi.followUp(session.id, body);
 
-      return session;
+      return { session, outcome };
     },
-    onSuccess: (session) => {
+    onSuccess: ({ session }) => {
       // Invalidate session queries to refresh the list
       queryClient.invalidateQueries({
         queryKey: workspaceSessionKeys.byWorkspace(

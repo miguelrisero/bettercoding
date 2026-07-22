@@ -73,6 +73,7 @@ function deriveForkAwareDisplayEntries(
         item.section,
         item.section.branches.map((branch) => ({
           isDefault: branch.isDefault,
+          branchLeafUuid: branch.branchLeafUuid,
           entries: aggregateRenderableEntries(
             branch.entries.map((entry) => ({
               ...entry,

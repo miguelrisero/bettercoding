@@ -111,9 +111,6 @@
     "filesChanged_one": "{{count}} file changed",
     "filesChanged_other": "{{count}} files changed"
   },
-  "followUp": {
-    "queuedMessage": "メッセージがキューに追加されました - 現在の実行が完了すると実行されます"
-  },
   "git": {
     "branch": {
       "current": "現在"
@@ -386,6 +383,27 @@
     "retry": "再試行",
     "showMore": "もっと見る",
     "showLess": "少なく表示",
+    "queue": {
+      "queued": "キューに追加済み — エージェントを待機中",
+      "pasting": "CLI に送信中…",
+      "pasted": "CLI のキューに追加済み — まだ送信されていません",
+      "failed": "送信を一時停止中",
+      "sendAgain": "再送信",
+      "sendingAgain": "送信中…",
+      "heldToast": "保留中 — エージェントが処理中のため、メッセージはキューに追加され、次に送信されます",
+      "deliveryFailedToast": "保留中 — 送信に失敗しました。メッセージはキューに残っています。今すぐ再試行するには「再送信」を選択してください。",
+      "routedToast": "CLI に送信しました — 会話に表示されるまでお待ちください",
+      "retryingToast": "メッセージを再度キューに追加しました — 次に再試行されます",
+      "replaceTitle": "キュー内のメッセージを置き換えますか？",
+      "replaceUiMessage": "キュー内のメッセージ「{{message}}」を置き換えますか？",
+      "replaceRecoveryMessage": "復元した CLI メッセージ「{{message}}」を置き換えますか？",
+      "replaceConfirm": "置き換えて送信",
+      "replaceInProgressToast": "そのメッセージはすでに送信中です。完了するまで待ってから、別のメッセージを送信してください。",
+      "replaceChangedToast": "置き換える前にキュー内のメッセージが変更されました。もう一度お試しください。",
+      "queueErrorToast": "メッセージをキューに追加できませんでした。もう一度お試しください。",
+      "retryErrorToast": "キュー内のメッセージを再送信できませんでした。もう一度お試しください。",
+      "dismissToast": "通知を閉じる"
+    },
     "actions": {
       "cancel": "キャンセル",
       "submitFeedback": "フィードバックを送信",

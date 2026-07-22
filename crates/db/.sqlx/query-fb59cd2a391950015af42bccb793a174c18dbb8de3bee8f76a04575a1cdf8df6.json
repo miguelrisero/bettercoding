@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE session_queued_messages SET\n                   state = 'queued',\n                   failure_reason = CASE\n                       WHEN executor_claim_owner IS NOT NULL\n                            AND ($2 IS NULL OR executor_claim_owner != $2)\n                            AND EXISTS (\n                                SELECT 1 FROM execution_processes process\n                                WHERE process.session_id = session_queued_messages.session_id\n                                  AND process.run_reason = 'codingagent'\n                                  AND process.status IN ('failed', 'killed')\n                                  AND julianday(process.completed_at) >= MIN(\n                                      julianday(session_queued_messages.updated_at),\n                                      julianday($5)\n                                  )\n                            ) THEN $6\n                       WHEN pasted_at IS NOT NULL THEN $3\n                       ELSE 'delivery interrupted; queued for retry'\n                   END,\n                   claude_session_id = CASE\n                       WHEN pasted_at IS NOT NULL THEN claude_session_id\n                       ELSE NULL\n                   END,\n                   executor_claim_owner = NULL,\n                   paste_claim_owner = NULL,\n                   updated_at = datetime('now', 'subsec')\n               WHERE state = 'pasting'\n                 AND (\n                     (executor_claim_owner IS NULL\n                      AND paste_claim_owner IS NULL\n                      AND julianday(updated_at) <= julianday($1))\n                     OR (executor_claim_owner IS NOT NULL\n                         AND ($2 IS NULL OR executor_claim_owner != $2))\n                     OR (paste_claim_owner IS NOT NULL\n                         AND ($4 IS NULL OR paste_claim_owner != $4))\n                 )",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "fb59cd2a391950015af42bccb793a174c18dbb8de3bee8f76a04575a1cdf8df6"
+}

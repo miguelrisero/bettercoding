@@ -75,6 +75,10 @@
     "assistant": "Claude",
     "viaCli": "via CLI",
     "cliSessionActive": "CLI session active",
+    "foreignWriter": {
+      "message": "This conversation is being edited outside the app.",
+      "dismiss": "Dismiss outside-editor notice"
+    },
     "quarantine": {
       "affordance": "Unassigned CLI",
       "openLabel": "Open {{count}} unassigned CLI conversations",
@@ -100,7 +104,15 @@
       "explanation": "Some messages went down a path the agent is no longer following.",
       "branchLabel": "Branch {{index}}",
       "resumeHint": "Claude resumes here",
-      "emptyBranch": "No visible messages in this branch"
+      "emptyBranch": "No visible messages in this branch",
+      "bringBack": "Bring these back",
+      "bringingBack": "Bringing these back…",
+      "recoveryStartedToast": "Recovered messages sent to the agent",
+      "recoveryQueuedToast": "Recovery held — the agent is busy; these messages will go next",
+      "recoveryRoutedToast": "Recovery sent to CLI — waiting for it to appear in the conversation",
+      "recoveryConflictToast": "Recovery not sent — another message is already queued",
+      "recoveryErrorToast": "These messages could not be brought back. Try again.",
+      "dismissToast": "Dismiss recovery notification"
     },
     "loadingEarlierMessages": "Loading earlier messages",
     "cliEmptyTitle": "This workspace usually runs in the terminal",

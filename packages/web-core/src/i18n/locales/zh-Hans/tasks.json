@@ -108,9 +108,6 @@
     "copyLogs": "复制日志",
     "logsCopied": "已复制！"
   },
-  "followUp": {
-    "queuedMessage": "消息已排队 - 将在当前运行完成时执行"
-  },
   "todoPopup": {
     "title": "任务",
     "progress": "{{completed}}/{{total}} 已完成",
@@ -386,6 +383,27 @@
     "retry": "重试",
     "showMore": "显示更多",
     "showLess": "收起",
+    "queue": {
+      "queued": "已加入队列 — 正在等待代理",
+      "pasting": "正在发送至 CLI…",
+      "pasted": "已加入 CLI 队列 — 尚未提交",
+      "failed": "发送已暂停",
+      "sendAgain": "再次发送",
+      "sendingAgain": "正在发送…",
+      "heldToast": "已暂缓 — 代理正忙；您的消息已加入队列，将接着发送",
+      "deliveryFailedToast": "已暂缓 — 发送失败；您的消息仍在队列中。使用“再次发送”立即重试。",
+      "routedToast": "已发送至 CLI — 正在等待消息出现在对话中",
+      "retryingToast": "消息已重新加入队列 — 接下来将重试",
+      "replaceTitle": "要替换队列中的消息吗？",
+      "replaceUiMessage": "要替换您已排队的消息“{{message}}”吗？",
+      "replaceRecoveryMessage": "要替换已恢复的 CLI 消息“{{message}}”吗？",
+      "replaceConfirm": "替换并发送",
+      "replaceInProgressToast": "该消息已在发送中。请等待发送完成后再发送其他消息。",
+      "replaceChangedToast": "队列中的消息在替换前发生了变化。请重试。",
+      "queueErrorToast": "无法将您的消息加入队列。请重试。",
+      "retryErrorToast": "无法再次发送队列中的消息。请重试。",
+      "dismissToast": "关闭通知"
+    },
     "actions": {
       "cancel": "取消",
       "submitFeedback": "提交反馈",

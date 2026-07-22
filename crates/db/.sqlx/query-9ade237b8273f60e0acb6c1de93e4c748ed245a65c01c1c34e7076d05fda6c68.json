@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE cli_pane_bindings SET released_at = datetime('now', 'subsec')\n               WHERE workspace_id = $1 AND released_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "9ade237b8273f60e0acb6c1de93e4c748ed245a65c01c1c34e7076d05fda6c68"
+}

@@ -1,5 +1,5 @@
 import { useCallback, useState } from 'react';
-import type { ExecutorConfig } from 'shared/types';
+import type { DispatchOutcome, ExecutorConfig } from 'shared/types';
 import { sessionsApi } from '@/shared/lib/api';
 import { useCreateSession } from './useCreateSession';
 
@@ -17,8 +17,12 @@ interface UseSessionSendOptions {
 }
 
 interface UseSessionSendResult {
-  /** Send a message. Returns true on success, false on failure. */
-  send: (message: string) => Promise<boolean>;
+  /** Send a message. Returns the accepted dispatch decision or null on failure. */
+  send: (
+    message: string,
+    replace?: boolean,
+    targetSessionId?: string
+  ) => Promise<SessionSendResult>;
   /** Whether a send operation is in progress */
   isSending: boolean;
   /** Error message if send failed */
@@ -27,13 +31,19 @@ interface UseSessionSendResult {
   clearError: () => void;
 }
 
+export type SessionSendResult = {
+  kind: 'dispatch';
+  sessionId: string;
+  outcome: DispatchOutcome;
+} | null;
+
 /**
  * Hook for sending messages in SessionChatBoxContainer.
  * Handles both new session creation and existing session follow-up.
  *
  * Unlike useFollowUpSend, this hook:
  * - Takes message/variant as parameters to send() (not captured in closure)
- * - Returns boolean for success/failure (caller handles cleanup)
+ * - Returns the backend dispatch outcome (caller handles cleanup and notices)
  * - Has no prompt composition (no conflict/review/clicked markdown)
  */
 export function useSessionSend({
@@ -49,54 +59,64 @@ export function useSessionSend({
   const [error, setError] = useState<string | null>(null);
 
   const send = useCallback(
-    async (message: string): Promise<boolean> => {
+    async (
+      message: string,
+      replace = false,
+      targetSessionId?: string
+    ): Promise<SessionSendResult> => {
       const trimmed = message.trim();
-      if (!trimmed) return false;
+      if (!trimmed) return null;
       if (!executorConfig) {
         setError('No executor selected');
-        return false;
+        return null;
       }
 
       setError(null);
 
-      if (isNewSessionMode) {
+      if (isNewSessionMode && !targetSessionId) {
         // New session flow
         if (!workspaceId) {
           setError('No workspace selected');
-          return false;
+          return null;
         }
         try {
-          const session = await createSession({
+          const { session, outcome } = await createSession({
             workspaceId,
             prompt: trimmed,
             executorConfig,
           });
           onSelectSession?.(session.id);
-          return true;
+          return { kind: 'dispatch', sessionId: session.id, outcome };
         } catch (e: unknown) {
           const err = e as { message?: string };
           setError(
             `Failed to create session: ${err.message ?? 'Unknown error'}`
           );
-          return false;
+          return null;
         }
       } else {
         // Existing session flow
-        if (!sessionId) return false;
+        const dispatchSessionId = targetSessionId ?? sessionId;
+        if (!dispatchSessionId) return null;
         setIsSendingFollowUp(true);
         try {
-          await sessionsApi.followUp(sessionId, {
+          const outcome = await sessionsApi.followUp(dispatchSessionId, {
             prompt: trimmed,
             executor_config: executorConfig,
             retry_process_id: null,
             force_when_dirty: null,
             perform_git_reset: null,
+            replace,
           });
-          return true;
+          return {
+            kind: 'dispatch',
+            sessionId: dispatchSessionId,
+            outcome,
+          };
         } catch (e: unknown) {
           const err = e as { message?: string };
           setError(`Failed to send: ${err.message ?? 'Unknown error'}`);
-          return false;
+          return null;
         } finally {
           setIsSendingFollowUp(false);
         }

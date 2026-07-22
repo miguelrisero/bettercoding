@@ -111,9 +111,6 @@
     "filesChanged_one": "{{count}} file changed",
     "filesChanged_other": "{{count}} files changed"
   },
-  "followUp": {
-    "queuedMessage": "메시지가 대기열에 추가됨 - 현재 실행이 완료되면 실행됩니다"
-  },
   "git": {
     "labels": {
       "taskBranch": "작업 브랜치"
@@ -386,6 +383,27 @@
     "retry": "재시도",
     "showMore": "더 보기",
     "showLess": "간략히",
+    "queue": {
+      "queued": "대기열에 추가됨 — 에이전트 대기 중",
+      "pasting": "CLI로 보내는 중…",
+      "pasted": "CLI 대기열에 추가됨 — 아직 제출되지 않음",
+      "failed": "전송 일시 중지됨",
+      "sendAgain": "다시 보내기",
+      "sendingAgain": "보내는 중…",
+      "heldToast": "보류됨 — 에이전트가 작업 중이므로 메시지가 대기열에 추가되었으며 다음에 전송됩니다",
+      "deliveryFailedToast": "보류됨 — 전송에 실패했습니다. 메시지는 대기열에 있습니다. 지금 재시도하려면 ‘다시 보내기’를 사용하세요.",
+      "routedToast": "CLI로 보냈습니다 — 대화에 표시되기를 기다리는 중입니다",
+      "retryingToast": "메시지가 대기열에 다시 추가됨 — 다음에 재시도됩니다",
+      "replaceTitle": "대기 중인 메시지를 바꾸시겠습니까?",
+      "replaceUiMessage": "대기 중인 메시지 “{{message}}” 대신 새 메시지를 보내시겠습니까?",
+      "replaceRecoveryMessage": "복구된 CLI 메시지 “{{message}}” 대신 새 메시지를 보내시겠습니까?",
+      "replaceConfirm": "바꾸고 보내기",
+      "replaceInProgressToast": "해당 메시지는 이미 전송 중입니다. 완료될 때까지 기다린 후 다른 메시지를 보내세요.",
+      "replaceChangedToast": "바꾸기 전에 대기열의 메시지가 변경되었습니다. 다시 시도하세요.",
+      "queueErrorToast": "메시지를 대기열에 추가할 수 없습니다. 다시 시도하세요.",
+      "retryErrorToast": "대기열의 메시지를 다시 보낼 수 없습니다. 다시 시도하세요.",
+      "dismissToast": "알림 닫기"
+    },
     "actions": {
       "cancel": "취소",
       "submitFeedback": "피드백 제출",

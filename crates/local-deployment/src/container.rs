@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -12,7 +12,7 @@ use command_group::AsyncGroupChild;
 use db::{
     DBService,
     models::{
-        coding_agent_turn::CodingAgentTurn,
+        coding_agent_turn::{CodingAgentResumeInfo, CodingAgentTurn},
         execution_process::{
             ExecutionContext, ExecutionProcess, ExecutionProcessRunReason, ExecutionProcessStatus,
         },
@@ -42,12 +42,15 @@ use serde_json::json;
 use services::services::{
     analytics::AnalyticsContext,
     approvals::{Approvals, executor_approvals::ExecutorApprovalBridge},
+    cli_collab::{
+        CliCollabService, CliExecutorDispatcher, DestructiveRetryResetAppliedError,
+        RetryDispatchContext,
+    },
     config::{Config, DEFAULT_COMMIT_REMINDER_PROMPT},
     container::{ContainerError, ContainerRef, ContainerService},
     diff_stream::{self, DiffStreamHandle},
     file::FileService,
     notification::NotificationService,
-    queued_message::QueuedMessageService,
     remote_client::RemoteClient,
     remote_sync,
 };
@@ -62,6 +65,29 @@ use uuid::Uuid;
 use workspace_manager::{RepoWorkspaceInput, WorkspaceError, WorkspaceManager};
 
 use crate::{command, copy};
+
+fn queued_action_type(
+    queued_data: &DraftFollowUpData,
+    latest_session_info: Option<CodingAgentResumeInfo>,
+    working_dir: Option<String>,
+    reset_to_message_id: Option<String>,
+) -> ExecutorActionType {
+    if let Some(info) = latest_session_info {
+        ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
+            prompt: queued_data.message.clone(),
+            session_id: info.session_id,
+            reset_to_message_id,
+            executor_config: queued_data.executor_config.clone(),
+            working_dir,
+        })
+    } else {
+        ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
+            prompt: queued_data.message.clone(),
+            executor_config: queued_data.executor_config.clone(),
+            working_dir,
+        })
+    }
+}
 
 const WORKSPACE_TOUCH_DEBOUNCE: Duration = Duration::from_mins(2);
 
@@ -82,7 +108,7 @@ pub struct LocalContainerService {
     file_service: FileService,
     analytics: Option<AnalyticsContext>,
     approvals: Approvals,
-    queued_message_service: QueuedMessageService,
+    cli_collab: Arc<OnceLock<Arc<CliCollabService>>>,
     notification_service: NotificationService,
     remote_client: Option<RemoteClient>,
 }
@@ -98,7 +124,6 @@ impl LocalContainerService {
         file_service: FileService,
         analytics: Option<AnalyticsContext>,
         approvals: Approvals,
-        queued_message_service: QueuedMessageService,
         remote_client: Option<RemoteClient>,
     ) -> Self {
         let child_store = Arc::new(RwLock::new(HashMap::new()));
@@ -122,7 +147,7 @@ impl LocalContainerService {
             file_service,
             analytics,
             approvals,
-            queued_message_service,
+            cli_collab: Arc::new(OnceLock::new()),
             notification_service,
             remote_client,
         };
@@ -130,6 +155,13 @@ impl LocalContainerService {
         container.spawn_workspace_cleanup();
 
         container
+    }
+
+    pub fn set_cli_collab(&self, cli_collab: Arc<CliCollabService>) {
+        assert!(
+            self.cli_collab.set(cli_collab).is_ok(),
+            "CLI collaboration service is initialized exactly once"
+        );
     }
 
     fn map_workspace_manager_error(err: WorkspaceError) -> ContainerError {
@@ -684,7 +716,7 @@ impl LocalContainerService {
                     ExecutionProcessStatus::Running
                 );
 
-                let mut already_finalized = false;
+                let mut skipped_cleanup = false;
 
                 if success || cleanup_done {
                     // Commit changes (if any) and get feedback about whether changes were made
@@ -721,80 +753,60 @@ impl LocalContainerService {
                             "Skipping cleanup script for workspace {} - no changes made by coding agent",
                             ctx.workspace.id
                         );
-
-                        // Manually finalize task since we're bypassing normal execution flow
-                        container.finalize_task(&ctx).await;
-                        already_finalized = true;
+                        skipped_cleanup = true;
                     }
                 }
 
-                if !already_finalized && container.should_finalize(&ctx) {
+                // The completion hook is invoked exactly once for every
+                // process. It self-guards chained actions, while setup
+                // completion remains eligible to release a queue only when no
+                // coding-agent writer was started next.
+                let should_finalize = skipped_cleanup || container.should_finalize(&ctx);
+                let releases_collaboration_writer = should_finalize
+                    || matches!(
+                        ctx.execution_process.run_reason,
+                        ExecutionProcessRunReason::SetupScript
+                    );
+                let started_queued_follow_up = match container.cli_collab.get() {
+                    Some(cli_collab) => match cli_collab
+                        .on_executor_finished(
+                            ctx.session.id,
+                            ctx.execution_process.status.clone(),
+                            releases_collaboration_writer,
+                        )
+                        .await
+                    {
+                        Ok(started) => started,
+                        Err(error) => {
+                            tracing::error!(
+                                ?error,
+                                session_id = %ctx.session.id,
+                                "CLI collaboration finish hook failed closed"
+                            );
+                            false
+                        }
+                    },
+                    None => false,
+                };
+
+                // A no-change coding turn bypasses its configured cleanup action,
+                // but it still finalizes like the normal final action in the chain.
+                if should_finalize {
                     let has_chained_follow_up = ctx
                         .execution_process
                         .executor_action()
                         .ok()
                         .and_then(|action| action.next_action())
                         .is_some();
-                    let mut started_queued_follow_up = false;
-
-                    // Only execute queued messages if the execution succeeded
-                    // If it failed or was killed, just clear the queue and finalize
-                    let should_execute_queued = !matches!(
-                        ctx.execution_process.status,
-                        ExecutionProcessStatus::Failed | ExecutionProcessStatus::Killed
-                    );
-
-                    if let Some(queued_msg) =
-                        container.queued_message_service.take_queued(ctx.session.id)
-                    {
-                        if should_execute_queued {
-                            tracing::info!(
-                                "Found queued message for session {}, starting follow-up execution",
-                                ctx.session.id
-                            );
-
-                            // Delete the scratch since we're consuming the queued message
-                            if let Err(e) = Scratch::delete(
-                                &db.pool,
-                                ctx.session.id,
-                                &ScratchType::DraftFollowUp,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    "Failed to delete scratch after consuming queued message: {}",
-                                    e
-                                );
-                            }
-
-                            // Execute the queued follow-up
-                            if let Err(e) = container
-                                .start_queued_follow_up(&ctx, &queued_msg.data)
-                                .await
-                            {
-                                tracing::error!("Failed to start queued follow-up: {}", e);
-                                // Fall back to finalization if follow-up fails
-                                container.finalize_task(&ctx).await;
-                            } else {
-                                started_queued_follow_up = true;
-                            }
-                        } else {
-                            // Execution failed or was killed - discard the queued message and finalize
-                            tracing::info!(
-                                "Discarding queued message for session {} due to execution status {:?}",
-                                ctx.session.id,
-                                ctx.execution_process.status
-                            );
-                            container.finalize_task(&ctx).await;
-                        }
-                    } else {
+                    if !started_queued_follow_up {
                         container.finalize_task(&ctx).await;
                     }
 
                     let should_mark_turn_unseen = matches!(
                         ctx.execution_process.run_reason,
                         ExecutionProcessRunReason::CodingAgent
-                    ) && !has_chained_follow_up
+                    ) && !skipped_cleanup
+                        && !has_chained_follow_up
                         && !started_queued_follow_up;
 
                     if should_mark_turn_unseen
@@ -809,51 +821,6 @@ impl LocalContainerService {
                             ctx.execution_process.id,
                             e
                         );
-                    }
-                }
-
-                // When a parallel setup script finishes and no coding agent is running,
-                // consume any queued message that was stuck waiting
-                if matches!(
-                    ctx.execution_process.run_reason,
-                    ExecutionProcessRunReason::SetupScript
-                ) && !container.should_finalize(&ctx)
-                {
-                    let has_running_agent = ExecutionProcess::has_running_coding_agent_for_session(
-                        &db.pool,
-                        ctx.session.id,
-                    )
-                    .await
-                    .unwrap_or(true);
-
-                    if !has_running_agent
-                        && let Some(queued_msg) =
-                            container.queued_message_service.take_queued(ctx.session.id)
-                    {
-                        tracing::info!(
-                            "Parallel setup script finished with queued message for session {}, starting follow-up",
-                            ctx.session.id
-                        );
-
-                        if let Err(e) =
-                            Scratch::delete(&db.pool, ctx.session.id, &ScratchType::DraftFollowUp)
-                                .await
-                        {
-                            tracing::warn!(
-                                "Failed to delete scratch after consuming queued message: {}",
-                                e
-                            );
-                        }
-
-                        if let Err(e) = container
-                            .start_queued_follow_up(&ctx, &queued_msg.data)
-                            .await
-                        {
-                            tracing::error!(
-                                "Failed to start queued follow-up from setup script completion: {}",
-                                e
-                            );
-                        }
                     }
                 }
 
@@ -1166,17 +1133,19 @@ impl LocalContainerService {
     /// Start a follow-up execution from a queued message
     async fn start_queued_follow_up(
         &self,
-        ctx: &ExecutionContext,
+        workspace: &Workspace,
+        session: &Session,
         queued_data: &DraftFollowUpData,
+        reset_to_message_id: Option<String>,
     ) -> Result<ExecutionProcess, ContainerError> {
         let executor_profile_id = queued_data.executor_config.profile_id();
 
         // Validate executor matches session if session has prior executions
         let expected_executor: Option<String> =
-            ExecutionProcess::latest_executor_profile_for_session(&self.db.pool, ctx.session.id)
+            ExecutionProcess::latest_executor_profile_for_session(&self.db.pool, session.id)
                 .await?
                 .map(|profile| profile.executor.to_string())
-                .or_else(|| ctx.session.executor.clone());
+                .or_else(|| session.executor.clone());
 
         if let Some(expected) = expected_executor {
             let actual = executor_profile_id.executor.to_string();
@@ -1185,10 +1154,10 @@ impl LocalContainerService {
             }
         }
 
-        if ctx.session.executor.is_none() {
+        if session.executor.is_none() {
             Session::update_executor(
                 &self.db.pool,
-                ctx.session.id,
+                session.id,
                 &executor_profile_id.executor.to_string(),
             )
             .await?;
@@ -1196,44 +1165,87 @@ impl LocalContainerService {
 
         // Get latest agent turn for session continuity (from coding agent turns)
         let latest_session_info =
-            CodingAgentTurn::find_latest_session_info(&self.db.pool, ctx.session.id).await?;
+            CodingAgentTurn::find_latest_session_info(&self.db.pool, session.id).await?;
 
-        let repos =
-            WorkspaceRepo::find_repos_for_workspace(&self.db.pool, ctx.workspace.id).await?;
+        let repos = WorkspaceRepo::find_repos_for_workspace(&self.db.pool, workspace.id).await?;
         let cleanup_action = self.cleanup_actions_for_repos(&repos);
 
-        let working_dir = ctx
-            .session
+        let working_dir = session
             .agent_working_dir
             .as_ref()
             .filter(|dir| !dir.is_empty())
             .cloned();
 
-        let action_type = if let Some(info) = latest_session_info {
-            ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
-                prompt: queued_data.message.clone(),
-                session_id: info.session_id,
-                reset_to_message_id: None,
-                executor_config: queued_data.executor_config.clone(),
-                working_dir: working_dir.clone(),
-            })
-        } else {
-            ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
-                prompt: queued_data.message.clone(),
-                executor_config: queued_data.executor_config.clone(),
-                working_dir,
-            })
-        };
+        let action_type = queued_action_type(
+            queued_data,
+            latest_session_info,
+            working_dir,
+            reset_to_message_id,
+        );
 
         let action = ExecutorAction::new(action_type, cleanup_action.map(Box::new));
 
         self.start_execution(
-            &ctx.workspace,
-            &ctx.session,
+            workspace,
+            session,
             &action,
             &ExecutionProcessRunReason::CodingAgent,
         )
         .await
+    }
+}
+
+#[async_trait]
+impl CliExecutorDispatcher for LocalContainerService {
+    async fn dispatch(
+        &self,
+        session: &Session,
+        prompt: &str,
+        executor_config: &executors::profile::ExecutorConfig,
+        retry: Option<&RetryDispatchContext>,
+    ) -> anyhow::Result<ExecutionProcess> {
+        let workspace = Workspace::find_by_id(&self.db.pool, session.workspace_id)
+            .await?
+            .ok_or_else(|| anyhow!("workspace {} not found", session.workspace_id))?;
+        let data = DraftFollowUpData {
+            message: prompt.to_string(),
+            executor_config: executor_config.clone(),
+        };
+        let destructive_reset_completed = if let Some(retry) = retry {
+            self.reset_session_to_process(
+                session.id,
+                retry.process_id,
+                retry.perform_git_reset,
+                retry.force_when_dirty,
+            )
+            .await?;
+            retry.perform_git_reset
+        } else {
+            false
+        };
+        let process = match self
+            .start_queued_follow_up(
+                &workspace,
+                session,
+                &data,
+                retry.and_then(|retry| retry.reset_to_message_id.clone()),
+            )
+            .await
+        {
+            Ok(process) => process,
+            Err(error) if destructive_reset_completed => {
+                return Err(anyhow::Error::new(DestructiveRetryResetAppliedError::new(
+                    anyhow::Error::new(error),
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Err(error) =
+            Scratch::delete(&self.db.pool, session.id, &ScratchType::DraftFollowUp).await
+        {
+            tracing::warn!(?error, session_id = %session.id, "failed to clear dispatched follow-up scratch");
+        }
+        Ok(process)
     }
 }
 
@@ -1270,6 +1282,10 @@ impl ContainerService for LocalContainerService {
 
     fn notification_service(&self) -> &NotificationService {
         &self.notification_service
+    }
+
+    fn cli_collab(&self) -> Option<&Arc<CliCollabService>> {
+        self.cli_collab.get()
     }
 
     async fn touch(&self, workspace: &Workspace) -> Result<(), ContainerError> {
@@ -1769,5 +1785,263 @@ fn success_exit_status() -> std::process::ExitStatus {
     {
         use std::os::windows::process::ExitStatusExt;
         ExitStatusExt::from_raw(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use db::models::{
+        coding_agent_turn::CreateCodingAgentTurn,
+        execution_process::CreateExecutionProcess,
+        repo::Repo,
+        session::CreateSession,
+        workspace::CreateWorkspace,
+        workspace_repo::{CreateWorkspaceRepo, WorkspaceRepo},
+    };
+    use executors::{executors::BaseCodingAgent, profile::ExecutorConfig};
+    use sqlx::sqlite::SqlitePoolOptions;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn retry_threads_transcript_truncation_into_follow_up_action() {
+        let reset_to_message_id = "assistant-message-to-retry".to_string();
+        let action = queued_action_type(
+            &DraftFollowUpData {
+                message: "retry this prompt".to_string(),
+                executor_config: ExecutorConfig::new(BaseCodingAgent::ClaudeCode),
+            },
+            Some(CodingAgentResumeInfo {
+                session_id: "claude-session".to_string(),
+                message_id: Some(reset_to_message_id.clone()),
+            }),
+            None,
+            Some(reset_to_message_id.clone()),
+        );
+
+        let ExecutorActionType::CodingAgentFollowUpRequest(request) = action else {
+            panic!("a retry with session continuity must be a follow-up");
+        };
+        assert_eq!(
+            request.reset_to_message_id.as_deref(),
+            Some(reset_to_message_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn local_destructive_retry_classifies_post_reset_spawn_failure() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations_for_tests(&pool).await.unwrap();
+        let db = DBService { pool };
+        let temp = TempDir::new().unwrap();
+        let source_repo_path = temp.path().join("source-repo");
+        let workspace_root = temp.path().join("workspace");
+        let git = GitService::new();
+        git.initialize_repo_with_main_branch(&source_repo_path)
+            .unwrap();
+        let repo = Repo::find_or_create(&db.pool, &source_repo_path, "source repo")
+            .await
+            .unwrap();
+
+        let workspace_id = Uuid::new_v4();
+        Workspace::create(
+            &db.pool,
+            &CreateWorkspace {
+                branch: "retry-call-site".to_string(),
+                name: Some("retry call-site fixture".to_string()),
+            },
+            workspace_id,
+        )
+        .await
+        .unwrap();
+        WorkspaceRepo::create_many(
+            &db.pool,
+            workspace_id,
+            &[CreateWorkspaceRepo {
+                repo_id: repo.id,
+                target_branch: "main".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+        Workspace::update_container_ref(&db.pool, workspace_id, &workspace_root.to_string_lossy())
+            .await
+            .unwrap();
+        let session = Session::create(
+            &db.pool,
+            &CreateSession {
+                executor: Some("CLAUDE_CODE".to_string()),
+                name: None,
+            },
+            Uuid::new_v4(),
+            workspace_id,
+        )
+        .await
+        .unwrap();
+
+        let base_process = ExecutionProcess::create(
+            &db.pool,
+            &CreateExecutionProcess {
+                session_id: session.id,
+                executor_action: ExecutorAction::new(
+                    ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
+                        prompt: "base turn".to_string(),
+                        executor_config: ExecutorConfig::new(BaseCodingAgent::ClaudeCode),
+                        working_dir: None,
+                    }),
+                    None,
+                ),
+                run_reason: ExecutionProcessRunReason::CodingAgent,
+            },
+            Uuid::new_v4(),
+            &[],
+        )
+        .await
+        .unwrap();
+        CodingAgentTurn::create(
+            &db.pool,
+            &CreateCodingAgentTurn {
+                execution_process_id: base_process.id,
+                prompt: Some("base turn".to_string()),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        CodingAgentTurn::update_agent_session_id(&db.pool, base_process.id, "claude-session")
+            .await
+            .unwrap();
+        ExecutionProcess::update_completion(
+            &db.pool,
+            base_process.id,
+            ExecutionProcessStatus::Completed,
+            Some(0),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE execution_processes SET created_at = datetime('now', '-2 seconds') WHERE id = ?")
+            .bind(base_process.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let reset_to_message_id = "assistant-message-to-retry".to_string();
+        let retry_process = ExecutionProcess::create(
+            &db.pool,
+            &CreateExecutionProcess {
+                session_id: session.id,
+                executor_action: ExecutorAction::new(
+                    ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
+                        prompt: "turn being retried".to_string(),
+                        session_id: "claude-session".to_string(),
+                        reset_to_message_id: None,
+                        executor_config: ExecutorConfig::new(BaseCodingAgent::ClaudeCode),
+                        working_dir: None,
+                    }),
+                    None,
+                ),
+                run_reason: ExecutionProcessRunReason::CodingAgent,
+            },
+            Uuid::new_v4(),
+            &[],
+        )
+        .await
+        .unwrap();
+        CodingAgentTurn::create(
+            &db.pool,
+            &CreateCodingAgentTurn {
+                execution_process_id: retry_process.id,
+                prompt: Some("turn being retried".to_string()),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        CodingAgentTurn::update_agent_session_id(&db.pool, retry_process.id, "claude-session")
+            .await
+            .unwrap();
+        CodingAgentTurn::update_agent_message_id(&db.pool, retry_process.id, &reset_to_message_id)
+            .await
+            .unwrap();
+        ExecutionProcess::update_completion(
+            &db.pool,
+            retry_process.id,
+            ExecutionProcessStatus::Completed,
+            Some(0),
+        )
+        .await
+        .unwrap();
+
+        let config = Arc::new(RwLock::new(Config::default()));
+        let notification_service = NotificationService::new(config.clone());
+        let service = LocalContainerService {
+            db: db.clone(),
+            workspace_manager: WorkspaceManager::new(db.clone()),
+            child_store: Arc::new(RwLock::new(HashMap::new())),
+            cancellation_tokens: Arc::new(RwLock::new(HashMap::new())),
+            msg_stores: Arc::new(RwLock::new(HashMap::new())),
+            db_stream_handles: Arc::new(RwLock::new(HashMap::new())),
+            exit_monitor_handles: Arc::new(RwLock::new(HashMap::new())),
+            workspace_touch_times: Arc::new(RwLock::new(HashMap::new())),
+            config,
+            git,
+            file_service: FileService::new(db.pool.clone()).unwrap(),
+            analytics: None,
+            approvals: Approvals::new(),
+            cli_collab: Arc::new(OnceLock::new()),
+            notification_service,
+            remote_client: None,
+        };
+        let mut missing_profile = ExecutorConfig::new(BaseCodingAgent::ClaudeCode);
+        missing_profile.variant = Some("__MISSING_RETRY_CALL_SITE_TEST_PROFILE".to_string());
+        let retry = RetryDispatchContext {
+            process_id: retry_process.id,
+            force_when_dirty: false,
+            perform_git_reset: true,
+            reset_to_message_id: Some(reset_to_message_id.clone()),
+        };
+
+        let error = CliExecutorDispatcher::dispatch(
+            &service,
+            &session,
+            "retry this prompt",
+            &missing_profile,
+            Some(&retry),
+        )
+        .await
+        .expect_err("the missing test profile must fail after the reset");
+        assert!(
+            error
+                .downcast_ref::<DestructiveRetryResetAppliedError>()
+                .is_some(),
+            "the dispatcher must preserve that the destructive reset already completed"
+        );
+
+        let processes = ExecutionProcess::find_by_session_id(&db.pool, session.id, false)
+            .await
+            .unwrap();
+        let dispatched = processes.last().unwrap();
+        assert_ne!(dispatched.id, base_process.id);
+        let ExecutorActionType::CodingAgentFollowUpRequest(request) =
+            dispatched.executor_action().unwrap().typ()
+        else {
+            panic!("retry dispatch with session continuity must persist a follow-up");
+        };
+        assert_eq!(request.session_id, "claude-session");
+        assert_eq!(
+            request.reset_to_message_id.as_deref(),
+            Some(reset_to_message_id.as_str())
+        );
+
+        let log_path = utils::execution_logs::process_log_file_path(session.id, dispatched.id);
+        std::fs::remove_file(&log_path).unwrap();
+        for directory in log_path.ancestors().skip(1).take(3) {
+            let _ = std::fs::remove_dir(directory);
+        }
     }
 }

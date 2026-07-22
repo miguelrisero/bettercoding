@@ -105,9 +105,6 @@
     "copyLogs": "Copier les logs",
     "logsCopied": "Copié !"
   },
-  "followUp": {
-    "queuedMessage": "Message en file d'attente - s'exécutera lorsque l'exécution actuelle sera terminée"
-  },
   "todoPopup": {
     "title": "Tâches",
     "progress": "{{completed}}/{{total}} terminées",
@@ -129,6 +126,27 @@
     "retry": "Réessayer",
     "showMore": "Afficher plus",
     "showLess": "Afficher moins",
+    "queue": {
+      "queued": "En file d'attente — en attente de l'agent",
+      "pasting": "Envoi à la CLI…",
+      "pasted": "En file d'attente dans la CLI — pas encore soumis",
+      "failed": "Envoi suspendu",
+      "sendAgain": "Renvoyer",
+      "sendingAgain": "Nouvel envoi…",
+      "heldToast": "En attente — l'agent est occupé ; votre message est dans la file et sera envoyé ensuite",
+      "deliveryFailedToast": "En attente — échec de l'envoi ; votre message est dans la file d'attente. Utilisez « Renvoyer » pour réessayer maintenant.",
+      "routedToast": "Envoyé à la CLI — en attente de son affichage dans la conversation",
+      "retryingToast": "Message remis en file d'attente — une nouvelle tentative aura lieu ensuite",
+      "replaceTitle": "Remplacer le message en file d'attente ?",
+      "replaceUiMessage": "Remplacer votre message en file d'attente : « {{message}} » ?",
+      "replaceRecoveryMessage": "Remplacer le message CLI récupéré : « {{message}} » ?",
+      "replaceConfirm": "Remplacer et envoyer",
+      "replaceInProgressToast": "Ce message est déjà en cours d'envoi. Attendez la fin de l'envoi avant d'en envoyer un autre.",
+      "replaceChangedToast": "Le message en file d'attente a changé avant de pouvoir être remplacé. Réessayez.",
+      "queueErrorToast": "Votre message n'a pas pu être mis en file d'attente. Réessayez.",
+      "retryErrorToast": "Le message en file d'attente n'a pas pu être renvoyé. Réessayez.",
+      "dismissToast": "Fermer la notification"
+    },
     "actions": {
       "cancel": "Annuler",
       "submitFeedback": "Soumettre le feedback",

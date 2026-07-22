@@ -105,9 +105,6 @@
     "copyLogs": "Copy logs",
     "logsCopied": "Copied!"
   },
-  "followUp": {
-    "queuedMessage": "Message queued - will execute when current run finishes"
-  },
   "todoPopup": {
     "title": "Tasks",
     "progress": "{{completed}}/{{total}} completed",
@@ -129,6 +126,27 @@
     "retry": "Retry",
     "showMore": "Show more",
     "showLess": "Show less",
+    "queue": {
+      "queued": "Queued — waiting for the agent",
+      "pasting": "Sending to CLI…",
+      "pasted": "Queued in CLI — not yet submitted",
+      "failed": "Delivery paused",
+      "sendAgain": "Send again",
+      "sendingAgain": "Sending…",
+      "heldToast": "Held — the agent is busy; your message is queued and will go next",
+      "deliveryFailedToast": "Held — delivery failed; your message is queued. Use Send again to retry now.",
+      "routedToast": "Sent to CLI — waiting for it to appear in the conversation",
+      "retryingToast": "Message queued again — it will retry next",
+      "replaceTitle": "Replace queued message?",
+      "replaceUiMessage": "Replace your queued message: “{{message}}”?",
+      "replaceRecoveryMessage": "Replace the recovered CLI message: “{{message}}”?",
+      "replaceConfirm": "Replace and send",
+      "replaceInProgressToast": "That message is already being delivered. Wait for it to finish before sending another.",
+      "replaceChangedToast": "The queued message changed before it could be replaced. Try again.",
+      "queueErrorToast": "Your message could not be queued. Try again.",
+      "retryErrorToast": "The queued message could not be sent again. Try again.",
+      "dismissToast": "Dismiss notification"
+    },
     "actions": {
       "cancel": "Cancel",
       "submitFeedback": "Submit Feedback",

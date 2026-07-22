@@ -70,6 +70,10 @@
     "assistant": "Claude",
     "viaCli": "透過 CLI",
     "cliSessionActive": "CLI 工作階段使用中",
+    "foreignWriter": {
+      "message": "此對話正在應用程式外進行編輯。",
+      "dismiss": "關閉外部編輯提示"
+    },
     "quarantine": {
       "affordance": "未分配的 CLI",
       "openLabel": "開啟 {{count}} 個未分配的 CLI 對話",
@@ -95,7 +99,15 @@
       "explanation": "部分訊息進入了代理不再繼續的路徑。",
       "branchLabel": "分支 {{index}}",
       "resumeHint": "Claude 將從這裡繼續",
-      "emptyBranch": "此分支中沒有可見訊息"
+      "emptyBranch": "此分支中沒有可見訊息",
+      "bringBack": "復原這些訊息",
+      "bringingBack": "正在復原這些訊息…",
+      "recoveryStartedToast": "已將復原的訊息傳送給代理",
+      "recoveryQueuedToast": "復原訊息已加入佇列 — 代理正忙；這些訊息將接著傳送",
+      "recoveryRoutedToast": "復原訊息已傳送至 CLI — 正在等待訊息出現在對話中",
+      "recoveryConflictToast": "未傳送復原訊息 — 已有另一則訊息在佇列中",
+      "recoveryErrorToast": "無法復原這些訊息，請再試一次。",
+      "dismissToast": "關閉復原通知"
     },
     "loadingEarlierMessages": "正在載入先前的訊息",
     "cliEmptyTitle": "此工作區通常在終端機中執行",

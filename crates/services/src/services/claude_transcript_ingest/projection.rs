@@ -63,6 +63,7 @@ pub struct NativeIngestHealth {
     pub rescans: u64,
     pub quarantined_files: u64,
     pub watch_degraded: bool,
+    pub foreign_writer_seen_at: Option<String>,
     pub files: Vec<NativeFileImportHealth>,
 }
 
@@ -139,7 +140,9 @@ pub fn build_projection(
                 .or(row.bound_turn_execution_process_id);
             let origin = if row.linked_execution_process_id.is_some() {
                 NativeFeedOrigin::Executor
-            } else if row.bound_turn_execution_process_id.is_some() {
+            } else if row.bound_turn_execution_process_id.is_some()
+                || row.bound_queued_message_id.is_some()
+            {
                 NativeFeedOrigin::App
             } else {
                 NativeFeedOrigin::Cli

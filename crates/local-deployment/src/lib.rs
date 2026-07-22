@@ -20,6 +20,7 @@ use services::services::{
     approvals::Approvals,
     auth::AuthContext,
     claude_transcript_ingest::ClaudeTranscriptIngest,
+    cli_collab::CliCollabService,
     config::{Config, load_config_from_file, save_config_to_file},
     container::ContainerService,
     events::EventService,
@@ -43,13 +44,18 @@ use uuid::Uuid;
 use workspace_manager::WorkspaceManager;
 use worktree_manager::WorktreeManager;
 
-use crate::{container::LocalContainerService, pty::PtyService};
+use crate::{
+    container::LocalContainerService, paste_transport::LocalCliPasteTransport, pty::PtyService,
+    writer_probe::LocalCliWriterProbe,
+};
 pub mod cli_activity;
 mod command;
 pub mod container;
 mod copy;
 pub mod loop_supervisor;
+mod paste_transport;
 pub mod pty;
+mod writer_probe;
 
 #[derive(Clone)]
 pub struct LocalDeployment {
@@ -68,6 +74,7 @@ pub struct LocalDeployment {
     approvals: Approvals,
     queued_message_service: QueuedMessageService,
     claude_transcript_ingest: Option<Arc<ClaudeTranscriptIngest>>,
+    cli_collab: Arc<CliCollabService>,
     remote_client: Result<RemoteClient, RemoteClientNotConfigured>,
     auth_context: AuthContext,
     oauth_handoffs: Arc<RwLock<HashMap<Uuid, PendingHandoff>>>,
@@ -162,7 +169,7 @@ impl Deployment for LocalDeployment {
         }
 
         let approvals = Approvals::new();
-        let queued_message_service = QueuedMessageService::new();
+        let queued_message_service = QueuedMessageService::new(db.clone());
 
         let oauth_credentials = Arc::new(OAuthCredentials::new(credentials_path()));
         if let Err(e) = oauth_credentials.load().await {
@@ -234,7 +241,6 @@ impl Deployment for LocalDeployment {
             file.clone(),
             analytics_ctx,
             approvals.clone(),
-            queued_message_service.clone(),
             remote_client.clone().ok(),
         )
         .await;
@@ -276,8 +282,18 @@ impl Deployment for LocalDeployment {
 
         // Read-only Claude native-store tailing for CLI-authored transcript
         // backfill and live session feeds. The service owns its watcher guards.
+        let writer_probe = Arc::new(LocalCliWriterProbe::new(db.clone()));
         let claude_transcript_ingest =
-            ClaudeTranscriptIngest::spawn(db.clone(), shutdown.child_token());
+            ClaudeTranscriptIngest::spawn(db.clone(), writer_probe.clone(), shutdown.child_token());
+        let cli_collab = CliCollabService::spawn(
+            db.clone(),
+            writer_probe,
+            Arc::new(LocalCliPasteTransport),
+            Arc::new(container.clone()),
+            claude_transcript_ingest.clone(),
+            shutdown.child_token(),
+        );
+        container.set_cli_collab(cli_collab.clone());
 
         // Keep opted-in CLI loops going across usage/rate limits: detect the
         // limit banner, schedule a wake-up, and re-prompt the agent.
@@ -299,6 +315,7 @@ impl Deployment for LocalDeployment {
             approvals,
             queued_message_service,
             claude_transcript_ingest,
+            cli_collab,
             remote_client,
             auth_context,
             oauth_handoffs,
@@ -373,6 +390,10 @@ impl Deployment for LocalDeployment {
 
     fn claude_transcript_ingest(&self) -> Option<&Arc<ClaudeTranscriptIngest>> {
         self.claude_transcript_ingest.as_ref()
+    }
+
+    fn cli_collab(&self) -> &Arc<CliCollabService> {
+        &self.cli_collab
     }
 
     fn auth_context(&self) -> &AuthContext {

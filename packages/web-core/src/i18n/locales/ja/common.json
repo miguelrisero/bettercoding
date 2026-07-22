@@ -83,6 +83,10 @@
     "assistant": "Claude",
     "viaCli": "CLI 経由",
     "cliSessionActive": "CLI セッションがアクティブ",
+    "foreignWriter": {
+      "message": "この会話はアプリの外部で編集されています。",
+      "dismiss": "外部編集の通知を閉じる"
+    },
     "quarantine": {
       "affordance": "未割り当ての CLI",
       "openLabel": "未割り当ての CLI 会話 {{count}} 件を開く",
@@ -108,7 +112,15 @@
       "explanation": "一部のメッセージは、エージェントが現在たどっていない経路に進みました。",
       "branchLabel": "ブランチ {{index}}",
       "resumeHint": "Claude はここから再開",
-      "emptyBranch": "このブランチに表示できるメッセージはありません"
+      "emptyBranch": "このブランチに表示できるメッセージはありません",
+      "bringBack": "これらのメッセージを復元",
+      "bringingBack": "メッセージを復元中…",
+      "recoveryStartedToast": "復元したメッセージをエージェントに送信しました",
+      "recoveryQueuedToast": "復元を保留中 — エージェントが処理中のため、これらのメッセージは次に送信されます",
+      "recoveryRoutedToast": "復元メッセージを CLI に送信しました — 会話に表示されるまでお待ちください",
+      "recoveryConflictToast": "復元メッセージは送信されませんでした — 別のメッセージがすでにキューに入っています",
+      "recoveryErrorToast": "これらのメッセージを復元できませんでした。もう一度お試しください。",
+      "dismissToast": "復元通知を閉じる"
     },
     "loadingEarlierMessages": "以前のメッセージを読み込み中",
     "cliEmptyTitle": "このワークスペースは通常ターミナルで実行されます",

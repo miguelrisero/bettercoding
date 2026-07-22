@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO cli_pane_bindings\n                   (id, workspace_id, session_id, claude_session_id, bound_via)\n               VALUES ($1, $2, $3, $4, $5)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "0cae1add79c3f27f8bf6a7dd9a2e8c0706c7e2271eefab440500f10b8a6910fa"
+}
