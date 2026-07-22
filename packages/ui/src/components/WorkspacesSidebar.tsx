@@ -46,6 +46,15 @@ const ARCHIVE_BUCKET_LABELS: Record<ArchiveBucket, string> = {
   older_than_thirty_days: 'Older than 30 days',
 };
 
+const ARCHIVE_BUCKET_TRANSLATION_KEYS: Record<ArchiveBucket, string> = {
+  today: 'common:workspaces.archiveBucketToday',
+  one_to_three_days: 'common:workspaces.archiveBucketOneToThreeDays',
+  three_to_seven_days: 'common:workspaces.archiveBucketThreeToSevenDays',
+  seven_to_fifteen_days: 'common:workspaces.archiveBucketSevenToFifteenDays',
+  fifteen_to_thirty_days: 'common:workspaces.archiveBucketFifteenToThirtyDays',
+  older_than_thirty_days: 'common:workspaces.archiveBucketOlderThanThirtyDays',
+};
+
 export interface WorkspacesSidebarWorkspace {
   id: string;
   name: string;
@@ -297,7 +306,7 @@ export function WorkspacesSidebar({
   } | null>(null);
 
   const getArchiveBucketLabel = (bucket: ArchiveBucket) =>
-    t(`common:workspaces.archiveBuckets.${bucket}`, {
+    t(ARCHIVE_BUCKET_TRANSLATION_KEYS[bucket], {
       defaultValue: ARCHIVE_BUCKET_LABELS[bucket],
     });
 

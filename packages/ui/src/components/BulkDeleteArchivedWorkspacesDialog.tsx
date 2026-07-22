@@ -154,7 +154,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
         setInspectionError(
           error instanceof Error
             ? error.message
-            : t('kanban.workspaceSidebar.bulkDelete.inspectionFailed', {
+            : t('kanban.workspaceSidebar.bulkDeleteInspectionFailed', {
                 defaultValue: 'Could not inspect every branch.',
               })
         );
@@ -190,7 +190,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
       setOperationError(
         error instanceof Error
           ? error.message
-          : t('kanban.workspaceSidebar.bulkDelete.requestFailed', {
+          : t('kanban.workspaceSidebar.bulkDeleteRequestFailed', {
               defaultValue: 'The bulk removal request failed.',
             })
       );
@@ -216,21 +216,21 @@ export function BulkDeleteArchivedWorkspacesDialog({
             <WarningIcon className="size-6 shrink-0 text-destructive" />
             <DialogTitle>
               {results
-                ? t('kanban.workspaceSidebar.bulkDelete.resultsTitle', {
+                ? t('kanban.workspaceSidebar.bulkDeleteResultsTitle', {
                     defaultValue: 'Removal results',
                   })
-                : t('kanban.workspaceSidebar.bulkDelete.title', {
+                : t('kanban.workspaceSidebar.bulkDeleteTitle', {
                     defaultValue: 'Remove archived workspaces',
                   })}
             </DialogTitle>
           </div>
           <DialogDescription className="pt-half text-left">
             {results
-              ? t('kanban.workspaceSidebar.bulkDelete.resultsDescription', {
+              ? t('kanban.workspaceSidebar.bulkDeleteResultsDescription', {
                   defaultValue:
                     'Each workspace is reported separately so skipped or failed removals are visible.',
                 })
-              : t('kanban.workspaceSidebar.bulkDelete.description', {
+              : t('kanban.workspaceSidebar.bulkDeleteDescription', {
                   bucket: bucketLabel,
                   defaultValue:
                     'This permanently removes every workspace currently in “{{bucket}}”. This action cannot be undone.',
@@ -241,7 +241,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
         {results && resultCounts ? (
           <div className="flex flex-col gap-base" aria-live="polite">
             <p className="text-sm font-medium text-normal tabular-nums">
-              {t('kanban.workspaceSidebar.bulkDelete.resultSummary', {
+              {t('kanban.workspaceSidebar.bulkDeleteResultSummary', {
                 deleted: resultCounts.deleted,
                 skipped: resultCounts.skipped,
                 failed: resultCounts.failed,
@@ -286,7 +286,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
             <div className="border border-destructive/30 bg-destructive/5 p-base">
               <dl className="grid grid-cols-[1fr_auto] gap-x-base gap-y-half text-sm">
                 <dt className="text-low">
-                  {t('kanban.workspaceSidebar.bulkDelete.workspaces', {
+                  {t('kanban.workspaceSidebar.bulkDeleteWorkspaces', {
                     defaultValue: 'Workspaces',
                   })}
                 </dt>
@@ -295,7 +295,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
                 </dd>
                 <dt className="flex items-center gap-half text-low">
                   <GitBranchIcon className="size-4" />
-                  {t('kanban.workspaceSidebar.bulkDelete.branches', {
+                  {t('kanban.workspaceSidebar.bulkDeleteBranches', {
                     defaultValue: 'Branches deleted',
                   })}
                 </dt>
@@ -304,7 +304,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
                 </dd>
                 <dt className="flex items-center gap-half text-low">
                   <FolderOpenIcon className="size-4" />
-                  {t('kanban.workspaceSidebar.bulkDelete.worktrees', {
+                  {t('kanban.workspaceSidebar.bulkDeleteWorktrees', {
                     defaultValue: 'Worktrees removed',
                   })}
                 </dt>
@@ -312,7 +312,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
                   {worktreeCount ?? '—'}
                 </dd>
                 <dt className="text-low">
-                  {t('kanban.workspaceSidebar.bulkDelete.unmerged', {
+                  {t('kanban.workspaceSidebar.bulkDeleteUnmerged', {
                     defaultValue: 'Branches with unmerged commits',
                   })}
                 </dt>
@@ -320,7 +320,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
                   {isInspecting ? (
                     <span className="inline-flex items-center gap-half text-low">
                       <SpinnerIcon className="size-4 animate-spin" />
-                      {t('kanban.workspaceSidebar.bulkDelete.inspecting', {
+                      {t('kanban.workspaceSidebar.bulkDeleteInspecting', {
                         defaultValue: 'Inspecting…',
                       })}
                     </span>
@@ -329,7 +329,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
                       {inspection.unmergedBranchCount}
                       <span className="ml-half text-xs font-normal text-low">
                         {t(
-                          'kanban.workspaceSidebar.bulkDelete.unmergedWorkspaces',
+                          'kanban.workspaceSidebar.bulkDeleteUnmergedWorkspaces',
                           {
                             count: inspection.unmergedWorkspaceCount,
                             defaultValue: 'across {{count}} workspace(s)',
@@ -353,7 +353,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
                   size="xs"
                   onClick={() => setInspectionAttempt((attempt) => attempt + 1)}
                 >
-                  {t('kanban.workspaceSidebar.bulkDelete.retry', {
+                  {t('kanban.workspaceSidebar.bulkDeleteRetry', {
                     defaultValue: 'Retry',
                   })}
                 </Button>
@@ -362,7 +362,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
 
             <div>
               <p className="mb-half text-xs text-low">
-                {t('kanban.workspaceSidebar.bulkDelete.targets', {
+                {t('kanban.workspaceSidebar.bulkDeleteTargets', {
                   defaultValue: 'Workspaces that will be removed',
                 })}
               </p>
@@ -404,10 +404,10 @@ export function BulkDeleteArchivedWorkspacesDialog({
                   <SpinnerIcon className="mr-half size-4 animate-spin" />
                 )}
                 {isDeleting
-                  ? t('kanban.workspaceSidebar.bulkDelete.removing', {
+                  ? t('kanban.workspaceSidebar.bulkDeleteRemoving', {
                       defaultValue: 'Removing…',
                     })
-                  : t('kanban.workspaceSidebar.bulkDelete.confirm', {
+                  : t('kanban.workspaceSidebar.bulkDeleteConfirm', {
                       count: workspaces.length,
                       defaultValue: 'Remove {{count}} workspaces',
                     })}
