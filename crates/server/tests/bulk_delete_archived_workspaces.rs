@@ -68,7 +68,7 @@ async fn add_running_process(deployment: &LocalDeployment, workspace_id: Uuid) {
     .unwrap();
 }
 
-fn result_for<'a>(results: &'a [Value], workspace_id: Uuid) -> &'a Value {
+fn result_for(results: &[Value], workspace_id: Uuid) -> &Value {
     results
         .iter()
         .find(|result| result["workspace_id"] == workspace_id.to_string())
