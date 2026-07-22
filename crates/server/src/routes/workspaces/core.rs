@@ -4,16 +4,20 @@ use axum::{
     http::StatusCode,
     response::Json as ResponseJson,
 };
+use chrono::Utc;
 use db::models::{
+    archive_bucket::ArchiveBucket,
     coding_agent_turn::CodingAgentTurn,
     execution_process::{ExecutionProcess, ExecutionProcessStatus},
     workspace::{Workspace, WorkspaceError},
 };
 use deployment::Deployment;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use services::services::{container::ContainerService, diff_stream, remote_sync};
 use sqlx::Error as SqlxError;
+use ts_rs::TS;
 use utils::response::ApiResponse;
+use uuid::Uuid;
 use workspace_manager::WorkspaceManager;
 
 use crate::{DeploymentImpl, error::ApiError};
@@ -33,6 +37,33 @@ const RUNNING_PROCESSES_DELETE_MESSAGE: &str =
 pub enum DeleteWorkspaceOutcome {
     Deleted,
     SkippedRunningProcesses,
+}
+
+#[derive(Debug, Deserialize, TS)]
+pub struct BulkDeleteArchivedWorkspacesRequest {
+    pub bucket: ArchiveBucket,
+    pub delete_branches: bool,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[ts(tag = "status", rename_all = "snake_case")]
+pub enum BulkDeleteItemOutcome {
+    Deleted,
+    Skipped { reason: String },
+    Failed { reason: String },
+}
+
+#[derive(Debug, Serialize, TS)]
+pub struct BulkDeleteItemResult {
+    pub workspace_id: Uuid,
+    pub workspace_name: Option<String>,
+    pub outcome: BulkDeleteItemOutcome,
+}
+
+#[derive(Debug, Serialize, TS)]
+pub struct BulkDeleteArchivedWorkspacesResponse {
+    pub results: Vec<BulkDeleteItemResult>,
 }
 
 pub async fn get_workspaces(
@@ -103,6 +134,93 @@ pub async fn get_first_user_message(
     let pool = &deployment.db().pool;
     let message = Workspace::get_first_user_message(pool, workspace.id).await?;
     Ok(ResponseJson(ApiResponse::success(message)))
+}
+
+pub async fn bulk_delete_archived_workspaces(
+    State(deployment): State<DeploymentImpl>,
+    Json(request): Json<BulkDeleteArchivedWorkspacesRequest>,
+) -> Result<ResponseJson<ApiResponse<BulkDeleteArchivedWorkspacesResponse>>, ApiError> {
+    let pool = &deployment.db().pool;
+    let now = Utc::now();
+    let targets = Workspace::fetch_all(pool)
+        .await?
+        .into_iter()
+        .filter(|workspace| workspace.archived)
+        .filter(|workspace| {
+            let bucket = workspace.archived_at.map_or(
+                // An archived row without a timestamp has unknown age. Keep it
+                // in the oldest bucket so it never appears deceptively fresh.
+                ArchiveBucket::OlderThanThirtyDays,
+                |archived_at| ArchiveBucket::from_age(now.signed_duration_since(archived_at)),
+            );
+            bucket == request.bucket
+        })
+        .map(|workspace| (workspace.id, workspace.name))
+        .collect::<Vec<_>>();
+
+    let mut results = Vec::with_capacity(targets.len());
+    for (workspace_id, resolved_name) in targets {
+        let fresh_workspace = match Workspace::find_by_id(pool, workspace_id).await {
+            Ok(Some(workspace)) if !workspace.archived => {
+                results.push(BulkDeleteItemResult {
+                    workspace_id,
+                    workspace_name: workspace.name,
+                    outcome: BulkDeleteItemOutcome::Skipped {
+                        reason: "no longer archived".to_string(),
+                    },
+                });
+                continue;
+            }
+            Ok(Some(workspace)) => workspace,
+            Ok(None) => {
+                results.push(BulkDeleteItemResult {
+                    workspace_id,
+                    workspace_name: resolved_name,
+                    outcome: BulkDeleteItemOutcome::Skipped {
+                        reason: "already deleted".to_string(),
+                    },
+                });
+                continue;
+            }
+            Err(error) => {
+                results.push(BulkDeleteItemResult {
+                    workspace_id,
+                    workspace_name: resolved_name,
+                    outcome: BulkDeleteItemOutcome::Failed {
+                        reason: error.to_string(),
+                    },
+                });
+                continue;
+            }
+        };
+        let workspace_name = fresh_workspace.name.clone();
+
+        let outcome = match delete_workspace_core(
+            &deployment,
+            fresh_workspace,
+            false,
+            request.delete_branches,
+        )
+        .await
+        {
+            Ok(DeleteWorkspaceOutcome::Deleted) => BulkDeleteItemOutcome::Deleted,
+            Ok(DeleteWorkspaceOutcome::SkippedRunningProcesses) => BulkDeleteItemOutcome::Skipped {
+                reason: RUNNING_PROCESSES_DELETE_MESSAGE.to_string(),
+            },
+            Err(error) => BulkDeleteItemOutcome::Failed {
+                reason: error.to_string(),
+            },
+        };
+        results.push(BulkDeleteItemResult {
+            workspace_id,
+            workspace_name,
+            outcome,
+        });
+    }
+
+    Ok(ResponseJson(ApiResponse::success(
+        BulkDeleteArchivedWorkspacesResponse { results },
+    )))
 }
 
 pub async fn delete_workspace(

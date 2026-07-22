@@ -420,6 +420,14 @@ export type ChangeTargetBranchRequest = { repo_id: string, new_target_branch: st
 
 export type ChangeTargetBranchResponse = { repo_id: string, new_target_branch: string, status: [number, number], };
 
+export type BulkDeleteArchivedWorkspacesRequest = { bucket: ArchiveBucket, delete_branches: boolean, };
+
+export type BulkDeleteItemOutcome = { "status": "deleted" } | { "status": "skipped", reason: string, } | { "status": "failed", reason: string, };
+
+export type BulkDeleteItemResult = { workspace_id: string, workspace_name: string | null, outcome: BulkDeleteItemOutcome, };
+
+export type BulkDeleteArchivedWorkspacesResponse = { results: Array<BulkDeleteItemResult>, };
+
 export type AddWorkspaceRepoRequest = { repo_id: string, target_branch: string, };
 
 export type AddWorkspaceRepoResponse = { workspace: Workspace, repo: RepoWithTargetBranch, };
