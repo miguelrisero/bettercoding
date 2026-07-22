@@ -22,6 +22,8 @@ export type WorkspaceLayoutMode = 'flat' | 'accordion';
 export interface WorkspacesSidebarWorkspace {
   id: string;
   name: string;
+  archivedAt: string | null;
+  repoCount?: number;
   filesChanged?: number;
   linesAdded?: number;
   linesRemoved?: number;

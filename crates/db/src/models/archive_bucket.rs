@@ -5,7 +5,7 @@ use ts_rs::TS;
 /// Non-overlapping age ranges for archived workspaces.
 ///
 /// Keep this half-open boundary table in sync with
-/// `packages/web-core/src/shared/lib/archiveBuckets.ts`.
+/// `packages/ui/src/lib/archiveBuckets.ts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(rename_all = "snake_case")]
