@@ -742,16 +742,15 @@ impl CliCollabService {
 
         match dispatched {
             Ok(execution_process) => {
-                if let Some(row) = claimed {
-                    if !SessionQueuedMessage::mark_consumed(
+                if let Some(row) = claimed
+                    && !SessionQueuedMessage::mark_consumed(
                         &self.db.pool,
                         row.id,
                         &self.executor_claim_owner,
                     )
                     .await?
-                    {
-                        return Err(CliCollabError::ExecutorClaimLost(row.id));
-                    }
+                {
+                    return Err(CliCollabError::ExecutorClaimLost(row.id));
                 }
                 Ok(DispatchOutcome::Started { execution_process })
             }
