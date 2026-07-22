@@ -237,9 +237,7 @@ impl SessionQueuedMessage {
                    claude_session_id = $1,
                    executor_claim_owner = $2,
                    paste_claim_owner = $3,
-                   pasted_at = CASE WHEN $3 IS NOT NULL
-                                    THEN datetime('now', 'subsec')
-                                    ELSE NULL END,
+                   pasted_at = NULL,
                    failure_reason = NULL,
                    updated_at = datetime('now', 'subsec')
                WHERE id = $4 AND state = 'queued'"#,
@@ -285,6 +283,7 @@ impl SessionQueuedMessage {
             r#"UPDATE session_queued_messages SET
                    state = 'pasted',
                    paste_claim_owner = NULL,
+                   pasted_at = datetime('now', 'subsec'),
                    updated_at = datetime('now', 'subsec')
                WHERE id = $1 AND state = 'pasting'
                  AND executor_claim_owner IS NULL
@@ -882,7 +881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abandoned_pasting_requeue_preserves_evidence_for_late_ack() {
+    async fn delivered_requeue_preserves_evidence_for_late_ack() {
         let (pool, session_id) = session_fixture().await;
         let sid = "43434343-4343-4343-8343-434343434343";
         let prompt = "ack an abandoned paste";
@@ -904,31 +903,26 @@ mod tests {
             StoreQueuedMessageResult::Stored(row) => row,
             StoreQueuedMessageResult::Conflict(_) => unreachable!(),
         };
-        let claimed =
-            SessionQueuedMessage::claim_for_paste(&pool, row.id, Some(sid), "abandoned-owner")
+        SessionQueuedMessage::claim_for_paste(&pool, row.id, Some(sid), "abandoned-owner")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            SessionQueuedMessage::mark_pasted(&pool, row.id, "abandoned-owner")
                 .await
                 .unwrap()
-                .unwrap();
-        let pasted_at = claimed.pasted_at.unwrap();
-        let old = Utc::now() - Duration::seconds(10);
-        sqlx::query("UPDATE session_queued_messages SET updated_at = ? WHERE id = ?")
-            .bind(old)
-            .bind(row.id)
-            .execute(&pool)
+        );
+        let pasted_at = SessionQueuedMessage::find_by_id(&pool, row.id)
             .await
+            .unwrap()
+            .unwrap()
+            .pasted_at
             .unwrap();
-
-        let recovered = SessionQueuedMessage::reconcile(
-            &pool,
-            Utc::now(),
-            Duration::seconds(5),
-            Duration::minutes(15),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(recovered.requeued_pasting, 1);
+        assert!(
+            SessionQueuedMessage::requeue_pasted(&pool, row.id)
+                .await
+                .unwrap()
+        );
         let requeued = SessionQueuedMessage::find_by_id(&pool, row.id)
             .await
             .unwrap()

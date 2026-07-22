@@ -2806,6 +2806,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paste_claim_crash_before_delivery_requeues_without_false_evidence() {
+        let (db, workspace, session) = fixture().await;
+        let sid = "43434343-4343-4343-8343-434343434343";
+        bind_confirmed_cli(&db, &workspace, &session, sid).await;
+        let row = store_message(
+            &db,
+            session.id,
+            "retry a paste that never reached the pane",
+            QueuedMessageSource::Ui,
+        )
+        .await;
+        SessionQueuedMessage::claim_for_paste(&db.pool, row.id, Some(sid), "pre-crash-paste-owner")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let transport_state = Arc::new(StdMutex::new(TransportState::default()));
+        let transport = Arc::new(RecordingTransport {
+            db: db.clone(),
+            session_id: session.id,
+            state: transport_state.clone(),
+            paste_succeeds: true,
+        });
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(
+                true,
+                Some(true),
+                SidEvidence::ConfirmedResume(sid.to_string()),
+            ),
+            transport,
+            Arc::new(NeverDispatcher),
+        );
+
+        service.reconcile_delivery_state_from_db().await;
+        let requeued = SessionQueuedMessage::find_by_id(&db.pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(requeued.state, QueuedMessageState::Queued);
+        assert!(requeued.pasted_at.is_none());
+        assert!(!requeued.was_requeued_from_pasted());
+
+        assert!(service.drain_session(session.id).await.unwrap());
+        assert_eq!(
+            transport_state.lock().unwrap().pasted_prompts,
+            ["retry a paste that never reached the pane"]
+        );
+        let delivered = SessionQueuedMessage::find_by_id(&db.pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.state, QueuedMessageState::Pasted);
+        assert!(delivered.pasted_at.is_some());
+    }
+
+    #[tokio::test]
     async fn replace_contract_preserves_conflict_details_and_rejects_in_flight_replace() {
         let (db, _workspace, session) = fixture().await;
         let (service, _) = service(db.clone(), report(false, Some(false), SidEvidence::Unknown));
