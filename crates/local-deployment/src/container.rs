@@ -42,7 +42,10 @@ use serde_json::json;
 use services::services::{
     analytics::AnalyticsContext,
     approvals::{Approvals, executor_approvals::ExecutorApprovalBridge},
-    cli_collab::{CliCollabService, CliExecutorDispatcher, RetryDispatchContext},
+    cli_collab::{
+        CliCollabService, CliExecutorDispatcher, DestructiveRetryResetAppliedError,
+        RetryDispatchContext,
+    },
     config::{Config, DEFAULT_COMMIT_REMINDER_PROMPT},
     container::{ContainerError, ContainerRef, ContainerService},
     diff_stream::{self, DiffStreamHandle},
@@ -1208,7 +1211,7 @@ impl CliExecutorDispatcher for LocalContainerService {
             message: prompt.to_string(),
             executor_config: executor_config.clone(),
         };
-        if let Some(retry) = retry {
+        let destructive_reset_completed = if let Some(retry) = retry {
             self.reset_session_to_process(
                 session.id,
                 retry.process_id,
@@ -1216,15 +1219,27 @@ impl CliExecutorDispatcher for LocalContainerService {
                 retry.force_when_dirty,
             )
             .await?;
-        }
-        let process = self
+            retry.perform_git_reset
+        } else {
+            false
+        };
+        let process = match self
             .start_queued_follow_up(
                 &workspace,
                 session,
                 &data,
                 retry.and_then(|retry| retry.reset_to_message_id.clone()),
             )
-            .await?;
+            .await
+        {
+            Ok(process) => process,
+            Err(error) if destructive_reset_completed => {
+                return Err(anyhow::Error::new(DestructiveRetryResetAppliedError::new(
+                    anyhow::Error::new(error),
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        };
         if let Err(error) =
             Scratch::delete(&self.db.pool, session.id, &ScratchType::DraftFollowUp).await
         {
@@ -1815,7 +1830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_retry_dispatch_threads_reset_id_into_follow_up_request() {
+    async fn local_destructive_retry_classifies_post_reset_spawn_failure() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -1987,21 +2002,24 @@ mod tests {
         let retry = RetryDispatchContext {
             process_id: retry_process.id,
             force_when_dirty: false,
-            perform_git_reset: false,
+            perform_git_reset: true,
             reset_to_message_id: Some(reset_to_message_id.clone()),
         };
 
+        let error = CliExecutorDispatcher::dispatch(
+            &service,
+            &session,
+            "retry this prompt",
+            &missing_profile,
+            Some(&retry),
+        )
+        .await
+        .expect_err("the missing test profile must fail after the reset");
         assert!(
-            CliExecutorDispatcher::dispatch(
-                &service,
-                &session,
-                "retry this prompt",
-                &missing_profile,
-                Some(&retry),
-            )
-            .await
-            .is_err(),
-            "the missing test profile must stop after persisting the action"
+            error
+                .downcast_ref::<DestructiveRetryResetAppliedError>()
+                .is_some(),
+            "the dispatcher must preserve that the destructive reset already completed"
         );
 
         let processes = ExecutionProcess::find_by_session_id(&db.pool, session.id, false)

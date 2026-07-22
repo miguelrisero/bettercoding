@@ -110,6 +110,22 @@ pub trait CliExecutorDispatcher: Send + Sync {
     ) -> AnyhowResult<ExecutionProcess>;
 }
 
+pub const DESTRUCTIVE_RETRY_START_FAILURE_REASON: &str =
+    "Git reset completed, but the executor failed to start; message queued for retry";
+
+#[derive(Debug, Error)]
+#[error("executor start failed after destructive retry reset: {source}")]
+pub struct DestructiveRetryResetAppliedError {
+    #[source]
+    source: anyhow::Error,
+}
+
+impl DestructiveRetryResetAppliedError {
+    pub fn new(source: anyhow::Error) -> Self {
+        Self { source }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetryDispatchContext {
     pub process_id: Uuid,
@@ -772,13 +788,33 @@ impl CliCollabService {
             }
             Err(error) => {
                 tracing::warn!(?error, session_id = %session.id, "executor dispatch failed; preserving prompt in queue");
+                let destructive_reset_applied = error
+                    .downcast_ref::<DestructiveRetryResetAppliedError>()
+                    .is_some();
+                let failure_reason = if destructive_reset_applied {
+                    DESTRUCTIVE_RETRY_START_FAILURE_REASON
+                } else {
+                    "executor start failed; queued for retry"
+                };
                 if let Some(row) = claimed {
-                    SessionQueuedMessage::requeue(
-                        &self.db.pool,
-                        row.id,
-                        Some("executor start failed; queued for retry"),
-                    )
-                    .await?;
+                    SessionQueuedMessage::requeue(&self.db.pool, row.id, Some(failure_reason))
+                        .await?;
+                    Ok(DispatchOutcome::Queued {
+                        status: self.status(session.id).await?,
+                    })
+                } else if destructive_reset_applied {
+                    let row = self
+                        .store_slot(
+                            session.id,
+                            prompt,
+                            executor_config,
+                            dispatch_context,
+                            source,
+                            false,
+                        )
+                        .await?;
+                    SessionQueuedMessage::set_failure_reason(&self.db.pool, row.id, failure_reason)
+                        .await?;
                     Ok(DispatchOutcome::Queued {
                         status: self.status(session.id).await?,
                     })
@@ -1420,7 +1456,7 @@ pub const COLLAB_RUN_REASON: ExecutionProcessRunReason = ExecutionProcessRunReas
 mod tests {
     use std::sync::{
         Mutex as StdMutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use db::models::{
@@ -1641,6 +1677,10 @@ mod tests {
         state: Arc<StdMutex<DispatcherState>>,
     }
 
+    struct ResetThenFailingDispatcher {
+        reset_succeeded: Arc<AtomicBool>,
+    }
+
     struct SlowDispatcher {
         db: DBService,
         calls: Arc<AtomicUsize>,
@@ -1681,6 +1721,24 @@ mod tests {
             state.prompts.push(prompt.to_string());
             state.reservation_seen = reservation_seen;
             Err(anyhow::anyhow!("intentional dispatcher failure"))
+        }
+    }
+
+    #[async_trait]
+    impl CliExecutorDispatcher for ResetThenFailingDispatcher {
+        async fn dispatch(
+            &self,
+            _session: &Session,
+            _prompt: &str,
+            _executor_config: &ExecutorConfig,
+            retry: Option<&RetryDispatchContext>,
+        ) -> AnyhowResult<ExecutionProcess> {
+            let retry = retry.expect("test dispatch must be a retry");
+            assert!(retry.perform_git_reset);
+            self.reset_succeeded.store(true, Ordering::SeqCst);
+            Err(anyhow::Error::new(DestructiveRetryResetAppliedError::new(
+                anyhow::anyhow!("spawn failed after reset"),
+            )))
         }
     }
 
@@ -2486,6 +2544,47 @@ mod tests {
             .unwrap();
         assert_eq!(queued.state, QueuedMessageState::Queued);
         assert_eq!(queued.prompt, "preserve failed dispatch");
+    }
+
+    #[tokio::test]
+    async fn destructive_retry_spawn_failure_reports_reset_before_queueing() {
+        let (db, _workspace, session) = fixture().await;
+        let reset_succeeded = Arc::new(AtomicBool::new(false));
+        let (service, _) = service_with_components(
+            db,
+            report(false, Some(false), SidEvidence::Unknown),
+            Arc::new(FakeTransport),
+            Arc::new(ResetThenFailingDispatcher {
+                reset_succeeded: reset_succeeded.clone(),
+            }),
+        );
+        let retry = RetryDispatchContext {
+            process_id: Uuid::new_v4(),
+            force_when_dirty: true,
+            perform_git_reset: true,
+            reset_to_message_id: Some("assistant-message".to_string()),
+        };
+
+        let outcome = service
+            .dispatch_retry(
+                &session,
+                "retry after reset".to_string(),
+                executor_config(),
+                QueuedMessageSource::Ui,
+                false,
+                retry,
+            )
+            .await
+            .unwrap();
+
+        assert!(reset_succeeded.load(Ordering::SeqCst));
+        let DispatchOutcome::Queued { status } = outcome else {
+            panic!("a post-reset spawn failure must preserve the prompt");
+        };
+        assert_eq!(
+            status.message().unwrap().failure_reason.as_deref(),
+            Some(DESTRUCTIVE_RETRY_START_FAILURE_REASON)
+        );
     }
 
     #[tokio::test]
