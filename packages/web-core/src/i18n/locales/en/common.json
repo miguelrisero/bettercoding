@@ -517,6 +517,7 @@
       "bulkDeleteBranches": "Branches deleted",
       "bulkDeleteWorktrees": "Worktrees removed",
       "bulkDeleteUnmerged": "Branches with unmerged commits",
+      "bulkDeleteUnknownComparison": "Branches that could not be compared",
       "bulkDeleteInspecting": "Inspecting…",
       "bulkDeleteUnmergedWorkspaces": "across {{count}} workspace(s)",
       "bulkDeleteInspectionFailed": "Could not inspect every branch.",

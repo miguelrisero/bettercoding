@@ -503,6 +503,7 @@
       "bulkDeleteBranches": "Branches supprimées",
       "bulkDeleteWorktrees": "Arborescences de travail supprimées",
       "bulkDeleteUnmerged": "Branches avec des commits non fusionnés",
+      "bulkDeleteUnknownComparison": "Branches qui n’ont pas pu être comparées",
       "bulkDeleteInspecting": "Analyse…",
       "bulkDeleteUnmergedWorkspaces": "dans {{count}} espace(s) de travail",
       "bulkDeleteInspectionFailed": "Impossible d’analyser toutes les branches.",

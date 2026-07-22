@@ -56,6 +56,40 @@ interface InspectionSummary {
   worktreeCount: number;
   unmergedBranchCount: number;
   unmergedWorkspaceCount: number;
+  unknownComparisonCount: number;
+}
+
+const MAX_INSPECTION_CONCURRENCY = 8;
+
+async function inspectWorkspaces(
+  workspaces: BulkDeleteDialogWorkspace[],
+  inspectWorkspace: BulkDeleteArchivedWorkspacesDialogProps['inspectWorkspace']
+) {
+  const results: Array<{
+    workspace: BulkDeleteDialogWorkspace;
+    statuses: BulkDeleteDialogBranchStatus[];
+  }> = new Array(workspaces.length);
+  let nextIndex = 0;
+
+  const workers = Array.from(
+    {
+      length: Math.min(MAX_INSPECTION_CONCURRENCY, workspaces.length),
+    },
+    async () => {
+      while (nextIndex < workspaces.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const workspace = workspaces[index];
+        results[index] = {
+          workspace,
+          statuses: await inspectWorkspace(workspace.id),
+        };
+      }
+    }
+  );
+
+  await Promise.all(workers);
+  return results;
 }
 
 function OutcomeIcon({
@@ -118,12 +152,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
     setInspectionError(null);
     setIsInspecting(true);
 
-    void Promise.all(
-      workspaces.map(async (workspace) => ({
-        workspace,
-        statuses: await inspectWorkspace(workspace.id),
-      }))
-    )
+    void inspectWorkspaces(workspaces, inspectWorkspace)
       .then((workspaceStatuses) => {
         if (canceled) return;
 
@@ -141,12 +170,20 @@ export function BulkDeleteArchivedWorkspacesDialog({
         const unmergedWorkspaceCount = workspaceStatuses.filter((item) =>
           item.statuses.some((status) => (status.commitsAhead ?? 0) > 0)
         ).length;
+        const unknownComparisonCount = workspaceStatuses.reduce(
+          (count, item) =>
+            count +
+            item.statuses.filter((status) => status.commitsAhead === null)
+              .length,
+          0
+        );
 
         setInspection({
           branchCount,
           worktreeCount: branchCount,
           unmergedBranchCount,
           unmergedWorkspaceCount,
+          unknownComparisonCount,
         });
       })
       .catch((error: unknown) => {
@@ -341,6 +378,21 @@ export function BulkDeleteArchivedWorkspacesDialog({
                     '—'
                   )}
                 </dd>
+                {inspection && inspection.unknownComparisonCount > 0 && (
+                  <>
+                    <dt className="text-warning">
+                      {t(
+                        'kanban.workspaceSidebar.bulkDeleteUnknownComparison',
+                        {
+                          defaultValue: 'Branches that could not be compared',
+                        }
+                      )}
+                    </dt>
+                    <dd className="text-right font-medium tabular-nums text-warning">
+                      {inspection.unknownComparisonCount}
+                    </dd>
+                  </>
+                )}
               </dl>
             </div>
 

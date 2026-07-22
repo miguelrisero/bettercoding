@@ -503,6 +503,7 @@
       "bulkDeleteBranches": "Ramas que se eliminarán",
       "bulkDeleteWorktrees": "Árboles de trabajo que se eliminarán",
       "bulkDeleteUnmerged": "Ramas con commits sin fusionar",
+      "bulkDeleteUnknownComparison": "Ramas que no se pudieron comparar",
       "bulkDeleteInspecting": "Inspeccionando…",
       "bulkDeleteUnmergedWorkspaces": "en {{count}} espacio(s) de trabajo",
       "bulkDeleteInspectionFailed": "No se pudieron inspeccionar todas las ramas.",

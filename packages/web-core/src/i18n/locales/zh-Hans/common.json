@@ -503,6 +503,7 @@
       "bulkDeleteBranches": "将删除的分支",
       "bulkDeleteWorktrees": "将移除的工作树",
       "bulkDeleteUnmerged": "包含未合并提交的分支",
+      "bulkDeleteUnknownComparison": "无法比较的分支",
       "bulkDeleteInspecting": "正在检查…",
       "bulkDeleteUnmergedWorkspaces": "涉及 {{count}} 个工作区",
       "bulkDeleteInspectionFailed": "无法检查所有分支。",

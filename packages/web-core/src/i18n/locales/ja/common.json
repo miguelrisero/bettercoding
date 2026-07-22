@@ -503,6 +503,7 @@
       "bulkDeleteBranches": "削除されるブランチ",
       "bulkDeleteWorktrees": "削除されるワークツリー",
       "bulkDeleteUnmerged": "未マージコミットがあるブランチ",
+      "bulkDeleteUnknownComparison": "比較できなかったブランチ",
       "bulkDeleteInspecting": "確認中…",
       "bulkDeleteUnmergedWorkspaces": "{{count}}件のワークスペース",
       "bulkDeleteInspectionFailed": "すべてのブランチを確認できませんでした。",
