@@ -9,6 +9,8 @@ import {
   XCircleIcon,
 } from '@phosphor-icons/react';
 import { useTranslation } from 'react-i18next';
+import type { BulkDeleteTarget } from 'shared/types';
+import type { BulkDeleteArchivedWorkspaceDetails } from '../lib/bulkDeleteArchivedWorkspaces';
 import { Button } from './Button';
 import {
   Dialog,
@@ -18,12 +20,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from './KeyboardDialog';
-
-export interface BulkDeleteDialogWorkspace {
-  id: string;
-  name: string;
-  repoCount?: number;
-}
 
 export interface BulkDeleteDialogBranchStatus {
   commitsAhead: number | null;
@@ -43,12 +39,17 @@ export interface BulkDeleteDialogItemResult {
 export interface BulkDeleteArchivedWorkspacesDialogProps {
   open: boolean;
   bucketLabel: string;
-  workspaces: BulkDeleteDialogWorkspace[];
+  targets: BulkDeleteTarget[];
+  detailsByWorkspaceId: Readonly<
+    Record<string, BulkDeleteArchivedWorkspaceDetails>
+  >;
   onOpenChange: (open: boolean) => void;
   inspectWorkspace: (
     workspaceId: string
   ) => Promise<BulkDeleteDialogBranchStatus[]>;
-  onConfirm: () => Promise<BulkDeleteDialogItemResult[]>;
+  onConfirm: (
+    targets: BulkDeleteTarget[]
+  ) => Promise<BulkDeleteDialogItemResult[]>;
 }
 
 interface InspectionSummary {
@@ -62,27 +63,27 @@ interface InspectionSummary {
 const MAX_INSPECTION_CONCURRENCY = 8;
 
 async function inspectWorkspaces(
-  workspaces: BulkDeleteDialogWorkspace[],
+  targets: BulkDeleteTarget[],
   inspectWorkspace: BulkDeleteArchivedWorkspacesDialogProps['inspectWorkspace']
 ) {
   const results: Array<{
-    workspace: BulkDeleteDialogWorkspace;
+    target: BulkDeleteTarget;
     statuses: BulkDeleteDialogBranchStatus[];
-  }> = new Array(workspaces.length);
+  }> = new Array(targets.length);
   let nextIndex = 0;
 
   const workers = Array.from(
     {
-      length: Math.min(MAX_INSPECTION_CONCURRENCY, workspaces.length),
+      length: Math.min(MAX_INSPECTION_CONCURRENCY, targets.length),
     },
     async () => {
-      while (nextIndex < workspaces.length) {
+      while (nextIndex < targets.length) {
         const index = nextIndex;
         nextIndex += 1;
-        const workspace = workspaces[index];
+        const target = targets[index];
         results[index] = {
-          workspace,
-          statuses: await inspectWorkspace(workspace.id),
+          target,
+          statuses: await inspectWorkspace(target.workspace_id),
         };
       }
     }
@@ -116,7 +117,8 @@ function OutcomeIcon({
 export function BulkDeleteArchivedWorkspacesDialog({
   open,
   bucketLabel,
-  workspaces,
+  targets,
+  detailsByWorkspaceId,
   onOpenChange,
   inspectWorkspace,
   onConfirm,
@@ -133,14 +135,20 @@ export function BulkDeleteArchivedWorkspacesDialog({
   );
 
   const initialRepoCount = useMemo(() => {
-    if (workspaces.some((workspace) => workspace.repoCount === undefined)) {
+    if (
+      targets.some(
+        (target) =>
+          detailsByWorkspaceId[target.workspace_id]?.repoCount === undefined
+      )
+    ) {
       return null;
     }
-    return workspaces.reduce(
-      (count, workspace) => count + (workspace.repoCount ?? 0),
+    return targets.reduce(
+      (count, target) =>
+        count + (detailsByWorkspaceId[target.workspace_id]?.repoCount ?? 0),
       0
     );
-  }, [workspaces]);
+  }, [detailsByWorkspaceId, targets]);
 
   useEffect(() => {
     if (!open) return;
@@ -152,7 +160,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
     setInspectionError(null);
     setIsInspecting(true);
 
-    void inspectWorkspaces(workspaces, inspectWorkspace)
+    void inspectWorkspaces(targets, inspectWorkspace)
       .then((workspaceStatuses) => {
         if (canceled) return;
 
@@ -203,7 +211,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
     return () => {
       canceled = true;
     };
-  }, [inspectWorkspace, inspectionAttempt, open, t, workspaces]);
+  }, [inspectWorkspace, inspectionAttempt, open, t, targets]);
 
   const resultCounts = useMemo(() => {
     if (!results) return null;
@@ -222,7 +230,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
     setIsDeleting(true);
     setOperationError(null);
     try {
-      setResults(await onConfirm());
+      setResults(await onConfirm(targets));
     } catch (error) {
       setOperationError(
         error instanceof Error
@@ -296,7 +304,10 @@ export function BulkDeleteArchivedWorkspacesDialog({
                   <div className="min-w-0 flex-1">
                     <div className="flex items-baseline justify-between gap-base">
                       <span className="truncate text-normal">
-                        {result.workspaceName ?? result.workspaceId}
+                        {result.workspaceName ??
+                          detailsByWorkspaceId[result.workspaceId]
+                            ?.workspaceName ??
+                          result.workspaceId}
                       </span>
                       <span className="shrink-0 text-xs capitalize text-low">
                         {result.outcome.status}
@@ -328,7 +339,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
                   })}
                 </dt>
                 <dd className="text-right font-medium tabular-nums text-normal">
-                  {workspaces.length}
+                  {targets.length}
                 </dd>
                 <dt className="flex items-center gap-half text-low">
                   <GitBranchIcon className="size-4" />
@@ -419,9 +430,13 @@ export function BulkDeleteArchivedWorkspacesDialog({
                 })}
               </p>
               <ul className="max-h-32 overflow-y-auto border-y border-border py-half text-sm text-low">
-                {workspaces.map((workspace) => (
-                  <li key={workspace.id} className="truncate px-half py-0.5">
-                    {workspace.name}
+                {targets.map((target) => (
+                  <li
+                    key={target.workspace_id}
+                    className="truncate px-half py-0.5"
+                  >
+                    {detailsByWorkspaceId[target.workspace_id]?.workspaceName ??
+                      target.workspace_id}
                   </li>
                 ))}
               </ul>
@@ -460,7 +475,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
                       defaultValue: 'Removing…',
                     })
                   : t('kanban.workspaceSidebar.bulkDeleteConfirm', {
-                      count: workspaces.length,
+                      count: targets.length,
                       defaultValue: 'Remove {{count}} workspaces',
                     })}
               </Button>

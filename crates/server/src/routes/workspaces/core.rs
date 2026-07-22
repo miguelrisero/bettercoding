@@ -4,9 +4,8 @@ use axum::{
     http::StatusCode,
     response::Json as ResponseJson,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use db::models::{
-    archive_bucket::ArchiveBucket,
     coding_agent_turn::CodingAgentTurn,
     execution_process::{ExecutionProcess, ExecutionProcessStatus},
     workspace::{Workspace, WorkspaceError},
@@ -40,8 +39,14 @@ pub enum DeleteWorkspaceOutcome {
 }
 
 #[derive(Debug, Deserialize, TS)]
+pub struct BulkDeleteTarget {
+    pub workspace_id: Uuid,
+    pub archived_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize, TS)]
 pub struct BulkDeleteArchivedWorkspacesRequest {
-    pub bucket: ArchiveBucket,
+    pub targets: Vec<BulkDeleteTarget>,
     pub delete_branches: bool,
 }
 
@@ -141,25 +146,18 @@ pub async fn bulk_delete_archived_workspaces(
     Json(request): Json<BulkDeleteArchivedWorkspacesRequest>,
 ) -> Result<ResponseJson<ApiResponse<BulkDeleteArchivedWorkspacesResponse>>, ApiError> {
     let pool = &deployment.db().pool;
-    let now = Utc::now();
-    let targets = Workspace::fetch_all(pool)
-        .await?
-        .into_iter()
-        .filter(|workspace| workspace.archived)
-        .filter(|workspace| {
-            let bucket = workspace.archived_at.map_or(
-                // An archived row without a timestamp has unknown age. Keep it
-                // in the oldest bucket so it never appears deceptively fresh.
-                ArchiveBucket::OlderThanThirtyDays,
-                |archived_at| ArchiveBucket::from_age(now.signed_duration_since(archived_at)),
-            );
-            bucket == request.bucket
-        })
-        .map(|workspace| (workspace.id, workspace.name))
-        .collect::<Vec<_>>();
+    let operation_id = Uuid::new_v4();
+    let target_count = request.targets.len();
+    tracing::info!(
+        %operation_id,
+        delete_branches = request.delete_branches,
+        target_count,
+        "Starting bulk archived-workspace deletion"
+    );
 
-    let mut results = Vec::with_capacity(targets.len());
-    for (workspace_id, resolved_name) in targets {
+    let mut results = Vec::with_capacity(target_count);
+    for target in request.targets {
+        let workspace_id = target.workspace_id;
         let fresh_workspace = match Workspace::find_by_id(pool, workspace_id).await {
             Ok(Some(workspace)) if !workspace.archived => {
                 results.push(BulkDeleteItemResult {
@@ -175,7 +173,7 @@ pub async fn bulk_delete_archived_workspaces(
             Ok(None) => {
                 results.push(BulkDeleteItemResult {
                     workspace_id,
-                    workspace_name: resolved_name,
+                    workspace_name: None,
                     outcome: BulkDeleteItemOutcome::Skipped {
                         reason: "already deleted".to_string(),
                     },
@@ -185,7 +183,7 @@ pub async fn bulk_delete_archived_workspaces(
             Err(error) => {
                 results.push(BulkDeleteItemResult {
                     workspace_id,
-                    workspace_name: resolved_name,
+                    workspace_name: None,
                     outcome: BulkDeleteItemOutcome::Failed {
                         reason: error.to_string(),
                     },
@@ -195,6 +193,18 @@ pub async fn bulk_delete_archived_workspaces(
         };
         let workspace_name = fresh_workspace.name.clone();
 
+        if fresh_workspace.archived_at != target.archived_at {
+            results.push(BulkDeleteItemResult {
+                workspace_id,
+                workspace_name,
+                outcome: BulkDeleteItemOutcome::Skipped {
+                    reason: "archive state changed since review".to_string(),
+                },
+            });
+            continue;
+        }
+
+        // Keep the archived guard here: the shared delete path must still delete active workspaces.
         let outcome = match delete_workspace_core(
             &deployment,
             fresh_workspace,
@@ -217,6 +227,24 @@ pub async fn bulk_delete_archived_workspaces(
             outcome,
         });
     }
+
+    let (deleted, skipped, failed) = results.iter().fold(
+        (0usize, 0usize, 0usize),
+        |(deleted, skipped, failed), result| match result.outcome {
+            BulkDeleteItemOutcome::Deleted => (deleted + 1, skipped, failed),
+            BulkDeleteItemOutcome::Skipped { .. } => (deleted, skipped + 1, failed),
+            BulkDeleteItemOutcome::Failed { .. } => (deleted, skipped, failed + 1),
+        },
+    );
+    tracing::info!(
+        %operation_id,
+        delete_branches = request.delete_branches,
+        target_count,
+        deleted,
+        skipped,
+        failed,
+        "Finished bulk archived-workspace deletion"
+    );
 
     Ok(ResponseJson(ApiResponse::success(
         BulkDeleteArchivedWorkspacesResponse { results },

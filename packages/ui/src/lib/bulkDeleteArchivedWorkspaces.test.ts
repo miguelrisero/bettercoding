@@ -1,0 +1,47 @@
+import { describe, expect, it } from 'vitest';
+import { archiveBucketForTimestamp } from './archiveBuckets';
+import { buildArchivedBucketState } from './bulkDeleteArchivedWorkspaces';
+
+describe('buildArchivedBucketState', () => {
+  it('builds targets from the full bucket despite search and pagination visibility', () => {
+    const fullBucket = Array.from({ length: 55 }, (_, index) => ({
+      id: `workspace-${index}`,
+      name: `Workspace ${index}`,
+      archivedAt: index === 54 ? null : '2026-06-01T12:00:00Z',
+    }));
+    const paginatedIds = new Set(
+      fullBucket.slice(0, 50).map((workspace) => workspace.id)
+    );
+    const searchMatchedIds = new Set(
+      fullBucket
+        .filter((workspace) => workspace.name.endsWith('1'))
+        .map((workspace) => workspace.id)
+        .filter((workspaceId) => paginatedIds.has(workspaceId))
+    );
+
+    const { targets, detailsByWorkspaceId, visibleWorkspaces } =
+      buildArchivedBucketState(fullBucket, searchMatchedIds);
+
+    expect(visibleWorkspaces.map((workspace) => workspace.id)).toEqual([
+      'workspace-1',
+      'workspace-11',
+      'workspace-21',
+      'workspace-31',
+      'workspace-41',
+    ]);
+    expect(targets).toHaveLength(fullBucket.length);
+    expect(targets.map((target) => target.workspace_id)).toEqual(
+      fullBucket.map((workspace) => workspace.id)
+    );
+    expect(targets.at(-1)?.archived_at).toBeNull();
+    expect(detailsByWorkspaceId['workspace-54'].workspaceName).toBe(
+      'Workspace 54'
+    );
+    expect(
+      archiveBucketForTimestamp(
+        fullBucket[54].archivedAt,
+        Date.UTC(2026, 6, 22, 12)
+      )
+    ).toBe('older_than_thirty_days');
+  });
+});

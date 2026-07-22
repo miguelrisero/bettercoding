@@ -10,12 +10,16 @@ import {
   TrashIcon,
 } from '@phosphor-icons/react';
 import { useTranslation } from 'react-i18next';
-import type { ArchiveBucket } from 'shared/types';
+import type { ArchiveBucket, BulkDeleteTarget } from 'shared/types';
 import { cn } from '../lib/cn';
 import {
   ARCHIVE_BUCKET_ORDER,
   archiveBucketForTimestamp,
 } from '../lib/archiveBuckets';
+import {
+  buildArchivedBucketState,
+  type BulkDeleteArchivedWorkspaceDetails,
+} from '../lib/bulkDeleteArchivedWorkspaces';
 import { InputField } from './InputField';
 import { WorkspaceSummary } from './WorkspaceSummary';
 export type WorkspacesSidebarHostStatus = 'online' | 'offline' | 'unpaired';
@@ -97,6 +101,8 @@ export interface WorkspacesSidebarProps {
   onAddWorkspace?: () => void;
   searchQuery: string;
   onSearchChange: (value: string) => void;
+  /** Whether a PR filter currently narrows the archived rows. */
+  hasActivePrFilter?: boolean;
   /** Whether we're in create mode */
   isCreateMode?: boolean;
   /** Title extracted from draft message (only shown when isCreateMode and non-empty) */
@@ -125,9 +131,9 @@ export interface WorkspacesSidebarProps {
   inspectArchivedWorkspace?: (
     workspaceId: string
   ) => Promise<BulkDeleteDialogBranchStatus[]>;
-  /** Permanently removes the server-resolved contents of an archive bucket. */
+  /** Permanently removes the reviewed targets from an archive bucket. */
   onBulkDeleteArchivedBucket?: (
-    bucket: ArchiveBucket
+    targets: BulkDeleteTarget[]
   ) => Promise<BulkDeleteDialogItemResult[]>;
   /** Persist keys for collapsible sections */
   persistKeys?: WorkspacesSidebarPersistKeys;
@@ -228,6 +234,7 @@ export function WorkspacesSidebar({
   onAddWorkspace,
   searchQuery,
   onSearchChange,
+  hasActivePrFilter = false,
   isCreateMode = false,
   draftTitle,
   onSelectCreate,
@@ -300,10 +307,22 @@ export function WorkspacesSidebar({
   }, [archivedWorkspaces]);
 
   const [bulkDeleteTarget, setBulkDeleteTarget] = useState<{
-    bucket: ArchiveBucket;
     label: string;
-    workspaces: WorkspacesSidebarWorkspace[];
+    targets: BulkDeleteTarget[];
+    detailsByWorkspaceId: Readonly<
+      Record<string, BulkDeleteArchivedWorkspaceDetails>
+    >;
   } | null>(null);
+
+  const bulkArchiveActionsDisabled =
+    searchQuery.length > 0 || hasActivePrFilter;
+  const bulkArchiveActionsDisabledLabel = t(
+    'common:workspaces.archiveBucketActionsFiltered',
+    {
+      defaultValue:
+        'Clear active filters to remove archived workspaces in bulk',
+    }
+  );
 
   const getArchiveBucketLabel = (bucket: ArchiveBucket) =>
     t(ARCHIVE_BUCKET_TRANSLATION_KEYS[bucket], {
@@ -417,6 +436,12 @@ export function WorkspacesSidebar({
             ) : (
               archivedBuckets.map((group) => {
                 const label = getArchiveBucketLabel(group.bucket);
+                // Targets intentionally come from the complete bucket group;
+                // visibility only controls which rows the sidebar renders.
+                const bucketState = buildArchivedBucketState(
+                  group.workspaces,
+                  visibleArchivedWorkspaceIds
+                );
                 return (
                   <CollapsibleSectionHeader
                     key={group.bucket}
@@ -424,61 +449,75 @@ export function WorkspacesSidebar({
                     defaultExpanded={true}
                     headerExtra={
                       inspectArchivedWorkspace && onBulkDeleteArchivedBucket ? (
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
+                        bulkArchiveActionsDisabled ? (
+                          <span
+                            className="inline-flex"
+                            title={bulkArchiveActionsDisabledLabel}
+                          >
                             <button
                               type="button"
-                              className="inline-flex size-10 items-center justify-center text-low transition-colors hover:text-normal focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-brand"
-                              aria-label={t(
-                                'common:workspaces.archiveBucketActions',
-                                {
-                                  bucket: label,
-                                  defaultValue: 'Actions for {{bucket}}',
-                                }
-                              )}
+                              disabled
+                              className="inline-flex size-10 cursor-not-allowed items-center justify-center text-low opacity-40"
+                              aria-label={bulkArchiveActionsDisabledLabel}
                             >
                               <DotsThreeIcon className="size-5" weight="bold" />
                             </button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end">
-                            <DropdownMenuItem
-                              className="text-destructive focus:text-destructive"
-                              onSelect={() =>
-                                setBulkDeleteTarget({
-                                  bucket: group.bucket,
-                                  label,
-                                  workspaces: [...group.workspaces],
-                                })
-                              }
-                            >
-                              <TrashIcon />
-                              {t('common:workspaces.removeArchiveBucket', {
-                                defaultValue: 'Remove all in this bucket',
-                              })}
-                            </DropdownMenuItem>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
+                          </span>
+                        ) : (
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <button
+                                type="button"
+                                className="inline-flex size-10 items-center justify-center text-low transition-colors hover:text-normal focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-brand"
+                                aria-label={t(
+                                  'common:workspaces.archiveBucketActions',
+                                  {
+                                    bucket: label,
+                                    defaultValue: 'Actions for {{bucket}}',
+                                  }
+                                )}
+                              >
+                                <DotsThreeIcon
+                                  className="size-5"
+                                  weight="bold"
+                                />
+                              </button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end">
+                              <DropdownMenuItem
+                                className="text-destructive focus:text-destructive"
+                                onSelect={() =>
+                                  setBulkDeleteTarget({
+                                    label,
+                                    targets: bucketState.targets,
+                                    detailsByWorkspaceId:
+                                      bucketState.detailsByWorkspaceId,
+                                  })
+                                }
+                              >
+                                <TrashIcon />
+                                {t('common:workspaces.removeArchiveBucket', {
+                                  defaultValue: 'Remove all in this bucket',
+                                })}
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        )
                       ) : null
                     }
                   >
                     <div className="flex flex-col gap-half py-half">
-                      {group.workspaces
-                        .filter(
-                          (workspace) =>
-                            !visibleArchivedWorkspaceIds ||
-                            visibleArchivedWorkspaceIds.has(workspace.id)
-                        )
-                        .map((workspace) => (
-                          <WorkspaceSummary
-                            summary
-                            key={workspace.id}
-                            name={workspace.name}
-                            workspaceId={workspace.id}
-                            isActive={selectedWorkspaceId === workspace.id}
-                            onOpenWorkspaceActions={handleOpenWorkspaceActions}
-                            onClick={() => onSelectWorkspace(workspace.id)}
-                          />
-                        ))}
+                      {bucketState.visibleWorkspaces.map((workspace) => (
+                        <WorkspaceSummary
+                          summary
+                          key={workspace.id}
+                          name={workspace.name}
+                          workspaceId={workspace.id}
+                          isActive={selectedWorkspaceId === workspace.id}
+                          onOpenWorkspaceActions={handleOpenWorkspaceActions}
+                          onClick={() => onSelectWorkspace(workspace.id)}
+                        />
+                      ))}
                     </div>
                   </CollapsibleSectionHeader>
                 );
@@ -674,11 +713,10 @@ export function WorkspacesSidebar({
           <BulkDeleteArchivedWorkspacesDialog
             open={true}
             bucketLabel={bulkDeleteTarget.label}
-            workspaces={bulkDeleteTarget.workspaces}
+            targets={bulkDeleteTarget.targets}
+            detailsByWorkspaceId={bulkDeleteTarget.detailsByWorkspaceId}
             inspectWorkspace={inspectArchivedWorkspace}
-            onConfirm={() =>
-              onBulkDeleteArchivedBucket(bulkDeleteTarget.bucket)
-            }
+            onConfirm={onBulkDeleteArchivedBucket}
             onOpenChange={(open) => {
               if (!open) setBulkDeleteTarget(null);
             }}

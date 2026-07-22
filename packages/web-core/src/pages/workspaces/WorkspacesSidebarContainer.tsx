@@ -5,7 +5,7 @@ import { useWorkspaceContext } from '@/shared/hooks/useWorkspaceContext';
 import { useScratch } from '@/shared/hooks/useScratch';
 import {
   ScratchType,
-  type ArchiveBucket,
+  type BulkDeleteTarget,
   type DraftWorkspaceData,
 } from 'shared/types';
 import { splitMessageToTitleDescription } from '@/shared/lib/string';
@@ -511,9 +511,11 @@ export function WorkspacesSidebarContainer({
   );
 
   const bulkDeleteArchivedBucket = useCallback(
-    async (bucket: ArchiveBucket): Promise<BulkDeleteDialogItemResult[]> => {
+    async (
+      targets: BulkDeleteTarget[]
+    ): Promise<BulkDeleteDialogItemResult[]> => {
       const response = await workspacesApi.bulkDeleteArchived({
-        bucket,
+        targets,
         delete_branches: true,
       });
       return response.results.map((result) => ({
@@ -615,6 +617,7 @@ export function WorkspacesSidebarContainer({
       onSelectWorkspace={handleSelectWorkspace}
       searchQuery={searchQuery}
       onSearchChange={setSearchQuery}
+      hasActivePrFilter={hasActiveFilters}
       onAddWorkspace={handleAddWorkspace}
       isCreateMode={isCreateMode}
       draftTitle={persistedDraftTitle}

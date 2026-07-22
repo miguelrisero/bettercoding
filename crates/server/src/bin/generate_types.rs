@@ -145,6 +145,7 @@ fn generate_types_content() -> String {
         server::routes::sessions::ResetProcessRequest::decl(),
         server::routes::workspaces::git::ChangeTargetBranchRequest::decl(),
         server::routes::workspaces::git::ChangeTargetBranchResponse::decl(),
+        server::routes::workspaces::core::BulkDeleteTarget::decl(),
         server::routes::workspaces::core::BulkDeleteArchivedWorkspacesRequest::decl(),
         server::routes::workspaces::core::BulkDeleteItemOutcome::decl(),
         server::routes::workspaces::core::BulkDeleteItemResult::decl(),

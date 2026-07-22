@@ -420,7 +420,9 @@ export type ChangeTargetBranchRequest = { repo_id: string, new_target_branch: st
 
 export type ChangeTargetBranchResponse = { repo_id: string, new_target_branch: string, status: [number, number], };
 
-export type BulkDeleteArchivedWorkspacesRequest = { bucket: ArchiveBucket, delete_branches: boolean, };
+export type BulkDeleteTarget = { workspace_id: string, archived_at: string | null, };
+
+export type BulkDeleteArchivedWorkspacesRequest = { targets: Array<BulkDeleteTarget>, delete_branches: boolean, };
 
 export type BulkDeleteItemOutcome = { "status": "deleted" } | { "status": "skipped", reason: string, } | { "status": "failed", reason: string, };
 
