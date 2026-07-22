@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT EXISTS(\n                   SELECT 1 FROM execution_processes ep\n                   WHERE ep.session_id = $1\n                     AND ep.run_reason = 'codingagent'\n                     AND ep.status IN ('failed', 'killed')\n                     AND julianday(ep.completed_at) >= julianday($2)\n               ) AS \"exists!: bool\"",
+  "describe": {
+    "columns": [
+      {
+        "name": "exists!: bool",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a0a7355dfb03a06f5dc4fe5c3df59ec91e1810d6244e35e6d99762b3e0f5efb2"
+}

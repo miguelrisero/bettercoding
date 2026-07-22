@@ -14,7 +14,7 @@ use db::{
         claude_session_link::ClaudeSessionLink,
         cli_pane_binding::CliPaneBinding,
         coding_agent_turn::CodingAgentTurn,
-        execution_process::{ExecutionProcess, ExecutionProcessRunReason},
+        execution_process::{ExecutionProcess, ExecutionProcessRunReason, ExecutionProcessStatus},
         session::Session,
         session_queued_message::{
             QueuedMessageSource, QueuedMessageState, SessionQueuedMessage, StoreQueuedMessageResult,
@@ -41,6 +41,8 @@ const RESUME_SIGNAL_ATTEMPTS: u32 = 3;
 const RESUME_SIGNAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 const PASTING_STARTUP_GRACE: ChronoDuration = ChronoDuration::seconds(5);
 const PASTE_ACK_HARD_CAP: ChronoDuration = ChronoDuration::minutes(15);
+const ABNORMAL_EXECUTOR_QUEUE_HOLD: &str =
+    "previous agent failed or was killed; confirm Send again to run this message";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidEvidence {
@@ -783,9 +785,25 @@ impl CliCollabService {
         Ok(QueueStatus::from_message(QueuedMessage::try_from(row)?))
     }
 
-    pub async fn on_executor_finished(&self, session_id: Uuid) -> Result<bool, CliCollabError> {
+    pub async fn on_executor_finished(
+        &self,
+        session_id: Uuid,
+        finished_status: ExecutionProcessStatus,
+    ) -> Result<bool, CliCollabError> {
         let lock = self.session_lock(session_id).await;
         let guard = lock.lock().await;
+        if matches!(
+            finished_status,
+            ExecutionProcessStatus::Failed | ExecutionProcessStatus::Killed
+        ) {
+            if let Some(row) = SessionQueuedMessage::find_active(&self.db.pool, session_id).await?
+                && row.state == QueuedMessageState::Queued
+            {
+                self.hold_after_abnormal_writer(&row).await?;
+            }
+            self.notify.notify_one();
+            return Ok(false);
+        }
         let session = Session::find_by_id(&self.db.pool, session_id)
             .await?
             .ok_or(CliCollabError::WorkspaceMissing(session_id))?;
@@ -820,6 +838,30 @@ impl CliCollabService {
         let started = self.drain_session(session_id).await?;
         self.notify.notify_one();
         Ok(started)
+    }
+
+    async fn hold_after_abnormal_writer(
+        &self,
+        row: &SessionQueuedMessage,
+    ) -> Result<bool, CliCollabError> {
+        if row.failure_reason.as_deref() == Some(ABNORMAL_EXECUTOR_QUEUE_HOLD) {
+            return Ok(true);
+        }
+        if !ExecutionProcess::has_abnormal_coding_agent_completion_after(
+            &self.db.pool,
+            row.session_id,
+            row.updated_at,
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+        Ok(SessionQueuedMessage::set_failure_reason(
+            &self.db.pool,
+            row.id,
+            ABNORMAL_EXECUTOR_QUEUE_HOLD,
+        )
+        .await?)
     }
 
     async fn hold_or_resume_bound_pane_locked(
@@ -957,6 +999,9 @@ impl CliCollabService {
             return Ok(false);
         };
         if row.state != QueuedMessageState::Queued {
+            return Ok(false);
+        }
+        if self.hold_after_abnormal_writer(&row).await? {
             return Ok(false);
         }
         let session = Session::find_by_id(&self.db.pool, session_id)
@@ -1882,7 +1927,12 @@ mod tests {
             Arc::new(NeverDispatcher),
         );
 
-        assert!(!service.on_executor_finished(session.id).await.unwrap());
+        assert!(
+            !service
+                .on_executor_finished(session.id, ExecutionProcessStatus::Completed)
+                .await
+                .unwrap()
+        );
         assert!(
             transport_state.lock().unwrap().signals.is_empty(),
             "a prior finish hook must not resume the pane over a newer executor"
@@ -1896,7 +1946,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!service.on_executor_finished(session.id).await.unwrap());
+        assert!(
+            !service
+                .on_executor_finished(session.id, ExecutionProcessStatus::Completed)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             transport_state.lock().unwrap().signals,
             [(workspace.id, sid.to_string())]
@@ -1915,6 +1970,55 @@ mod tests {
         );
         *probe.0.lock().unwrap() = report(true, Some(false), SidEvidence::Unknown);
         assert_eq!(service.derive_lease(&session).await, WriterLease::Free);
+    }
+
+    #[tokio::test]
+    async fn killed_executor_holds_queued_follow_up_until_explicit_retry() {
+        let (db, _workspace, session) = fixture().await;
+        let execution = create_running_executor(&db, session.id, "running writer").await;
+        let row = store_message(
+            &db,
+            session.id,
+            "do not run after kill",
+            QueuedMessageSource::Ui,
+        )
+        .await;
+        ExecutionProcess::update_completion(
+            &db.pool,
+            execution.id,
+            ExecutionProcessStatus::Killed,
+            None,
+        )
+        .await
+        .unwrap();
+        let dispatcher_state = Arc::new(StdMutex::new(DispatcherState::default()));
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(false, Some(false), SidEvidence::Unknown),
+            Arc::new(FakeTransport),
+            Arc::new(RecordingDispatcher {
+                db: db.clone(),
+                state: dispatcher_state.clone(),
+            }),
+        );
+
+        assert!(
+            !service
+                .on_executor_finished(session.id, ExecutionProcessStatus::Killed)
+                .await
+                .unwrap()
+        );
+        assert!(!service.drain_session(session.id).await.unwrap());
+        assert!(dispatcher_state.lock().unwrap().prompts.is_empty());
+        let held = SessionQueuedMessage::find_by_id(&db.pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.state, QueuedMessageState::Queued);
+        assert_eq!(
+            held.failure_reason.as_deref(),
+            Some(ABNORMAL_EXECUTOR_QUEUE_HOLD)
+        );
     }
 
     #[tokio::test]
@@ -1978,7 +2082,12 @@ mod tests {
             Arc::new(NeverDispatcher),
         );
 
-        assert!(!service.on_executor_finished(session.id).await.unwrap());
+        assert!(
+            !service
+                .on_executor_finished(session.id, ExecutionProcessStatus::Completed)
+                .await
+                .unwrap()
+        );
 
         assert_eq!(
             transport_state.lock().unwrap().signals,
@@ -2014,7 +2123,10 @@ mod tests {
             Arc::new(NeverDispatcher),
         );
 
-        let error = service.on_executor_finished(session.id).await.unwrap_err();
+        let error = service
+            .on_executor_finished(session.id, ExecutionProcessStatus::Completed)
+            .await
+            .unwrap_err();
 
         assert!(matches!(error, CliCollabError::Transport { .. }));
         assert_eq!(
@@ -2374,7 +2486,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!service.on_executor_finished(session.id).await.unwrap());
+        assert!(
+            !service
+                .on_executor_finished(session.id, ExecutionProcessStatus::Completed)
+                .await
+                .unwrap()
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

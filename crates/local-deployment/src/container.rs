@@ -766,7 +766,13 @@ impl LocalContainerService {
                         .is_some();
                     let started_queued_follow_up = match container.cli_collab.get() {
                         Some(cli_collab) => {
-                            match cli_collab.on_executor_finished(ctx.session.id).await {
+                            match cli_collab
+                                .on_executor_finished(
+                                    ctx.session.id,
+                                    ctx.execution_process.status.clone(),
+                                )
+                                .await
+                            {
                                 Ok(started) => started,
                                 Err(error) => {
                                     tracing::error!(
@@ -822,7 +828,12 @@ impl LocalContainerService {
 
                     if !has_running_agent
                         && let Some(cli_collab) = container.cli_collab.get()
-                        && let Err(error) = cli_collab.on_executor_finished(ctx.session.id).await
+                        && let Err(error) = cli_collab
+                            .on_executor_finished(
+                                ctx.session.id,
+                                ctx.execution_process.status.clone(),
+                            )
+                            .await
                     {
                         tracing::error!(
                             ?error,

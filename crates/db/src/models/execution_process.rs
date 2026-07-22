@@ -289,6 +289,28 @@ impl ExecutionProcess {
         Ok(count > 0)
     }
 
+    /// Whether a failed or killed coding-agent writer completed after the
+    /// queued row's last user-authorized update.
+    pub async fn has_abnormal_coding_agent_completion_after(
+        pool: &SqlitePool,
+        session_id: Uuid,
+        after: DateTime<Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar!(
+            r#"SELECT EXISTS(
+                   SELECT 1 FROM execution_processes ep
+                   WHERE ep.session_id = $1
+                     AND ep.run_reason = 'codingagent'
+                     AND ep.status IN ('failed', 'killed')
+                     AND julianday(ep.completed_at) >= julianday($2)
+               ) AS "exists!: bool""#,
+            session_id,
+            after
+        )
+        .fetch_one(pool)
+        .await
+    }
+
     /// Check if there are running processes (excluding dev servers) for a workspace (across all sessions)
     pub async fn has_running_non_dev_server_processes_for_workspace(
         pool: &SqlitePool,
