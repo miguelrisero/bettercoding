@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use executors::{
     actions::{ExecutorAction, ExecutorActionType},
-    profile::ExecutorProfileId,
+    profile::{ExecutorConfig, ExecutorProfileId},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -594,14 +594,11 @@ impl ExecutionProcess {
         })
     }
 
-    /// Fetch the latest CodingAgent executor profile for a session.
-    /// Returns None if no CodingAgent execution process exists for this session.
-    pub async fn latest_executor_profile_for_session(
+    async fn latest_coding_agent_for_session(
         pool: &SqlitePool,
         session_id: Uuid,
-    ) -> Result<Option<ExecutorProfileId>, ExecutionProcessError> {
-        // Find the latest CodingAgent execution process for this session
-        let latest_execution_process = sqlx::query_as!(
+    ) -> Result<Option<Self>, sqlx::Error> {
+        sqlx::query_as!(
             ExecutionProcess,
             r#"SELECT
                     ep.id as "id!: Uuid",
@@ -622,9 +619,18 @@ impl ExecutionProcess {
             ExecutionProcessRunReason::CodingAgent
         )
         .fetch_optional(pool)
-        .await?;
+        .await
+    }
 
-        let Some(latest_execution_process) = latest_execution_process else {
+    /// Fetch the latest CodingAgent executor configuration for a session.
+    /// Returns None if no CodingAgent execution process exists for this session.
+    pub async fn latest_executor_config_for_session(
+        pool: &SqlitePool,
+        session_id: Uuid,
+    ) -> Result<Option<ExecutorConfig>, ExecutionProcessError> {
+        let Some(latest_execution_process) =
+            Self::latest_coding_agent_for_session(pool, session_id).await?
+        else {
             return Ok(None);
         };
 
@@ -634,18 +640,27 @@ impl ExecutionProcess {
 
         match &action.typ {
             ExecutorActionType::CodingAgentInitialRequest(request) => {
-                Ok(Some(request.executor_config.profile_id()))
+                Ok(Some(request.executor_config.clone()))
             }
             ExecutorActionType::CodingAgentFollowUpRequest(request) => {
-                Ok(Some(request.executor_config.profile_id()))
+                Ok(Some(request.executor_config.clone()))
             }
-            ExecutorActionType::ReviewRequest(request) => {
-                Ok(Some(request.executor_config.profile_id()))
-            }
+            ExecutorActionType::ReviewRequest(request) => Ok(Some(request.executor_config.clone())),
             _ => Err(ExecutionProcessError::ValidationError(
-                "Couldn't find profile from initial request".to_string(),
+                "Couldn't find executor configuration from coding-agent action".to_string(),
             )),
         }
+    }
+
+    /// Fetch the latest CodingAgent executor profile for a session.
+    /// Returns None if no CodingAgent execution process exists for this session.
+    pub async fn latest_executor_profile_for_session(
+        pool: &SqlitePool,
+        session_id: Uuid,
+    ) -> Result<Option<ExecutorProfileId>, ExecutionProcessError> {
+        Ok(Self::latest_executor_config_for_session(pool, session_id)
+            .await?
+            .map(|config| config.profile_id()))
     }
 
     /// Fetch latest execution process info for all workspaces with the given archived status.
@@ -719,5 +734,84 @@ impl ExecutionProcess {
         .await?;
 
         Ok(rows.into_iter().collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use executors::{
+        actions::{ExecutorAction, ExecutorActionType, review::ReviewRequest},
+        executors::BaseCodingAgent,
+        profile::ExecutorConfig,
+    };
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+    use crate::models::{
+        session::{CreateSession, Session},
+        workspace::{CreateWorkspace, Workspace},
+    };
+
+    #[tokio::test]
+    async fn latest_executor_config_includes_review_only_sessions() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::run_migrations_for_tests(&pool).await.unwrap();
+        let workspace_id = Uuid::new_v4();
+        Workspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "main".to_string(),
+                name: Some("review config fixture".to_string()),
+            },
+            workspace_id,
+        )
+        .await
+        .unwrap();
+        let session_id = Uuid::new_v4();
+        Session::create(
+            &pool,
+            &CreateSession {
+                executor: Some(BaseCodingAgent::ClaudeCode.to_string()),
+                name: None,
+            },
+            session_id,
+            workspace_id,
+        )
+        .await
+        .unwrap();
+        let mut expected = ExecutorConfig::new(BaseCodingAgent::Codex);
+        expected.model_id = Some("review-model".to_string());
+        ExecutionProcess::create(
+            &pool,
+            &CreateExecutionProcess {
+                session_id,
+                executor_action: ExecutorAction::new(
+                    ExecutorActionType::ReviewRequest(ReviewRequest {
+                        executor_config: expected.clone(),
+                        context: None,
+                        prompt: "review".to_string(),
+                        session_id: None,
+                        working_dir: None,
+                    }),
+                    None,
+                ),
+                run_reason: ExecutionProcessRunReason::CodingAgent,
+            },
+            Uuid::new_v4(),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            ExecutionProcess::latest_executor_config_for_session(&pool, session_id)
+                .await
+                .unwrap(),
+            Some(expected)
+        );
     }
 }

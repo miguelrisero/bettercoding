@@ -42,7 +42,8 @@ impl WorkspaceSpawnReservation {
         let mut tx = pool.begin().await?;
         sqlx::query!(
             r#"DELETE FROM workspace_spawn_reservations
-               WHERE workspace_id = $1 AND expires_at <= $2"#,
+               WHERE workspace_id = $1
+                 AND julianday(expires_at) <= julianday($2)"#,
             workspace_id,
             now
         )
@@ -205,6 +206,60 @@ mod tests {
             WorkspaceSpawnReservation::release(&pool, workspace_id, &third.fence)
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn reservation_expiry_compares_mixed_timestamp_formats_chronologically() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::run_migrations_for_tests(&pool).await.unwrap();
+        let workspace_id = Uuid::new_v4();
+        Workspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "main".to_string(),
+                name: Some("timestamp fixture".to_string()),
+            },
+            workspace_id,
+        )
+        .await
+        .unwrap();
+        let now = "2026-07-21T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        WorkspaceSpawnReservation::acquire_at(
+            &pool,
+            workspace_id,
+            SpawnReservationHolder::Executor,
+            now,
+            Duration::hours(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        sqlx::query(
+            "UPDATE workspace_spawn_reservations SET expires_at = \
+             '2026-07-21 12:00:00' WHERE workspace_id = ?",
+        )
+        .bind(workspace_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            WorkspaceSpawnReservation::acquire_at(
+                &pool,
+                workspace_id,
+                SpawnReservationHolder::Cli,
+                now,
+                Duration::minutes(15),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a future SQL datetime must not be deleted by textual ordering"
         );
     }
 }

@@ -24,7 +24,6 @@ use db::models::{
 };
 use deployment::Deployment;
 use executors::{
-    actions::ExecutorActionType,
     executors::{BaseCodingAgent, claude::native::adapt_native_claude_line},
     profile::ExecutorConfig,
 };
@@ -266,23 +265,10 @@ async fn latest_executor_config(
     pool: &sqlx::SqlitePool,
     session: &Session,
 ) -> Result<ExecutorConfig, ApiError> {
-    for process in ExecutionProcess::find_by_session_id(pool, session.id, false)
-        .await?
-        .iter()
-        .rev()
+    if let Some(config) =
+        ExecutionProcess::latest_executor_config_for_session(pool, session.id).await?
     {
-        let Ok(action) = process.executor_action() else {
-            continue;
-        };
-        match action.typ() {
-            ExecutorActionType::CodingAgentInitialRequest(request) => {
-                return Ok(request.executor_config.clone());
-            }
-            ExecutorActionType::CodingAgentFollowUpRequest(request) => {
-                return Ok(request.executor_config.clone());
-            }
-            _ => {}
-        }
+        return Ok(config);
     }
     let executor = session
         .executor

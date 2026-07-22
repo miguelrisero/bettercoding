@@ -29,12 +29,6 @@ pub enum QueuedMessageState {
     Cancelled,
 }
 
-impl QueuedMessageState {
-    pub fn is_active(self) -> bool {
-        matches!(self, Self::Queued | Self::Pasting | Self::Pasted)
-    }
-}
-
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize, TS)]
 pub struct SessionQueuedMessage {
     pub id: Uuid,

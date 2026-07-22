@@ -141,18 +141,4 @@ impl CliPaneBinding {
         .await?;
         Ok(result.rows_affected() > 0)
     }
-
-    pub async fn release_workspace(
-        pool: &SqlitePool,
-        workspace_id: Uuid,
-    ) -> Result<u64, sqlx::Error> {
-        Ok(sqlx::query!(
-            r#"UPDATE cli_pane_bindings SET released_at = datetime('now', 'subsec')
-               WHERE workspace_id = $1 AND released_at IS NULL"#,
-            workspace_id
-        )
-        .execute(pool)
-        .await?
-        .rows_affected())
-    }
 }

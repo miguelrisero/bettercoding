@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM workspace_spawn_reservations\n               WHERE workspace_id = $1\n                 AND julianday(expires_at) <= julianday($2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "ce75e8250227891f8cd516d89cdb2b93cea4fa86653c95a318153c84ee6eb242"
+}

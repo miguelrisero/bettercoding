@@ -72,6 +72,7 @@ import { RenameSessionDialog } from '@vibe/ui/components/RenameSessionDialog';
 import type { TurnNavigationItem } from '@vibe/ui/components/TurnNavigationPopup';
 import { ConfirmDialog } from '@vibe/ui/components/ConfirmDialog';
 import {
+  assertNever,
   deriveQueueChipState,
   getActiveQueuedMessage,
   mapDispatchOutcomeToUiState,
@@ -531,6 +532,8 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
           break;
         case 'none':
           break;
+        default:
+          assertNever(notice);
       }
     },
     [showToast, t]
@@ -599,7 +602,7 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
         );
       }
 
-      if (uiState.confirmReplacement) {
+      if (uiState.kind === 'conflict') {
         if (replace) {
           showReplacementConflict(uiState.queueStatus);
           return false;
@@ -609,7 +612,7 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
       }
 
       showDispatchNotice(uiState.notice);
-      return uiState.clearComposer;
+      return true;
     };
 
     const accepted = await attemptDispatch(false);

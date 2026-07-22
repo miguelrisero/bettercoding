@@ -288,12 +288,13 @@ async fn terminal_ws(
             let resume_session_id = (!executor_active)
                 .then(|| known_claude_session_id.clone())
                 .flatten();
-            let cli_session_exists = if cli_tmux_available() {
+            let tmux_available = cli_tmux_available();
+            let cli_session_exists = if tmux_available {
                 cli_tmux_session_exists_checked(query.workspace_id).await?
             } else {
                 false
             };
-            if cli_tmux_available() && !cli_session_exists {
+            if tmux_available && !cli_session_exists {
                 let launch_session = session.as_ref().ok_or_else(|| {
                     ApiError::BadRequest(
                         "CLI mode requires a BetterCoding session for this workspace".to_string(),

@@ -210,10 +210,7 @@ impl CliCollabService {
         lock
     }
 
-    pub fn wake_drain(&self) {
-        self.notify.notify_one();
-    }
-
+    #[cfg(test)]
     pub async fn derive_lease(&self, session: &Session) -> WriterLease {
         let lock = self.session_lock(session.id).await;
         let _guard = lock.lock().await;
@@ -391,13 +388,12 @@ impl CliCollabService {
                 replace,
             )
             .await?;
-        if let PreparedSlot::Conflict(status) = existing {
-            return Ok(DispatchOutcome::Conflict { status });
-        }
         let existing = match existing {
             PreparedSlot::None => None,
             PreparedSlot::Stored(row) => Some(row),
-            PreparedSlot::Conflict(_) => unreachable!(),
+            PreparedSlot::Conflict(status) => {
+                return Ok(DispatchOutcome::Conflict { status });
+            }
         };
 
         let lease = self.derive_lease_locked(session).await;
@@ -510,7 +506,7 @@ impl CliCollabService {
         }
     }
 
-    pub async fn status(&self, session_id: Uuid) -> Result<QueueStatus, CliCollabError> {
+    async fn status(&self, session_id: Uuid) -> Result<QueueStatus, CliCollabError> {
         match SessionQueuedMessage::find_active(&self.db.pool, session_id).await? {
             Some(row) => Self::status_from_row(row),
             None => Ok(QueueStatus::Empty),
@@ -594,8 +590,9 @@ impl CliCollabService {
             )
             .await?
         {
-            StoreQueuedMessageResult::Stored(row) => Ok(row),
-            StoreQueuedMessageResult::Conflict(row) => Ok(row),
+            StoreQueuedMessageResult::Stored(row) | StoreQueuedMessageResult::Conflict(row) => {
+                Ok(row)
+            }
         }
     }
 

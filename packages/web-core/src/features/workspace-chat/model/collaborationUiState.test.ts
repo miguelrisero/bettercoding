@@ -52,8 +52,6 @@ describe('mapDispatchOutcomeToUiState', () => {
       kind: 'started',
       notice: 'none',
       queueStatus: { status: 'empty' },
-      clearComposer: true,
-      confirmReplacement: false,
     });
   });
 
@@ -67,8 +65,6 @@ describe('mapDispatchOutcomeToUiState', () => {
       kind: 'queued',
       notice: 'held',
       queueStatus: queued,
-      clearComposer: true,
-      confirmReplacement: false,
     });
     expect(
       mapDispatchOutcomeToUiState({
@@ -79,8 +75,6 @@ describe('mapDispatchOutcomeToUiState', () => {
       kind: 'routed-to-cli',
       notice: 'routed-to-cli',
       queueStatus: pasted,
-      clearComposer: true,
-      confirmReplacement: false,
     });
     expect(
       mapDispatchOutcomeToUiState({ outcome: 'conflict', status: queued })
@@ -88,8 +82,6 @@ describe('mapDispatchOutcomeToUiState', () => {
       kind: 'conflict',
       notice: 'none',
       queueStatus: queued,
-      clearComposer: false,
-      confirmReplacement: true,
     });
   });
 

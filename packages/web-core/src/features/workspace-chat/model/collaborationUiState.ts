@@ -16,8 +16,6 @@ export interface DispatchUiState {
   kind: DispatchUiKind;
   notice: DispatchNoticeKind;
   queueStatus: QueueStatus;
-  clearComposer: boolean;
-  confirmReplacement: boolean;
 }
 
 export type QueueChipKind = 'queued' | 'pasting' | 'pasted' | 'failed';
@@ -29,10 +27,23 @@ export interface QueueChipState {
   canSendAgain: boolean;
 }
 
+export function assertNever(value: never): never {
+  throw new Error(`Unhandled collaboration state: ${String(value)}`);
+}
+
 export function getActiveQueuedMessage(
   status: QueueStatus
 ): QueuedMessage | null {
-  return status.status === 'empty' ? null : status.message;
+  switch (status.status) {
+    case 'empty':
+      return null;
+    case 'queued':
+    case 'pasting':
+    case 'pasted':
+      return status.message;
+    default:
+      return assertNever(status);
+  }
 }
 
 /**
@@ -49,8 +60,6 @@ export function mapDispatchOutcomeToUiState(
         kind: 'started',
         notice: 'none',
         queueStatus: { status: 'empty' },
-        clearComposer: true,
-        confirmReplacement: false,
       };
     case 'queued': {
       const message = getActiveQueuedMessage(outcome.status);
@@ -58,8 +67,6 @@ export function mapDispatchOutcomeToUiState(
         kind: 'queued',
         notice: message?.failure_reason ? 'delivery-failed' : 'held',
         queueStatus: outcome.status,
-        clearComposer: true,
-        confirmReplacement: false,
       };
     }
     case 'routed_to_cli':
@@ -67,17 +74,15 @@ export function mapDispatchOutcomeToUiState(
         kind: 'routed-to-cli',
         notice: 'routed-to-cli',
         queueStatus: outcome.delivery,
-        clearComposer: true,
-        confirmReplacement: false,
       };
     case 'conflict':
       return {
         kind: 'conflict',
         notice: 'none',
         queueStatus: outcome.status,
-        clearComposer: false,
-        confirmReplacement: true,
       };
+    default:
+      return assertNever(outcome);
   }
 }
 
@@ -85,22 +90,30 @@ export function mapDispatchOutcomeToUiState(
 export function deriveQueueChipState(
   status: QueueStatus
 ): QueueChipState | null {
-  if (status.status === 'empty') return null;
+  switch (status.status) {
+    case 'empty':
+      return null;
+    case 'queued':
+    case 'pasting':
+    case 'pasted': {
+      const failureReason = status.message.failure_reason;
+      if (failureReason) {
+        return {
+          kind: 'failed',
+          message: status.message,
+          failureReason,
+          canSendAgain: status.status === 'queued',
+        };
+      }
 
-  const failureReason = status.message.failure_reason;
-  if (failureReason) {
-    return {
-      kind: 'failed',
-      message: status.message,
-      failureReason,
-      canSendAgain: status.status === 'queued',
-    };
+      return {
+        kind: status.status,
+        message: status.message,
+        failureReason: null,
+        canSendAgain: false,
+      };
+    }
+    default:
+      return assertNever(status);
   }
-
-  return {
-    kind: status.status,
-    message: status.message,
-    failureReason: null,
-    canSendAgain: false,
-  };
 }

@@ -237,79 +237,14 @@ impl CliNativeRecord {
         records: &[NewCliNativeRecord],
         cursor: &ImportedCursor<'_>,
     ) -> Result<ReplacedGenerationImport, sqlx::Error> {
-        let mut tx = pool.begin().await?;
-        let next_generation = sqlx::query_scalar!(
-            r#"SELECT COALESCE(MAX(generation), -1) + 1 AS "generation!: i64"
-               FROM cli_native_files
-               WHERE dir_path = $1 AND file_name = $2"#,
-            registration.dir_path,
-            registration.file_name
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-
-        // Capture the pre-purge watermark so replacement rows never reuse a
-        // sequence already observed by a connected publisher.
-        let session_id = sqlx::query_scalar!(
-            r#"SELECT session_id AS "session_id!: Uuid"
-               FROM claude_session_links
-               WHERE claude_session_id = $1"#,
-            registration.claude_session_id
-        )
-        .fetch_optional(&mut *tx)
-        .await?;
-        let next_outbox_seq = if let Some(session_id) = session_id {
-            Some(CliIngestOutbox::next_seq_in_transaction(&mut tx, session_id).await?)
-        } else {
-            None
-        };
-
-        let file_id = Uuid::new_v4();
-        sqlx::query!(
-            r#"INSERT INTO cli_native_files
-                   (id, claude_session_id, dir_path, file_name,
-                    discovered_workspace_id, dev, inode, generation,
-                    observed_size, observed_mtime_ms)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
-            file_id,
-            registration.claude_session_id,
-            registration.dir_path,
-            registration.file_name,
-            registration.discovered_workspace_id,
-            registration.dev,
-            registration.inode,
-            next_generation,
-            registration.observed_size,
-            registration.observed_mtime_ms
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query!(
-            r#"DELETE FROM cli_native_files
-               WHERE dir_path = $1 AND file_name = $2 AND id != $3"#,
-            registration.dir_path,
-            registration.file_name,
-            file_id
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        let imported = Self::import_batch_in_transaction(
-            &mut tx,
-            file_id,
+        Self::replace_generation_and_import_batch_with_context(
+            pool,
+            registration,
             records,
             cursor,
-            next_outbox_seq,
             NativeImportContext::default(),
         )
-        .await?;
-        tx.commit().await?;
-
-        let file = CliNativeFile::find_by_id(pool, file_id)
-            .await?
-            .expect("activated native generation exists");
-        Ok(ReplacedGenerationImport { file, imported })
+        .await
     }
 
     pub async fn replace_generation_and_import_batch_with_context(
@@ -441,7 +376,9 @@ impl CliNativeRecord {
                         // without a timestamp use this import's clock so they
                         // can still reconcile without matching old turns.
                         let reference_time = record.recorded_at.unwrap_or(imported_at);
-                        let window_start = reference_time - chrono::Duration::minutes(15);
+                        let window_start = reference_time
+                            .checked_sub_signed(chrono::Duration::minutes(15))
+                            .unwrap_or(reference_time);
                         sqlx::query_scalar!(
                             r#"SELECT cat.id AS "id!: Uuid"
                                FROM coding_agent_turns cat
@@ -485,8 +422,12 @@ impl CliNativeRecord {
                     match (record.user_prompt.as_deref(), session_id) {
                         (Some(prompt), Some(session_id)) => {
                             let reference_time = record.recorded_at.unwrap_or(imported_at);
-                            let earliest_paste = reference_time - chrono::Duration::minutes(15);
-                            let latest_paste = reference_time + chrono::Duration::seconds(5);
+                            let earliest_paste = reference_time
+                                .checked_sub_signed(chrono::Duration::minutes(15))
+                                .unwrap_or(reference_time);
+                            let latest_paste = reference_time
+                                .checked_add_signed(chrono::Duration::seconds(5))
+                                .unwrap_or(reference_time);
                             sqlx::query_scalar!(
                                 r#"SELECT id AS "id!: Uuid"
                                FROM session_queued_messages

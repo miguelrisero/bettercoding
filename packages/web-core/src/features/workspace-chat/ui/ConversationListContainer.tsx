@@ -61,7 +61,10 @@ import { Badge } from '@vibe/ui/components/Badge';
 import { UnassignedCliSessions } from './UnassignedCliSessions';
 import { shouldShowForeignWriterBanner } from '../model/foreignWriterBanner';
 import { sessionsApi } from '@/shared/lib/api';
-import { mapDispatchOutcomeToUiState } from '../model/collaborationUiState';
+import {
+  assertNever,
+  mapDispatchOutcomeToUiState,
+} from '../model/collaborationUiState';
 import { sessionQueueKeys } from '../model/hooks/useSessionQueueInteraction';
 import { useTransientToast } from '@/shared/hooks/useTransientToast';
 import { Toast } from '@vibe/ui/components/Toast';
@@ -611,6 +614,8 @@ export const ConversationList = forwardRef<
               'warning'
             );
             break;
+          default:
+            assertNever(uiState.kind);
         }
       } catch {
         showRecoveryToast(t('conversation.fork.recoveryErrorToast'), 'error');

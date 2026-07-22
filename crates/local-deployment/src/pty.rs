@@ -371,13 +371,7 @@ pub fn cli_resume_ready_file_path(workspace_id: Uuid) -> PathBuf {
         .join(format!("{}.ready", workspace_id.simple()))
 }
 
-fn write_cli_resume_ready_file_at(path: &Path, sid: &str, now: SystemTime) -> std::io::Result<()> {
-    let _ = Uuid::parse_str(sid)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let timestamp = now
-        .duration_since(UNIX_EPOCH)
-        .map_err(std::io::Error::other)?
-        .as_secs();
+fn write_private_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         #[cfg(unix)]
         {
@@ -399,12 +393,24 @@ fn write_cli_resume_ready_file_at(path: &Path, sid: &str, now: SystemTime) -> st
             .truncate(true)
             .mode(0o600)
             .open(path)?;
+        // `.mode()` only applies when the file is created. Force the mode on
+        // every write so a pre-existing, same-user file cannot stay broader.
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        writeln!(file, "{timestamp} {sid}")?;
+        file.write_all(content)?;
     }
     #[cfg(not(unix))]
-    std::fs::write(path, format!("{timestamp} {sid}\n"))?;
+    std::fs::write(path, content)?;
     Ok(())
+}
+
+fn write_cli_resume_ready_file_at(path: &Path, sid: &str, now: SystemTime) -> std::io::Result<()> {
+    let _ = Uuid::parse_str(sid)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let timestamp = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_secs();
+    write_private_file(path, format!("{timestamp} {sid}\n").as_bytes())
 }
 
 pub fn write_cli_resume_ready_file(workspace_id: Uuid, sid: &str) -> std::io::Result<()> {
@@ -425,42 +431,7 @@ pub fn remove_cli_resume_ready_file(workspace_id: Uuid) {
 /// [`kill_cli_tmux_session`] clean up the never-consumed case.
 fn write_cli_prompt_file(workspace_id: Uuid, content: &str) -> std::io::Result<PathBuf> {
     let path = cli_prompt_file_path(workspace_id);
-    if let Some(dir) = path.parent() {
-        // Owner-only dir: the files inside are already 0600, but a 0700 dir
-        // also keeps prompt-file names (workspace ids + staging times) from
-        // being enumerable by other local users.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)?;
-        }
-        #[cfg(not(unix))]
-        std::fs::create_dir_all(dir)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)?;
-        // `.mode()` only applies when the file is CREATED; if a looser-perm file
-        // pre-existed at this path (stale from an older build, or same-user
-        // tampering) `create(true)` reuses it without re-chmod'ing. Force 0600
-        // so the prompt is never readable at wider perms. (The 0700 dir already
-        // blocks other users; this is defense in depth.)
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f.write_all(content.as_bytes())?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&path, content.as_bytes())?;
-    }
+    write_private_file(&path, content.as_bytes())?;
     Ok(path)
 }
 

@@ -1,7 +1,7 @@
 import { useCallback } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ApiError, queueApi } from '@/shared/lib/api';
-import type { ExecutorConfig, QueuedMessage, QueueStatus } from 'shared/types';
+import type { ExecutorConfig, QueueStatus } from 'shared/types';
 
 interface UseSessionQueueInteractionOptions {
   /** Session ID for queue operations */
@@ -17,8 +17,6 @@ interface UseSessionQueueInteractionResult {
   queueStatus: QueueStatus;
   /** Whether the active slot can still be edited or cancelled. */
   isQueued: boolean;
-  /** The active queue record in any delivery phase. */
-  activeMessage: QueuedMessage | null;
   /** The editable queued message content, if any. */
   queuedMessage: string | null;
   /** The executor config from the editable queued message, if any. */
@@ -77,8 +75,6 @@ export function useSessionQueueInteraction({
       },
     });
 
-  const activeMessage =
-    queueStatus.status === 'empty' ? null : queueStatus.message;
   const editableMessage =
     queueStatus.status === 'queued' ? queueStatus.message : null;
   const isQueued = editableMessage !== null;
@@ -163,7 +159,6 @@ export function useSessionQueueInteraction({
   return {
     queueStatus,
     isQueued,
-    activeMessage,
     queuedMessage,
     queuedConfig,
     isQueueLoading: queueMutation.isPending || cancelMutation.isPending,

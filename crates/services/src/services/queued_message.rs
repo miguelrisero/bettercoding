@@ -95,6 +95,7 @@ impl QueueStatus {
         }
     }
 
+    #[cfg(test)]
     pub fn message(&self) -> Option<&QueuedMessage> {
         match self {
             Self::Empty => None,
