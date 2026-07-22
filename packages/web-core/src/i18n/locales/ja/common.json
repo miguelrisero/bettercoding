@@ -211,6 +211,7 @@
     "removeArchiveBucket": "このグループをすべて削除",
     "archivedRecentlyCount": "最近アーカイブ ({{count}})",
     "restoreArchivedWorkspace": "{{workspace}}を復元",
+    "restoreArchivedWorkspaceFailed": "{{workspace}}を復元できませんでした。もう一度お試しください。",
     "rename": {
       "title": "ワークスペースの名前を変更",
       "description": "このワークスペースの新しい名前を入力してください。",

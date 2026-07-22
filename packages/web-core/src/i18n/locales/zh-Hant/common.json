@@ -211,6 +211,7 @@
     "removeArchiveBucket": "刪除此分組中的全部工作區",
     "archivedRecentlyCount": "最近封存 ({{count}})",
     "restoreArchivedWorkspace": "還原 {{workspace}}",
+    "restoreArchivedWorkspaceFailed": "無法還原 {{workspace}}。請再試一次。",
     "rename": {
       "title": "重新命名工作區",
       "description": "輸入此工作區的新名稱。",

@@ -225,6 +225,7 @@
     "removeArchiveBucket": "Remove all in this bucket",
     "archivedRecentlyCount": "Archived recently ({{count}})",
     "restoreArchivedWorkspace": "Restore {{workspace}}",
+    "restoreArchivedWorkspaceFailed": "Could not restore {{workspace}}. Try again.",
     "rename": {
       "title": "Rename Workspace",
       "description": "Enter a new name for this workspace.",

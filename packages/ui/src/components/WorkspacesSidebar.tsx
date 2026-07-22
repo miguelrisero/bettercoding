@@ -313,6 +313,7 @@ export function WorkspacesSidebar({
       Record<string, BulkDeleteArchivedWorkspaceDetails>
     >;
   } | null>(null);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
 
   const bulkArchiveActionsDisabled =
     searchQuery.length > 0 || hasActivePrFilter;
@@ -328,6 +329,25 @@ export function WorkspacesSidebar({
     t(ARCHIVE_BUCKET_TRANSLATION_KEYS[bucket], {
       defaultValue: ARCHIVE_BUCKET_LABELS[bucket],
     });
+
+  const handleRestoreWorkspace = useCallback(
+    async (workspace: WorkspacesSidebarWorkspace) => {
+      if (!onRestoreWorkspace) return;
+
+      setRestoreError(null);
+      try {
+        await onRestoreWorkspace(workspace.id);
+      } catch {
+        setRestoreError(
+          t('common:workspaces.restoreArchivedWorkspaceFailed', {
+            workspace: workspace.name,
+            defaultValue: 'Could not restore {{workspace}}. Try again.',
+          })
+        );
+      }
+    },
+    [onRestoreWorkspace, t]
+  );
 
   const headerActions: SectionAction[] = [
     {
@@ -687,9 +707,17 @@ export function WorkspacesSidebar({
                             defaultValue: 'Restore {{workspace}}',
                           }
                         )}
-                        onClick={() => void onRestoreWorkspace(workspace.id)}
+                        onClick={() => void handleRestoreWorkspace(workspace)}
                       />
                     ))}
+                    {restoreError && (
+                      <p
+                        className="px-base py-half text-xs text-error"
+                        role="alert"
+                      >
+                        {restoreError}
+                      </p>
+                    )}
                   </div>
                 </CollapsibleSectionHeader>
               </div>

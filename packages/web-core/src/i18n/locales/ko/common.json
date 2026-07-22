@@ -211,6 +211,7 @@
     "removeArchiveBucket": "이 구간 모두 삭제",
     "archivedRecentlyCount": "최근 보관됨 ({{count}})",
     "restoreArchivedWorkspace": "{{workspace}} 복원",
+    "restoreArchivedWorkspaceFailed": "{{workspace}}을(를) 복원하지 못했습니다. 다시 시도하세요.",
     "rename": {
       "title": "워크스페이스 이름 변경",
       "description": "이 워크스페이스의 새 이름을 입력하세요.",

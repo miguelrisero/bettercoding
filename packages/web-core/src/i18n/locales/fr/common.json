@@ -211,6 +211,7 @@
     "removeArchiveBucket": "Tout supprimer dans ce groupe",
     "archivedRecentlyCount": "Archivés récemment ({{count}})",
     "restoreArchivedWorkspace": "Restaurer {{workspace}}",
+    "restoreArchivedWorkspaceFailed": "Impossible de restaurer {{workspace}}. Réessayez.",
     "rename": {
       "title": "Renommer l'espace de travail",
       "description": "Saisissez un nouveau nom pour cet espace de travail.",
