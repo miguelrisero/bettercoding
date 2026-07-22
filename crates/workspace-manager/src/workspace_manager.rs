@@ -262,6 +262,7 @@ impl WorkspaceManager {
             if delete_branches {
                 let git_service = GitService::new();
                 for repo_path in repo_paths {
+                    let _repo_guard = WorktreeManager::lock_repo_mutation(&repo_path).await;
                     match git_service.delete_branch(&repo_path, &branch_name) {
                         Ok(()) => {
                             info!("Deleted branch '{}' from repo {:?}", branch_name, repo_path);

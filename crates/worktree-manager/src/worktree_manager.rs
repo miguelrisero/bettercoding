@@ -16,6 +16,10 @@ use utils::{path::normalize_macos_private_alias, shell::resolve_executable_path}
 static WORKTREE_CREATION_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+// Serialize git metadata mutations across different worktrees that share a repo.
+static REPO_MUTATION_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 #[derive(Debug, Clone)]
 pub struct WorktreeCleanup {
     pub worktree_path: PathBuf,
@@ -52,6 +56,20 @@ pub enum WorktreeError {
 pub struct WorktreeManager;
 
 impl WorktreeManager {
+    pub async fn lock_repo_mutation(repo_path: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+        let normalized_path = normalize_macos_private_alias(repo_path);
+        let canonical_path = dunce::canonicalize(&normalized_path).unwrap_or(normalized_path);
+        let lock = {
+            let mut locks = REPO_MUTATION_LOCKS.lock().unwrap();
+            locks
+                .entry(canonical_path)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+
+        lock.lock_owned().await
+    }
+
     pub fn set_workspace_dir_override(path: PathBuf) {
         let _ = WORKSPACE_DIR_OVERRIDE.set(path);
     }
@@ -423,6 +441,7 @@ impl WorktreeManager {
         };
 
         if let Some(repo_path) = resolved_repo_path {
+            let _repo_guard = Self::lock_repo_mutation(&repo_path).await;
             Self::comprehensive_worktree_cleanup_async(&repo_path, &worktree.worktree_path).await?;
         } else {
             // Can't determine repo path, just clean up the worktree directory
@@ -588,4 +607,33 @@ async fn create_worktree_when_repo_path_is_a_worktree() {
     )
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn repo_mutation_lock_uses_the_canonical_repo_path() {
+    use std::time::Duration;
+
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let repo_path = temp_dir.path().join("repo");
+    let nested_path = repo_path.join("nested");
+    std::fs::create_dir_all(&nested_path).unwrap();
+
+    let first_guard = WorktreeManager::lock_repo_mutation(&repo_path).await;
+    let aliased_repo_path = nested_path.join("..");
+    let waiter =
+        tokio::spawn(async move { WorktreeManager::lock_repo_mutation(&aliased_repo_path).await });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "canonical aliases must contend on the same repository lock"
+    );
+
+    drop(first_guard);
+    tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("repo lock waiter should proceed after release")
+        .expect("repo lock waiter task should complete");
 }
