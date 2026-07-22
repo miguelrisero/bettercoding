@@ -45,6 +45,9 @@ export interface WorkspaceSummaryProps {
   onClick?: () => void;
   className?: string;
   summary?: boolean;
+  summaryTimestamp?: string;
+  mutedSummary?: boolean;
+  actionLabel?: string;
   /** Whether this is a draft workspace (shows "Draft" instead of elapsed time) */
   isDraft?: boolean;
   onOpenWorkspaceActions?: (workspaceId: string) => void;
@@ -68,6 +71,9 @@ export function WorkspaceSummary({
   onClick,
   className,
   summary = false,
+  summaryTimestamp,
+  mutedSummary = false,
+  actionLabel,
   isDraft = false,
   onOpenWorkspaceActions,
 }: WorkspaceSummaryProps) {
@@ -98,28 +104,41 @@ export function WorkspaceSummary({
         )}
       />
       <button
+        type="button"
         onClick={onClick}
+        aria-label={actionLabel}
+        title={actionLabel}
         className={cn(
           'flex w-full cursor-pointer flex-col text-left px-base py-half transition-all duration-150',
-          isActive
-            ? 'text-normal'
-            : 'text-low sm:opacity-60 sm:hover:opacity-100 sm:hover:text-normal'
+          mutedSummary
+            ? 'text-low opacity-50 hover:opacity-80'
+            : isActive
+              ? 'text-normal'
+              : 'text-low sm:opacity-60 sm:hover:opacity-100 sm:hover:text-normal'
         )}
       >
-        <div
-          className={cn(
-            'overflow-hidden whitespace-nowrap pr-double',
-            !summary && 'text-normal'
-          )}
-          style={{
-            maskImage:
-              'linear-gradient(to right, black calc(100% - 24px), transparent 100%)',
-            WebkitMaskImage:
-              'linear-gradient(to right, black calc(100% - 24px), transparent 100%)',
-          }}
-        >
-          {name}
-        </div>
+        {summary ? (
+          <div className="flex w-full items-baseline gap-base whitespace-nowrap">
+            <span className="min-w-0 flex-1 truncate">{name}</span>
+            {summaryTimestamp && (
+              <span className="shrink-0 text-xs tabular-nums text-low">
+                {formatRelativeElapsed(summaryTimestamp)}
+              </span>
+            )}
+          </div>
+        ) : (
+          <div
+            className="overflow-hidden whitespace-nowrap pr-double text-normal"
+            style={{
+              maskImage:
+                'linear-gradient(to right, black calc(100% - 24px), transparent 100%)',
+              WebkitMaskImage:
+                'linear-gradient(to right, black calc(100% - 24px), transparent 100%)',
+            }}
+          >
+            {name}
+          </div>
+        )}
         {(!summary || isActive) && (
           <div className="flex w-full items-center gap-base text-sm h-5">
             {/* Dev server running - leftmost */}

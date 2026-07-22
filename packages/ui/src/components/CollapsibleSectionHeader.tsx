@@ -38,6 +38,7 @@ interface CollapsibleSectionHeaderProps {
   headerExtra?: ReactNode;
   children?: ReactNode;
   className?: string;
+  titleClassName?: string;
 }
 
 export function CollapsibleSectionHeader({
@@ -49,6 +50,7 @@ export function CollapsibleSectionHeader({
   headerExtra,
   children,
   className,
+  titleClassName,
 }: CollapsibleSectionHeaderProps) {
   const [expanded, setExpanded] = useState(() =>
     getInitialExpanded(persistKey, defaultExpanded)
@@ -82,7 +84,12 @@ export function CollapsibleSectionHeader({
             aria-expanded={expanded}
             className="flex min-w-0 flex-1 cursor-pointer items-center justify-between py-half pr-half text-left"
           >
-            <span className="truncate font-medium tabular-nums text-normal">
+            <span
+              className={cn(
+                'truncate font-medium tabular-nums text-normal',
+                titleClassName
+              )}
+            >
               {title}
             </span>
             <CaretDownIcon
@@ -94,7 +101,12 @@ export function CollapsibleSectionHeader({
             />
           </button>
         ) : (
-          <span className="min-w-0 flex-1 truncate py-half font-medium tabular-nums text-normal">
+          <span
+            className={cn(
+              'min-w-0 flex-1 truncate py-half font-medium tabular-nums text-normal',
+              titleClassName
+            )}
+          >
             {title}
           </span>
         )}

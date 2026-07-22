@@ -81,6 +81,7 @@ export interface WorkspacesSidebarProps {
   totalWorkspacesCount: number;
   archivedWorkspaces?: WorkspacesSidebarWorkspace[];
   visibleArchivedWorkspaceIds?: ReadonlySet<string>;
+  recentlyArchivedWorkspaces?: WorkspacesSidebarWorkspace[];
   isLoading?: boolean;
   selectedWorkspaceId: string | null;
   onSelectWorkspace: (id: string) => void;
@@ -109,6 +110,8 @@ export interface WorkspacesSidebarProps {
   searchControls?: ReactNode;
   /** Callback for opening workspace actions */
   onOpenWorkspaceActions?: (workspaceId: string) => void;
+  /** Restores an archived workspace through the application's archive action. */
+  onRestoreWorkspace?: (workspaceId: string) => Promise<void>;
   /** Loads current branch status before a destructive bucket removal. */
   inspectArchivedWorkspace?: (
     workspaceId: string
@@ -209,6 +212,7 @@ export function WorkspacesSidebar({
   totalWorkspacesCount,
   archivedWorkspaces = [],
   visibleArchivedWorkspaceIds,
+  recentlyArchivedWorkspaces = [],
   isLoading = false,
   selectedWorkspaceId,
   onSelectWorkspace,
@@ -226,6 +230,7 @@ export function WorkspacesSidebar({
   hasMoreWorkspaces = false,
   searchControls,
   onOpenWorkspaceActions,
+  onRestoreWorkspace,
   inspectArchivedWorkspace,
   onBulkDeleteArchivedBucket,
   persistKeys = DEFAULT_PERSIST_KEYS,
@@ -471,16 +476,96 @@ export function WorkspacesSidebar({
               })
             )}
           </div>
-        ) : layoutMode === 'accordion' ? (
-          /* Accordion layout view */
-          <div className="flex flex-col gap-base">
-            {/* Needs Attention section */}
-            <CollapsibleSectionHeader
-              title={t('common:workspaces.needsAttention')}
-              persistKey={persistKeys.raisedHand}
-              defaultExpanded={true}
-            >
-              <div className="flex flex-col gap-base py-half">
+        ) : (
+          <>
+            {layoutMode === 'accordion' ? (
+              /* Accordion layout view */
+              <div className="flex flex-col gap-base">
+                {/* Needs Attention section */}
+                <CollapsibleSectionHeader
+                  title={t('common:workspaces.needsAttention')}
+                  persistKey={persistKeys.raisedHand}
+                  defaultExpanded={true}
+                >
+                  <div className="flex flex-col gap-base py-half">
+                    {draftTitle && (
+                      <WorkspaceSummary
+                        name={draftTitle}
+                        isActive={isCreateMode}
+                        isDraft={true}
+                        onClick={onSelectCreate}
+                      />
+                    )}
+                    {raisedHandWorkspaces.length === 0 && !draftTitle ? (
+                      <span className="text-sm text-low opacity-60 pl-base">
+                        {t('common:workspaces.noWorkspaces')}
+                      </span>
+                    ) : (
+                      <WorkspaceList
+                        workspaces={raisedHandWorkspaces}
+                        selectedWorkspaceId={selectedWorkspaceId}
+                        onSelectWorkspace={onSelectWorkspace}
+                        onOpenWorkspaceActions={handleOpenWorkspaceActions}
+                      />
+                    )}
+                  </div>
+                </CollapsibleSectionHeader>
+
+                {/* Running section */}
+                <CollapsibleSectionHeader
+                  title={t('common:workspaces.running')}
+                  persistKey={persistKeys.running}
+                  defaultExpanded={true}
+                >
+                  <div className="flex flex-col gap-base py-half">
+                    {runningWorkspaces.length === 0 ? (
+                      <span className="text-sm text-low opacity-60 pl-base">
+                        {t('common:workspaces.noWorkspaces')}
+                      </span>
+                    ) : (
+                      <WorkspaceList
+                        workspaces={runningWorkspaces}
+                        selectedWorkspaceId={selectedWorkspaceId}
+                        onSelectWorkspace={onSelectWorkspace}
+                        onOpenWorkspaceActions={handleOpenWorkspaceActions}
+                      />
+                    )}
+                  </div>
+                </CollapsibleSectionHeader>
+
+                {/* Idle section */}
+                <CollapsibleSectionHeader
+                  title={t('common:workspaces.idle')}
+                  persistKey={persistKeys.notRunning}
+                  defaultExpanded={true}
+                >
+                  <div className="flex flex-col gap-base py-half">
+                    {idleWorkspaces.length === 0 ? (
+                      <span className="text-sm text-low opacity-60 pl-base">
+                        {t('common:workspaces.noWorkspaces')}
+                      </span>
+                    ) : (
+                      <WorkspaceList
+                        workspaces={idleWorkspaces}
+                        selectedWorkspaceId={selectedWorkspaceId}
+                        onSelectWorkspace={onSelectWorkspace}
+                        onOpenWorkspaceActions={handleOpenWorkspaceActions}
+                      />
+                    )}
+                  </div>
+                </CollapsibleSectionHeader>
+              </div>
+            ) : (
+              /* Active workspaces flat view */
+              <div className="flex flex-col gap-base">
+                <div className="flex items-center justify-between px-base">
+                  <span className="text-sm font-medium text-low">
+                    {t('common:workspaces.active')}
+                  </span>
+                  <span className="text-xs text-low">
+                    {totalWorkspacesCount}
+                  </span>
+                </div>
                 {draftTitle && (
                   <WorkspaceSummary
                     name={draftTitle}
@@ -489,104 +574,66 @@ export function WorkspacesSidebar({
                     onClick={onSelectCreate}
                   />
                 )}
-                {raisedHandWorkspaces.length === 0 && !draftTitle ? (
-                  <span className="text-sm text-low opacity-60 pl-base">
-                    {t('common:workspaces.noWorkspaces')}
-                  </span>
-                ) : (
-                  <WorkspaceList
-                    workspaces={raisedHandWorkspaces}
-                    selectedWorkspaceId={selectedWorkspaceId}
-                    onSelectWorkspace={onSelectWorkspace}
+                {workspaces.map((workspace) => (
+                  <WorkspaceSummary
+                    key={workspace.id}
+                    name={workspace.name}
+                    workspaceId={workspace.id}
+                    filesChanged={workspace.filesChanged}
+                    linesAdded={workspace.linesAdded}
+                    linesRemoved={workspace.linesRemoved}
+                    isActive={selectedWorkspaceId === workspace.id}
+                    isRunning={workspace.isRunning}
+                    isPinned={workspace.isPinned}
+                    hasPendingApproval={workspace.hasPendingApproval}
+                    hasRunningDevServer={workspace.hasRunningDevServer}
+                    hasUnseenActivity={workspace.hasUnseenActivity}
+                    latestProcessCompletedAt={
+                      workspace.latestProcessCompletedAt
+                    }
+                    latestProcessStatus={workspace.latestProcessStatus}
+                    prStatus={workspace.prStatus}
                     onOpenWorkspaceActions={handleOpenWorkspaceActions}
+                    onClick={() => onSelectWorkspace(workspace.id)}
                   />
-                )}
+                ))}
               </div>
-            </CollapsibleSectionHeader>
-
-            {/* Running section */}
-            <CollapsibleSectionHeader
-              title={t('common:workspaces.running')}
-              persistKey={persistKeys.running}
-              defaultExpanded={true}
-            >
-              <div className="flex flex-col gap-base py-half">
-                {runningWorkspaces.length === 0 ? (
-                  <span className="text-sm text-low opacity-60 pl-base">
-                    {t('common:workspaces.noWorkspaces')}
-                  </span>
-                ) : (
-                  <WorkspaceList
-                    workspaces={runningWorkspaces}
-                    selectedWorkspaceId={selectedWorkspaceId}
-                    onSelectWorkspace={onSelectWorkspace}
-                    onOpenWorkspaceActions={handleOpenWorkspaceActions}
-                  />
-                )}
-              </div>
-            </CollapsibleSectionHeader>
-
-            {/* Idle section */}
-            <CollapsibleSectionHeader
-              title={t('common:workspaces.idle')}
-              persistKey={persistKeys.notRunning}
-              defaultExpanded={true}
-            >
-              <div className="flex flex-col gap-base py-half">
-                {idleWorkspaces.length === 0 ? (
-                  <span className="text-sm text-low opacity-60 pl-base">
-                    {t('common:workspaces.noWorkspaces')}
-                  </span>
-                ) : (
-                  <WorkspaceList
-                    workspaces={idleWorkspaces}
-                    selectedWorkspaceId={selectedWorkspaceId}
-                    onSelectWorkspace={onSelectWorkspace}
-                    onOpenWorkspaceActions={handleOpenWorkspaceActions}
-                  />
-                )}
-              </div>
-            </CollapsibleSectionHeader>
-          </div>
-        ) : (
-          /* Active workspaces flat view */
-          <div className="flex flex-col gap-base">
-            <div className="flex items-center justify-between px-base">
-              <span className="text-sm font-medium text-low">
-                {t('common:workspaces.active')}
-              </span>
-              <span className="text-xs text-low">{totalWorkspacesCount}</span>
-            </div>
-            {draftTitle && (
-              <WorkspaceSummary
-                name={draftTitle}
-                isActive={isCreateMode}
-                isDraft={true}
-                onClick={onSelectCreate}
-              />
             )}
-            {workspaces.map((workspace) => (
-              <WorkspaceSummary
-                key={workspace.id}
-                name={workspace.name}
-                workspaceId={workspace.id}
-                filesChanged={workspace.filesChanged}
-                linesAdded={workspace.linesAdded}
-                linesRemoved={workspace.linesRemoved}
-                isActive={selectedWorkspaceId === workspace.id}
-                isRunning={workspace.isRunning}
-                isPinned={workspace.isPinned}
-                hasPendingApproval={workspace.hasPendingApproval}
-                hasRunningDevServer={workspace.hasRunningDevServer}
-                hasUnseenActivity={workspace.hasUnseenActivity}
-                latestProcessCompletedAt={workspace.latestProcessCompletedAt}
-                latestProcessStatus={workspace.latestProcessStatus}
-                prStatus={workspace.prStatus}
-                onOpenWorkspaceActions={handleOpenWorkspaceActions}
-                onClick={() => onSelectWorkspace(workspace.id)}
-              />
-            ))}
-          </div>
+
+            {recentlyArchivedWorkspaces.length > 0 && onRestoreWorkspace && (
+              <div className="mt-base border-t border-primary pt-half">
+                {/* Deliberately omit persistKey so this resets collapsed. */}
+                <CollapsibleSectionHeader
+                  title={t('common:workspaces.archivedRecentlyCount', {
+                    count: recentlyArchivedWorkspaces.length,
+                    defaultValue: 'Archived recently ({{count}})',
+                  })}
+                  defaultExpanded={false}
+                  titleClassName="font-normal text-low"
+                >
+                  <div className="flex flex-col gap-0 py-half">
+                    {recentlyArchivedWorkspaces.map((workspace) => (
+                      <WorkspaceSummary
+                        summary
+                        mutedSummary
+                        key={workspace.id}
+                        name={workspace.name}
+                        summaryTimestamp={workspace.archivedAt ?? undefined}
+                        actionLabel={t(
+                          'common:workspaces.restoreArchivedWorkspace',
+                          {
+                            workspace: workspace.name,
+                            defaultValue: 'Restore {{workspace}}',
+                          }
+                        )}
+                        onClick={() => void onRestoreWorkspace(workspace.id)}
+                      />
+                    ))}
+                  </div>
+                </CollapsibleSectionHeader>
+              </div>
+            )}
+          </>
         )}
       </div>
 

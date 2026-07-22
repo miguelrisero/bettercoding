@@ -53,6 +53,9 @@ import {
 } from '@phosphor-icons/react';
 import { useRemoteCloudHostsAppBarModel } from '@/shared/hooks/useRemoteCloudHosts';
 import { workspacesApi } from '@/shared/lib/api';
+import { isArchivedRecently } from '@/shared/lib/archiveBuckets';
+import { useActions } from '@/shared/hooks/useActions';
+import { Actions } from '@/shared/actions';
 
 export type WorkspaceLayoutMode = 'flat' | 'accordion';
 
@@ -266,6 +269,7 @@ export function WorkspacesSidebarContainer({
   const [isSortDialogOpen, setIsSortDialogOpen] = useState(false);
   const [isFilterDialogOpen, setIsFilterDialogOpen] = useState(false);
   const { t } = useTranslation('common');
+  const { executeAction } = useActions();
   const sortDialogTitle = t('kanban.workspaceSidebar.sortButtonTitle');
   const filterDialogTitle = t('kanban.workspaceSidebar.filterButtonTitle');
 
@@ -395,6 +399,18 @@ export function WorkspacesSidebarContainer({
     [archivedWorkspaces, sortWorkspaces]
   );
 
+  const recentlyArchivedWorkspaces = useMemo(() => {
+    const nowMilliseconds = Date.now();
+    return archivedWorkspaces
+      .filter((workspace) =>
+        isArchivedRecently(workspace.archivedAt, nowMilliseconds)
+      )
+      .sort(
+        (a, b) =>
+          Date.parse(b.archivedAt ?? '') - Date.parse(a.archivedAt ?? '')
+      );
+  }, [archivedWorkspaces]);
+
   // Apply pagination (only when not searching)
   const paginatedActiveWorkspaces = useMemo(
     () =>
@@ -509,6 +525,13 @@ export function WorkspacesSidebarContainer({
     []
   );
 
+  const restoreArchivedWorkspace = useCallback(
+    async (workspaceId: string) => {
+      await executeAction(Actions.ArchiveWorkspace, workspaceId);
+    },
+    [executeAction]
+  );
+
   const sidebarPersistKeys: WorkspacesSidebarPersistKeys = {
     raisedHand: PERSIST_KEYS.workspacesSidebarRaisedHand,
     notRunning: PERSIST_KEYS.workspacesSidebarNotRunning,
@@ -586,6 +609,7 @@ export function WorkspacesSidebarContainer({
       totalWorkspacesCount={activeWorkspaces.length}
       archivedWorkspaces={allSortedArchivedWorkspaces}
       visibleArchivedWorkspaceIds={visibleArchivedWorkspaceIds}
+      recentlyArchivedWorkspaces={recentlyArchivedWorkspaces}
       isLoading={isWorkspacesListLoading}
       selectedWorkspaceId={selectedWorkspaceId ?? null}
       onSelectWorkspace={handleSelectWorkspace}
@@ -603,6 +627,7 @@ export function WorkspacesSidebarContainer({
       hasMoreWorkspaces={hasMoreWorkspaces && !isSearching}
       searchControls={searchControls}
       onOpenWorkspaceActions={handleOpenWorkspaceActions}
+      onRestoreWorkspace={restoreArchivedWorkspace}
       inspectArchivedWorkspace={inspectArchivedWorkspace}
       onBulkDeleteArchivedBucket={bulkDeleteArchivedBucket}
       persistKeys={sidebarPersistKeys}
