@@ -16,6 +16,28 @@ export interface BulkDeleteArchivedWorkspaceDetails {
   worktreeDeleted: boolean;
 }
 
+export function sumRepoCounts(
+  targets: readonly BulkDeleteTarget[],
+  detailsByWorkspaceId: Readonly<
+    Record<string, BulkDeleteArchivedWorkspaceDetails>
+  >
+): number | null {
+  if (
+    targets.some(
+      (target) =>
+        detailsByWorkspaceId[target.workspace_id]?.repoCount === undefined
+    )
+  ) {
+    return null;
+  }
+
+  return targets.reduce(
+    (count, target) =>
+      count + (detailsByWorkspaceId[target.workspace_id]?.repoCount ?? 0),
+    0
+  );
+}
+
 export function buildArchivedBucketState<
   TWorkspace extends ArchivedWorkspaceBulkDeleteSource,
 >(

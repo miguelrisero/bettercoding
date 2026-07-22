@@ -12,6 +12,7 @@ import { useTranslation } from 'react-i18next';
 import type { BulkDeleteTarget } from 'shared/types';
 import {
   inspectArchivedWorkspaceTargets,
+  sumRepoCounts,
   type BulkDeleteArchivedWorkspaceDetails,
 } from '../lib/bulkDeleteArchivedWorkspaces';
 import { Button } from './Button';
@@ -106,21 +107,10 @@ export function BulkDeleteArchivedWorkspacesDialog({
     null
   );
 
-  const initialRepoCount = useMemo(() => {
-    if (
-      targets.some(
-        (target) =>
-          detailsByWorkspaceId[target.workspace_id]?.repoCount === undefined
-      )
-    ) {
-      return null;
-    }
-    return targets.reduce(
-      (count, target) =>
-        count + (detailsByWorkspaceId[target.workspace_id]?.repoCount ?? 0),
-      0
-    );
-  }, [detailsByWorkspaceId, targets]);
+  const initialRepoCount = useMemo(
+    () => sumRepoCounts(targets, detailsByWorkspaceId),
+    [detailsByWorkspaceId, targets]
+  );
 
   const initialWorktreeCount = useMemo(() => {
     const targetsWithWorktrees = targets.filter(

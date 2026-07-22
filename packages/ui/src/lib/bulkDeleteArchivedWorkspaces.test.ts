@@ -3,7 +3,50 @@ import { archiveBucketForTimestamp } from './archiveBuckets';
 import {
   buildArchivedBucketState,
   inspectArchivedWorkspaceTargets,
+  sumRepoCounts,
 } from './bulkDeleteArchivedWorkspaces';
+
+describe('sumRepoCounts', () => {
+  const targets = ['one-repo', 'two-repos', 'three-repos'].map(
+    (workspaceId) => ({
+      workspace_id: workspaceId,
+      archived_at: '2026-06-01T12:00:00Z',
+    })
+  );
+  const detailsByWorkspaceId = {
+    'one-repo': {
+      workspaceName: 'One repo',
+      repoCount: 1,
+      worktreeDeleted: false,
+    },
+    'two-repos': {
+      workspaceName: 'Two repos',
+      repoCount: 2,
+      worktreeDeleted: false,
+    },
+    'three-repos': {
+      workspaceName: 'Three repos',
+      repoCount: 3,
+      worktreeDeleted: false,
+    },
+  };
+
+  it('sums mixed repository counts across the targeted workspaces', () => {
+    expect(sumRepoCounts(targets, detailsByWorkspaceId)).toBe(6);
+  });
+
+  it('returns null when any targeted workspace has an unknown repository count', () => {
+    expect(
+      sumRepoCounts(targets, {
+        ...detailsByWorkspaceId,
+        'two-repos': {
+          ...detailsByWorkspaceId['two-repos'],
+          repoCount: undefined,
+        },
+      })
+    ).toBeNull();
+  });
+});
 
 describe('buildArchivedBucketState', () => {
   it('builds targets from the full bucket despite search and pagination visibility', () => {
