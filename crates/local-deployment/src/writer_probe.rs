@@ -57,6 +57,7 @@ fn resume_evidence(cmdlines: &[String]) -> SidEvidence {
     }
 }
 
+// `_expected_sid` and `_binding` are load-bearing for `probe_path_never_replaces_live_evidence_with_matching_database_sid`.
 fn live_process_report(
     processes: &[CliPaneAgentProcess],
     only_active_claude_in_cwd: Option<bool>,

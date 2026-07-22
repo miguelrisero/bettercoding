@@ -326,6 +326,7 @@ pub trait ContainerService {
             // Process marked as failed
             tracing::info!("Marked orphaned execution process {} as failed", process.id);
             if let Some(cli_collab) = self.cli_collab()
+                // Orphan cleanup has transitioned every process here out of Running, so its collaboration writer is always releasable.
                 && let Err(error) = cli_collab
                     .on_executor_finished(process.session_id, ExecutionProcessStatus::Failed, true)
                     .await

@@ -231,6 +231,10 @@ impl SessionQueuedMessage {
         executor_claim_owner: Option<&str>,
         paste_claim_owner: Option<&str>,
     ) -> Result<Option<Self>, sqlx::Error> {
+        debug_assert!(
+            !(executor_claim_owner.is_some() && paste_claim_owner.is_some()),
+            "executor and paste claim owners are mutually exclusive"
+        );
         let result = sqlx::query!(
             r#"UPDATE session_queued_messages SET
                    state = 'pasting',
@@ -704,6 +708,36 @@ mod tests {
             CancelQueuedMessageResult::Conflict(ref row)
                 if row.state == QueuedMessageState::Pasting
         ));
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "executor and paste claim owners are mutually exclusive")]
+    async fn claim_rejects_simultaneous_executor_and_paste_owners_in_debug_builds() {
+        let (pool, session_id) = session_fixture().await;
+        let row = match SessionQueuedMessage::store(
+            &pool,
+            session_id,
+            "invalid dual claim",
+            None,
+            QueuedMessageSource::Ui,
+            false,
+        )
+        .await
+        .unwrap()
+        {
+            StoreQueuedMessageResult::Stored(row) => row,
+            StoreQueuedMessageResult::Conflict(_) => unreachable!(),
+        };
+
+        let _ = SessionQueuedMessage::claim(
+            &pool,
+            row.id,
+            None,
+            Some("executor-owner"),
+            Some("paste-owner"),
+        )
+        .await;
     }
 
     #[tokio::test]
