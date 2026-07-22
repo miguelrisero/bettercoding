@@ -513,7 +513,20 @@ export function WorkspacesSidebar({
                           key={workspace.id}
                           name={workspace.name}
                           workspaceId={workspace.id}
+                          filesChanged={workspace.filesChanged}
+                          linesAdded={workspace.linesAdded}
+                          linesRemoved={workspace.linesRemoved}
                           isActive={selectedWorkspaceId === workspace.id}
+                          isRunning={workspace.isRunning}
+                          isPinned={workspace.isPinned}
+                          hasPendingApproval={workspace.hasPendingApproval}
+                          hasRunningDevServer={workspace.hasRunningDevServer}
+                          hasUnseenActivity={workspace.hasUnseenActivity}
+                          latestProcessCompletedAt={
+                            workspace.latestProcessCompletedAt
+                          }
+                          latestProcessStatus={workspace.latestProcessStatus}
+                          prStatus={workspace.prStatus}
                           onOpenWorkspaceActions={handleOpenWorkspaceActions}
                           onClick={() => onSelectWorkspace(workspace.id)}
                         />
