@@ -71,17 +71,46 @@ describe('inspectArchivedWorkspaceTargets', () => {
         target: targets[0],
         statuses: [{ commitsAhead: 1 }],
         inspectionFailed: false,
+        worktreeAlreadyRemoved: false,
       },
       {
         target: targets[1],
         statuses: [],
         inspectionFailed: true,
+        worktreeAlreadyRemoved: false,
       },
       {
         target: targets[2],
         statuses: [{ commitsAhead: 0 }],
         inspectionFailed: false,
+        worktreeAlreadyRemoved: false,
       },
     ]);
+  });
+
+  it('does not inspect a workspace whose worktree is already removed', async () => {
+    const targets = ['removed', 'existing'].map((workspaceId) => ({
+      workspace_id: workspaceId,
+      archived_at: '2026-06-01T12:00:00Z',
+    }));
+    const inspectedWorkspaceIds: string[] = [];
+
+    const results = await inspectArchivedWorkspaceTargets(
+      targets,
+      async (workspaceId) => {
+        inspectedWorkspaceIds.push(workspaceId);
+        return [{ commitsAhead: 0 }];
+      },
+      (workspaceId) => workspaceId === 'removed'
+    );
+
+    expect(inspectedWorkspaceIds).toEqual(['existing']);
+    expect(results[0]).toEqual({
+      target: targets[0],
+      statuses: [],
+      inspectionFailed: false,
+      worktreeAlreadyRemoved: true,
+    });
+    expect(results[1].worktreeAlreadyRemoved).toBe(false);
   });
 });

@@ -510,6 +510,7 @@
       "bulkDeleteUnmergedWorkspaces": "en {{count}} espacio(s) de trabajo",
       "bulkDeleteInspectionFailed": "No se pudieron inspeccionar todas las ramas.",
       "bulkDeleteInspectionFailures": "Espacios de trabajo cuyo estado de commits sin fusionar se desconoce",
+      "bulkDeleteWorktreeAlreadyRemoved": "Estado sin fusionar desconocido; árbol de trabajo ya eliminado",
       "bulkDeleteRequestFailed": "La solicitud de eliminación masiva falló.",
       "bulkDeleteRetry": "Reintentar",
       "bulkDeleteTargets": "Espacios de trabajo que se eliminarán",

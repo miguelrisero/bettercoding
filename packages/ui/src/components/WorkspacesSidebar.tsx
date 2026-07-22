@@ -63,6 +63,7 @@ export interface WorkspacesSidebarWorkspace {
   id: string;
   name: string;
   archivedAt: string | null;
+  worktreeDeleted?: boolean;
   repoCount?: number;
   filesChanged?: number;
   linesAdded?: number;

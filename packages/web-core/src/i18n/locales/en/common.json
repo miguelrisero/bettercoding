@@ -524,6 +524,7 @@
       "bulkDeleteUnmergedWorkspaces": "across {{count}} workspace(s)",
       "bulkDeleteInspectionFailed": "Could not inspect every branch.",
       "bulkDeleteInspectionFailures": "Workspaces whose unmerged status is unknown",
+      "bulkDeleteWorktreeAlreadyRemoved": "Unmerged status unknown, worktree already removed",
       "bulkDeleteRequestFailed": "The bulk removal request failed.",
       "bulkDeleteRetry": "Retry",
       "bulkDeleteTargets": "Workspaces that will be removed",

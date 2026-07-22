@@ -6,12 +6,14 @@ export interface ArchivedWorkspaceBulkDeleteSource {
   id: string;
   name: string;
   archivedAt: string | null;
+  worktreeDeleted?: boolean;
   repoCount?: number;
 }
 
 export interface BulkDeleteArchivedWorkspaceDetails {
   workspaceName: string;
   repoCount?: number;
+  worktreeDeleted: boolean;
 }
 
 export function buildArchivedBucketState<
@@ -37,6 +39,7 @@ export function buildArchivedBucketState<
         {
           workspaceName: workspace.name,
           repoCount: workspace.repoCount,
+          worktreeDeleted: workspace.worktreeDeleted === true,
         },
       ])
     ),
@@ -52,11 +55,13 @@ export interface ArchivedWorkspaceInspectionResult<TStatus> {
   target: BulkDeleteTarget;
   statuses: TStatus[];
   inspectionFailed: boolean;
+  worktreeAlreadyRemoved: boolean;
 }
 
 export async function inspectArchivedWorkspaceTargets<TStatus>(
   targets: readonly BulkDeleteTarget[],
-  inspectWorkspace: (workspaceId: string) => Promise<TStatus[]>
+  inspectWorkspace: (workspaceId: string) => Promise<TStatus[]>,
+  isWorktreeAlreadyRemoved: (workspaceId: string) => boolean = () => false
 ): Promise<ArchivedWorkspaceInspectionResult<TStatus>[]> {
   const results: ArchivedWorkspaceInspectionResult<TStatus>[] = new Array(
     targets.length
@@ -73,17 +78,29 @@ export async function inspectArchivedWorkspaceTargets<TStatus>(
         nextIndex += 1;
         const target = targets[index];
 
+        if (isWorktreeAlreadyRemoved(target.workspace_id)) {
+          results[index] = {
+            target,
+            statuses: [],
+            inspectionFailed: false,
+            worktreeAlreadyRemoved: true,
+          };
+          continue;
+        }
+
         try {
           results[index] = {
             target,
             statuses: await inspectWorkspace(target.workspace_id),
             inspectionFailed: false,
+            worktreeAlreadyRemoved: false,
           };
         } catch {
           results[index] = {
             target,
             statuses: [],
             inspectionFailed: true,
+            worktreeAlreadyRemoved: false,
           };
         }
       }

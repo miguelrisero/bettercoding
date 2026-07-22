@@ -510,6 +510,7 @@
       "bulkDeleteUnmergedWorkspaces": "{{count}}개 워크스페이스",
       "bulkDeleteInspectionFailed": "모든 브랜치를 검사하지 못했습니다.",
       "bulkDeleteInspectionFailures": "병합되지 않은 상태를 알 수 없는 워크스페이스",
+      "bulkDeleteWorktreeAlreadyRemoved": "병합되지 않은 상태를 알 수 없음, 워크트리는 이미 제거됨",
       "bulkDeleteRequestFailed": "대량 삭제 요청에 실패했습니다.",
       "bulkDeleteRetry": "다시 시도",
       "bulkDeleteTargets": "삭제될 워크스페이스",

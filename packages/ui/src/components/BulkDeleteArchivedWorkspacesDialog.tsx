@@ -62,6 +62,7 @@ interface InspectionSummary {
   unmergedWorkspaceCount: number;
   unknownComparisonCount: number;
   inspectionFailureCount: number;
+  worktreeAlreadyRemovedCount: number;
 }
 
 function OutcomeIcon({
@@ -121,6 +122,25 @@ export function BulkDeleteArchivedWorkspacesDialog({
     );
   }, [detailsByWorkspaceId, targets]);
 
+  const initialWorktreeCount = useMemo(() => {
+    const targetsWithWorktrees = targets.filter(
+      (target) => !detailsByWorkspaceId[target.workspace_id]?.worktreeDeleted
+    );
+    if (
+      targetsWithWorktrees.some(
+        (target) =>
+          detailsByWorkspaceId[target.workspace_id]?.repoCount === undefined
+      )
+    ) {
+      return null;
+    }
+    return targetsWithWorktrees.reduce(
+      (count, target) =>
+        count + (detailsByWorkspaceId[target.workspace_id]?.repoCount ?? 0),
+      0
+    );
+  }, [detailsByWorkspaceId, targets]);
+
   useEffect(() => {
     if (!open) return;
 
@@ -131,7 +151,12 @@ export function BulkDeleteArchivedWorkspacesDialog({
     setInspectionError(null);
     setIsInspecting(true);
 
-    void inspectArchivedWorkspaceTargets(targets, inspectWorkspace)
+    void inspectArchivedWorkspaceTargets(
+      targets,
+      inspectWorkspace,
+      (workspaceId) =>
+        detailsByWorkspaceId[workspaceId]?.worktreeDeleted === true
+    )
       .then((workspaceStatuses) => {
         if (canceled) return;
 
@@ -159,6 +184,9 @@ export function BulkDeleteArchivedWorkspacesDialog({
         const inspectionFailureCount = workspaceStatuses.filter(
           (item) => item.inspectionFailed
         ).length;
+        const worktreeAlreadyRemovedCount = workspaceStatuses.filter(
+          (item) => item.worktreeAlreadyRemoved
+        ).length;
 
         setInspection({
           branchCount,
@@ -167,6 +195,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
           unmergedWorkspaceCount,
           unknownComparisonCount,
           inspectionFailureCount,
+          worktreeAlreadyRemovedCount,
         });
       })
       .catch((error: unknown) => {
@@ -186,7 +215,14 @@ export function BulkDeleteArchivedWorkspacesDialog({
     return () => {
       canceled = true;
     };
-  }, [inspectWorkspace, inspectionAttempt, open, t, targets]);
+  }, [
+    detailsByWorkspaceId,
+    inspectWorkspace,
+    inspectionAttempt,
+    open,
+    t,
+    targets,
+  ]);
 
   const resultCounts = useMemo(() => {
     if (!results) return null;
@@ -220,7 +256,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
   };
 
   const branchCount = initialRepoCount ?? inspection?.branchCount;
-  const worktreeCount = initialRepoCount ?? inspection?.worktreeCount;
+  const worktreeCount = initialWorktreeCount ?? inspection?.worktreeCount;
 
   return (
     <Dialog
@@ -392,6 +428,22 @@ export function BulkDeleteArchivedWorkspacesDialog({
                     </dt>
                     <dd className="text-right font-medium tabular-nums text-warning">
                       {inspection.inspectionFailureCount}
+                    </dd>
+                  </>
+                )}
+                {inspection && inspection.worktreeAlreadyRemovedCount > 0 && (
+                  <>
+                    <dt className="text-warning">
+                      {t(
+                        'kanban.workspaceSidebar.bulkDeleteWorktreeAlreadyRemoved',
+                        {
+                          defaultValue:
+                            'Unmerged status unknown, worktree already removed',
+                        }
+                      )}
+                    </dt>
+                    <dd className="text-right font-medium tabular-nums text-warning">
+                      {inspection.worktreeAlreadyRemovedCount}
                     </dd>
                   </>
                 )}
