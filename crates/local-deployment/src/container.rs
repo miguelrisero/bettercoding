@@ -1775,7 +1775,17 @@ fn success_exit_status() -> std::process::ExitStatus {
 
 #[cfg(test)]
 mod tests {
+    use db::models::{
+        coding_agent_turn::CreateCodingAgentTurn,
+        execution_process::CreateExecutionProcess,
+        repo::Repo,
+        session::CreateSession,
+        workspace::CreateWorkspace,
+        workspace_repo::{CreateWorkspaceRepo, WorkspaceRepo},
+    };
     use executors::{executors::BaseCodingAgent, profile::ExecutorConfig};
+    use sqlx::sqlite::SqlitePoolOptions;
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -1802,5 +1812,218 @@ mod tests {
             request.reset_to_message_id.as_deref(),
             Some(reset_to_message_id.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn local_retry_dispatch_threads_reset_id_into_follow_up_request() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations_for_tests(&pool).await.unwrap();
+        let db = DBService { pool };
+        let temp = TempDir::new().unwrap();
+        let source_repo_path = temp.path().join("source-repo");
+        let workspace_root = temp.path().join("workspace");
+        let git = GitService::new();
+        git.initialize_repo_with_main_branch(&source_repo_path)
+            .unwrap();
+        let repo = Repo::find_or_create(&db.pool, &source_repo_path, "source repo")
+            .await
+            .unwrap();
+
+        let workspace_id = Uuid::new_v4();
+        Workspace::create(
+            &db.pool,
+            &CreateWorkspace {
+                branch: "retry-call-site".to_string(),
+                name: Some("retry call-site fixture".to_string()),
+            },
+            workspace_id,
+        )
+        .await
+        .unwrap();
+        WorkspaceRepo::create_many(
+            &db.pool,
+            workspace_id,
+            &[CreateWorkspaceRepo {
+                repo_id: repo.id,
+                target_branch: "main".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+        Workspace::update_container_ref(&db.pool, workspace_id, &workspace_root.to_string_lossy())
+            .await
+            .unwrap();
+        let session = Session::create(
+            &db.pool,
+            &CreateSession {
+                executor: Some("CLAUDE_CODE".to_string()),
+                name: None,
+            },
+            Uuid::new_v4(),
+            workspace_id,
+        )
+        .await
+        .unwrap();
+
+        let base_process = ExecutionProcess::create(
+            &db.pool,
+            &CreateExecutionProcess {
+                session_id: session.id,
+                executor_action: ExecutorAction::new(
+                    ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
+                        prompt: "base turn".to_string(),
+                        executor_config: ExecutorConfig::new(BaseCodingAgent::ClaudeCode),
+                        working_dir: None,
+                    }),
+                    None,
+                ),
+                run_reason: ExecutionProcessRunReason::CodingAgent,
+            },
+            Uuid::new_v4(),
+            &[],
+        )
+        .await
+        .unwrap();
+        CodingAgentTurn::create(
+            &db.pool,
+            &CreateCodingAgentTurn {
+                execution_process_id: base_process.id,
+                prompt: Some("base turn".to_string()),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        CodingAgentTurn::update_agent_session_id(&db.pool, base_process.id, "claude-session")
+            .await
+            .unwrap();
+        ExecutionProcess::update_completion(
+            &db.pool,
+            base_process.id,
+            ExecutionProcessStatus::Completed,
+            Some(0),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE execution_processes SET created_at = datetime('now', '-2 seconds') WHERE id = ?")
+            .bind(base_process.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let reset_to_message_id = "assistant-message-to-retry".to_string();
+        let retry_process = ExecutionProcess::create(
+            &db.pool,
+            &CreateExecutionProcess {
+                session_id: session.id,
+                executor_action: ExecutorAction::new(
+                    ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
+                        prompt: "turn being retried".to_string(),
+                        session_id: "claude-session".to_string(),
+                        reset_to_message_id: None,
+                        executor_config: ExecutorConfig::new(BaseCodingAgent::ClaudeCode),
+                        working_dir: None,
+                    }),
+                    None,
+                ),
+                run_reason: ExecutionProcessRunReason::CodingAgent,
+            },
+            Uuid::new_v4(),
+            &[],
+        )
+        .await
+        .unwrap();
+        CodingAgentTurn::create(
+            &db.pool,
+            &CreateCodingAgentTurn {
+                execution_process_id: retry_process.id,
+                prompt: Some("turn being retried".to_string()),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        CodingAgentTurn::update_agent_session_id(&db.pool, retry_process.id, "claude-session")
+            .await
+            .unwrap();
+        CodingAgentTurn::update_agent_message_id(&db.pool, retry_process.id, &reset_to_message_id)
+            .await
+            .unwrap();
+        ExecutionProcess::update_completion(
+            &db.pool,
+            retry_process.id,
+            ExecutionProcessStatus::Completed,
+            Some(0),
+        )
+        .await
+        .unwrap();
+
+        let config = Arc::new(RwLock::new(Config::default()));
+        let notification_service = NotificationService::new(config.clone());
+        let service = LocalContainerService {
+            db: db.clone(),
+            workspace_manager: WorkspaceManager::new(db.clone()),
+            child_store: Arc::new(RwLock::new(HashMap::new())),
+            cancellation_tokens: Arc::new(RwLock::new(HashMap::new())),
+            msg_stores: Arc::new(RwLock::new(HashMap::new())),
+            db_stream_handles: Arc::new(RwLock::new(HashMap::new())),
+            exit_monitor_handles: Arc::new(RwLock::new(HashMap::new())),
+            workspace_touch_times: Arc::new(RwLock::new(HashMap::new())),
+            config,
+            git,
+            file_service: FileService::new(db.pool.clone()).unwrap(),
+            analytics: None,
+            approvals: Approvals::new(),
+            cli_collab: Arc::new(OnceLock::new()),
+            notification_service,
+            remote_client: None,
+        };
+        let mut missing_profile = ExecutorConfig::new(BaseCodingAgent::ClaudeCode);
+        missing_profile.variant = Some("__MISSING_RETRY_CALL_SITE_TEST_PROFILE".to_string());
+        let retry = RetryDispatchContext {
+            process_id: retry_process.id,
+            force_when_dirty: false,
+            perform_git_reset: false,
+            reset_to_message_id: Some(reset_to_message_id.clone()),
+        };
+
+        assert!(
+            CliExecutorDispatcher::dispatch(
+                &service,
+                &session,
+                "retry this prompt",
+                &missing_profile,
+                Some(&retry),
+            )
+            .await
+            .is_err(),
+            "the missing test profile must stop after persisting the action"
+        );
+
+        let processes = ExecutionProcess::find_by_session_id(&db.pool, session.id, false)
+            .await
+            .unwrap();
+        let dispatched = processes.last().unwrap();
+        assert_ne!(dispatched.id, base_process.id);
+        let ExecutorActionType::CodingAgentFollowUpRequest(request) =
+            dispatched.executor_action().unwrap().typ()
+        else {
+            panic!("retry dispatch with session continuity must persist a follow-up");
+        };
+        assert_eq!(request.session_id, "claude-session");
+        assert_eq!(
+            request.reset_to_message_id.as_deref(),
+            Some(reset_to_message_id.as_str())
+        );
+
+        let log_path = utils::execution_logs::process_log_file_path(session.id, dispatched.id);
+        std::fs::remove_file(&log_path).unwrap();
+        for directory in log_path.ancestors().skip(1).take(3) {
+            let _ = std::fs::remove_dir(directory);
+        }
     }
 }
