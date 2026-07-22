@@ -289,7 +289,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
               : t('kanban.workspaceSidebar.bulkDeleteDescription', {
                   bucket: bucketLabel,
                   defaultValue:
-                    'This permanently removes every workspace currently in “{{bucket}}”. This action cannot be undone.',
+                    'This permanently removes the workspaces listed below from “{{bucket}}” if their archive state is unchanged. This action cannot be undone.',
                 })}
           </DialogDescription>
         </DialogHeader>

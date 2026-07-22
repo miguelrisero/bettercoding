@@ -204,7 +204,7 @@ pub async fn bulk_delete_archived_workspaces(
             continue;
         }
 
-        // Keep the archived guard here: the shared delete path must still delete active workspaces.
+        // Do not make the shared DELETE conditional on archived: single-delete must remove active workspaces.
         let outcome = match delete_workspace_core(
             &deployment,
             fresh_workspace,
