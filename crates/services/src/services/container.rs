@@ -57,7 +57,9 @@ use utils::{
 use uuid::Uuid;
 use worktree_manager::WorktreeError;
 
-use crate::services::{execution_process, notification::NotificationService};
+use crate::services::{
+    cli_collab::CliCollabService, execution_process, notification::NotificationService,
+};
 pub type ContainerRef = String;
 
 #[derive(Debug, Error)]
@@ -93,6 +95,8 @@ pub trait ContainerService {
     fn git(&self) -> &GitService;
 
     fn notification_service(&self) -> &NotificationService;
+
+    fn cli_collab(&self) -> Option<&Arc<CliCollabService>>;
 
     async fn touch(&self, workspace: &Workspace) -> Result<(), ContainerError>;
 
@@ -321,6 +325,18 @@ pub trait ContainerService {
             }
             // Process marked as failed
             tracing::info!("Marked orphaned execution process {} as failed", process.id);
+            if let Some(cli_collab) = self.cli_collab()
+                && let Err(error) = cli_collab
+                    .on_executor_finished(process.session_id, ExecutionProcessStatus::Failed, true)
+                    .await
+            {
+                tracing::error!(
+                    ?error,
+                    session_id = %process.session_id,
+                    execution_process_id = %process.id,
+                    "CLI collaboration orphan completion hook failed closed"
+                );
+            }
         }
         Ok(())
     }

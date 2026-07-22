@@ -789,9 +789,13 @@ impl CliCollabService {
         &self,
         session_id: Uuid,
         finished_status: ExecutionProcessStatus,
+        releases_collaboration_writer: bool,
     ) -> Result<bool, CliCollabError> {
         let lock = self.session_lock(session_id).await;
         let guard = lock.lock().await;
+        if !releases_collaboration_writer {
+            return Ok(false);
+        }
         if matches!(
             finished_status,
             ExecutionProcessStatus::Failed | ExecutionProcessStatus::Killed
@@ -1263,12 +1267,9 @@ impl CliCollabService {
                         continue;
                     }
                 };
-            let writer_released_after_binding = processes.iter().any(|process| {
-                process.run_reason == ExecutionProcessRunReason::CodingAgent
-                    && process
-                        .completed_at
-                        .is_some_and(|completed_at| completed_at >= binding.created_at)
-            });
+            let writer_released_after_binding = processes
+                .iter()
+                .any(|process| process.writer_released_after(binding.created_at));
             if !writer_released_after_binding {
                 continue;
             }
@@ -1929,7 +1930,7 @@ mod tests {
 
         assert!(
             !service
-                .on_executor_finished(session.id, ExecutionProcessStatus::Completed)
+                .on_executor_finished(session.id, ExecutionProcessStatus::Completed, true)
                 .await
                 .unwrap()
         );
@@ -1948,7 +1949,7 @@ mod tests {
         .unwrap();
         assert!(
             !service
-                .on_executor_finished(session.id, ExecutionProcessStatus::Completed)
+                .on_executor_finished(session.id, ExecutionProcessStatus::Completed, true)
                 .await
                 .unwrap()
         );
@@ -2004,7 +2005,7 @@ mod tests {
 
         assert!(
             !service
-                .on_executor_finished(session.id, ExecutionProcessStatus::Killed)
+                .on_executor_finished(session.id, ExecutionProcessStatus::Killed, true)
                 .await
                 .unwrap()
         );
@@ -2018,6 +2019,44 @@ mod tests {
         assert_eq!(
             held.failure_reason.as_deref(),
             Some(ABNORMAL_EXECUTOR_QUEUE_HOLD)
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_hook_self_guards_a_non_releasing_chained_action() {
+        let (db, _workspace, session) = fixture().await;
+        let row = store_message(
+            &db,
+            session.id,
+            "wait for the chained action",
+            QueuedMessageSource::Ui,
+        )
+        .await;
+        let dispatcher_state = Arc::new(StdMutex::new(DispatcherState::default()));
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(false, Some(false), SidEvidence::Unknown),
+            Arc::new(FakeTransport),
+            Arc::new(RecordingDispatcher {
+                db: db.clone(),
+                state: dispatcher_state.clone(),
+            }),
+        );
+
+        assert!(
+            !service
+                .on_executor_finished(session.id, ExecutionProcessStatus::Completed, false)
+                .await
+                .unwrap()
+        );
+        assert!(dispatcher_state.lock().unwrap().prompts.is_empty());
+        assert_eq!(
+            SessionQueuedMessage::find_by_id(&db.pool, row.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            QueuedMessageState::Queued
         );
     }
 
@@ -2084,7 +2123,7 @@ mod tests {
 
         assert!(
             !service
-                .on_executor_finished(session.id, ExecutionProcessStatus::Completed)
+                .on_executor_finished(session.id, ExecutionProcessStatus::Completed, true)
                 .await
                 .unwrap()
         );
@@ -2124,7 +2163,7 @@ mod tests {
         );
 
         let error = service
-            .on_executor_finished(session.id, ExecutionProcessStatus::Completed)
+            .on_executor_finished(session.id, ExecutionProcessStatus::Completed, true)
             .await
             .unwrap_err();
 
@@ -2488,7 +2527,7 @@ mod tests {
         .unwrap();
         assert!(
             !service
-                .on_executor_finished(session.id, ExecutionProcessStatus::Completed)
+                .on_executor_finished(session.id, ExecutionProcessStatus::Completed, true)
                 .await
                 .unwrap()
         );

@@ -754,38 +754,47 @@ impl LocalContainerService {
                     }
                 }
 
+                // The completion hook is invoked exactly once for every
+                // process. It self-guards chained actions, while setup
+                // completion remains eligible to release a queue only when no
+                // coding-agent writer was started next.
+                let should_finalize = skipped_cleanup || container.should_finalize(&ctx);
+                let releases_collaboration_writer = should_finalize
+                    || matches!(
+                        ctx.execution_process.run_reason,
+                        ExecutionProcessRunReason::SetupScript
+                    );
+                let started_queued_follow_up = match container.cli_collab.get() {
+                    Some(cli_collab) => match cli_collab
+                        .on_executor_finished(
+                            ctx.session.id,
+                            ctx.execution_process.status.clone(),
+                            releases_collaboration_writer,
+                        )
+                        .await
+                    {
+                        Ok(started) => started,
+                        Err(error) => {
+                            tracing::error!(
+                                ?error,
+                                session_id = %ctx.session.id,
+                                "CLI collaboration finish hook failed closed"
+                            );
+                            false
+                        }
+                    },
+                    None => false,
+                };
+
                 // A no-change coding turn bypasses its configured cleanup action,
-                // but it still releases the collaboration writer just like the
-                // normal final action in the chain.
-                if skipped_cleanup || container.should_finalize(&ctx) {
+                // but it still finalizes like the normal final action in the chain.
+                if should_finalize {
                     let has_chained_follow_up = ctx
                         .execution_process
                         .executor_action()
                         .ok()
                         .and_then(|action| action.next_action())
                         .is_some();
-                    let started_queued_follow_up = match container.cli_collab.get() {
-                        Some(cli_collab) => {
-                            match cli_collab
-                                .on_executor_finished(
-                                    ctx.session.id,
-                                    ctx.execution_process.status.clone(),
-                                )
-                                .await
-                            {
-                                Ok(started) => started,
-                                Err(error) => {
-                                    tracing::error!(
-                                        ?error,
-                                        session_id = %ctx.session.id,
-                                        "CLI collaboration finish hook failed closed"
-                                    );
-                                    false
-                                }
-                            }
-                        }
-                        None => false,
-                    };
                     if !started_queued_follow_up {
                         container.finalize_task(&ctx).await;
                     }
@@ -808,37 +817,6 @@ impl LocalContainerService {
                             "Failed to mark coding agent turn unseen for execution {}: {}",
                             ctx.execution_process.id,
                             e
-                        );
-                    }
-                }
-
-                // When a parallel setup script finishes and no coding agent is running,
-                // consume any queued message that was stuck waiting
-                if matches!(
-                    ctx.execution_process.run_reason,
-                    ExecutionProcessRunReason::SetupScript
-                ) && !container.should_finalize(&ctx)
-                {
-                    let has_running_agent = ExecutionProcess::has_running_coding_agent_for_session(
-                        &db.pool,
-                        ctx.session.id,
-                    )
-                    .await
-                    .unwrap_or(true);
-
-                    if !has_running_agent
-                        && let Some(cli_collab) = container.cli_collab.get()
-                        && let Err(error) = cli_collab
-                            .on_executor_finished(
-                                ctx.session.id,
-                                ctx.execution_process.status.clone(),
-                            )
-                            .await
-                    {
-                        tracing::error!(
-                            ?error,
-                            session_id = %ctx.session.id,
-                            "CLI collaboration setup completion hook failed closed"
                         );
                     }
                 }
@@ -1289,6 +1267,10 @@ impl ContainerService for LocalContainerService {
 
     fn notification_service(&self) -> &NotificationService {
         &self.notification_service
+    }
+
+    fn cli_collab(&self) -> Option<&Arc<CliCollabService>> {
+        self.cli_collab.get()
     }
 
     async fn touch(&self, workspace: &Workspace) -> Result<(), ContainerError> {

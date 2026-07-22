@@ -121,6 +121,18 @@ pub struct MissingBeforeContext {
 }
 
 impl ExecutionProcess {
+    pub fn is_active_writer(&self) -> bool {
+        self.run_reason == ExecutionProcessRunReason::CodingAgent
+            && self.status == ExecutionProcessStatus::Running
+    }
+
+    pub fn writer_released_after(&self, after: DateTime<Utc>) -> bool {
+        self.run_reason == ExecutionProcessRunReason::CodingAgent
+            && self
+                .completed_at
+                .is_some_and(|completed_at| completed_at >= after)
+    }
+
     /// Find execution process by ID
     pub async fn find_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<Self>, sqlx::Error> {
         sqlx::query_as!(
@@ -276,17 +288,27 @@ impl ExecutionProcess {
         pool: &SqlitePool,
         session_id: Uuid,
     ) -> Result<bool, sqlx::Error> {
-        let count: i64 = sqlx::query_scalar!(
-            r#"SELECT COUNT(*) as "count!: i64"
+        let processes = sqlx::query_as!(
+            ExecutionProcess,
+            r#"SELECT
+                    ep.id as "id!: Uuid",
+                    ep.session_id as "session_id!: Uuid",
+                    ep.run_reason as "run_reason!: ExecutionProcessRunReason",
+                    ep.executor_action as "executor_action!: sqlx::types::Json<ExecutorActionField>",
+                    ep.status as "status!: ExecutionProcessStatus",
+                    ep.exit_code,
+                    ep.dropped as "dropped!: bool",
+                    ep.started_at as "started_at!: DateTime<Utc>",
+                    ep.completed_at as "completed_at?: DateTime<Utc>",
+                    ep.created_at as "created_at!: DateTime<Utc>",
+                    ep.updated_at as "updated_at!: DateTime<Utc>"
                FROM execution_processes ep
-               WHERE ep.session_id = $1
-                 AND ep.status = 'running'
-                 AND ep.run_reason = 'codingagent'"#,
+               WHERE ep.session_id = $1 AND ep.status = 'running'"#,
             session_id
         )
-        .fetch_one(pool)
+        .fetch_all(pool)
         .await?;
-        Ok(count > 0)
+        Ok(processes.iter().any(Self::is_active_writer))
     }
 
     /// Whether a failed or killed coding-agent writer completed after the
@@ -296,19 +318,16 @@ impl ExecutionProcess {
         session_id: Uuid,
         after: DateTime<Utc>,
     ) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar!(
-            r#"SELECT EXISTS(
-                   SELECT 1 FROM execution_processes ep
-                   WHERE ep.session_id = $1
-                     AND ep.run_reason = 'codingagent'
-                     AND ep.status IN ('failed', 'killed')
-                     AND julianday(ep.completed_at) >= julianday($2)
-               ) AS "exists!: bool""#,
-            session_id,
-            after
-        )
-        .fetch_one(pool)
-        .await
+        Ok(Self::find_by_session_id(pool, session_id, true)
+            .await?
+            .iter()
+            .any(|process| {
+                process.writer_released_after(after)
+                    && matches!(
+                        process.status,
+                        ExecutionProcessStatus::Failed | ExecutionProcessStatus::Killed
+                    )
+            }))
     }
 
     /// Check if there are running processes (excluding dev servers) for a workspace (across all sessions)
