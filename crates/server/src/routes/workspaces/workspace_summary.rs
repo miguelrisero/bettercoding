@@ -8,6 +8,7 @@ use db::models::{
     pull_request::PullRequest,
     workspace::Workspace,
     workspace_cli_activity::WorkspaceCliActivity,
+    workspace_repo::WorkspaceRepo,
 };
 use deployment::Deployment;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,8 @@ pub struct WorkspaceSummaryRequest {
 #[derive(Debug, Serialize, TS)]
 pub struct WorkspaceSummary {
     pub workspace_id: Uuid,
+    /// Number of repositories/worktrees owned by this workspace.
+    pub repo_count: usize,
     /// Session ID of the latest execution process
     pub latest_session_id: Option<Uuid>,
     /// Is a tool approval currently pending?
@@ -120,7 +123,18 @@ pub async fn get_workspace_summaries(
     // 6. Get PR status for each workspace
     let pr_statuses = PullRequest::get_latest_for_workspaces(pool, archived).await?;
 
-    // 7. Compute diff stats for each workspace (in parallel)
+    // 7. Count repositories/worktrees for each workspace (in parallel)
+    let repo_count_futures = workspaces.iter().map(|workspace| async move {
+        WorkspaceRepo::find_by_workspace_id(pool, workspace.id)
+            .await
+            .map(|repos| (workspace.id, repos.len()))
+    });
+    let repo_counts: HashMap<Uuid, usize> = futures_util::future::join_all(repo_count_futures)
+        .await
+        .into_iter()
+        .collect::<Result<_, _>>()?;
+
+    // 8. Compute diff stats for each workspace (in parallel)
     let diff_futures: Vec<_> = workspaces
         .iter()
         .map(|ws| {
@@ -142,7 +156,7 @@ pub async fn get_workspace_summaries(
         futures_util::future::join_all(diff_futures).await;
     let diff_stats: HashMap<Uuid, DiffStats> = diff_results.into_iter().flatten().collect();
 
-    // 8. Assemble response
+    // 9. Assemble response
     let summaries: Vec<WorkspaceSummary> = workspaces
         .iter()
         .map(|ws| {
@@ -155,6 +169,7 @@ pub async fn get_workspace_summaries(
 
             WorkspaceSummary {
                 workspace_id: id,
+                repo_count: repo_counts.get(&id).copied().unwrap_or_default(),
                 latest_session_id: latest.map(|p| p.session_id),
                 has_pending_approval: has_pending,
                 files_changed: stats.map(|s| s.files_changed),

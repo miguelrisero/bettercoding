@@ -567,6 +567,10 @@ export type WorkspaceSummaryRequest = { archived: boolean, };
 
 export type WorkspaceSummary = { workspace_id: string, 
 /**
+ * Number of repositories/worktrees owned by this workspace.
+ */
+repo_count: number, 
+/**
  * Session ID of the latest execution process
  */
 latest_session_id: string | null, 
