@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { archiveBucketForTimestamp } from './archiveBuckets';
-import { buildArchivedBucketState } from './bulkDeleteArchivedWorkspaces';
+import {
+  buildArchivedBucketState,
+  inspectArchivedWorkspaceTargets,
+} from './bulkDeleteArchivedWorkspaces';
 
 describe('buildArchivedBucketState', () => {
   it('builds targets from the full bucket despite search and pagination visibility', () => {
@@ -43,5 +46,42 @@ describe('buildArchivedBucketState', () => {
         Date.UTC(2026, 6, 22, 12)
       )
     ).toBe('older_than_thirty_days');
+  });
+});
+
+describe('inspectArchivedWorkspaceTargets', () => {
+  it('preserves successful results when one workspace inspection fails', async () => {
+    const targets = ['first', 'failing', 'last'].map((workspaceId) => ({
+      workspace_id: workspaceId,
+      archived_at: '2026-06-01T12:00:00Z',
+    }));
+
+    const results = await inspectArchivedWorkspaceTargets(
+      targets,
+      async (workspaceId) => {
+        if (workspaceId === 'failing') {
+          throw new Error('transient inspection failure');
+        }
+        return [{ commitsAhead: workspaceId === 'first' ? 1 : 0 }];
+      }
+    );
+
+    expect(results).toEqual([
+      {
+        target: targets[0],
+        statuses: [{ commitsAhead: 1 }],
+        inspectionFailed: false,
+      },
+      {
+        target: targets[1],
+        statuses: [],
+        inspectionFailed: true,
+      },
+      {
+        target: targets[2],
+        statuses: [{ commitsAhead: 0 }],
+        inspectionFailed: false,
+      },
+    ]);
   });
 });

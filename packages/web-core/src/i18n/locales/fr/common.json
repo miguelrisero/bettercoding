@@ -509,6 +509,7 @@
       "bulkDeleteInspecting": "Analyse…",
       "bulkDeleteUnmergedWorkspaces": "dans {{count}} espace(s) de travail",
       "bulkDeleteInspectionFailed": "Impossible d’analyser toutes les branches.",
+      "bulkDeleteInspectionFailures": "Espaces de travail dont l’état de fusion est inconnu",
       "bulkDeleteRequestFailed": "La demande de suppression groupée a échoué.",
       "bulkDeleteRetry": "Réessayer",
       "bulkDeleteTargets": "Espaces de travail qui seront supprimés",

@@ -10,7 +10,10 @@ import {
 } from '@phosphor-icons/react';
 import { useTranslation } from 'react-i18next';
 import type { BulkDeleteTarget } from 'shared/types';
-import type { BulkDeleteArchivedWorkspaceDetails } from '../lib/bulkDeleteArchivedWorkspaces';
+import {
+  inspectArchivedWorkspaceTargets,
+  type BulkDeleteArchivedWorkspaceDetails,
+} from '../lib/bulkDeleteArchivedWorkspaces';
 import { Button } from './Button';
 import {
   Dialog,
@@ -58,39 +61,7 @@ interface InspectionSummary {
   unmergedBranchCount: number;
   unmergedWorkspaceCount: number;
   unknownComparisonCount: number;
-}
-
-const MAX_INSPECTION_CONCURRENCY = 8;
-
-async function inspectWorkspaces(
-  targets: BulkDeleteTarget[],
-  inspectWorkspace: BulkDeleteArchivedWorkspacesDialogProps['inspectWorkspace']
-) {
-  const results: Array<{
-    target: BulkDeleteTarget;
-    statuses: BulkDeleteDialogBranchStatus[];
-  }> = new Array(targets.length);
-  let nextIndex = 0;
-
-  const workers = Array.from(
-    {
-      length: Math.min(MAX_INSPECTION_CONCURRENCY, targets.length),
-    },
-    async () => {
-      while (nextIndex < targets.length) {
-        const index = nextIndex;
-        nextIndex += 1;
-        const target = targets[index];
-        results[index] = {
-          target,
-          statuses: await inspectWorkspace(target.workspace_id),
-        };
-      }
-    }
-  );
-
-  await Promise.all(workers);
-  return results;
+  inspectionFailureCount: number;
 }
 
 function OutcomeIcon({
@@ -160,7 +131,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
     setInspectionError(null);
     setIsInspecting(true);
 
-    void inspectWorkspaces(targets, inspectWorkspace)
+    void inspectArchivedWorkspaceTargets(targets, inspectWorkspace)
       .then((workspaceStatuses) => {
         if (canceled) return;
 
@@ -185,6 +156,9 @@ export function BulkDeleteArchivedWorkspacesDialog({
               .length,
           0
         );
+        const inspectionFailureCount = workspaceStatuses.filter(
+          (item) => item.inspectionFailed
+        ).length;
 
         setInspection({
           branchCount,
@@ -192,6 +166,7 @@ export function BulkDeleteArchivedWorkspacesDialog({
           unmergedBranchCount,
           unmergedWorkspaceCount,
           unknownComparisonCount,
+          inspectionFailureCount,
         });
       })
       .catch((error: unknown) => {
@@ -244,8 +219,8 @@ export function BulkDeleteArchivedWorkspacesDialog({
     }
   };
 
-  const branchCount = inspection?.branchCount ?? initialRepoCount;
-  const worktreeCount = inspection?.worktreeCount ?? initialRepoCount;
+  const branchCount = initialRepoCount ?? inspection?.branchCount;
+  const worktreeCount = initialRepoCount ?? inspection?.worktreeCount;
 
   return (
     <Dialog
@@ -401,6 +376,22 @@ export function BulkDeleteArchivedWorkspacesDialog({
                     </dt>
                     <dd className="text-right font-medium tabular-nums text-warning">
                       {inspection.unknownComparisonCount}
+                    </dd>
+                  </>
+                )}
+                {inspection && inspection.inspectionFailureCount > 0 && (
+                  <>
+                    <dt className="text-warning">
+                      {t(
+                        'kanban.workspaceSidebar.bulkDeleteInspectionFailures',
+                        {
+                          defaultValue:
+                            'Workspaces whose unmerged status is unknown',
+                        }
+                      )}
+                    </dt>
+                    <dd className="text-right font-medium tabular-nums text-warning">
+                      {inspection.inspectionFailureCount}
                     </dd>
                   </>
                 )}

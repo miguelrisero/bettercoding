@@ -509,6 +509,7 @@
       "bulkDeleteInspecting": "正在檢查…",
       "bulkDeleteUnmergedWorkspaces": "涉及 {{count}} 個工作區",
       "bulkDeleteInspectionFailed": "無法檢查所有分支。",
+      "bulkDeleteInspectionFailures": "無法確定未合併狀態的工作區",
       "bulkDeleteRequestFailed": "批次刪除請求失敗。",
       "bulkDeleteRetry": "重試",
       "bulkDeleteTargets": "將刪除的工作區",

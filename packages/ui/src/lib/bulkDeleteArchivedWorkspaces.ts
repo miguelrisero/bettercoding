@@ -1,5 +1,7 @@
 import type { BulkDeleteTarget } from 'shared/types';
 
+const MAX_INSPECTION_CONCURRENCY = 8;
+
 export interface ArchivedWorkspaceBulkDeleteSource {
   id: string;
   name: string;
@@ -44,4 +46,50 @@ export function buildArchivedBucketState<
         )
       : [...groupWorkspaces],
   };
+}
+
+export interface ArchivedWorkspaceInspectionResult<TStatus> {
+  target: BulkDeleteTarget;
+  statuses: TStatus[];
+  inspectionFailed: boolean;
+}
+
+export async function inspectArchivedWorkspaceTargets<TStatus>(
+  targets: readonly BulkDeleteTarget[],
+  inspectWorkspace: (workspaceId: string) => Promise<TStatus[]>
+): Promise<ArchivedWorkspaceInspectionResult<TStatus>[]> {
+  const results: ArchivedWorkspaceInspectionResult<TStatus>[] = new Array(
+    targets.length
+  );
+  let nextIndex = 0;
+
+  const workers = Array.from(
+    {
+      length: Math.min(MAX_INSPECTION_CONCURRENCY, targets.length),
+    },
+    async () => {
+      while (nextIndex < targets.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const target = targets[index];
+
+        try {
+          results[index] = {
+            target,
+            statuses: await inspectWorkspace(target.workspace_id),
+            inspectionFailed: false,
+          };
+        } catch {
+          results[index] = {
+            target,
+            statuses: [],
+            inspectionFailed: true,
+          };
+        }
+      }
+    }
+  );
+
+  await Promise.all(workers);
+  return results;
 }

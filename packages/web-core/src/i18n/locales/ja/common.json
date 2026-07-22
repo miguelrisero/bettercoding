@@ -509,6 +509,7 @@
       "bulkDeleteInspecting": "確認中…",
       "bulkDeleteUnmergedWorkspaces": "{{count}}件のワークスペース",
       "bulkDeleteInspectionFailed": "すべてのブランチを確認できませんでした。",
+      "bulkDeleteInspectionFailures": "未マージ状態を確認できないワークスペース",
       "bulkDeleteRequestFailed": "一括削除リクエストに失敗しました。",
       "bulkDeleteRetry": "再試行",
       "bulkDeleteTargets": "削除されるワークスペース",
