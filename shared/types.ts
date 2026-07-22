@@ -164,7 +164,7 @@ export type CreateScratch = { payload: ScratchPayload, };
 
 export type UpdateScratch = { payload: ScratchPayload, };
 
-export type Workspace = { id: string, task_id: string | null, container_ref: string | null, branch: string, setup_completed_at: string | null, created_at: string, updated_at: string, archived: boolean, pinned: boolean, name: string | null, worktree_deleted: boolean, };
+export type Workspace = { id: string, task_id: string | null, container_ref: string | null, branch: string, setup_completed_at: string | null, created_at: string, updated_at: string, archived: boolean, archived_at: string | null, pinned: boolean, name: string | null, worktree_deleted: boolean, };
 
 export type WorkspaceWithStatus = { 
 /**
@@ -183,7 +183,7 @@ is_executor_running: boolean,
  * scripts). Lets the CLI gate phrase itself correctly: "claude is
  * working in chat" vs "preparing the workspace".
  */
-is_coding_agent_running: boolean, is_errored: boolean, id: string, task_id: string | null, container_ref: string | null, branch: string, setup_completed_at: string | null, created_at: string, updated_at: string, archived: boolean, pinned: boolean, name: string | null, worktree_deleted: boolean, };
+is_coding_agent_running: boolean, is_errored: boolean, id: string, task_id: string | null, container_ref: string | null, branch: string, setup_completed_at: string | null, created_at: string, updated_at: string, archived: boolean, archived_at: string | null, pinned: boolean, name: string | null, worktree_deleted: boolean, };
 
 export type Session = { id: string, workspace_id: string, name: string | null, executor: string | null, agent_working_dir: string | null, created_at: string, updated_at: string, };
 

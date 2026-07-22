@@ -48,6 +48,7 @@ pub struct Workspace {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub archived: bool,
+    pub archived_at: Option<DateTime<Utc>>,
     pub pinned: bool,
     pub name: Option<String>,
     pub worktree_deleted: bool,
@@ -112,6 +113,7 @@ impl Workspace {
                           created_at AS "created_at!: DateTime<Utc>",
                           updated_at AS "updated_at!: DateTime<Utc>",
                           archived AS "archived!: bool",
+                          archived_at AS "archived_at: DateTime<Utc>",
                           pinned AS "pinned!: bool",
                           name,
                           worktree_deleted AS "worktree_deleted!: bool"
@@ -214,6 +216,7 @@ impl Workspace {
                        created_at        AS "created_at!: DateTime<Utc>",
                        updated_at        AS "updated_at!: DateTime<Utc>",
                        archived          AS "archived!: bool",
+                       archived_at       AS "archived_at: DateTime<Utc>",
                        pinned            AS "pinned!: bool",
                        name,
                        worktree_deleted  AS "worktree_deleted!: bool"
@@ -236,6 +239,7 @@ impl Workspace {
                        created_at        AS "created_at!: DateTime<Utc>",
                        updated_at        AS "updated_at!: DateTime<Utc>",
                        archived          AS "archived!: bool",
+                       archived_at       AS "archived_at: DateTime<Utc>",
                        pinned            AS "pinned!: bool",
                        name,
                        worktree_deleted  AS "worktree_deleted!: bool"
@@ -279,6 +283,7 @@ impl Workspace {
                 w.created_at as "created_at!: DateTime<Utc>",
                 w.updated_at as "updated_at!: DateTime<Utc>",
                 w.archived as "archived!: bool",
+                w.archived_at as "archived_at: DateTime<Utc>",
                 w.pinned as "pinned!: bool",
                 w.name,
                 w.worktree_deleted as "worktree_deleted!: bool"
@@ -329,7 +334,7 @@ impl Workspace {
             Workspace,
             r#"INSERT INTO workspaces (id, task_id, container_ref, branch, setup_completed_at, name)
                VALUES ($1, $2, $3, $4, $5, $6)
-               RETURNING id as "id!: Uuid", task_id as "task_id: Uuid", container_ref, branch, setup_completed_at as "setup_completed_at: DateTime<Utc>", created_at as "created_at!: DateTime<Utc>", updated_at as "updated_at!: DateTime<Utc>", archived as "archived!: bool", pinned as "pinned!: bool", name, worktree_deleted as "worktree_deleted!: bool""#,
+               RETURNING id as "id!: Uuid", task_id as "task_id: Uuid", container_ref, branch, setup_completed_at as "setup_completed_at: DateTime<Utc>", created_at as "created_at!: DateTime<Utc>", updated_at as "updated_at!: DateTime<Utc>", archived as "archived!: bool", archived_at as "archived_at: DateTime<Utc>", pinned as "pinned!: bool", name, worktree_deleted as "worktree_deleted!: bool""#,
             id,
             Option::<Uuid>::None,
             Option::<String>::None,
@@ -454,7 +459,15 @@ impl Workspace {
         archived: bool,
     ) -> Result<(), sqlx::Error> {
         sqlx::query!(
-            "UPDATE workspaces SET archived = $1, updated_at = datetime('now', 'subsec') WHERE id = $2",
+            r#"UPDATE workspaces SET
+                archived = $1,
+                archived_at = CASE
+                    WHEN $1 = TRUE AND archived = FALSE THEN datetime('now', 'subsec')
+                    WHEN $1 = FALSE THEN NULL
+                    ELSE archived_at
+                END,
+                updated_at = datetime('now', 'subsec')
+            WHERE id = $2"#,
             archived,
             workspace_id
         )
@@ -479,6 +492,11 @@ impl Workspace {
         sqlx::query!(
             r#"UPDATE workspaces SET
                 archived = COALESCE($1, archived),
+                archived_at = CASE
+                    WHEN $1 = TRUE AND archived = FALSE THEN datetime('now', 'subsec')
+                    WHEN $1 = FALSE THEN NULL
+                    ELSE archived_at
+                END,
                 pinned = COALESCE($2, pinned),
                 name = CASE WHEN $3 THEN $4 ELSE name END,
                 updated_at = datetime('now', 'subsec')
@@ -571,6 +589,7 @@ impl Workspace {
                 w.created_at AS "created_at!: DateTime<Utc>",
                 w.updated_at AS "updated_at!: DateTime<Utc>",
                 w.archived AS "archived!: bool",
+                w.archived_at AS "archived_at: DateTime<Utc>",
                 w.pinned AS "pinned!: bool",
                 w.name,
                 w.worktree_deleted AS "worktree_deleted!: bool",
@@ -639,6 +658,7 @@ impl Workspace {
                     created_at: rec.created_at,
                     updated_at: rec.updated_at,
                     archived: rec.archived,
+                    archived_at: rec.archived_at,
                     pinned: rec.pinned,
                     name: rec.name,
                     worktree_deleted: rec.worktree_deleted,
@@ -693,6 +713,7 @@ impl Workspace {
                 w.created_at AS "created_at!: DateTime<Utc>",
                 w.updated_at AS "updated_at!: DateTime<Utc>",
                 w.archived AS "archived!: bool",
+                w.archived_at AS "archived_at: DateTime<Utc>",
                 w.pinned AS "pinned!: bool",
                 w.name,
                 w.worktree_deleted AS "worktree_deleted!: bool",
@@ -764,6 +785,7 @@ impl Workspace {
                 created_at: rec.created_at,
                 updated_at: rec.updated_at,
                 archived: rec.archived,
+                archived_at: rec.archived_at,
                 pinned: rec.pinned,
                 name: rec.name,
                 worktree_deleted: rec.worktree_deleted,
@@ -788,9 +810,35 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
     use uuid::Uuid;
 
-    use super::Workspace;
+    use super::{CreateWorkspace, Workspace};
+
+    async fn test_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::run_migrations_for_tests(&pool).await.unwrap();
+        pool
+    }
+
+    async fn create_test_workspace(pool: &SqlitePool) -> Workspace {
+        Workspace::create(
+            pool,
+            &CreateWorkspace {
+                branch: "archive-timestamp-test".to_string(),
+                name: Some("Archive timestamp test".to_string()),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap()
+    }
 
     #[test]
     fn best_matching_container_ref_prefers_deepest_match() {
@@ -824,5 +872,119 @@ mod tests {
         );
 
         assert_eq!(selected, None);
+    }
+
+    #[tokio::test]
+    async fn update_tracks_archive_timestamp_transitions() {
+        let pool = test_pool().await;
+        let workspace = create_test_workspace(&pool).await;
+
+        Workspace::update(&pool, workspace.id, Some(true), None, None)
+            .await
+            .unwrap();
+        let first_archived_at = Workspace::find_by_id(&pool, workspace.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .expect("archiving should set archived_at");
+
+        Workspace::update(&pool, workspace.id, Some(true), None, None)
+            .await
+            .unwrap();
+        Workspace::set_archived(&pool, workspace.id, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            Workspace::find_by_id(&pool, workspace.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .archived_at,
+            Some(first_archived_at),
+            "redundant archive writes must preserve the original transition time"
+        );
+
+        Workspace::update(&pool, workspace.id, Some(false), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            Workspace::find_by_id(&pool, workspace.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .archived_at,
+            None,
+            "unarchiving through update must clear archived_at"
+        );
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        Workspace::update(&pool, workspace.id, Some(true), None, None)
+            .await
+            .unwrap();
+        let rearchived_at = Workspace::find_by_id(&pool, workspace.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .expect("re-archiving should set archived_at again");
+        assert!(rearchived_at > first_archived_at);
+    }
+
+    #[tokio::test]
+    async fn set_archived_tracks_archive_timestamp_transitions() {
+        let pool = test_pool().await;
+        let workspace = create_test_workspace(&pool).await;
+
+        Workspace::set_archived(&pool, workspace.id, true)
+            .await
+            .unwrap();
+        let first_archived_at = Workspace::find_by_id(&pool, workspace.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .expect("archiving should set archived_at");
+
+        Workspace::set_archived(&pool, workspace.id, true)
+            .await
+            .unwrap();
+        Workspace::update(&pool, workspace.id, Some(true), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            Workspace::find_by_id(&pool, workspace.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .archived_at,
+            Some(first_archived_at),
+            "redundant archive writes must preserve the original transition time"
+        );
+
+        Workspace::set_archived(&pool, workspace.id, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            Workspace::find_by_id(&pool, workspace.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .archived_at,
+            None,
+            "unarchiving through set_archived must clear archived_at"
+        );
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        Workspace::set_archived(&pool, workspace.id, true)
+            .await
+            .unwrap();
+        let rearchived_at = Workspace::find_by_id(&pool, workspace.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .expect("re-archiving should set archived_at again");
+        assert!(rearchived_at > first_archived_at);
     }
 }

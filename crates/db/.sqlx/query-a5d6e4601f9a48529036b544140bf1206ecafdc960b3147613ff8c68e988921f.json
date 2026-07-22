@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id AS \"id!: Uuid\",\n                          task_id AS \"task_id: Uuid\",\n                          container_ref,\n                          branch,\n                          setup_completed_at AS \"setup_completed_at: DateTime<Utc>\",\n                          created_at AS \"created_at!: DateTime<Utc>\",\n                          updated_at AS \"updated_at!: DateTime<Utc>\",\n                          archived AS \"archived!: bool\",\n                          pinned AS \"pinned!: bool\",\n                          name,\n                          worktree_deleted AS \"worktree_deleted!: bool\"\n                   FROM workspaces\n                   ORDER BY created_at DESC",
+  "query": "SELECT  id                AS \"id!: Uuid\",\n                       task_id           AS \"task_id: Uuid\",\n                       container_ref,\n                       branch,\n                       setup_completed_at AS \"setup_completed_at: DateTime<Utc>\",\n                       created_at        AS \"created_at!: DateTime<Utc>\",\n                       updated_at        AS \"updated_at!: DateTime<Utc>\",\n                       archived          AS \"archived!: bool\",\n                       archived_at       AS \"archived_at: DateTime<Utc>\",\n                       pinned            AS \"pinned!: bool\",\n                       name,\n                       worktree_deleted  AS \"worktree_deleted!: bool\"\n               FROM    workspaces\n               WHERE   rowid = $1",
   "describe": {
     "columns": [
       {
@@ -44,23 +44,28 @@
         "type_info": "Integer"
       },
       {
-        "name": "pinned!: bool",
+        "name": "archived_at: DateTime<Utc>",
         "ordinal": 8,
+        "type_info": "Datetime"
+      },
+      {
+        "name": "pinned!: bool",
+        "ordinal": 9,
         "type_info": "Integer"
       },
       {
         "name": "name",
-        "ordinal": 9,
+        "ordinal": 10,
         "type_info": "Text"
       },
       {
         "name": "worktree_deleted!: bool",
-        "ordinal": 10,
+        "ordinal": 11,
         "type_info": "Bool"
       }
     ],
     "parameters": {
-      "Right": 0
+      "Right": 1
     },
     "nullable": [
       true,
@@ -71,10 +76,11 @@
       false,
       false,
       false,
+      true,
       false,
       true,
       false
     ]
   },
-  "hash": "64f31710ab7ba14047f31cce44ad36c60a53624f9bcb03a5eaff5d61ca8cc9cf"
+  "hash": "a5d6e4601f9a48529036b544140bf1206ecafdc960b3147613ff8c68e988921f"
 }
