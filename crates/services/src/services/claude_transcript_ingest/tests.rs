@@ -1,4 +1,10 @@
-use std::{collections::HashSet, fs, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    fs,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
@@ -51,8 +57,34 @@ impl CliWriterProbe for StaticWriterProbe {
         _workspace_id: Uuid,
         _effective_dir: &Path,
         _expected_sid: Option<&str>,
+        _binding: Option<&CliPaneBinding>,
+        _check_cwd_uniqueness: bool,
     ) -> ProbeReport {
         self.0.clone()
+    }
+}
+
+#[derive(Clone)]
+struct RecordingWriterProbe {
+    report: ProbeReport,
+    uniqueness_checks: Arc<Mutex<Vec<bool>>>,
+}
+
+#[async_trait]
+impl CliWriterProbe for RecordingWriterProbe {
+    async fn probe(
+        &self,
+        _workspace_id: Uuid,
+        _effective_dir: &Path,
+        _expected_sid: Option<&str>,
+        _binding: Option<&CliPaneBinding>,
+        check_cwd_uniqueness: bool,
+    ) -> ProbeReport {
+        self.uniqueness_checks
+            .lock()
+            .unwrap()
+            .push(check_cwd_uniqueness);
+        self.report.clone()
     }
 }
 
@@ -357,7 +389,7 @@ async fn import_foreign_writer_case(report: ProbeReport, executor_running: bool)
 async fn import_cli_fresh_case(
     release_binding: bool,
     report: ProbeReport,
-) -> (Option<ClaudeSessionLink>, CliPaneBinding, u64) {
+) -> (Option<ClaudeSessionLink>, CliPaneBinding, u64, Vec<bool>) {
     let temp = TempDir::new().unwrap();
     let workspace_root = temp.path().join("worktree");
     let projects_dir = temp.path().join("projects");
@@ -391,10 +423,14 @@ async fn import_cli_fresh_case(
     )
     .unwrap();
 
+    let uniqueness_checks = Arc::new(Mutex::new(Vec::new()));
     let service = Arc::new(ClaudeTranscriptIngest::new_with_probe(
         db.clone(),
         projects_dir,
-        Arc::new(StaticWriterProbe(report)),
+        Arc::new(RecordingWriterProbe {
+            report,
+            uniqueness_checks: uniqueness_checks.clone(),
+        }),
     ));
     service
         .reconcile_registry(false, CancellationToken::new())
@@ -412,7 +448,8 @@ async fn import_cli_fresh_case(
         .unwrap()
         .health
         .quarantined_files;
-    (link, binding, quarantined_files)
+    let uniqueness_checks = uniqueness_checks.lock().unwrap().clone();
+    (link, binding, quarantined_files, uniqueness_checks)
 }
 
 #[tokio::test]
@@ -447,7 +484,7 @@ async fn foreign_writer_classifier_fails_safe_for_executor_pane_and_probe_failur
 
 #[tokio::test]
 async fn cli_fresh_file_auto_binds_to_the_only_live_unreleased_pane() {
-    let (link, binding, quarantined_files) = import_cli_fresh_case(
+    let (link, binding, quarantined_files, _) = import_cli_fresh_case(
         false,
         writer_report(true, Some(true), SidEvidence::NoResumeArg, Some(true)),
     )
@@ -461,6 +498,17 @@ async fn cli_fresh_file_auto_binds_to_the_only_live_unreleased_pane() {
     );
     assert!(binding.released_at.is_none());
     assert_eq!(quarantined_files, 0);
+}
+
+#[tokio::test]
+async fn cwd_uniqueness_is_requested_only_for_cli_fresh_auto_binding() {
+    let (_, _, _, uniqueness_checks) = import_cli_fresh_case(
+        false,
+        writer_report(true, Some(true), SidEvidence::NoResumeArg, Some(true)),
+    )
+    .await;
+
+    assert_eq!(uniqueness_checks, vec![true, false]);
 }
 
 #[tokio::test]
@@ -479,7 +527,7 @@ async fn cli_fresh_file_quarantines_for_released_dead_or_nonexclusive_panes() {
     ];
 
     for (release_binding, report) in cases {
-        let (link, binding, quarantined_files) =
+        let (link, binding, quarantined_files, _) =
             import_cli_fresh_case(release_binding, report).await;
         assert!(link.is_none());
         assert!(binding.claude_session_id.is_none());

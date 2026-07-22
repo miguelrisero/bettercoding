@@ -84,6 +84,8 @@ pub trait CliWriterProbe: Send + Sync {
         workspace_id: Uuid,
         effective_dir: &Path,
         expected_sid: Option<&str>,
+        binding: Option<&CliPaneBinding>,
+        check_cwd_uniqueness: bool,
     ) -> ProbeReport;
 }
 
@@ -269,6 +271,8 @@ impl CliCollabService {
                 session.workspace_id,
                 &effective_dir,
                 expected_sid.as_deref(),
+                binding.as_ref(),
+                false,
             )
             .await;
         if report.probe_failed {
@@ -1137,6 +1141,8 @@ impl CliCollabService {
                 session.workspace_id,
                 &effective_dir,
                 row.claude_session_id.as_deref(),
+                Some(&binding),
+                false,
             )
             .await;
         if report.probe_failed || report.agent_running.is_none() {
@@ -1151,7 +1157,7 @@ impl CliCollabService {
         Ok(false)
     }
 
-    async fn reconcile_delivery_state(&self) {
+    async fn reconcile_delivery_state(&self, pasted_rows: Vec<SessionQueuedMessage>) {
         let reconciled = match SessionQueuedMessage::reconcile(
             &self.db.pool,
             Utc::now(),
@@ -1167,18 +1173,8 @@ impl CliCollabService {
                 return;
             }
         };
-        let rows = match SessionQueuedMessage::list_active(&self.db.pool).await {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(?error, "failed to scan pasted CLI delivery evidence");
-                return;
-            }
-        };
         let mut requeued_lost_evidence = 0_u64;
-        for row in rows
-            .into_iter()
-            .filter(|row| row.state == QueuedMessageState::Pasted)
-        {
+        for row in pasted_rows {
             let queue_id = row.id;
             let session_id = row.session_id;
             match self.reconcile_pasted_delivery(row).await {
@@ -1207,14 +1203,18 @@ impl CliCollabService {
         }
     }
 
-    async fn reconcile_waiting_panes(&self) {
-        let bindings = match CliPaneBinding::list_active(&self.db.pool).await {
-            Ok(bindings) => bindings,
-            Err(error) => {
-                tracing::warn!(?error, "failed to scan active CLI pane bindings");
-                return;
-            }
-        };
+    #[cfg(test)]
+    async fn reconcile_delivery_state_from_db(&self) {
+        let pasted_rows = SessionQueuedMessage::list_active(&self.db.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.state == QueuedMessageState::Pasted)
+            .collect();
+        self.reconcile_delivery_state(pasted_rows).await;
+    }
+
+    async fn reconcile_waiting_panes(&self, bindings: Vec<CliPaneBinding>) {
         let active_ids: HashSet<_> = bindings.iter().map(|binding| binding.id).collect();
         self.resume_signaled_bindings
             .lock()
@@ -1296,23 +1296,47 @@ impl CliCollabService {
     }
 
     async fn drain_all(&self) {
-        self.reconcile_waiting_panes().await;
-        self.reconcile_delivery_state().await;
-        if self.routing_disabled {
-            return;
-        }
-        let rows = match SessionQueuedMessage::list_active(&self.db.pool).await {
+        let bindings = match CliPaneBinding::list_active(&self.db.pool).await {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                tracing::warn!(?error, "failed to scan active CLI pane bindings");
+                return;
+            }
+        };
+        let active_rows = match SessionQueuedMessage::list_active(&self.db.pool).await {
             Ok(rows) => rows,
             Err(error) => {
                 tracing::warn!(?error, "durable CLI queue scan failed closed");
                 return;
             }
         };
-        for session_id in rows
-            .into_iter()
-            .filter(|row| row.state == QueuedMessageState::Queued)
-            .map(|row| row.session_id)
-        {
+        if bindings.is_empty() && active_rows.is_empty() {
+            self.resume_signaled_bindings.lock().await.clear();
+            return;
+        }
+
+        let mut pasted_rows = Vec::new();
+        let mut queued_session_ids = Vec::new();
+        for row in active_rows {
+            match row.state {
+                QueuedMessageState::Pasted => pasted_rows.push(row),
+                QueuedMessageState::Queued => queued_session_ids.push(row.session_id),
+                QueuedMessageState::Pasting => {}
+                QueuedMessageState::Imported
+                | QueuedMessageState::Failed
+                | QueuedMessageState::Consumed
+                | QueuedMessageState::Cancelled => {
+                    debug_assert!(false, "active queue scan returned a terminal row");
+                }
+            }
+        }
+
+        self.reconcile_waiting_panes(bindings).await;
+        self.reconcile_delivery_state(pasted_rows).await;
+        if self.routing_disabled {
+            return;
+        }
+        for session_id in queued_session_ids {
             if let Err(error) = self.drain_session(session_id).await {
                 tracing::warn!(?error, %session_id, "durable CLI queue drain failed");
             }
@@ -1320,7 +1344,7 @@ impl CliCollabService {
     }
 
     async fn run_drain(self: Arc<Self>) {
-        self.reconcile_delivery_state().await;
+        self.drain_all().await;
         let mut interval = tokio::time::interval(DRAIN_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -1413,6 +1437,8 @@ mod tests {
             _workspace_id: Uuid,
             _effective_dir: &Path,
             _expected_sid: Option<&str>,
+            _binding: Option<&CliPaneBinding>,
+            _check_cwd_uniqueness: bool,
         ) -> ProbeReport {
             self.0.lock().unwrap().clone()
         }
@@ -2668,7 +2694,7 @@ mod tests {
             Arc::new(NeverDispatcher),
         );
 
-        service.reconcile_delivery_state().await;
+        service.reconcile_delivery_state_from_db().await;
 
         let row = SessionQueuedMessage::find_by_id(&db.pool, row.id)
             .await
@@ -2707,7 +2733,7 @@ mod tests {
             .pasted_at;
         let (service, _) = service(db.clone(), report(false, Some(false), SidEvidence::Unknown));
 
-        service.reconcile_delivery_state().await;
+        service.reconcile_delivery_state_from_db().await;
 
         let row = SessionQueuedMessage::find_by_id(&db.pool, row.id)
             .await
@@ -2782,7 +2808,7 @@ mod tests {
             Arc::new(NeverDispatcher),
         );
 
-        service.reconcile_delivery_state().await;
+        service.reconcile_delivery_state_from_db().await;
 
         let row = SessionQueuedMessage::find_by_id(&db.pool, row.id)
             .await
@@ -2955,7 +2981,7 @@ mod tests {
             transport,
             Arc::new(NeverDispatcher),
         );
-        service.reconcile_delivery_state().await;
+        service.reconcile_delivery_state_from_db().await;
 
         let interrupted = SessionQueuedMessage::find_by_id(&db.pool, interrupted.id)
             .await

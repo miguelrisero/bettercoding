@@ -150,6 +150,8 @@ impl CliWriterProbe for TestNoPaneWriterProbe {
         _workspace_id: Uuid,
         _effective_dir: &Path,
         _expected_sid: Option<&str>,
+        _binding: Option<&CliPaneBinding>,
+        _check_cwd_uniqueness: bool,
     ) -> crate::services::cli_collab::ProbeReport {
         crate::services::cli_collab::ProbeReport {
             pane_session_exists: false,
@@ -756,7 +758,13 @@ impl ClaudeTranscriptIngest {
         let import_context = if link.is_some() {
             let report = self
                 .writer_probe
-                .probe(context.workspace_id, &context.cwd, Some(claude_session_id))
+                .probe(
+                    context.workspace_id,
+                    &context.cwd,
+                    Some(claude_session_id),
+                    None,
+                    false,
+                )
                 .await;
             NativeImportContext {
                 app_pane_absent: !(report.probe_failed
@@ -944,7 +952,13 @@ impl ClaudeTranscriptIngest {
         }
         let report = self
             .writer_probe
-            .probe(context.workspace_id, &context.cwd, None)
+            .probe(
+                context.workspace_id,
+                &context.cwd,
+                None,
+                Some(&binding),
+                true,
+            )
             .await;
         if report.probe_failed
             || !report.pane_session_exists

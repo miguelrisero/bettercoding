@@ -141,15 +141,9 @@ impl CliWriterProbe for LocalCliWriterProbe {
         workspace_id: Uuid,
         effective_dir: &Path,
         _expected_sid: Option<&str>,
+        binding: Option<&CliPaneBinding>,
+        check_cwd_uniqueness: bool,
     ) -> ProbeReport {
-        let binding =
-            match CliPaneBinding::find_active_for_workspace(&self.db.pool, workspace_id).await {
-                Ok(binding) => binding,
-                Err(error) => {
-                    tracing::warn!(?error, %workspace_id, "CLI pane binding probe failed");
-                    return ProbeReport::failed();
-                }
-            };
         let exists = match cli_tmux_session_exists_checked(workspace_id).await {
             Ok(exists) => exists,
             Err(error) => {
@@ -169,7 +163,7 @@ impl CliWriterProbe for LocalCliWriterProbe {
                 agent_running: Some(false),
                 sid_evidence: SidEvidence::Unknown,
                 probe_failed: false,
-                only_active_claude_in_cwd: Some(false),
+                only_active_claude_in_cwd: check_cwd_uniqueness.then_some(false),
             };
         }
 
@@ -178,15 +172,26 @@ impl CliWriterProbe for LocalCliWriterProbe {
             None => return ProbeReport::failed(),
         };
         let agent_running = !processes.is_empty();
-        let pane_pids = processes.iter().map(|process| process.pid).collect();
-        live_process_report(
-            &processes,
-            if agent_running {
-                only_active_claude_in_cwd(effective_dir, &pane_pids)
-            } else {
-                Some(false)
-            },
-        )
+        let cwd_uniqueness = if !check_cwd_uniqueness {
+            None
+        } else if !agent_running {
+            Some(false)
+        } else {
+            let effective_dir = effective_dir.to_path_buf();
+            let pane_pids = processes.iter().map(|process| process.pid).collect();
+            match tokio::task::spawn_blocking(move || {
+                only_active_claude_in_cwd(&effective_dir, &pane_pids)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!(?error, %workspace_id, "CLI cwd uniqueness probe failed");
+                    None
+                }
+            }
+        };
+        live_process_report(&processes, cwd_uniqueness)
     }
 }
 
