@@ -45,6 +45,7 @@ fn generate_types_content() -> String {
         db::models::scratch::UpdateScratch::decl(),
         db::models::workspace::Workspace::decl(),
         db::models::workspace::WorkspaceWithStatus::decl(),
+        db::models::archive_bucket::ArchiveBucket::decl(),
         db::models::session::Session::decl(),
         db::models::session_queued_message::QueuedMessageSource::decl(),
         db::models::session_queued_message::QueuedMessageState::decl(),
