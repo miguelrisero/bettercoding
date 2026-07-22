@@ -17,7 +17,8 @@ use db::{
         execution_process::{ExecutionProcess, ExecutionProcessRunReason, ExecutionProcessStatus},
         session::Session,
         session_queued_message::{
-            QueuedMessageSource, QueuedMessageState, SessionQueuedMessage, StoreQueuedMessageResult,
+            ABNORMAL_EXECUTOR_QUEUE_HOLD, QueuedMessageSource, QueuedMessageState,
+            SessionQueuedMessage, StoreQueuedMessageResult,
         },
         workspace::Workspace,
         workspace_spawn_reservation::{SpawnReservationHolder, WorkspaceSpawnReservation},
@@ -41,8 +42,6 @@ const RESUME_SIGNAL_ATTEMPTS: u32 = 3;
 const RESUME_SIGNAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 const PASTING_STARTUP_GRACE: ChronoDuration = ChronoDuration::seconds(5);
 const PASTE_ACK_HARD_CAP: ChronoDuration = ChronoDuration::minutes(15);
-const ABNORMAL_EXECUTOR_QUEUE_HOLD: &str =
-    "previous agent failed or was killed; confirm Send again to run this message";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidEvidence {
@@ -2090,6 +2089,64 @@ mod tests {
         assert_eq!(
             held.failure_reason.as_deref(),
             Some(ABNORMAL_EXECUTOR_QUEUE_HOLD)
+        );
+    }
+
+    #[tokio::test]
+    async fn orphaned_executor_claim_requeue_remains_held_from_automatic_dispatch() {
+        let (db, _workspace, session) = fixture().await;
+        let row = store_message(
+            &db,
+            session.id,
+            "do not redispatch an orphaned claim",
+            QueuedMessageSource::Ui,
+        )
+        .await;
+        SessionQueuedMessage::claim_for_executor(&db.pool, row.id, "pre-crash-owner")
+            .await
+            .unwrap()
+            .unwrap();
+        let orphaned = create_running_executor(&db, session.id, "orphaned writer").await;
+        ExecutionProcess::update_completion(
+            &db.pool,
+            orphaned.id,
+            ExecutionProcessStatus::Failed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let dispatcher_state = Arc::new(StdMutex::new(DispatcherState::default()));
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(false, Some(false), SidEvidence::Unknown),
+            Arc::new(FakeTransport),
+            Arc::new(RecordingDispatcher {
+                db: db.clone(),
+                state: dispatcher_state.clone(),
+            }),
+        );
+
+        service.reconcile_delivery_state_from_db().await;
+        let held = SessionQueuedMessage::find_by_id(&db.pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.state, QueuedMessageState::Queued);
+        assert_eq!(
+            held.failure_reason.as_deref(),
+            Some(ABNORMAL_EXECUTOR_QUEUE_HOLD)
+        );
+
+        assert!(!service.drain_session(session.id).await.unwrap());
+        assert!(dispatcher_state.lock().unwrap().prompts.is_empty());
+        assert_eq!(
+            ExecutionProcess::find_by_session_id(&db.pool, session.id, true)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the held prompt must not create a replacement execution"
         );
     }
 

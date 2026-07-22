@@ -7,6 +7,8 @@ use uuid::Uuid;
 
 pub const PASTED_REQUEUE_FAILURE_REASON: &str =
     "CLI submission was not acknowledged; queued for retry";
+pub const ABNORMAL_EXECUTOR_QUEUE_HOLD: &str =
+    "previous agent failed or was killed; confirm Send again to run this message";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, TS)]
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
@@ -429,10 +431,27 @@ impl SessionQueuedMessage {
         .rows_affected();
 
         let pasting_cutoff = now - pasting_grace;
+        // Executor owners are process-scoped UUIDs, so recovery cannot prove
+        // which execution abandoned a claim. Use the earlier of the claim
+        // timestamp and this tick's start as a conservative floor: a false
+        // hold costs an explicit resend, while a missed hold can run two
+        // coding agents against one worktree.
         let requeued_pasting = sqlx::query!(
             r#"UPDATE session_queued_messages SET
                    state = 'queued',
                    failure_reason = CASE
+                       WHEN executor_claim_owner IS NOT NULL
+                            AND ($2 IS NULL OR executor_claim_owner != $2)
+                            AND EXISTS (
+                                SELECT 1 FROM execution_processes process
+                                WHERE process.session_id = session_queued_messages.session_id
+                                  AND process.run_reason = 'codingagent'
+                                  AND process.status IN ('failed', 'killed')
+                                  AND julianday(process.completed_at) >= MIN(
+                                      julianday(session_queued_messages.updated_at),
+                                      julianday($5)
+                                  )
+                            ) THEN $6
                        WHEN pasted_at IS NOT NULL THEN $3
                        ELSE 'delivery interrupted; queued for retry'
                    END,
@@ -456,7 +475,9 @@ impl SessionQueuedMessage {
             pasting_cutoff,
             active_executor_claim_owner,
             PASTED_REQUEUE_FAILURE_REASON,
-            active_paste_claim_owner
+            active_paste_claim_owner,
+            now,
+            ABNORMAL_EXECUTOR_QUEUE_HOLD
         )
         .execute(pool)
         .await?
