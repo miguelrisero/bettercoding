@@ -60,6 +60,8 @@ fn resume_evidence(cmdlines: &[String]) -> SidEvidence {
 fn live_process_report(
     processes: &[CliPaneAgentProcess],
     only_active_claude_in_cwd: Option<bool>,
+    _expected_sid: Option<&str>,
+    _binding: Option<&CliPaneBinding>,
 ) -> ProbeReport {
     let agent_running = !processes.is_empty();
     let cmdlines: Vec<_> = processes
@@ -140,7 +142,7 @@ impl CliWriterProbe for LocalCliWriterProbe {
         &self,
         workspace_id: Uuid,
         effective_dir: &Path,
-        _expected_sid: Option<&str>,
+        expected_sid: Option<&str>,
         binding: Option<&CliPaneBinding>,
         check_cwd_uniqueness: bool,
     ) -> ProbeReport {
@@ -191,7 +193,7 @@ impl CliWriterProbe for LocalCliWriterProbe {
                 }
             }
         };
-        live_process_report(&processes, cwd_uniqueness)
+        live_process_report(&processes, cwd_uniqueness, expected_sid, binding)
     }
 }
 
@@ -229,6 +231,8 @@ mod tests {
                 cmdline: format!("claude --resume {observed}"),
             }],
             None,
+            None,
+            None,
         );
         assert_eq!(
             mismatched.sid_evidence,
@@ -245,11 +249,53 @@ mod tests {
                 cmdline: "claude --model opus".to_string(),
             }],
             None,
+            None,
+            None,
         );
         assert_eq!(no_resume.sid_evidence, SidEvidence::NoResumeArg);
         assert_ne!(
             no_resume.sid_evidence,
             SidEvidence::ConfirmedResume(expected.to_string())
         );
+    }
+
+    #[test]
+    fn probe_path_never_replaces_live_evidence_with_matching_database_sid() {
+        let expected = "11111111-1111-4111-8111-111111111111";
+        let observed = "22222222-2222-4222-8222-222222222222";
+        let binding = CliPaneBinding {
+            id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            claude_session_id: Some(expected.to_string()),
+            bound_via: db::models::cli_pane_binding::CliPaneBoundVia::CliResume,
+            created_at: chrono::Utc::now(),
+            released_at: None,
+        };
+
+        let mismatched = live_process_report(
+            &[CliPaneAgentProcess {
+                pid: 44,
+                cmdline: format!("claude --resume {observed}"),
+            }],
+            None,
+            Some(expected),
+            Some(&binding),
+        );
+        assert_eq!(
+            mismatched.sid_evidence,
+            SidEvidence::ConfirmedResume(observed.to_string())
+        );
+
+        let no_resume = live_process_report(
+            &[CliPaneAgentProcess {
+                pid: 45,
+                cmdline: "claude --model opus".to_string(),
+            }],
+            None,
+            Some(expected),
+            Some(&binding),
+        );
+        assert_eq!(no_resume.sid_evidence, SidEvidence::NoResumeArg);
     }
 }
