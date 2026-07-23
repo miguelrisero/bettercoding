@@ -89,7 +89,13 @@
       "noPreview": "No prompt preview available",
       "assign": "Assign here",
       "assigning": "Assigning…",
-      "error": "This conversation could not be assigned. Try again."
+      "error": "This conversation could not be assigned. Try again.",
+      "mainBadge": "Main",
+      "agentBadge": "Agent",
+      "showBackgroundAgents": "Show {{count}} background agent",
+      "showBackgroundAgents_other": "Show {{count}} background agents",
+      "hideBackgroundAgents": "Hide {{count}} background agent",
+      "hideBackgroundAgents_other": "Hide {{count}} background agents"
     },
     "toolSummary": {
       "read": "Read {{path}}",

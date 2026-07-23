@@ -382,7 +382,9 @@ export type NativeIngestHealth = { unknown_kinds: bigint, rescans: bigint, quara
 
 export type NativeFeedSnapshot = { revision: bigint, seq: bigint, entries: Array<NativeFeedEntry>, forks: Array<NativeFeedFork>, health: NativeIngestHealth, };
 
-export type UnassignedCliSession = { claude_session_id: string, cwd: string, dir_path: string, file_name: string, mtime_ms: bigint | null, first_prompt_snippet: string | null, };
+export type CliSessionKind = "main" | "subagent";
+
+export type UnassignedCliSession = { claude_session_id: string, cwd: string, dir_path: string, file_name: string, mtime_ms: bigint | null, first_prompt_snippet: string | null, kind: CliSessionKind, };
 
 export type AssignNativeCliSessionRequest = { claude_session_id: string, session_id: string, };
 

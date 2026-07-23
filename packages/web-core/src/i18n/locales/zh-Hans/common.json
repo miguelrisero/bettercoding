@@ -84,7 +84,13 @@
       "noPreview": "没有可用的提示预览",
       "assign": "分配到此处",
       "assigning": "正在分配…",
-      "error": "无法分配此对话，请重试。"
+      "error": "无法分配此对话，请重试。",
+      "mainBadge": "主",
+      "agentBadge": "代理",
+      "showBackgroundAgents": "显示 {{count}} 个后台代理",
+      "showBackgroundAgents_other": "显示 {{count}} 个后台代理",
+      "hideBackgroundAgents": "隐藏 {{count}} 个后台代理",
+      "hideBackgroundAgents_other": "隐藏 {{count}} 个后台代理"
     },
     "toolSummary": {
       "read": "读取 {{path}}",

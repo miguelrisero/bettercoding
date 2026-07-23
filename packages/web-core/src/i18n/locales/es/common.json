@@ -97,7 +97,13 @@
       "noPreview": "No hay vista previa del mensaje",
       "assign": "Asignar aquí",
       "assigning": "Asignando…",
-      "error": "No se pudo asignar esta conversación. Inténtalo de nuevo."
+      "error": "No se pudo asignar esta conversación. Inténtalo de nuevo.",
+      "mainBadge": "Principal",
+      "agentBadge": "Agente",
+      "showBackgroundAgents": "Mostrar {{count}} agente en segundo plano",
+      "showBackgroundAgents_other": "Mostrar {{count}} agentes en segundo plano",
+      "hideBackgroundAgents": "Ocultar {{count}} agente en segundo plano",
+      "hideBackgroundAgents_other": "Ocultar {{count}} agentes en segundo plano"
     },
     "toolSummary": {
       "read": "Leyó {{path}}",

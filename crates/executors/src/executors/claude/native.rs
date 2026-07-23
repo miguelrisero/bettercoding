@@ -31,6 +31,7 @@ pub struct NativeClaudeEnvelopeMetadata {
     pub timestamp: Option<String>,
     pub version: Option<String>,
     pub git_branch: Option<String>,
+    pub entrypoint: Option<String>,
     pub kind: String,
     pub leaf_uuid: Option<String>,
     pub is_sidechain: bool,
@@ -111,6 +112,7 @@ struct NativeClaudeWireEnvelope {
     timestamp: Option<String>,
     version: Option<String>,
     git_branch: Option<String>,
+    entrypoint: Option<String>,
     #[serde(default)]
     is_sidechain: bool,
     leaf_uuid: Option<String>,
@@ -143,6 +145,7 @@ pub fn adapt_native_claude_line(
         timestamp: wire.timestamp,
         version: wire.version,
         git_branch: wire.git_branch,
+        entrypoint: wire.entrypoint,
         kind: kind.clone(),
         leaf_uuid: wire.leaf_uuid,
         is_sidechain: wire.is_sidechain,
@@ -274,6 +277,23 @@ mod tests {
         assert_eq!(metadata.parent_uuid.as_deref(), Some("p-1"));
         assert_eq!(metadata.uuid.as_deref(), Some("u-1"));
         assert_eq!(line.plain_user_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn parses_optional_entrypoint_on_bookkeeping_records() {
+        let with_entrypoint = adapt_native_claude_line(
+            r#"{"type":"attachment","entrypoint":"sdk-py"}"#,
+            "file-session",
+        )
+        .unwrap();
+        assert_eq!(
+            with_entrypoint.metadata().entrypoint.as_deref(),
+            Some("sdk-py")
+        );
+
+        let without_entrypoint =
+            adapt_native_claude_line(r#"{"type":"attachment"}"#, "file-session").unwrap();
+        assert_eq!(without_entrypoint.metadata().entrypoint, None);
     }
 
     #[test]
