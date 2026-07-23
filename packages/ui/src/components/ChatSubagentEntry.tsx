@@ -73,7 +73,9 @@ export function ChatSubagentEntry({
       return <XCircleIcon className="size-icon-xs text-error" weight="fill" />;
     }
     if (isPending) {
-      return <CircleNotchIcon className="size-icon-xs text-low animate-spin" />;
+      return (
+        <CircleNotchIcon className="size-icon-xs text-low animate-spin motion-reduce:animate-none" />
+      );
     }
     return null;
   }, [status]);
