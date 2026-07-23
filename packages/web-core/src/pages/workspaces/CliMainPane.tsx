@@ -1,6 +1,10 @@
 import { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ChatsTeardropIcon, CircleNotchIcon } from '@phosphor-icons/react';
+import {
+  ChatsTeardropIcon,
+  CircleIcon,
+  CircleNotchIcon,
+} from '@phosphor-icons/react';
 
 import { XTermInstance } from '@/shared/components/XTermInstance';
 import { LoopAutomationControl } from '@/shared/components/LoopAutomationControl';
@@ -37,6 +41,13 @@ interface CliMainPaneProps {
    * "claude is working in chat" and "preparing the workspace".
    */
   codingAgentRunning?: boolean;
+  /**
+   * The CLI tmux `claude` pane is actively producing output right now (live
+   * `is_running`, executor excluded). Drives the header working/idle indicator
+   * — NOT the full-screen executor notice, so the live terminal stays visible
+   * while the agent works.
+   */
+  cliRunning?: boolean;
 }
 
 /**
@@ -55,6 +66,7 @@ export function CliMainPane({
   sessionsReady = true,
   executorRunning = false,
   codingAgentRunning = false,
+  cliRunning = false,
 }: CliMainPaneProps) {
   const { t } = useTranslation('common');
   const { closeTab } = useTerminal();
@@ -76,6 +88,36 @@ export function CliMainPane({
           </span>
         </span>
         <div className="flex items-center gap-2 md:gap-3 shrink-0">
+          {sessionsReady && !executorRunning && (
+            <span
+              aria-hidden="true"
+              className="flex items-center gap-1 shrink-0"
+            >
+              {cliRunning ? (
+                <>
+                  <CircleNotchIcon
+                    className="size-icon-sm animate-spin motion-reduce:animate-none text-brand shrink-0"
+                    weight="bold"
+                    aria-hidden="true"
+                  />
+                  <span className="text-xs text-normal hidden md:inline">
+                    {t('cliMode.working')}
+                  </span>
+                </>
+              ) : (
+                <>
+                  <CircleIcon
+                    className="size-2 text-low shrink-0"
+                    weight="fill"
+                    aria-hidden="true"
+                  />
+                  <span className="text-xs text-low hidden md:inline">
+                    {t('cliMode.idle')}
+                  </span>
+                </>
+              )}
+            </span>
+          )}
           <LoopAutomationControl workspaceId={workspaceId} />
           <button
             type="button"

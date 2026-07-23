@@ -8,7 +8,9 @@
     "agentRunningBody": "编码代理正在聊天中执行此任务。完成后终端将接管同一会话 — 无需在此重复提示。",
     "agentRunningViewChat": "在聊天中查看进度",
     "setupRunningTitle": "正在准备工作区",
-    "setupRunningBody": "安装脚本正在运行。完成后终端将带着你的提示打开。"
+    "setupRunningBody": "安装脚本正在运行。完成后终端将带着你的提示打开。",
+    "working": "工作中…",
+    "idle": "空闲"
   },
   "loopAutomation": {
     "label": "继续运行",
@@ -69,7 +71,7 @@
     "thinking": "思考中",
     "assistant": "Claude",
     "viaCli": "通过 CLI",
-    "cliSessionActive": "CLI 会话活跃",
+    "cliAgentWorking": "代理正在工作…",
     "foreignWriter": {
       "message": "此对话正在应用外进行编辑。",
       "dismiss": "关闭外部编辑提示"
