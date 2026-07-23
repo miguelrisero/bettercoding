@@ -116,6 +116,20 @@
     "subagent": {
       "defaultType": "サブエージェント"
     },
+    "subagentStrip": {
+      "main": "メイン",
+      "working": "作業中",
+      "completed": "完了",
+      "failed": "失敗",
+      "done": "{{count}} 件完了",
+      "done_other": "{{count}} 件完了",
+      "more": "ほか {{count}} 件",
+      "more_other": "ほか {{count}} 件",
+      "mobileSummary": "実行中 {{active}} 件 · 完了 {{done}} 件",
+      "drawerTitle": "完了したサブエージェント",
+      "stillRunning": "実行中",
+      "allSubagents": "サブエージェント"
+    },
     "fork": {
       "explanation": "一部のメッセージは、エージェントが現在たどっていない経路に進みました。",
       "branchLabel": "ブランチ {{index}}",

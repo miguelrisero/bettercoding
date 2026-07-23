@@ -116,6 +116,20 @@
     "subagent": {
       "defaultType": "서브에이전트"
     },
+    "subagentStrip": {
+      "main": "메인",
+      "working": "작업 중",
+      "completed": "완료",
+      "failed": "실패",
+      "done": "{{count}}개 완료",
+      "done_other": "{{count}}개 완료",
+      "more": "{{count}}개 더",
+      "more_other": "{{count}}개 더",
+      "mobileSummary": "활성 {{active}}개 · 완료 {{done}}개",
+      "drawerTitle": "완료된 서브에이전트",
+      "stillRunning": "실행 중",
+      "allSubagents": "서브에이전트"
+    },
     "fork": {
       "explanation": "일부 메시지는 에이전트가 더 이상 따르지 않는 경로로 진행되었습니다.",
       "branchLabel": "브랜치 {{index}}",

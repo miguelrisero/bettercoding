@@ -2,7 +2,7 @@
 import '@/integrations/vscode/bridge';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Session } from 'shared/types';
+import type { BaseCodingAgent, Session } from 'shared/types';
 import { useTranslation } from 'react-i18next';
 import { AppWithStyleOverride } from '@/shared/lib/StyleOverride';
 import { useStyleOverrideThemeSetter } from '@/shared/lib/StyleOverride';
@@ -21,6 +21,7 @@ import { MessageEditProvider } from '@/features/workspace-chat/model/contexts/Me
 import { RetryUiProvider } from '@/features/workspace-chat/model/contexts/RetryUiContext';
 import { ApprovalFeedbackProvider } from '@/features/workspace-chat/model/contexts/ApprovalFeedbackContext';
 import { forwardWheelToScroller } from '@/features/workspace-chat/ui/forwardWheelToScroller';
+import { SubagentStrip } from '@/features/workspace-chat/ui/subagent-strip/SubagentStrip';
 import { createWorkspaceWithSession } from '@/shared/types/attempt';
 
 function VSCodeChatBox({
@@ -202,16 +203,28 @@ export function VSCodeWorkspacePage() {
                       forwardWheelToScroller(e, conversationListRef)
                     }
                   >
-                    <div className="w-chat max-w-full h-full">
+                    <div className="flex h-full min-h-0 w-chat max-w-full flex-col">
                       <RetryUiProvider workspaceId={workspaceWithSession.id}>
-                        <ConversationList
-                          key={`${workspaceWithSession.id}-${selectedSessionId ?? 'new'}`}
-                          ref={conversationListRef}
-                          attempt={workspaceWithSession}
-                          repos={repos}
-                          onAtBottomChange={handleAtBottomChange}
-                          sessionScopeId={selectedSessionId}
+                        <SubagentStrip
+                          executor={
+                            selectedSession?.executor as
+                              | BaseCodingAgent
+                              | null
+                              | undefined
+                          }
+                          workspaceId={workspaceWithSession.id}
+                          sessionId={selectedSession?.id}
                         />
+                        <div className="min-h-0 flex-1">
+                          <ConversationList
+                            key={`${workspaceWithSession.id}-${selectedSessionId ?? 'new'}`}
+                            ref={conversationListRef}
+                            attempt={workspaceWithSession}
+                            repos={repos}
+                            onAtBottomChange={handleAtBottomChange}
+                            sessionScopeId={selectedSessionId}
+                          />
+                        </div>
                       </RetryUiProvider>
                     </div>
                   </div>

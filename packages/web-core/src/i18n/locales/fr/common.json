@@ -103,6 +103,20 @@
     "subagent": {
       "defaultType": "Sous-agent"
     },
+    "subagentStrip": {
+      "main": "Principal",
+      "working": "En cours",
+      "completed": "Terminé",
+      "failed": "Échec",
+      "done": "{{count}} terminé",
+      "done_other": "{{count}} terminés",
+      "more": "{{count}} autre",
+      "more_other": "{{count}} autres",
+      "mobileSummary": "{{active}} actifs · {{done}} terminés",
+      "drawerTitle": "Sous-agents terminés",
+      "stillRunning": "En cours",
+      "allSubagents": "Sous-agents"
+    },
     "fork": {
       "explanation": "Certains messages ont suivi un chemin que l'agent ne suit plus.",
       "branchLabel": "Branche {{index}}",

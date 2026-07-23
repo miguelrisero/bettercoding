@@ -477,7 +477,7 @@ function FileEntryDiffBody({
   );
 }
 
-function AppChatMarkdown({
+export function AppChatMarkdown({
   content,
   workspaceId,
   sessionId,

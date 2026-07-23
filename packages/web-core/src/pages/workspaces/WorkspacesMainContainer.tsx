@@ -7,7 +7,12 @@ import {
   useRef,
   useState,
 } from 'react';
-import type { Workspace, Session, RepoWithTargetBranch } from 'shared/types';
+import type {
+  BaseCodingAgent,
+  Workspace,
+  Session,
+  RepoWithTargetBranch,
+} from 'shared/types';
 import { createWorkspaceWithSession } from '@/shared/types/attempt';
 import { WorkspacesMain } from '@vibe/ui/components/WorkspacesMain';
 import {
@@ -21,6 +26,7 @@ import { MessageEditProvider } from '@/features/workspace-chat/model/contexts/Me
 import { RetryUiProvider } from '@/features/workspace-chat/model/contexts/RetryUiContext';
 import { ApprovalFeedbackProvider } from '@/features/workspace-chat/model/contexts/ApprovalFeedbackContext';
 import { forwardWheelToScroller } from '@/features/workspace-chat/ui/forwardWheelToScroller';
+import { SubagentStrip } from '@/features/workspace-chat/ui/subagent-strip/SubagentStrip';
 import { useDiffStats } from '@/shared/stores/useWorkspaceDiffStore';
 
 /**
@@ -207,21 +213,28 @@ export const WorkspacesMainContainer = forwardRef<
       className="flex-1 min-h-0 overflow-hidden flex justify-center"
       onWheel={(e) => forwardWheelToScroller(e, conversationListRef)}
     >
-      <div className="w-chat max-w-full h-full">
+      <div className="flex h-full min-h-0 w-chat max-w-full flex-col">
         <RetryUiProvider workspaceId={workspaceWithSession.id}>
-          <ConversationList
-            key={entriesProviderKey}
-            ref={conversationListRef}
-            attempt={workspaceWithSession}
-            repos={repos}
-            onAtBottomChange={handleAtBottomChange}
-            sessionScopeId={selectedSessionId}
-            // The workspaces shell can switch to the CLI pane, so its empty
-            // chat offers "Open terminal" (the VS Code page, which renders
-            // ConversationList without a terminal, omits this).
-            cliAvailable
-            cliSessionActive={cliSessionActive}
+          <SubagentStrip
+            executor={session?.executor as BaseCodingAgent | null | undefined}
+            workspaceId={workspaceWithSession.id}
+            sessionId={session?.id}
           />
+          <div className="min-h-0 flex-1">
+            <ConversationList
+              key={entriesProviderKey}
+              ref={conversationListRef}
+              attempt={workspaceWithSession}
+              repos={repos}
+              onAtBottomChange={handleAtBottomChange}
+              sessionScopeId={selectedSessionId}
+              // The workspaces shell can switch to the CLI pane, so its empty
+              // chat offers "Open terminal" (the VS Code page, which renders
+              // ConversationList without a terminal, omits this).
+              cliAvailable
+              cliSessionActive={cliSessionActive}
+            />
+          </div>
         </RetryUiProvider>
       </div>
     </div>
