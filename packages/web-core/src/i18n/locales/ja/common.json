@@ -84,7 +84,6 @@
     "thinking": "思考中",
     "assistant": "Claude",
     "viaCli": "CLI 経由",
-    "cliSessionActive": "CLI セッションがアクティブ",
     "cliAgentWorking": "エージェントが作業中…",
     "foreignWriter": {
       "message": "この会話はアプリの外部で編集されています。",

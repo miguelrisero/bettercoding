@@ -84,7 +84,6 @@
     "thinking": "생각 중",
     "assistant": "Claude",
     "viaCli": "CLI를 통해",
-    "cliSessionActive": "CLI 세션 활성",
     "cliAgentWorking": "에이전트가 작업 중…",
     "foreignWriter": {
       "message": "이 대화는 앱 외부에서 편집 중입니다.",

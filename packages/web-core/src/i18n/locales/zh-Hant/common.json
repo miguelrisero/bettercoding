@@ -71,7 +71,6 @@
     "thinking": "思考中",
     "assistant": "Claude",
     "viaCli": "透過 CLI",
-    "cliSessionActive": "CLI 工作階段使用中",
     "cliAgentWorking": "代理正在工作…",
     "foreignWriter": {
       "message": "此對話正在應用程式外進行編輯。",
