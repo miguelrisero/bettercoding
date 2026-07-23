@@ -164,7 +164,7 @@ export type CreateScratch = { payload: ScratchPayload, };
 
 export type UpdateScratch = { payload: ScratchPayload, };
 
-export type Workspace = { id: string, task_id: string | null, container_ref: string | null, branch: string, setup_completed_at: string | null, created_at: string, updated_at: string, archived: boolean, pinned: boolean, name: string | null, worktree_deleted: boolean, };
+export type Workspace = { id: string, task_id: string | null, container_ref: string | null, branch: string, setup_completed_at: string | null, created_at: string, updated_at: string, archived: boolean, archived_at: string | null, pinned: boolean, name: string | null, worktree_deleted: boolean, };
 
 export type WorkspaceWithStatus = { 
 /**
@@ -183,7 +183,9 @@ is_executor_running: boolean,
  * scripts). Lets the CLI gate phrase itself correctly: "claude is
  * working in chat" vs "preparing the workspace".
  */
-is_coding_agent_running: boolean, is_errored: boolean, id: string, task_id: string | null, container_ref: string | null, branch: string, setup_completed_at: string | null, created_at: string, updated_at: string, archived: boolean, pinned: boolean, name: string | null, worktree_deleted: boolean, };
+is_coding_agent_running: boolean, is_errored: boolean, id: string, task_id: string | null, container_ref: string | null, branch: string, setup_completed_at: string | null, created_at: string, updated_at: string, archived: boolean, archived_at: string | null, pinned: boolean, name: string | null, worktree_deleted: boolean, };
+
+export type ArchiveBucket = "today" | "one_to_three_days" | "three_to_seven_days" | "seven_to_fifteen_days" | "fifteen_to_thirty_days" | "older_than_thirty_days";
 
 export type Session = { id: string, workspace_id: string, name: string | null, executor: string | null, agent_working_dir: string | null, created_at: string, updated_at: string, };
 
@@ -418,6 +420,16 @@ export type ChangeTargetBranchRequest = { repo_id: string, new_target_branch: st
 
 export type ChangeTargetBranchResponse = { repo_id: string, new_target_branch: string, status: [number, number], };
 
+export type BulkDeleteTarget = { workspace_id: string, archived_at: string | null, };
+
+export type BulkDeleteArchivedWorkspacesRequest = { targets: Array<BulkDeleteTarget>, delete_branches: boolean, };
+
+export type BulkDeleteItemOutcome = { "status": "deleted" } | { "status": "skipped", reason: string, } | { "status": "failed", reason: string, };
+
+export type BulkDeleteItemResult = { workspace_id: string, workspace_name: string | null, outcome: BulkDeleteItemOutcome, };
+
+export type BulkDeleteArchivedWorkspacesResponse = { results: Array<BulkDeleteItemResult>, };
+
 export type AddWorkspaceRepoRequest = { repo_id: string, target_branch: string, };
 
 export type AddWorkspaceRepoResponse = { workspace: Workspace, repo: RepoWithTargetBranch, };
@@ -556,6 +568,10 @@ export type UpdateSession = { name: string | null, };
 export type WorkspaceSummaryRequest = { archived: boolean, };
 
 export type WorkspaceSummary = { workspace_id: string, 
+/**
+ * Number of repositories/worktrees owned by this workspace.
+ */
+repo_count: number, 
 /**
  * Session ID of the latest execution process
  */

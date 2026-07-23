@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE workspaces SET\n                archived = $1,\n                archived_at = CASE\n                    WHEN $1 = TRUE AND archived = FALSE THEN datetime('now', 'subsec')\n                    WHEN $1 = FALSE THEN NULL\n                    ELSE archived_at\n                END,\n                updated_at = datetime('now', 'subsec')\n            WHERE id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "42c452ed4370a6c3403b7e16b25e75fe336537063a13e8ce39a16a1f6953da69"
+}

@@ -1,4 +1,4 @@
-import type { KeyboardEvent, MouseEvent, ReactNode } from 'react';
+import type { ReactNode } from 'react';
 import { useEffect, useState } from 'react';
 import type { Icon } from '@phosphor-icons/react';
 import { CaretDownIcon } from '@phosphor-icons/react';
@@ -26,6 +26,7 @@ export type SectionAction = {
   icon: Icon;
   onClick: () => void;
   isActive?: boolean;
+  ariaLabel?: string;
 };
 
 interface CollapsibleSectionHeaderProps {
@@ -37,6 +38,7 @@ interface CollapsibleSectionHeaderProps {
   headerExtra?: ReactNode;
   children?: ReactNode;
   className?: string;
+  titleClassName?: string;
 }
 
 export function CollapsibleSectionHeader({
@@ -48,6 +50,7 @@ export function CollapsibleSectionHeader({
   headerExtra,
   children,
   className,
+  titleClassName,
 }: CollapsibleSectionHeaderProps) {
   const [expanded, setExpanded] = useState(() =>
     getInitialExpanded(persistKey, defaultExpanded)
@@ -69,84 +72,65 @@ export function CollapsibleSectionHeader({
     }
   }, [persistKey, expanded]);
 
-  const handleActionClick = (
-    e: MouseEvent<HTMLSpanElement>,
-    onClick: () => void
-  ) => {
-    e.stopPropagation();
-    onClick();
-  };
-
-  const handleActionKeyDown = (
-    e: KeyboardEvent<HTMLSpanElement>,
-    onClick: () => void
-  ) => {
-    if (e.key !== 'Enter' && e.key !== ' ') return;
-    e.preventDefault();
-    e.stopPropagation();
-    onClick();
-  };
-
   const isExpanded = collapsible ? expanded : true;
-
-  const headerContent = (
-    <>
-      <span className="font-medium truncate text-normal">{title}</span>
-      <div className="flex items-center gap-half">
-        {headerExtra}
-        {actions.map((action, index) => {
-          const ActionIcon = action.icon;
-          return (
-            <span
-              key={index}
-              role="button"
-              tabIndex={0}
-              onClick={(e) => handleActionClick(e, action.onClick)}
-              onKeyDown={(e) => handleActionKeyDown(e, action.onClick)}
-              className={cn(
-                'hover:text-normal',
-                action.isActive ? 'text-brand' : 'text-low'
-              )}
-            >
-              <ActionIcon className="size-icon-xs" weight="bold" />
-            </span>
-          );
-        })}
-        {collapsible && (
-          <CaretDownIcon
-            weight="fill"
-            className={cn(
-              'size-icon-xs text-low transition-transform',
-              !expanded && '-rotate-90'
-            )}
-          />
-        )}
-      </div>
-    </>
-  );
 
   return (
     <div className={cn('flex flex-col h-full min-h-0', className)}>
-      <div className="">
+      <div className="flex w-full items-center pl-base">
         {collapsible ? (
           <button
             type="button"
             onClick={() => setExpanded((prev) => !prev)}
-            className={cn(
-              'flex items-center justify-between w-full px-base py-half cursor-pointer'
-            )}
+            aria-expanded={expanded}
+            className="flex min-w-0 flex-1 cursor-pointer items-center justify-between py-half pr-half text-left"
           >
-            {headerContent}
+            <span
+              className={cn(
+                'truncate font-medium tabular-nums text-normal',
+                titleClassName
+              )}
+            >
+              {title}
+            </span>
+            <CaretDownIcon
+              weight="fill"
+              className={cn(
+                'size-icon-xs shrink-0 text-low transition-transform',
+                !expanded && '-rotate-90'
+              )}
+            />
           </button>
         ) : (
-          <div
+          <span
             className={cn(
-              'flex items-center justify-between w-full px-base py-half'
+              'min-w-0 flex-1 truncate py-half font-medium tabular-nums text-normal',
+              titleClassName
             )}
           >
-            {headerContent}
-          </div>
+            {title}
+          </span>
         )}
+        <div className="flex shrink-0 items-center gap-half pr-base">
+          {headerExtra}
+          {actions.map((action, index) => {
+            const ActionIcon = action.icon;
+            return (
+              <button
+                key={index}
+                type="button"
+                onClick={action.onClick}
+                aria-label={action.ariaLabel}
+                title={action.ariaLabel}
+                className={cn(
+                  'inline-flex size-8 items-center justify-center hover:text-normal',
+                  action.isActive ? 'text-brand' : 'text-low'
+                )}
+              >
+                <ActionIcon className="size-icon-xs" weight="bold" />
+              </button>
+            );
+          })}
+        </div>
       </div>
       {isExpanded && children}
     </div>

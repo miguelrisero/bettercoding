@@ -1,14 +1,25 @@
 import type { ReactNode } from 'react';
-import { useCallback, useMemo, useRef } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import {
   PlusIcon,
   ArrowLeftIcon,
   ArchiveIcon,
+  DotsThreeIcon,
   StackIcon,
   SpinnerIcon,
+  TrashIcon,
 } from '@phosphor-icons/react';
 import { useTranslation } from 'react-i18next';
+import type { ArchiveBucket, BulkDeleteTarget } from 'shared/types';
 import { cn } from '../lib/cn';
+import {
+  ARCHIVE_BUCKET_ORDER,
+  archiveBucketForTimestamp,
+} from '../lib/archiveBuckets';
+import {
+  buildArchivedBucketState,
+  type BulkDeleteArchivedWorkspaceDetails,
+} from '../lib/bulkDeleteArchivedWorkspaces';
 import { InputField } from './InputField';
 import { WorkspaceSummary } from './WorkspaceSummary';
 export type WorkspacesSidebarHostStatus = 'online' | 'offline' | 'unpaired';
@@ -16,12 +27,44 @@ import {
   CollapsibleSectionHeader,
   type SectionAction,
 } from './CollapsibleSectionHeader';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from './DropdownMenu';
+import {
+  BulkDeleteArchivedWorkspacesDialog,
+  type BulkDeleteDialogBranchStatus,
+  type BulkDeleteDialogItemResult,
+} from './BulkDeleteArchivedWorkspacesDialog';
 
 export type WorkspaceLayoutMode = 'flat' | 'accordion';
+
+const ARCHIVE_BUCKET_LABELS: Record<ArchiveBucket, string> = {
+  today: 'Today',
+  one_to_three_days: '1–3 days',
+  three_to_seven_days: '3–7 days',
+  seven_to_fifteen_days: '7–15 days',
+  fifteen_to_thirty_days: '15–30 days',
+  older_than_thirty_days: 'Older than 30 days',
+};
+
+const ARCHIVE_BUCKET_TRANSLATION_KEYS: Record<ArchiveBucket, string> = {
+  today: 'common:workspaces.archiveBucketToday',
+  one_to_three_days: 'common:workspaces.archiveBucketOneToThreeDays',
+  three_to_seven_days: 'common:workspaces.archiveBucketThreeToSevenDays',
+  seven_to_fifteen_days: 'common:workspaces.archiveBucketSevenToFifteenDays',
+  fifteen_to_thirty_days: 'common:workspaces.archiveBucketFifteenToThirtyDays',
+  older_than_thirty_days: 'common:workspaces.archiveBucketOlderThanThirtyDays',
+};
 
 export interface WorkspacesSidebarWorkspace {
   id: string;
   name: string;
+  archivedAt: string | null;
+  worktreeDeleted?: boolean;
+  repoCount?: number;
   filesChanged?: number;
   linesAdded?: number;
   linesRemoved?: number;
@@ -51,12 +94,16 @@ export interface WorkspacesSidebarProps {
   workspaces: WorkspacesSidebarWorkspace[];
   totalWorkspacesCount: number;
   archivedWorkspaces?: WorkspacesSidebarWorkspace[];
+  visibleArchivedWorkspaceIds?: ReadonlySet<string>;
+  recentlyArchivedWorkspaces?: WorkspacesSidebarWorkspace[];
   isLoading?: boolean;
   selectedWorkspaceId: string | null;
   onSelectWorkspace: (id: string) => void;
   onAddWorkspace?: () => void;
   searchQuery: string;
   onSearchChange: (value: string) => void;
+  /** Whether a PR filter currently narrows the archived rows. */
+  hasActivePrFilter?: boolean;
   /** Whether we're in create mode */
   isCreateMode?: boolean;
   /** Title extracted from draft message (only shown when isCreateMode and non-empty) */
@@ -79,6 +126,16 @@ export interface WorkspacesSidebarProps {
   searchControls?: ReactNode;
   /** Callback for opening workspace actions */
   onOpenWorkspaceActions?: (workspaceId: string) => void;
+  /** Restores an archived workspace through the application's archive action. */
+  onRestoreWorkspace?: (workspaceId: string) => Promise<void>;
+  /** Loads current branch status before a destructive bucket removal. */
+  inspectArchivedWorkspace?: (
+    workspaceId: string
+  ) => Promise<BulkDeleteDialogBranchStatus[]>;
+  /** Permanently removes the reviewed targets from an archive bucket. */
+  onBulkDeleteArchivedBucket?: (
+    targets: BulkDeleteTarget[]
+  ) => Promise<BulkDeleteDialogItemResult[]>;
   /** Persist keys for collapsible sections */
   persistKeys?: WorkspacesSidebarPersistKeys;
   activeRemoteHost?: {
@@ -170,12 +227,15 @@ export function WorkspacesSidebar({
   workspaces,
   totalWorkspacesCount,
   archivedWorkspaces = [],
+  visibleArchivedWorkspaceIds,
+  recentlyArchivedWorkspaces = [],
   isLoading = false,
   selectedWorkspaceId,
   onSelectWorkspace,
   onAddWorkspace,
   searchQuery,
   onSearchChange,
+  hasActivePrFilter = false,
   isCreateMode = false,
   draftTitle,
   onSelectCreate,
@@ -187,6 +247,9 @@ export function WorkspacesSidebar({
   hasMoreWorkspaces = false,
   searchControls,
   onOpenWorkspaceActions,
+  onRestoreWorkspace,
+  inspectArchivedWorkspace,
+  onBulkDeleteArchivedBucket,
   persistKeys = DEFAULT_PERSIST_KEYS,
   activeRemoteHost = null,
   onOpenRemoteHostSettings,
@@ -232,15 +295,74 @@ export function WorkspacesSidebar({
       };
     }, [workspaces]);
 
+  const archivedBuckets = useMemo(() => {
+    const nowMilliseconds = Date.now();
+    return ARCHIVE_BUCKET_ORDER.map((bucket) => ({
+      bucket,
+      workspaces: archivedWorkspaces.filter(
+        (workspace) =>
+          archiveBucketForTimestamp(workspace.archivedAt, nowMilliseconds) ===
+          bucket
+      ),
+    })).filter((group) => group.workspaces.length > 0);
+  }, [archivedWorkspaces]);
+
+  const [bulkDeleteTarget, setBulkDeleteTarget] = useState<{
+    label: string;
+    targets: BulkDeleteTarget[];
+    detailsByWorkspaceId: Readonly<
+      Record<string, BulkDeleteArchivedWorkspaceDetails>
+    >;
+  } | null>(null);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+
+  const bulkArchiveActionsDisabled =
+    searchQuery.length > 0 || hasActivePrFilter;
+  const bulkArchiveActionsDisabledLabel = t(
+    'common:workspaces.archiveBucketActionsFiltered',
+    {
+      defaultValue:
+        'Clear active filters to remove archived workspaces in bulk',
+    }
+  );
+
+  const getArchiveBucketLabel = (bucket: ArchiveBucket) =>
+    t(ARCHIVE_BUCKET_TRANSLATION_KEYS[bucket], {
+      defaultValue: ARCHIVE_BUCKET_LABELS[bucket],
+    });
+
+  const handleRestoreWorkspace = useCallback(
+    async (workspace: WorkspacesSidebarWorkspace) => {
+      if (!onRestoreWorkspace) return;
+
+      setRestoreError(null);
+      try {
+        await onRestoreWorkspace(workspace.id);
+      } catch {
+        setRestoreError(
+          t('common:workspaces.restoreArchivedWorkspaceFailed', {
+            workspace: workspace.name,
+            defaultValue: 'Could not restore {{workspace}}. Try again.',
+          })
+        );
+      }
+    },
+    [onRestoreWorkspace, t]
+  );
+
   const headerActions: SectionAction[] = [
     {
       icon: StackIcon,
       onClick: () => onToggleLayoutMode?.(),
       isActive: layoutMode === 'accordion',
+      ariaLabel: t('common:workspaces.toggleLayout', {
+        defaultValue: 'Toggle workspace layout',
+      }),
     },
     {
       icon: PlusIcon,
       onClick: () => onAddWorkspace?.(),
+      ariaLabel: t('common:workspaces.newWorkspace'),
     },
   ];
 
@@ -328,45 +450,204 @@ export function WorkspacesSidebar({
             <span className="text-sm font-medium text-low px-base">
               {t('common:workspaces.archived')}
             </span>
-            {archivedWorkspaces.length === 0 ? (
+            {archivedBuckets.length === 0 ? (
               <span className="text-sm text-low opacity-60 px-base">
                 {t('common:workspaces.noArchived')}
               </span>
             ) : (
-              archivedWorkspaces.map((workspace) => (
-                <WorkspaceSummary
-                  summary
-                  key={workspace.id}
-                  name={workspace.name}
-                  workspaceId={workspace.id}
-                  filesChanged={workspace.filesChanged}
-                  linesAdded={workspace.linesAdded}
-                  linesRemoved={workspace.linesRemoved}
-                  isActive={selectedWorkspaceId === workspace.id}
-                  isRunning={workspace.isRunning}
-                  isPinned={workspace.isPinned}
-                  hasPendingApproval={workspace.hasPendingApproval}
-                  hasRunningDevServer={workspace.hasRunningDevServer}
-                  hasUnseenActivity={workspace.hasUnseenActivity}
-                  latestProcessCompletedAt={workspace.latestProcessCompletedAt}
-                  latestProcessStatus={workspace.latestProcessStatus}
-                  prStatus={workspace.prStatus}
-                  onOpenWorkspaceActions={handleOpenWorkspaceActions}
-                  onClick={() => onSelectWorkspace(workspace.id)}
-                />
-              ))
+              archivedBuckets.map((group) => {
+                const label = getArchiveBucketLabel(group.bucket);
+                // Targets intentionally come from the complete bucket group;
+                // visibility only controls which rows the sidebar renders.
+                const bucketState = buildArchivedBucketState(
+                  group.workspaces,
+                  visibleArchivedWorkspaceIds
+                );
+                return (
+                  <CollapsibleSectionHeader
+                    key={group.bucket}
+                    title={`${label} (${group.workspaces.length})`}
+                    defaultExpanded={true}
+                    headerExtra={
+                      inspectArchivedWorkspace && onBulkDeleteArchivedBucket ? (
+                        bulkArchiveActionsDisabled ? (
+                          <span
+                            className="inline-flex"
+                            title={bulkArchiveActionsDisabledLabel}
+                          >
+                            <button
+                              type="button"
+                              disabled
+                              className="inline-flex size-10 cursor-not-allowed items-center justify-center text-low opacity-40"
+                              aria-label={bulkArchiveActionsDisabledLabel}
+                            >
+                              <DotsThreeIcon className="size-5" weight="bold" />
+                            </button>
+                          </span>
+                        ) : (
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <button
+                                type="button"
+                                className="inline-flex size-10 items-center justify-center text-low transition-colors hover:text-normal focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-brand"
+                                aria-label={t(
+                                  'common:workspaces.archiveBucketActions',
+                                  {
+                                    bucket: label,
+                                    defaultValue: 'Actions for {{bucket}}',
+                                  }
+                                )}
+                              >
+                                <DotsThreeIcon
+                                  className="size-5"
+                                  weight="bold"
+                                />
+                              </button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end">
+                              <DropdownMenuItem
+                                className="text-destructive focus:text-destructive"
+                                onSelect={() =>
+                                  setBulkDeleteTarget({
+                                    label,
+                                    targets: bucketState.targets,
+                                    detailsByWorkspaceId:
+                                      bucketState.detailsByWorkspaceId,
+                                  })
+                                }
+                              >
+                                <TrashIcon />
+                                {t('common:workspaces.removeArchiveBucket', {
+                                  defaultValue: 'Remove all in this bucket',
+                                })}
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        )
+                      ) : null
+                    }
+                  >
+                    <div className="flex flex-col gap-half py-half">
+                      {bucketState.visibleWorkspaces.map((workspace) => (
+                        <WorkspaceSummary
+                          summary
+                          key={workspace.id}
+                          name={workspace.name}
+                          workspaceId={workspace.id}
+                          filesChanged={workspace.filesChanged}
+                          linesAdded={workspace.linesAdded}
+                          linesRemoved={workspace.linesRemoved}
+                          isActive={selectedWorkspaceId === workspace.id}
+                          isRunning={workspace.isRunning}
+                          isPinned={workspace.isPinned}
+                          hasPendingApproval={workspace.hasPendingApproval}
+                          hasRunningDevServer={workspace.hasRunningDevServer}
+                          hasUnseenActivity={workspace.hasUnseenActivity}
+                          latestProcessCompletedAt={
+                            workspace.latestProcessCompletedAt
+                          }
+                          latestProcessStatus={workspace.latestProcessStatus}
+                          prStatus={workspace.prStatus}
+                          onOpenWorkspaceActions={handleOpenWorkspaceActions}
+                          onClick={() => onSelectWorkspace(workspace.id)}
+                        />
+                      ))}
+                    </div>
+                  </CollapsibleSectionHeader>
+                );
+              })
             )}
           </div>
-        ) : layoutMode === 'accordion' ? (
-          /* Accordion layout view */
-          <div className="flex flex-col gap-base">
-            {/* Needs Attention section */}
-            <CollapsibleSectionHeader
-              title={t('common:workspaces.needsAttention')}
-              persistKey={persistKeys.raisedHand}
-              defaultExpanded={true}
-            >
-              <div className="flex flex-col gap-base py-half">
+        ) : (
+          <>
+            {layoutMode === 'accordion' ? (
+              /* Accordion layout view */
+              <div className="flex flex-col gap-base">
+                {/* Needs Attention section */}
+                <CollapsibleSectionHeader
+                  title={t('common:workspaces.needsAttention')}
+                  persistKey={persistKeys.raisedHand}
+                  defaultExpanded={true}
+                >
+                  <div className="flex flex-col gap-base py-half">
+                    {draftTitle && (
+                      <WorkspaceSummary
+                        name={draftTitle}
+                        isActive={isCreateMode}
+                        isDraft={true}
+                        onClick={onSelectCreate}
+                      />
+                    )}
+                    {raisedHandWorkspaces.length === 0 && !draftTitle ? (
+                      <span className="text-sm text-low opacity-60 pl-base">
+                        {t('common:workspaces.noWorkspaces')}
+                      </span>
+                    ) : (
+                      <WorkspaceList
+                        workspaces={raisedHandWorkspaces}
+                        selectedWorkspaceId={selectedWorkspaceId}
+                        onSelectWorkspace={onSelectWorkspace}
+                        onOpenWorkspaceActions={handleOpenWorkspaceActions}
+                      />
+                    )}
+                  </div>
+                </CollapsibleSectionHeader>
+
+                {/* Running section */}
+                <CollapsibleSectionHeader
+                  title={t('common:workspaces.running')}
+                  persistKey={persistKeys.running}
+                  defaultExpanded={true}
+                >
+                  <div className="flex flex-col gap-base py-half">
+                    {runningWorkspaces.length === 0 ? (
+                      <span className="text-sm text-low opacity-60 pl-base">
+                        {t('common:workspaces.noWorkspaces')}
+                      </span>
+                    ) : (
+                      <WorkspaceList
+                        workspaces={runningWorkspaces}
+                        selectedWorkspaceId={selectedWorkspaceId}
+                        onSelectWorkspace={onSelectWorkspace}
+                        onOpenWorkspaceActions={handleOpenWorkspaceActions}
+                      />
+                    )}
+                  </div>
+                </CollapsibleSectionHeader>
+
+                {/* Idle section */}
+                <CollapsibleSectionHeader
+                  title={t('common:workspaces.idle')}
+                  persistKey={persistKeys.notRunning}
+                  defaultExpanded={true}
+                >
+                  <div className="flex flex-col gap-base py-half">
+                    {idleWorkspaces.length === 0 ? (
+                      <span className="text-sm text-low opacity-60 pl-base">
+                        {t('common:workspaces.noWorkspaces')}
+                      </span>
+                    ) : (
+                      <WorkspaceList
+                        workspaces={idleWorkspaces}
+                        selectedWorkspaceId={selectedWorkspaceId}
+                        onSelectWorkspace={onSelectWorkspace}
+                        onOpenWorkspaceActions={handleOpenWorkspaceActions}
+                      />
+                    )}
+                  </div>
+                </CollapsibleSectionHeader>
+              </div>
+            ) : (
+              /* Active workspaces flat view */
+              <div className="flex flex-col gap-base">
+                <div className="flex items-center justify-between px-base">
+                  <span className="text-sm font-medium text-low">
+                    {t('common:workspaces.active')}
+                  </span>
+                  <span className="text-xs text-low">
+                    {totalWorkspacesCount}
+                  </span>
+                </div>
                 {draftTitle && (
                   <WorkspaceSummary
                     name={draftTitle}
@@ -375,104 +656,74 @@ export function WorkspacesSidebar({
                     onClick={onSelectCreate}
                   />
                 )}
-                {raisedHandWorkspaces.length === 0 && !draftTitle ? (
-                  <span className="text-sm text-low opacity-60 pl-base">
-                    {t('common:workspaces.noWorkspaces')}
-                  </span>
-                ) : (
-                  <WorkspaceList
-                    workspaces={raisedHandWorkspaces}
-                    selectedWorkspaceId={selectedWorkspaceId}
-                    onSelectWorkspace={onSelectWorkspace}
+                {workspaces.map((workspace) => (
+                  <WorkspaceSummary
+                    key={workspace.id}
+                    name={workspace.name}
+                    workspaceId={workspace.id}
+                    filesChanged={workspace.filesChanged}
+                    linesAdded={workspace.linesAdded}
+                    linesRemoved={workspace.linesRemoved}
+                    isActive={selectedWorkspaceId === workspace.id}
+                    isRunning={workspace.isRunning}
+                    isPinned={workspace.isPinned}
+                    hasPendingApproval={workspace.hasPendingApproval}
+                    hasRunningDevServer={workspace.hasRunningDevServer}
+                    hasUnseenActivity={workspace.hasUnseenActivity}
+                    latestProcessCompletedAt={
+                      workspace.latestProcessCompletedAt
+                    }
+                    latestProcessStatus={workspace.latestProcessStatus}
+                    prStatus={workspace.prStatus}
                     onOpenWorkspaceActions={handleOpenWorkspaceActions}
+                    onClick={() => onSelectWorkspace(workspace.id)}
                   />
-                )}
+                ))}
               </div>
-            </CollapsibleSectionHeader>
-
-            {/* Running section */}
-            <CollapsibleSectionHeader
-              title={t('common:workspaces.running')}
-              persistKey={persistKeys.running}
-              defaultExpanded={true}
-            >
-              <div className="flex flex-col gap-base py-half">
-                {runningWorkspaces.length === 0 ? (
-                  <span className="text-sm text-low opacity-60 pl-base">
-                    {t('common:workspaces.noWorkspaces')}
-                  </span>
-                ) : (
-                  <WorkspaceList
-                    workspaces={runningWorkspaces}
-                    selectedWorkspaceId={selectedWorkspaceId}
-                    onSelectWorkspace={onSelectWorkspace}
-                    onOpenWorkspaceActions={handleOpenWorkspaceActions}
-                  />
-                )}
-              </div>
-            </CollapsibleSectionHeader>
-
-            {/* Idle section */}
-            <CollapsibleSectionHeader
-              title={t('common:workspaces.idle')}
-              persistKey={persistKeys.notRunning}
-              defaultExpanded={true}
-            >
-              <div className="flex flex-col gap-base py-half">
-                {idleWorkspaces.length === 0 ? (
-                  <span className="text-sm text-low opacity-60 pl-base">
-                    {t('common:workspaces.noWorkspaces')}
-                  </span>
-                ) : (
-                  <WorkspaceList
-                    workspaces={idleWorkspaces}
-                    selectedWorkspaceId={selectedWorkspaceId}
-                    onSelectWorkspace={onSelectWorkspace}
-                    onOpenWorkspaceActions={handleOpenWorkspaceActions}
-                  />
-                )}
-              </div>
-            </CollapsibleSectionHeader>
-          </div>
-        ) : (
-          /* Active workspaces flat view */
-          <div className="flex flex-col gap-base">
-            <div className="flex items-center justify-between px-base">
-              <span className="text-sm font-medium text-low">
-                {t('common:workspaces.active')}
-              </span>
-              <span className="text-xs text-low">{totalWorkspacesCount}</span>
-            </div>
-            {draftTitle && (
-              <WorkspaceSummary
-                name={draftTitle}
-                isActive={isCreateMode}
-                isDraft={true}
-                onClick={onSelectCreate}
-              />
             )}
-            {workspaces.map((workspace) => (
-              <WorkspaceSummary
-                key={workspace.id}
-                name={workspace.name}
-                workspaceId={workspace.id}
-                filesChanged={workspace.filesChanged}
-                linesAdded={workspace.linesAdded}
-                linesRemoved={workspace.linesRemoved}
-                isActive={selectedWorkspaceId === workspace.id}
-                isRunning={workspace.isRunning}
-                isPinned={workspace.isPinned}
-                hasPendingApproval={workspace.hasPendingApproval}
-                hasRunningDevServer={workspace.hasRunningDevServer}
-                hasUnseenActivity={workspace.hasUnseenActivity}
-                latestProcessCompletedAt={workspace.latestProcessCompletedAt}
-                latestProcessStatus={workspace.latestProcessStatus}
-                prStatus={workspace.prStatus}
-                onOpenWorkspaceActions={handleOpenWorkspaceActions}
-                onClick={() => onSelectWorkspace(workspace.id)}
-              />
-            ))}
-          </div>
+
+            {recentlyArchivedWorkspaces.length > 0 && onRestoreWorkspace && (
+              <div className="mt-base border-t border-primary pt-half">
+                {/* Deliberately omit persistKey so this resets collapsed. */}
+                <CollapsibleSectionHeader
+                  title={t('common:workspaces.archivedRecentlyCount', {
+                    count: recentlyArchivedWorkspaces.length,
+                    defaultValue: 'Archived recently ({{count}})',
+                  })}
+                  defaultExpanded={false}
+                  titleClassName="font-normal text-low"
+                >
+                  <div className="flex flex-col gap-0 py-half">
+                    {recentlyArchivedWorkspaces.map((workspace) => (
+                      <WorkspaceSummary
+                        summary
+                        mutedSummary
+                        key={workspace.id}
+                        name={workspace.name}
+                        summaryTimestamp={workspace.archivedAt ?? undefined}
+                        actionLabel={t(
+                          'common:workspaces.restoreArchivedWorkspace',
+                          {
+                            workspace: workspace.name,
+                            defaultValue: 'Restore {{workspace}}',
+                          }
+                        )}
+                        onClick={() => void handleRestoreWorkspace(workspace)}
+                      />
+                    ))}
+                    {restoreError && (
+                      <p
+                        className="px-base py-half text-xs text-error"
+                        role="alert"
+                      >
+                        {restoreError}
+                      </p>
+                    )}
+                  </div>
+                </CollapsibleSectionHeader>
+              </div>
+            )}
+          </>
         )}
       </div>
 
@@ -498,6 +749,21 @@ export function WorkspacesSidebar({
           )}
         </button>
       </div>
+      {bulkDeleteTarget &&
+        inspectArchivedWorkspace &&
+        onBulkDeleteArchivedBucket && (
+          <BulkDeleteArchivedWorkspacesDialog
+            open={true}
+            bucketLabel={bulkDeleteTarget.label}
+            targets={bulkDeleteTarget.targets}
+            detailsByWorkspaceId={bulkDeleteTarget.detailsByWorkspaceId}
+            inspectWorkspace={inspectArchivedWorkspace}
+            onConfirm={onBulkDeleteArchivedBucket}
+            onOpenChange={(open) => {
+              if (!open) setBulkDeleteTarget(null);
+            }}
+          />
+        )}
     </div>
   );
 }

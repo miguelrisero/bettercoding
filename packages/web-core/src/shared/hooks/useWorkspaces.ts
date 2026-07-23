@@ -18,7 +18,10 @@ export interface SidebarWorkspace {
   branch: string;
   createdAt: string;
   updatedAt: string;
+  archivedAt: string | null;
+  worktreeDeleted: boolean;
   description: string;
+  repoCount?: number;
   filesChanged?: number;
   linesAdded?: number;
   linesRemoved?: number;
@@ -66,7 +69,10 @@ function toSidebarWorkspace(
     branch: ws.branch,
     createdAt: ws.created_at,
     updatedAt: ws.updated_at,
+    archivedAt: ws.archived_at,
+    worktreeDeleted: ws.worktree_deleted,
     description: '',
+    repoCount: summary?.repo_count,
     // Use real stats from summary if available
     filesChanged: summary?.files_changed ?? undefined,
     linesAdded: summary?.lines_added ?? undefined,

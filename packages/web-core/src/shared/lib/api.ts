@@ -109,6 +109,8 @@ import {
   UpsertLoopAutomationRequest,
   ScheduledWakeup,
   CreateWakeupRequest,
+  BulkDeleteArchivedWorkspacesRequest,
+  BulkDeleteArchivedWorkspacesResponse,
 } from 'shared/types';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
 import { createWorkspaceWithSession } from '@/shared/types/attempt';
@@ -515,6 +517,16 @@ export const workspacesApi = {
       method: 'DELETE',
     });
     return handleApiResponse<void>(response);
+  },
+
+  bulkDeleteArchived: async (
+    data: BulkDeleteArchivedWorkspacesRequest
+  ): Promise<BulkDeleteArchivedWorkspacesResponse> => {
+    const response = await makeRequest('/api/workspaces/archived/bulk-delete', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+    return handleApiResponse<BulkDeleteArchivedWorkspacesResponse>(response);
   },
 
   linkToIssue: async (

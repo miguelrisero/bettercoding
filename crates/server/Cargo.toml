@@ -74,6 +74,9 @@ tempfile = "3"
 [build-dependencies]
 dotenv = "0.15"
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 [features]
 default = []
 qa-mode = ["services/qa-mode", "executors/qa-mode"]

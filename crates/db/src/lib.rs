@@ -148,3 +148,67 @@ impl DBService {
         Ok(pool)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn archived_at_migration_backfills_preexisting_archived_rows() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE workspaces (
+                id BLOB PRIMARY KEY,
+                updated_at TEXT NOT NULL,
+                archived INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let archived_id = Uuid::new_v4();
+        let active_id = Uuid::new_v4();
+        let archived_updated_at = "2026-07-20 12:34:56.789";
+        sqlx::query("INSERT INTO workspaces (id, updated_at, archived) VALUES (?, ?, TRUE)")
+            .bind(archived_id)
+            .bind(archived_updated_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces (id, updated_at, archived) VALUES (?, ?, FALSE)")
+            .bind(active_id)
+            .bind("2026-07-21 01:02:03.456")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/20260721103000_add_workspace_archived_at.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let archived_at: Option<String> =
+            sqlx::query_scalar("SELECT archived_at FROM workspaces WHERE id = ?")
+                .bind(archived_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let active_archived_at: Option<String> =
+            sqlx::query_scalar("SELECT archived_at FROM workspaces WHERE id = ?")
+                .bind(active_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(archived_at.as_deref(), Some(archived_updated_at));
+        assert_eq!(active_archived_at, None);
+    }
+}
