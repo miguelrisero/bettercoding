@@ -44,6 +44,10 @@ function getSubagentPhase(status: ToolStatus): SubagentDescriptor['phase'] {
     case 'denied':
     case 'timed_out':
       return 'error';
+    default: {
+      const _exhaustive: never = status;
+      return _exhaustive;
+    }
   }
 }
 
