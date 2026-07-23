@@ -90,9 +90,8 @@ export function CliMainPane({
         <div className="flex items-center gap-2 md:gap-3 shrink-0">
           {sessionsReady && !executorRunning && (
             <span
-              role="status"
-              aria-live="polite"
-              className="flex items-center gap-1 min-w-0 shrink-0"
+              aria-hidden="true"
+              className="flex items-center gap-1 shrink-0"
             >
               {cliRunning ? (
                 <>
