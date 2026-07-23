@@ -1195,19 +1195,19 @@ fn read_session_preview(path: &Path, file_session_id: &str) -> SessionPreview {
             let Ok(adapted) = adapt_native_claude_line(&line, file_session_id) else {
                 continue;
             };
-            if entrypoint.is_none() {
-                if let Some(ep) = adapted.metadata().entrypoint.as_deref() {
-                    entrypoint = Some(ep.to_string());
-                }
+            if entrypoint.is_none()
+                && let Some(ep) = adapted.metadata().entrypoint.as_deref()
+            {
+                entrypoint = Some(ep.to_string());
             }
-            if snippet.is_none() {
-                if let Some(prompt) = adapted.plain_user_text() {
-                    let mut s = prompt.chars().take(160).collect::<String>();
-                    if prompt.chars().count() > 160 {
-                        s.push('…');
-                    }
-                    snippet = Some(s);
+            if snippet.is_none()
+                && let Some(prompt) = adapted.plain_user_text()
+            {
+                let mut s = prompt.chars().take(160).collect::<String>();
+                if prompt.chars().count() > 160 {
+                    s.push('…');
                 }
+                snippet = Some(s);
             }
             if snippet.is_some() && entrypoint.is_some() {
                 break;
