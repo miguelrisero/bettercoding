@@ -126,6 +126,7 @@ fn generate_types_content() -> String {
         services::services::claude_transcript_ingest::NativeFileImportHealth::decl(),
         services::services::claude_transcript_ingest::NativeIngestHealth::decl(),
         services::services::claude_transcript_ingest::NativeFeedSnapshot::decl(),
+        services::services::claude_transcript_ingest::CliSessionKind::decl(),
         services::services::claude_transcript_ingest::UnassignedCliSession::decl(),
         server::routes::native_transcripts::AssignNativeCliSessionRequest::decl(),
         relay_types::StartSpake2EnrollmentRequest::decl(),
