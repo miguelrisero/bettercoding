@@ -104,6 +104,35 @@ pub enum ClaudeTranscriptIngestError {
     NotQuarantined(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum CliSessionKind {
+    /// A real, interactive human CLI session (entrypoint "cli", or anything
+    /// we cannot positively identify as a background subagent).
+    Main,
+    /// A programmatically spawned background agent (entrypoint "sdk-cli" / "sdk-py").
+    Subagent,
+}
+
+impl CliSessionKind {
+    /// Classify a session from its transcript `entrypoint`.
+    ///
+    /// FAIL OPEN TO MAIN: we hide a session from the default view ONLY when it
+    /// is positively identified as a background subagent. Every other case —
+    /// an unrecognized entrypoint, a value added by a future Claude version, a
+    /// missing field, or a transcript we failed to read — classifies as Main so
+    /// a real conversation is never hidden behind the agents toggle. Do NOT
+    /// rewrite this as a closed match on the known values; the default arm is
+    /// load-bearing.
+    pub fn from_entrypoint(entrypoint: Option<&str>) -> Self {
+        match entrypoint {
+            Some("sdk-cli") | Some("sdk-py") => Self::Subagent,
+            // Anything else (including None / unknown) -> visible Main.
+            _ => Self::Main,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct UnassignedCliSession {
     pub claude_session_id: String,
@@ -112,6 +141,7 @@ pub struct UnassignedCliSession {
     pub file_name: String,
     pub mtime_ms: Option<i64>,
     pub first_prompt_snippet: Option<String>,
+    pub kind: CliSessionKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,13 +378,15 @@ impl ClaudeTranscriptIngest {
             .into_iter()
             .map(|file| {
                 let path = Path::new(&file.dir_path).join(&file.file_name);
+                let preview = read_session_preview(&path, &file.claude_session_id);
                 UnassignedCliSession {
                     claude_session_id: file.claude_session_id.clone(),
                     cwd: cwd.to_string_lossy().into_owned(),
                     dir_path: file.dir_path,
                     file_name: file.file_name,
                     mtime_ms: file.observed_mtime_ms,
-                    first_prompt_snippet: first_prompt_snippet(&path, &file.claude_session_id),
+                    first_prompt_snippet: preview.first_prompt_snippet,
+                    kind: preview.kind,
                 }
             })
             .collect())
@@ -1147,24 +1179,45 @@ fn claude_project_slug(cwd: &Path) -> String {
         .collect()
 }
 
-fn first_prompt_snippet(path: &Path, file_session_id: &str) -> Option<String> {
-    let file = File::open(path).ok()?;
-    for line in BufReader::new(file).lines().take(50) {
-        let Ok(line) = line else {
-            continue;
-        };
-        let Ok(adapted) = adapt_native_claude_line(&line, file_session_id) else {
-            continue;
-        };
-        if let Some(prompt) = adapted.plain_user_text() {
-            let mut snippet = prompt.chars().take(160).collect::<String>();
-            if prompt.chars().count() > 160 {
-                snippet.push('…');
+struct SessionPreview {
+    first_prompt_snippet: Option<String>,
+    kind: CliSessionKind,
+}
+
+fn read_session_preview(path: &Path, file_session_id: &str) -> SessionPreview {
+    let mut snippet: Option<String> = None;
+    let mut entrypoint: Option<String> = None;
+    if let Ok(file) = File::open(path) {
+        for line in BufReader::new(file).lines().take(50) {
+            let Ok(line) = line else {
+                continue;
+            };
+            let Ok(adapted) = adapt_native_claude_line(&line, file_session_id) else {
+                continue;
+            };
+            if entrypoint.is_none() {
+                if let Some(ep) = adapted.metadata().entrypoint.as_deref() {
+                    entrypoint = Some(ep.to_string());
+                }
             }
-            return Some(snippet);
+            if snippet.is_none() {
+                if let Some(prompt) = adapted.plain_user_text() {
+                    let mut s = prompt.chars().take(160).collect::<String>();
+                    if prompt.chars().count() > 160 {
+                        s.push('…');
+                    }
+                    snippet = Some(s);
+                }
+            }
+            if snippet.is_some() && entrypoint.is_some() {
+                break;
+            }
         }
     }
-    None
+    SessionPreview {
+        first_prompt_snippet: snippet,
+        kind: CliSessionKind::from_entrypoint(entrypoint.as_deref()),
+    }
 }
 
 fn verify_last_line_hash(

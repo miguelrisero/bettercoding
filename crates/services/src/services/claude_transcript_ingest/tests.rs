@@ -42,8 +42,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    ClaudeTranscriptIngest, ClaudeTranscriptIngestError, DirectoryContext, NativeFeedOrigin,
-    NativeFeedUpdate, claude_project_slug, first_prompt_snippet,
+    ClaudeTranscriptIngest, ClaudeTranscriptIngestError, CliSessionKind, DirectoryContext,
+    NativeFeedOrigin, NativeFeedUpdate, claude_project_slug, read_session_preview,
 };
 use crate::services::cli_collab::{CliWriterProbe, ProbeReport, SidEvidence};
 
@@ -832,7 +832,28 @@ async fn paste_ack_matcher_excludes_executor_linked_native_records() {
 }
 
 #[test]
-fn prompt_preview_skips_malformed_lines_within_its_scan_bound() {
+fn cli_session_kind_classification_fails_open_to_main() {
+    assert_eq!(
+        CliSessionKind::from_entrypoint(Some("cli")),
+        CliSessionKind::Main
+    );
+    assert_eq!(CliSessionKind::from_entrypoint(None), CliSessionKind::Main);
+    assert_eq!(
+        CliSessionKind::from_entrypoint(Some("totally-new-thing")),
+        CliSessionKind::Main
+    );
+    assert_eq!(
+        CliSessionKind::from_entrypoint(Some("sdk-cli")),
+        CliSessionKind::Subagent
+    );
+    assert_eq!(
+        CliSessionKind::from_entrypoint(Some("sdk-py")),
+        CliSessionKind::Subagent
+    );
+}
+
+#[test]
+fn session_preview_skips_malformed_lines_within_its_scan_bound() {
     let temp = TempDir::new().unwrap();
     let sid = "91919191-9191-4919-8919-919191919191";
     let path = temp.path().join(format!("{sid}.jsonl"));
@@ -850,8 +871,42 @@ fn prompt_preview_skips_malformed_lines_within_its_scan_bound() {
     )
     .unwrap();
 
+    let preview = read_session_preview(&path, sid);
     assert_eq!(
-        first_prompt_snippet(&path, sid).as_deref(),
+        preview.first_prompt_snippet.as_deref(),
+        Some("usable preview")
+    );
+    assert_eq!(preview.kind, CliSessionKind::Main);
+}
+
+#[test]
+fn session_preview_reads_entrypoint_from_bookkeeping_before_prompt() {
+    let temp = TempDir::new().unwrap();
+    let sid = "92929292-9292-4929-8929-929292929292";
+    let path = temp.path().join(format!("{sid}.jsonl"));
+    let attachment = serde_json::json!({
+        "type": "attachment",
+        "sessionId": sid,
+        "entrypoint": "sdk-py"
+    });
+    fs::write(
+        &path,
+        format!(
+            "{attachment}\n{}",
+            native_user_record(
+                sid,
+                "preview-user",
+                "usable preview",
+                "2026-07-20T20:00:00Z"
+            )
+        ),
+    )
+    .unwrap();
+
+    let preview = read_session_preview(&path, sid);
+    assert_eq!(preview.kind, CliSessionKind::Subagent);
+    assert_eq!(
+        preview.first_prompt_snippet.as_deref(),
         Some("usable preview")
     );
 }
