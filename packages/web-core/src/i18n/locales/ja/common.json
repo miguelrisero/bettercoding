@@ -8,7 +8,9 @@
     "agentRunningBody": "コーディングエージェントがチャットでこのタスクを実行中です。完了するとターミナルが同じ会話を引き継ぎます — ここでプロンプトを繰り返す必要はありません。",
     "agentRunningViewChat": "チャットで進捗を見る",
     "setupRunningTitle": "ワークスペースを準備しています",
-    "setupRunningBody": "セットアップスクリプトを実行中です。完了するとターミナルがプロンプトとともに開きます。"
+    "setupRunningBody": "セットアップスクリプトを実行中です。完了するとターミナルがプロンプトとともに開きます。",
+    "working": "作業中…",
+    "idle": "待機中"
   },
   "loopAutomation": {
     "label": "継続",

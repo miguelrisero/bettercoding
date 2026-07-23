@@ -8,7 +8,9 @@
     "agentRunningBody": "編碼代理正在聊天中執行此任務。完成後終端將接管同一會話 — 無需在此重複提示。",
     "agentRunningViewChat": "在聊天中查看進度",
     "setupRunningTitle": "正在準備工作區",
-    "setupRunningBody": "安裝腳本正在執行。完成後終端將帶著你的提示開啟。"
+    "setupRunningBody": "安裝腳本正在執行。完成後終端將帶著你的提示開啟。",
+    "working": "工作中…",
+    "idle": "閒置"
   },
   "loopAutomation": {
     "label": "繼續執行",

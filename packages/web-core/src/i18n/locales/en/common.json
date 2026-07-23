@@ -8,7 +8,9 @@
     "agentRunningBody": "The coding agent is running this task in chat. The terminal will take over with the same conversation as soon as it finishes — no need to repeat the prompt here.",
     "agentRunningViewChat": "Watch progress in chat",
     "setupRunningTitle": "Preparing the workspace",
-    "setupRunningBody": "A setup script is running. The terminal will open with your prompt as soon as it finishes."
+    "setupRunningBody": "A setup script is running. The terminal will open with your prompt as soon as it finishes.",
+    "working": "Working…",
+    "idle": "Idle"
   },
   "loopAutomation": {
     "label": "Keep going",

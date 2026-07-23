@@ -289,6 +289,7 @@ export function WorkspacesLayout() {
                     activeWorkspaces.find((w) => w.id === selectedWorkspace.id)
                       ?.isCodingAgentRunning ?? false
                   }
+                  cliRunning={cliSessionActive}
                 />
               ) : (
                 <WorkspacesMainContainer
@@ -446,6 +447,7 @@ export function WorkspacesLayout() {
                         (w) => w.id === selectedWorkspace.id
                       )?.isCodingAgentRunning ?? false
                     }
+                    cliRunning={cliSessionActive}
                   />
                 ) : (
                   <WorkspacesMainContainer
