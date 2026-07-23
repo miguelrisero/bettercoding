@@ -12,6 +12,7 @@ import { useTranslation } from 'react-i18next';
 import type { BulkDeleteTarget } from 'shared/types';
 import {
   inspectArchivedWorkspaceTargets,
+  resolveDialogTotals,
   sumRepoCounts,
   type BulkDeleteArchivedWorkspaceDetails,
 } from '../lib/bulkDeleteArchivedWorkspaces';
@@ -245,8 +246,11 @@ export function BulkDeleteArchivedWorkspacesDialog({
     }
   };
 
-  const branchCount = initialRepoCount ?? inspection?.branchCount;
-  const worktreeCount = initialWorktreeCount ?? inspection?.worktreeCount;
+  const { branchCount, worktreeCount } = resolveDialogTotals({
+    initialRepoCount,
+    initialWorktreeCount,
+    inspection,
+  });
 
   return (
     <Dialog

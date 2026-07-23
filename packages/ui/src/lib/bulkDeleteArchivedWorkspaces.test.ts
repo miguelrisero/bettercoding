@@ -3,6 +3,7 @@ import { archiveBucketForTimestamp } from './archiveBuckets';
 import {
   buildArchivedBucketState,
   inspectArchivedWorkspaceTargets,
+  resolveDialogTotals,
   sumRepoCounts,
 } from './bulkDeleteArchivedWorkspaces';
 
@@ -45,6 +46,68 @@ describe('sumRepoCounts', () => {
         },
       })
     ).toBeNull();
+  });
+});
+
+describe('resolveDialogTotals', () => {
+  const completeInspection = {
+    branchCount: 6,
+    worktreeCount: 5,
+    inspectionFailureCount: 0,
+    worktreeAlreadyRemovedCount: 0,
+  };
+
+  it('uses inspection totals when initial totals are unavailable and inspection is complete', () => {
+    expect(
+      resolveDialogTotals({
+        initialRepoCount: null,
+        initialWorktreeCount: null,
+        inspection: completeInspection,
+      })
+    ).toEqual({
+      branchCount: 6,
+      worktreeCount: 5,
+    });
+  });
+
+  it.each([
+    ['an inspection failure', 1, 0],
+    ['a removed-worktree skip', 0, 1],
+  ])(
+    'returns unknown fallback totals after %s',
+    (_reason, inspectionFailureCount, worktreeAlreadyRemovedCount) => {
+      expect(
+        resolveDialogTotals({
+          initialRepoCount: null,
+          initialWorktreeCount: null,
+          inspection: {
+            ...completeInspection,
+            inspectionFailureCount,
+            worktreeAlreadyRemovedCount,
+          },
+        })
+      ).toEqual({
+        branchCount: null,
+        worktreeCount: null,
+      });
+    }
+  );
+
+  it('prefers initial totals regardless of incomplete inspection state', () => {
+    expect(
+      resolveDialogTotals({
+        initialRepoCount: 8,
+        initialWorktreeCount: 7,
+        inspection: {
+          ...completeInspection,
+          inspectionFailureCount: 1,
+          worktreeAlreadyRemovedCount: 1,
+        },
+      })
+    ).toEqual({
+      branchCount: 8,
+      worktreeCount: 7,
+    });
   });
 });
 

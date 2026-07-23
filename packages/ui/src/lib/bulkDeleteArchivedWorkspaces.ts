@@ -38,6 +38,39 @@ export function sumRepoCounts(
   );
 }
 
+export interface BulkDeleteArchivedWorkspaceInspectionTotals {
+  branchCount: number;
+  worktreeCount: number;
+  inspectionFailureCount: number;
+  worktreeAlreadyRemovedCount: number;
+}
+
+export function resolveDialogTotals({
+  initialRepoCount,
+  initialWorktreeCount,
+  inspection,
+}: {
+  initialRepoCount: number | null;
+  initialWorktreeCount: number | null;
+  inspection: BulkDeleteArchivedWorkspaceInspectionTotals | null;
+}): {
+  branchCount: number | null;
+  worktreeCount: number | null;
+} {
+  const completeInspection =
+    inspection !== null &&
+    inspection.inspectionFailureCount === 0 &&
+    inspection.worktreeAlreadyRemovedCount === 0;
+
+  return {
+    branchCount:
+      initialRepoCount ?? (completeInspection ? inspection.branchCount : null),
+    worktreeCount:
+      initialWorktreeCount ??
+      (completeInspection ? inspection.worktreeCount : null),
+  };
+}
+
 export function buildArchivedBucketState<
   TWorkspace extends ArchivedWorkspaceBulkDeleteSource,
 >(
