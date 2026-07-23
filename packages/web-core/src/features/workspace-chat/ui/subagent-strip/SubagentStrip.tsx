@@ -4,6 +4,11 @@ import type { BaseCodingAgent } from 'shared/types';
 import { CaretDownIcon, CpuIcon, UserCircleIcon } from '@phosphor-icons/react';
 
 import { RunningDots } from '@vibe/ui/components/RunningDots';
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@vibe/ui/components/Popover';
 import { cn } from '@vibe/ui/lib/cn';
 import { AgentIcon } from '@/shared/components/AgentIcon';
 import { useIsMobile } from '@/shared/hooks/useIsMobile';
@@ -137,34 +142,38 @@ function MobileSubagentStrip({
   );
 
   return (
-    <section className="shrink-0 border-b border-border bg-primary/95 backdrop-blur-sm">
-      <button
-        type="button"
-        className="flex min-h-11 w-full items-center justify-between gap-base px-double text-sm font-medium tabular-nums text-normal transition-colors hover:bg-secondary/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-brand"
-        onClick={() => {
-          setOpen((current) => !current);
-        }}
-        aria-controls={panelId}
-        aria-expanded={open}
-      >
-        <span>
-          {t('conversation.subagentStrip.mobileSummary', {
-            active: activeCount,
-            done: doneCount,
-          })}
-        </span>
-        <CaretDownIcon
-          aria-hidden
-          className={cn(
-            'size-icon-sm shrink-0 transition-transform duration-150',
-            open ? 'rotate-180' : 'rotate-0'
-          )}
-        />
-      </button>
-      {open ? (
-        <div
+    <Popover open={open} onOpenChange={setOpen}>
+      <section className="shrink-0 border-b border-border bg-primary/95 backdrop-blur-sm">
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            className="flex min-h-11 w-full items-center justify-between gap-base px-double text-sm font-medium tabular-nums text-normal transition-colors hover:bg-secondary/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-brand"
+            aria-controls={panelId}
+            aria-expanded={open}
+          >
+            <span>
+              {t('conversation.subagentStrip.mobileSummary', {
+                active: activeCount,
+                done: doneCount,
+              })}
+            </span>
+            <CaretDownIcon
+              aria-hidden
+              className={cn(
+                'size-icon-sm shrink-0 transition-transform duration-150',
+                open ? 'rotate-180' : 'rotate-0'
+              )}
+            />
+          </button>
+        </PopoverTrigger>
+        <PopoverContent
           id={panelId}
-          className="max-h-[min(50vh,24rem)] overflow-y-auto border-t border-border bg-primary p-double"
+          align="start"
+          side="bottom"
+          sideOffset={0}
+          collisionPadding={0}
+          className="max-h-[min(50vh,24rem)] max-w-[100vw] overflow-y-auto bg-primary p-double"
+          style={{ width: 'var(--radix-popover-trigger-width)' }}
           role="region"
           aria-label={t('conversation.subagentStrip.allSubagents')}
         >
@@ -195,9 +204,9 @@ function MobileSubagentStrip({
               </div>
             ) : null}
           </div>
-        </div>
-      ) : null}
-    </section>
+        </PopoverContent>
+      </section>
+    </Popover>
   );
 }
 
