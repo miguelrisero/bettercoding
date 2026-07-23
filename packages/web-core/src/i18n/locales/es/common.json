@@ -116,6 +116,20 @@
     "subagent": {
       "defaultType": "Subagente"
     },
+    "subagentStrip": {
+      "main": "Principal",
+      "working": "Trabajando",
+      "completed": "Completado",
+      "failed": "Fallido",
+      "done": "{{count}} finalizado",
+      "done_other": "{{count}} finalizados",
+      "more": "{{count}} más",
+      "more_other": "{{count}} más",
+      "mobileSummary": "{{active}} activos · {{done}} finalizados",
+      "drawerTitle": "Subagentes finalizados",
+      "stillRunning": "En ejecución",
+      "allSubagents": "Subagentes"
+    },
     "fork": {
       "explanation": "Algunos mensajes siguieron un camino que el agente ya no está siguiendo.",
       "branchLabel": "Rama {{index}}",

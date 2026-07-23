@@ -103,6 +103,20 @@
     "subagent": {
       "defaultType": "子代理"
     },
+    "subagentStrip": {
+      "main": "主代理",
+      "working": "工作中",
+      "completed": "已完成",
+      "failed": "失败",
+      "done": "{{count}} 个已完成",
+      "done_other": "{{count}} 个已完成",
+      "more": "另有 {{count}} 个",
+      "more_other": "另有 {{count}} 个",
+      "mobileSummary": "{{active}} 个运行中 · {{done}} 个已完成",
+      "drawerTitle": "已完成的子代理",
+      "stillRunning": "运行中",
+      "allSubagents": "子代理"
+    },
     "fork": {
       "explanation": "部分消息进入了代理不再继续的路径。",
       "branchLabel": "分支 {{index}}",
