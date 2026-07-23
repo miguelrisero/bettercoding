@@ -39,7 +39,6 @@ export function SubagentTab({ descriptor }: SubagentTabProps) {
         'flex h-8 min-w-0 max-w-36 flex-1 basis-0 items-center gap-half rounded-sm border px-base',
         toneClass
       )}
-      role="status"
       title={descriptor.description}
     >
       <CpuIcon aria-hidden className="size-icon-sm shrink-0 text-low" />
