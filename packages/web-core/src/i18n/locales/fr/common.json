@@ -84,7 +84,13 @@
       "noPreview": "Aucun aperçu du message disponible",
       "assign": "Attribuer ici",
       "assigning": "Attribution…",
-      "error": "Cette conversation n'a pas pu être attribuée. Réessayez."
+      "error": "Cette conversation n'a pas pu être attribuée. Réessayez.",
+      "mainBadge": "Principale",
+      "agentBadge": "Agent",
+      "showBackgroundAgents": "Afficher {{count}} agent en arrière-plan",
+      "showBackgroundAgents_other": "Afficher {{count}} agents en arrière-plan",
+      "hideBackgroundAgents": "Masquer {{count}} agent en arrière-plan",
+      "hideBackgroundAgents_other": "Masquer {{count}} agents en arrière-plan"
     },
     "toolSummary": {
       "read": "Lu {{path}}",

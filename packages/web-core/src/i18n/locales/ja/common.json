@@ -97,7 +97,13 @@
       "noPreview": "プロンプトのプレビューはありません",
       "assign": "ここに割り当て",
       "assigning": "割り当て中…",
-      "error": "この会話を割り当てられませんでした。もう一度お試しください。"
+      "error": "この会話を割り当てられませんでした。もう一度お試しください。",
+      "mainBadge": "メイン",
+      "agentBadge": "エージェント",
+      "showBackgroundAgents": "バックグラウンドエージェント {{count}} 件を表示",
+      "showBackgroundAgents_other": "バックグラウンドエージェント {{count}} 件を表示",
+      "hideBackgroundAgents": "バックグラウンドエージェント {{count}} 件を非表示",
+      "hideBackgroundAgents_other": "バックグラウンドエージェント {{count}} 件を非表示"
     },
     "toolSummary": {
       "read": "{{path}} を読み込み",
