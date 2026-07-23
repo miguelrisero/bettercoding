@@ -75,6 +75,7 @@
     "assistant": "Claude",
     "viaCli": "via CLI",
     "cliSessionActive": "CLI session active",
+    "cliAgentWorking": "Agent working…",
     "foreignWriter": {
       "message": "This conversation is being edited outside the app.",
       "dismiss": "Dismiss outside-editor notice"

@@ -83,6 +83,7 @@
     "assistant": "Claude",
     "viaCli": "vía CLI",
     "cliSessionActive": "Sesión CLI activa",
+    "cliAgentWorking": "Agente trabajando…",
     "foreignWriter": {
       "message": "Esta conversación se está editando fuera de la aplicación.",
       "dismiss": "Cerrar aviso de edición externa"

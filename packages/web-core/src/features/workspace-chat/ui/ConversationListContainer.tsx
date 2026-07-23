@@ -10,7 +10,6 @@ import {
 } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import {
-  CircleIcon,
   SpinnerIcon,
   TerminalWindowIcon,
   WarningIcon,
@@ -58,6 +57,7 @@ import { ChatScriptPlaceholder } from '@vibe/ui/components/ChatScriptPlaceholder
 import { ScriptFixerDialog } from '@/shared/dialogs/scripts/ScriptFixerDialog';
 import { ChatForkBranches } from '@vibe/ui/components/ChatForkBranches';
 import { Badge } from '@vibe/ui/components/Badge';
+import { RunningDots } from '@vibe/ui/components/RunningDots';
 import { UnassignedCliSessions } from './UnassignedCliSessions';
 import { shouldShowForeignWriterBanner } from '../model/foreignWriterBanner';
 import { sessionsApi } from '@/shared/lib/api';
@@ -1041,12 +1041,8 @@ export const ConversationList = forwardRef<
                     variant="outline"
                     className="pointer-events-none gap-half border-border bg-primary/90 font-normal text-normal shadow-sm backdrop-blur-sm"
                   >
-                    <CircleIcon
-                      className="size-2 text-brand"
-                      weight="fill"
-                      aria-hidden="true"
-                    />
-                    {t('conversation.cliSessionActive')}
+                    <RunningDots />
+                    {t('conversation.cliAgentWorking')}
                   </Badge>
                 )}
               </div>

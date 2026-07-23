@@ -70,6 +70,7 @@
     "assistant": "Claude",
     "viaCli": "via la CLI",
     "cliSessionActive": "Session CLI active",
+    "cliAgentWorking": "L’agent travaille…",
     "foreignWriter": {
       "message": "Cette conversation est en cours de modification en dehors de l'application.",
       "dismiss": "Fermer l'avis de modification externe"
