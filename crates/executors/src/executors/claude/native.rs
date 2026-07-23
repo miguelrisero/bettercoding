@@ -145,7 +145,7 @@ pub fn adapt_native_claude_line(
         timestamp: wire.timestamp,
         version: wire.version,
         git_branch: wire.git_branch,
-        entrypoint: wire.entrypoint.clone(),
+        entrypoint: wire.entrypoint,
         kind: kind.clone(),
         leaf_uuid: wire.leaf_uuid,
         is_sidechain: wire.is_sidechain,
