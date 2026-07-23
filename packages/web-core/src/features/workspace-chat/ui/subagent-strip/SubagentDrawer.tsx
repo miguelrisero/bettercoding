@@ -26,6 +26,7 @@ export function SubagentDetailList({
   workspaceId,
   sessionId,
 }: SubagentDetailListProps) {
+  const { t } = useTranslation('common');
   const [expandedKeys, setExpandedKeys] = useState<Set<string>>(
     () => new Set()
   );
@@ -60,24 +61,33 @@ export function SubagentDetailList({
     <div className="flex flex-col gap-base">
       {descriptors.map((descriptor) => {
         const hasResult = Boolean(descriptor.result?.value);
+        const statusLabel =
+          descriptor.phase === 'active'
+            ? t('conversation.subagentStrip.stillRunning')
+            : descriptor.phase === 'done'
+              ? t('conversation.subagentStrip.completed')
+              : t('conversation.subagentStrip.failed');
+
         return (
-          <ChatSubagentEntry
-            key={descriptor.key}
-            description={descriptor.description}
-            subagentType={descriptor.name}
-            result={descriptor.result}
-            expanded={expandedKeys.has(descriptor.key)}
-            onToggle={
-              hasResult
-                ? () => {
-                    toggleExpanded(descriptor.key);
-                  }
-                : undefined
-            }
-            status={descriptor.status}
-            workspaceId={workspaceId}
-            renderMarkdown={renderMarkdown}
-          />
+          <div key={descriptor.key}>
+            <ChatSubagentEntry
+              description={descriptor.description}
+              subagentType={descriptor.name}
+              result={descriptor.result}
+              expanded={expandedKeys.has(descriptor.key)}
+              onToggle={
+                hasResult
+                  ? () => {
+                      toggleExpanded(descriptor.key);
+                    }
+                  : undefined
+              }
+              status={descriptor.status}
+              workspaceId={workspaceId}
+              renderMarkdown={renderMarkdown}
+            />
+            <span className="sr-only">{statusLabel}</span>
+          </div>
         );
       })}
     </div>
