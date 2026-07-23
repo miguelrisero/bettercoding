@@ -101,7 +101,7 @@ export function useSubagentStrip(): UseSubagentStripResult {
           setNow(Date.now());
         }
       },
-      Math.max(0, soonestExpiry - now)
+      Math.max(0, soonestExpiry - Date.now())
     );
 
     return () => {
