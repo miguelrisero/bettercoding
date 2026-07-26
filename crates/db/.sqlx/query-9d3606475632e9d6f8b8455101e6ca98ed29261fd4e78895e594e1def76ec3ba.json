@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT f.id AS \"id!: Uuid\"\n               FROM cli_native_files f\n               WHERE COALESCE(f.last_import_at, f.updated_at, f.created_at)\n                     < datetime('now', $1)\n                 AND NOT EXISTS (\n                     SELECT 1 FROM claude_session_links l\n                     WHERE l.claude_session_id = f.claude_session_id\n                 )\n                 AND NOT EXISTS (\n                     SELECT 1 FROM cli_ingest_outbox o\n                     JOIN sessions s ON s.id = o.session_id\n                     WHERE o.file_id = f.id\n                 )\n               ORDER BY COALESCE(f.last_import_at, f.updated_at, f.created_at) ASC\n               LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "9d3606475632e9d6f8b8455101e6ca98ed29261fd4e78895e594e1def76ec3ba"
+}
