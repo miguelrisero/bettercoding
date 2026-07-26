@@ -62,6 +62,40 @@ pub(crate) fn normalize_path_override(name: &str, value: Option<OsString>) -> Op
     }
 }
 
+/// Check a `DISABLE_*` style opt-out flag.
+///
+/// Any value — including `0`, `false` and the empty string — disables the gated
+/// behaviour. That is deliberately unchanged from the original
+/// `std::env::var(..).is_ok()` gate: several of these flags guard destructive
+/// cleanup, so tightening them such that `DISABLE_X=0` means "enabled" would
+/// silently switch worktree deletion back on for anyone relying on the previous
+/// behaviour. The surprising case is reported instead of reinterpreted.
+pub fn disable_flag_set(name: &str) -> bool {
+    evaluate_disable_flag(name, std::env::var(name).ok())
+}
+
+/// Evaluate an opt-out flag without reading the environment, so the warning
+/// behaviour is testable.
+pub(crate) fn evaluate_disable_flag(name: &str, value: Option<String>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+
+    if matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    ) {
+        tracing::warn!(
+            variable = name,
+            value = %value,
+            "Opt-out flag is set to a falsy-looking value but still DISABLES the \
+             gated behaviour; unset the variable entirely to re-enable it"
+        );
+    }
+
+    true
+}
+
 fn select_env_var_with_legacy<F>(lookup: F, new_name: &str, legacy_name: &str) -> Option<String>
 where
     F: Fn(&str) -> Option<String>,
@@ -84,6 +118,28 @@ mod tests {
             new_name,
             legacy_name,
         )
+    }
+
+    #[test]
+    fn disable_flag_is_unset_when_variable_is_absent() {
+        assert!(!evaluate_disable_flag("DISABLE_X", None));
+    }
+
+    #[test]
+    fn disable_flag_is_set_for_a_truthy_value() {
+        assert!(evaluate_disable_flag("DISABLE_X", Some("1".to_string())));
+    }
+
+    /// The whole point of the helper: falsy-looking values still disable, so a
+    /// bug fix can never silently re-enable destructive cleanup.
+    #[test]
+    fn falsy_looking_values_still_disable() {
+        for value in ["0", "false", "no", "off", "", "  FALSE  "] {
+            assert!(
+                evaluate_disable_flag("DISABLE_X", Some(value.to_string())),
+                "{value:?} should still disable"
+            );
+        }
     }
 
     #[test]

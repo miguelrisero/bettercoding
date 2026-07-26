@@ -358,7 +358,7 @@ pub struct LoopSupervisor;
 impl LoopSupervisor {
     pub fn spawn(db: DBService) {
         tokio::spawn(async move {
-            if std::env::var(DISABLE_ENV).is_ok() {
+            if utils::env::disable_flag_set(DISABLE_ENV) {
                 tracing::info!("{DISABLE_ENV} set; loop automation supervisor disabled");
                 return;
             }

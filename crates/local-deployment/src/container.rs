@@ -310,7 +310,7 @@ impl LocalContainerService {
     }
 
     async fn cleanup_expired_workspaces(&self) -> Result<(), DeploymentError> {
-        if std::env::var("DISABLE_WORKTREE_CLEANUP").is_ok() {
+        if utils::env::disable_flag_set("DISABLE_WORKTREE_CLEANUP") {
             tracing::info!(
                 "Expired workspace cleanup is disabled via DISABLE_WORKTREE_CLEANUP environment variable"
             );
@@ -348,7 +348,7 @@ impl LocalContainerService {
         const IDLE_REAP_HOURS: i64 = 48;
         const ACTIVITY_GRACE_SECS: i64 = 60;
 
-        if std::env::var("DISABLE_CLI_SESSION_REAP").is_ok() {
+        if utils::env::disable_flag_set("DISABLE_CLI_SESSION_REAP") {
             return;
         }
         let sessions = match crate::pty::list_cli_tmux_sessions().await {

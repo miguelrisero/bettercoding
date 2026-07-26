@@ -537,7 +537,7 @@ impl WorkspaceManager {
     }
 
     pub async fn cleanup_orphan_workspaces(&self) {
-        if std::env::var("DISABLE_WORKTREE_CLEANUP").is_ok() {
+        if utils::env::disable_flag_set("DISABLE_WORKTREE_CLEANUP") {
             info!(
                 "Orphan workspace cleanup is disabled via DISABLE_WORKTREE_CLEANUP environment variable"
             );
