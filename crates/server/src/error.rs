@@ -27,6 +27,7 @@ use services::services::{
     remote_client::RemoteClientError,
     repo::RepoError as RepoServiceError,
 };
+use sqlx::error::DatabaseError;
 use thiserror::Error;
 use trusted_key_auth::error::TrustedKeyAuthError;
 use utils::response::ApiResponse;
@@ -343,8 +344,45 @@ fn remote_client_error(err: &RemoteClientError) -> ErrorInfo {
     }
 }
 
+/// SQLite serialises writers, so a request that loses the race exhausts the
+/// busy timeout and fails with `SQLITE_BUSY`/`SQLITE_LOCKED`. That is
+/// contention, not a defect: the request is retryable and the server is
+/// healthy, so it should not be reported as an opaque internal error.
+fn sqlite_contention(err: &(dyn std::error::Error + 'static)) -> bool {
+    // The failure reaches here wrapped in whichever domain error the route
+    // happened to use, so walk the source chain rather than enumerating every
+    // variant that can carry one. The chain ends at the driver error: those
+    // wrappers are `#[error(transparent)]`, and that forwards `source()` past
+    // the error it wraps, so the intermediate `sqlx::Error` is never yielded.
+    std::iter::successors(Some(err), |err| err.source()).any(|err| {
+        // The chain element is the `Box<dyn DatabaseError>` itself, not the
+        // driver's concrete error type: sqlx writes `impl StdError for
+        // Box<dyn DatabaseError>`, so the box is what carries the vtable here.
+        err.downcast_ref::<Box<dyn DatabaseError>>()
+            .and_then(|err| err.code())
+            // sqlx reports SQLite's *extended* result code, so the primary code
+            // is the low byte: plain SQLITE_BUSY is 5, but WAL also raises
+            // SQLITE_BUSY_SNAPSHOT (517) and recovery raises 261.
+            .and_then(|code| code.parse::<u32>().ok())
+            .is_some_and(|code| matches!(code & 0xff, SQLITE_BUSY | SQLITE_LOCKED))
+    })
+}
+
+const SQLITE_BUSY: u32 = 5;
+const SQLITE_LOCKED: u32 = 6;
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if sqlite_contention(&self) {
+            tracing::warn!(
+                error = ?self,
+                "request failed on database contention; retryable"
+            );
+            let response =
+                ApiResponse::<()>::error("The database is busy right now. Please try that again.");
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(response)).into_response();
+        }
+
         let info = match &self {
             ApiError::Repo(RepoError::Database(_)) => ErrorInfo::internal("RepoError"),
             ApiError::Repo(RepoError::NotFound) => {
@@ -658,6 +696,11 @@ impl From<RelayPairingClientError> for ApiError {
 
 #[cfg(test)]
 mod tests {
+    use sqlx::{
+        Connection,
+        sqlite::{SqliteConnectOptions, SqliteConnection},
+    };
+
     use super::*;
 
     #[test]
@@ -674,5 +717,95 @@ mod tests {
             ApiError::from(error).into_response().status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// Provokes a genuine `SQLITE_BUSY` rather than a stand-in: `SqliteError`
+    /// cannot be constructed outside sqlx, and the behaviour under test is
+    /// precisely that a *real* error's source chain is matched. Wrappers here
+    /// are `#[error(transparent)]`, which forwards `source()` past the error it
+    /// wraps, so a hand-built chain would not prove anything.
+    async fn real_busy_error() -> sqlx::Error {
+        let dir = tempfile::tempdir().unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(dir.path().join("busy.sqlite"))
+            .create_if_missing(true)
+            // A zero timeout makes losing the write race immediate, so the test
+            // is deterministic rather than dependent on timing.
+            .busy_timeout(std::time::Duration::ZERO);
+
+        let mut holder = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query("CREATE TABLE t (v INTEGER)")
+            .execute(&mut holder)
+            .await
+            .unwrap();
+        let mut contender = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query("BEGIN EXCLUSIVE")
+            .execute(&mut holder)
+            .await
+            .unwrap();
+
+        let err = sqlx::query("INSERT INTO t (v) VALUES (1)")
+            .execute(&mut contender)
+            .await
+            .expect_err("the exclusive lock must block this write");
+        drop(dir);
+        err
+    }
+
+    async fn real_constraint_error() -> sqlx::Error {
+        let mut conn = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        for statement in [
+            "CREATE TABLE t (v INTEGER PRIMARY KEY)",
+            "INSERT INTO t (v) VALUES (1)",
+        ] {
+            sqlx::query(statement).execute(&mut conn).await.unwrap();
+        }
+        sqlx::query("INSERT INTO t (v) VALUES (1)")
+            .execute(&mut conn)
+            .await
+            .expect_err("duplicate primary key")
+    }
+
+    #[tokio::test]
+    async fn contention_is_detected_through_every_wrapper_a_route_uses() {
+        let err = real_busy_error().await;
+        assert!(
+            matches!(&err, sqlx::Error::Database(db) if db.code().as_deref() == Some("5")),
+            "expected SQLITE_BUSY, got {err:?}"
+        );
+        assert!(sqlite_contention(&ApiError::Database(err)));
+        // The variants that produced the observed 500s.
+        assert!(sqlite_contention(&ApiError::Workspace(
+            WorkspaceError::Database(real_busy_error().await)
+        )));
+        assert!(sqlite_contention(&ApiError::Container(
+            ContainerError::Sqlx(real_busy_error().await)
+        )));
+    }
+
+    #[tokio::test]
+    async fn contention_answers_service_unavailable_not_internal_error() {
+        let response =
+            ApiError::Container(ContainerError::Sqlx(real_busy_error().await)).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn other_sqlite_errors_still_report_internal() {
+        // Masking the extended code to its low byte must not catch unrelated
+        // failures: a primary-key violation is 1555, whose low byte is 19.
+        let err = ApiError::Database(real_constraint_error().await);
+        assert!(!sqlite_contention(&err));
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn non_database_errors_are_unaffected() {
+        assert!(!sqlite_contention(&ApiError::Database(
+            sqlx::Error::RowNotFound
+        )));
     }
 }

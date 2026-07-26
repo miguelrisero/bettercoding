@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM cli_ingest_outbox WHERE file_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "ca6f9129f197133edeece41f44cfc9586dc5b07162f090016c352e1695f2c4f6"
+}

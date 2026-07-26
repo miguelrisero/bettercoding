@@ -72,6 +72,35 @@ const REGISTRY_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const OUTBOX_SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const IMPORT_BATCH_LINE_LIMIT: usize = 256;
 
+/// Days an unreachable transcript is kept before retention removes it. `0`
+/// disables retention and lets the store grow without bound.
+const RETENTION_ENV: &str = "VIBE_KANBAN_CLI_TRANSCRIPT_RETENTION_DAYS";
+const DEFAULT_RETENTION_DAYS: u32 = 14;
+const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Retention competes for the same write lock as ingest, so the first sweep
+/// waits for start-up scanning to settle.
+const RETENTION_STARTUP_DELAY: Duration = Duration::from_secs(5 * 60);
+/// Files per sweep. Each is one transaction, so this bounds how long retention
+/// can hold the write lock at a time; a backlog drains over several sweeps.
+const RETENTION_FILES_PER_SWEEP: i64 = 25;
+
+fn retention_days() -> Option<u32> {
+    match std::env::var(RETENTION_ENV) {
+        Err(_) => Some(DEFAULT_RETENTION_DAYS),
+        Ok(raw) => match raw.trim().parse::<u32>() {
+            Ok(0) => None,
+            Ok(days) => Some(days),
+            Err(_) => {
+                tracing::warn!(
+                    "{RETENTION_ENV}={raw:?} is not a whole number of days; \
+                     using {DEFAULT_RETENTION_DAYS}"
+                );
+                Some(DEFAULT_RETENTION_DAYS)
+            }
+        },
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct NativeLinkPersisted {
     pub execution_process_id: Uuid,
@@ -237,7 +266,43 @@ impl ClaudeTranscriptIngest {
                 .run_native_link_invalidation(native_link_updates, shutdown.child_token()),
         );
         tokio::spawn(service.clone().run_registry(shutdown.child_token(), true));
+        tokio::spawn(service.clone().run_retention(shutdown.child_token()));
         Some(service)
+    }
+
+    /// Periodically reclaims transcripts no session can reach. Without this the
+    /// raw-record table grows for the lifetime of the install, and a larger
+    /// database makes every commit — and so every write-lock hold — slower.
+    async fn run_retention(self: Arc<Self>, shutdown: CancellationToken) {
+        let Some(days) = retention_days() else {
+            tracing::info!("CLI transcript retention disabled by {RETENTION_ENV}");
+            return;
+        };
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + RETENTION_STARTUP_DELAY,
+            RETENTION_SWEEP_INTERVAL,
+        );
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = interval.tick() => {}
+            }
+            match CliNativeFile::prune_unreachable(&self.db.pool, days, RETENTION_FILES_PER_SWEEP)
+                .await
+            {
+                Ok(pruned) if pruned.is_empty() => {}
+                Ok(pruned) => tracing::info!(
+                    files = pruned.files,
+                    records = pruned.records,
+                    retention_days = days,
+                    "pruned unreachable CLI transcripts"
+                ),
+                Err(err) => {
+                    tracing::warn!(%err, "CLI transcript retention sweep failed")
+                }
+            }
+        }
     }
 
     fn new_with_probe(

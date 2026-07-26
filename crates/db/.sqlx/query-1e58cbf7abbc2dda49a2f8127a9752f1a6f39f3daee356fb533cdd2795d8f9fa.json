@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM cli_native_records WHERE file_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "1e58cbf7abbc2dda49a2f8127a9752f1a6f39f3daee356fb533cdd2795d8f9fa"
+}

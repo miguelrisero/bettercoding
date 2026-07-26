@@ -1,13 +1,108 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use sqlx::{
-    ConnectOptions, Error, Pool, Sqlite, SqlitePool,
+    ConnectOptions, Error, Pool, Sqlite,
     migrate::MigrateError,
-    sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions},
+    sqlite::{
+        SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions,
+        SqliteSynchronous,
+    },
 };
 use utils::assets::{DB_FILE_NAME, asset_dir};
 
 pub mod models;
+
+/// Overrides the journal mode, accepting `wal` or `delete`.
+///
+/// We default to WAL: in rollback-journal mode a writer holds an exclusive lock
+/// that blocks every reader, so a continuously-writing background service (CLI
+/// transcript ingest, activity monitors, PR monitor) starves ordinary requests
+/// until they exhaust the busy timeout and surface as 500s. Upstream pinned
+/// `delete` in #1882 after reverting #1806, but recorded no reason for the
+/// revert; the likely one is that WAL needs an mmap-able `-shm` sidecar and so
+/// fails on network mounts. [`connect_pool`] detects that and falls back, and
+/// this variable forces the old behaviour outright.
+const JOURNAL_MODE_ENV: &str = "VIBE_KANBAN_SQLITE_JOURNAL_MODE";
+
+/// SQLite serialises writers, so contention is normal and waiting is correct.
+/// sqlx defaults to 5s, which a slow commit can exceed — and losing that race
+/// fails the request rather than delaying it.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn preferred_journal_mode() -> SqliteJournalMode {
+    match std::env::var(JOURNAL_MODE_ENV) {
+        Err(_) => SqliteJournalMode::Wal,
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "wal" => SqliteJournalMode::Wal,
+            "delete" => SqliteJournalMode::Delete,
+            other => {
+                tracing::warn!(
+                    "{JOURNAL_MODE_ENV}={other:?} is not a supported journal mode \
+                     (expected `wal` or `delete`); using `wal`"
+                );
+                SqliteJournalMode::Wal
+            }
+        },
+    }
+}
+
+/// Applies the concurrency settings to any connection, separately from which
+/// file it points at, so the settings can be exercised against a scratch
+/// database in tests.
+fn tune(options: SqliteConnectOptions, journal_mode: SqliteJournalMode) -> SqliteConnectOptions {
+    options
+        .journal_mode(journal_mode)
+        .busy_timeout(BUSY_TIMEOUT)
+        // WAL already fsyncs the log before a checkpoint can discard it, so
+        // NORMAL only risks the most recent commits on host power loss — never
+        // on process crash — and removes an fsync from every commit.
+        .synchronous(match journal_mode {
+            SqliteJournalMode::Wal => SqliteSynchronous::Normal,
+            _ => SqliteSynchronous::Full,
+        })
+}
+
+fn connect_options(journal_mode: SqliteJournalMode) -> SqliteConnectOptions {
+    tune(
+        SqliteConnectOptions::new()
+            .filename(asset_dir().join(DB_FILE_NAME))
+            .create_if_missing(true),
+        journal_mode,
+    )
+}
+
+/// Connects with the preferred journal mode, retrying once in `delete` mode so
+/// a filesystem that cannot host WAL's shared-memory file still opens.
+async fn connect_pool(
+    pool_options: SqlitePoolOptions,
+    disable_statement_logging: bool,
+) -> Result<Pool<Sqlite>, Error> {
+    let build = |journal_mode| {
+        let options = connect_options(journal_mode);
+        if disable_statement_logging {
+            options.disable_statement_logging()
+        } else {
+            options
+        }
+    };
+
+    let preferred = preferred_journal_mode();
+    match pool_options.clone().connect_with(build(preferred)).await {
+        Ok(pool) => Ok(pool),
+        Err(err) if preferred == SqliteJournalMode::Wal => {
+            tracing::warn!(
+                %err,
+                "could not open the database in WAL mode (the filesystem may not support \
+                 shared memory); falling back to `delete`. Set {JOURNAL_MODE_ENV}=delete \
+                 to select it explicitly."
+            );
+            pool_options
+                .connect_with(build(SqliteJournalMode::Delete))
+                .await
+        }
+        Err(err) => Err(err),
+    }
+}
 
 async fn run_migrations(pool: &Pool<Sqlite>) -> Result<(), Error> {
     use std::collections::HashSet;
@@ -79,25 +174,13 @@ pub struct DBService {
 
 impl DBService {
     pub async fn new() -> Result<DBService, Error> {
-        let options = SqliteConnectOptions::new()
-            .filename(asset_dir().join(DB_FILE_NAME))
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Delete);
-        let pool = SqlitePool::connect_with(options).await?;
+        let pool = connect_pool(SqlitePoolOptions::new(), false).await?;
         run_migrations(&pool).await?;
         Ok(DBService { pool })
     }
 
     pub async fn new_migration_pool() -> Result<Pool<Sqlite>, Error> {
-        let options = SqliteConnectOptions::new()
-            .filename(asset_dir().join(DB_FILE_NAME))
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Delete)
-            .disable_statement_logging();
-        SqlitePoolOptions::new()
-            .max_connections(64)
-            .connect_with(options)
-            .await
+        connect_pool(SqlitePoolOptions::new().max_connections(64), true).await
     }
 
     pub async fn new_with_after_connect<F>(after_connect: F) -> Result<DBService, Error>
@@ -124,25 +207,17 @@ impl DBService {
             + Sync
             + 'static,
     {
-        let options = SqliteConnectOptions::new()
-            .filename(asset_dir().join(DB_FILE_NAME))
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Delete);
-
-        let pool = if let Some(hook) = after_connect {
-            SqlitePoolOptions::new()
-                .after_connect(move |conn, _meta| {
-                    let hook = hook.clone();
-                    Box::pin(async move {
-                        hook(conn).await?;
-                        Ok(())
-                    })
+        let pool_options = match after_connect {
+            Some(hook) => SqlitePoolOptions::new().after_connect(move |conn, _meta| {
+                let hook = hook.clone();
+                Box::pin(async move {
+                    hook(conn).await?;
+                    Ok(())
                 })
-                .connect_with(options)
-                .await?
-        } else {
-            SqlitePool::connect_with(options).await?
+            }),
+            None => SqlitePoolOptions::new(),
         };
+        let pool = connect_pool(pool_options, false).await?;
 
         run_migrations(&pool).await?;
         Ok(pool)
@@ -153,6 +228,99 @@ impl DBService {
 mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use uuid::Uuid;
+
+    use super::*;
+
+    /// Opens a scratch database with the real tuning and reports the pragmas
+    /// SQLite actually settled on — `journal_mode` is a property of the file, so
+    /// asking for WAL is not the same as getting it.
+    async fn effective_pragmas(journal_mode: SqliteJournalMode) -> (String, i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(tune(
+                SqliteConnectOptions::new()
+                    .filename(dir.path().join("pragmas.sqlite"))
+                    .create_if_missing(true),
+                journal_mode,
+            ))
+            .await
+            .unwrap();
+        let mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let timeout = sqlx::query_scalar::<_, i64>("PRAGMA busy_timeout")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        (mode, timeout)
+    }
+
+    #[tokio::test]
+    async fn wal_and_a_generous_busy_timeout_are_actually_applied() {
+        let (mode, busy_timeout) = effective_pragmas(SqliteJournalMode::Wal).await;
+        assert_eq!(mode, "wal");
+        assert_eq!(busy_timeout, BUSY_TIMEOUT.as_millis() as i64);
+    }
+
+    #[tokio::test]
+    async fn the_delete_fallback_remains_available() {
+        let (mode, busy_timeout) = effective_pragmas(SqliteJournalMode::Delete).await;
+        assert_eq!(mode, "delete");
+        assert_eq!(busy_timeout, BUSY_TIMEOUT.as_millis() as i64);
+    }
+
+    #[tokio::test]
+    async fn a_reader_does_not_block_a_writer_under_wal() {
+        // The behaviour the whole change exists for: in `delete` mode an open
+        // read transaction holds a shared lock that fails the writer, which is
+        // what surfaced as 500s.
+        let dir = tempfile::tempdir().unwrap();
+        let options = tune(
+            SqliteConnectOptions::new()
+                .filename(dir.path().join("concurrent.sqlite"))
+                .create_if_missing(true),
+            SqliteJournalMode::Wal,
+        )
+        // Without waiting, any blocking would surface immediately as an error.
+        .busy_timeout(Duration::ZERO);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE t (v INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO t (v) VALUES (1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut reader = pool.begin().await.unwrap();
+        let seen = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM t")
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
+        assert_eq!(seen, 1);
+
+        sqlx::query("INSERT INTO t (v) VALUES (2)")
+            .execute(&pool)
+            .await
+            .expect("an open read transaction must not block a writer under WAL");
+
+        // The reader keeps its original snapshot.
+        let still_seen = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM t")
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
+        assert_eq!(still_seen, 1);
+        drop(reader);
+        pool.close().await;
+    }
 
     #[tokio::test]
     async fn archived_at_migration_backfills_preexisting_archived_rows() {
