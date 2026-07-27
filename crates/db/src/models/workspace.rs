@@ -412,10 +412,16 @@ impl Workspace {
 
     /// Find workspace by path using container-ref path containment.
     /// Used by clients that may open a repo subfolder rather than the workspace root.
+    ///
+    /// `Ok(None)` means no workspace contains the path. Callers ask this about
+    /// arbitrary directories — an editor or MCP client probing its working
+    /// directory — so "not a workspace" is an ordinary answer, not a failure,
+    /// and must stay distinguishable from a database error. Reporting the miss
+    /// as `sqlx::Error::RowNotFound` previously made every such probe a 500.
     pub async fn resolve_container_ref_by_prefix(
         pool: &SqlitePool,
         path: &str,
-    ) -> Result<ContainerInfo, sqlx::Error> {
+    ) -> Result<Option<ContainerInfo>, sqlx::Error> {
         let workspaces = sqlx::query_as!(
             WorkspaceContainerRefRow,
             r#"SELECT id as "id!: Uuid",
@@ -426,14 +432,13 @@ impl Workspace {
         .fetch_all(pool)
         .await?;
 
-        Self::best_matching_container_ref(
+        Ok(Self::best_matching_container_ref(
             path,
             workspaces
                 .iter()
                 .map(|ws| (ws.id, ws.container_ref.as_str())),
         )
-        .map(|workspace_id| ContainerInfo { workspace_id })
-        .ok_or(sqlx::Error::RowNotFound)
+        .map(|workspace_id| ContainerInfo { workspace_id }))
     }
 
     fn best_matching_container_ref<'a>(
@@ -872,6 +877,52 @@ mod tests {
         );
 
         assert_eq!(selected, None);
+    }
+
+    #[tokio::test]
+    async fn resolving_a_path_outside_every_workspace_is_a_miss_not_an_error() {
+        let pool = test_pool().await;
+        let workspace = create_test_workspace(&pool).await;
+        Workspace::update_container_ref(&pool, workspace.id, "/tmp/ws")
+            .await
+            .unwrap();
+
+        // Editors and MCP clients probe whatever directory they were started
+        // in, so this is the common case, not an exceptional one. Reporting it
+        // as sqlx::Error::RowNotFound made every such probe answer HTTP 500.
+        let resolved = Workspace::resolve_container_ref_by_prefix(&pool, "/home/someone")
+            .await
+            .expect("a path outside every workspace is not a database failure");
+
+        assert!(resolved.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolving_finds_the_workspace_containing_a_subdirectory() {
+        let pool = test_pool().await;
+        let workspace = create_test_workspace(&pool).await;
+        Workspace::update_container_ref(&pool, workspace.id, "/tmp/ws")
+            .await
+            .unwrap();
+
+        for path in ["/tmp/ws", "/tmp/ws/repo/packages/app"] {
+            let resolved = Workspace::resolve_container_ref_by_prefix(&pool, path)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{path} should resolve to the workspace"));
+            assert_eq!(resolved.workspace_id, workspace.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn resolving_against_no_workspaces_at_all_is_a_miss() {
+        let pool = test_pool().await;
+
+        let resolved = Workspace::resolve_container_ref_by_prefix(&pool, "/tmp/ws")
+            .await
+            .unwrap();
+
+        assert!(resolved.is_none());
     }
 
     #[tokio::test]
