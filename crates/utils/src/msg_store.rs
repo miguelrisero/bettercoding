@@ -1,16 +1,68 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, RwLock},
+    sync::{Arc, LazyLock, RwLock},
 };
 
 use futures::{StreamExt, future};
 use tokio::{sync::broadcast, task::JoinHandle};
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
-use crate::{log_msg::LogMsg, stream_lines::LinesStreamExt};
+use crate::{env::env_usize, log_msg::LogMsg, stream_lines::LinesStreamExt};
 
-// 100 MB Limit
-const HISTORY_BYTES: usize = 100000 * 1024;
+/// Byte budget for the in-memory log history each [`MsgStore`] retains, so a
+/// dashboard client that connects (or reconnects) mid-run gets scrollback.
+///
+/// This is charged PER STORE, and there is more than one kind of store: the
+/// server creates one per running execution (`services::container`), plus a
+/// single process-lifetime events store fed by the DB change hook
+/// (`local_deployment`), plus short-lived stores used to replay a finished
+/// execution. Peak usage is therefore roughly this value times the number of
+/// concurrent agents, plus a constant.
+///
+/// Lowered from ~100 MB to 16 MB: on a host running 22 concurrent agents the
+/// old value allowed scrollback to reach GBs on its own (the deque grows on
+/// demand — this is a ceiling, not a reservation) and resident memory reached
+/// 14.5 GB before an operator restarted the server. Note the accounting is
+/// approximate — `LogMsg::approx_bytes` measures a patch by its serialized
+/// length, which understates its real heap cost — so treat this as a budget
+/// knob, not an exact resident-memory guarantee.
+///
+/// Override with `BC_MSG_HISTORY_BYTES` (bytes).
+static HISTORY_BYTES: LazyLock<usize> =
+    LazyLock::new(|| env_usize("BC_MSG_HISTORY_BYTES", 16 * 1024 * 1024));
+
+/// Capacity, in messages, of the live broadcast ring each [`MsgStore`] creates.
+///
+/// Tokio rounds this up to a power of two and allocates the ring eagerly, and
+/// each occupied slot retains a clone of the message until every receiver has
+/// consumed it — so this costs memory per store even while idle.
+///
+/// It also bounds how far a subscriber may fall behind: one that lags past
+/// capacity receives `Lagged` and PERMANENTLY misses those messages. What
+/// happens next depends on the consumer, and the two differ:
+/// `history_plus_stream` logs `MsgStore broadcast lagged` at error level and
+/// then drops the item without surfacing an error downstream, so the gap is
+/// recorded but invisible to the reader; the events SSE streams in
+/// `services::events::streams` discard the error with no log at all.
+///
+/// The binding constraint is NOT the dashboard — it is
+/// `spawn_stream_raw_logs_to_storage`, which consumes this same stream to
+/// write the durable per-execution JSONL. A lagging writer therefore leaves a
+/// gap in the on-disk record of what an agent did. That path does at least go
+/// through `history_plus_stream`, so such a gap is greppable.
+///
+/// Lowered from 100_000 (131_072 after rounding) to 32_768. That is a 4x cut
+/// rather than the 16x an aggressive value would give, deliberately keeping
+/// headroom for the persistence path until it stops riding a lossy broadcast.
+///
+/// Override with `BC_MSG_BROADCAST_CAPACITY` (messages; rounded up to a power
+/// of two by tokio).
+// TODO(bc-msg-buffers): retire the headroom this value is holding open —
+// give the durable-log writer a lossless transport instead of a broadcast
+// subscription, and add `MsgStore::with_limits` so the replay store in
+// `services::container` is not bounded by a knob tuned for live memory.
+static BROADCAST_CAPACITY: LazyLock<usize> =
+    LazyLock::new(|| env_usize("BC_MSG_BROADCAST_CAPACITY", 32 * 1024));
 
 #[derive(Clone)]
 struct StoredMsg {
@@ -36,7 +88,7 @@ impl Default for MsgStore {
 
 impl MsgStore {
     pub fn new() -> Self {
-        let (sender, _) = broadcast::channel(100000);
+        let (sender, _) = broadcast::channel(*BROADCAST_CAPACITY);
         Self {
             inner: RwLock::new(Inner {
                 history: VecDeque::with_capacity(32),
@@ -50,7 +102,7 @@ impl MsgStore {
         let bytes = msg.approx_bytes();
 
         let mut inner = self.inner.write().unwrap();
-        while inner.total_bytes.saturating_add(bytes) > HISTORY_BYTES {
+        while inner.total_bytes.saturating_add(bytes) > *HISTORY_BYTES {
             if let Some(front) = inner.history.pop_front() {
                 inner.total_bytes = inner.total_bytes.saturating_sub(front.bytes);
             } else {

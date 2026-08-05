@@ -103,6 +103,39 @@ where
     lookup(new_name).or_else(|| lookup(legacy_name))
 }
 
+/// Read a positive `usize` tunable from the environment, falling back to
+/// `default` when unset, unparseable, or zero.
+pub fn env_usize(name: &str, default: usize) -> usize {
+    evaluate_usize_override(name, std::env::var(name).ok(), default)
+}
+
+/// Resolve a `usize` tunable without reading the environment, so the fallback
+/// and warning behaviour is testable. Companion to [`evaluate_disable_flag`].
+///
+/// Zero is rejected rather than honoured because callers use these values to
+/// size buffers: a zero-byte budget evicts every item it is handed, and
+/// `tokio::sync::broadcast::channel(0)` panics. A caller asking for zero has
+/// almost certainly made a mistake, so the default is used and the surprise
+/// reported rather than reinterpreted.
+pub(crate) fn evaluate_usize_override(name: &str, value: Option<String>, default: usize) -> usize {
+    let Some(raw) = value else {
+        return default;
+    };
+
+    match raw.trim().parse::<usize>() {
+        Ok(parsed) if parsed > 0 => parsed,
+        _ => {
+            tracing::warn!(
+                variable = name,
+                value = %raw,
+                default,
+                "Expected a positive integer; falling back to the default"
+            );
+            default
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -227,5 +260,47 @@ mod tests {
             normalize_path_override("BC_TEST_PATH", Some(OsString::from(raw))),
             Some(expected)
         );
+    }
+
+    #[test]
+    fn usize_override_unset_uses_the_default() {
+        assert_eq!(evaluate_usize_override("BC_X", None, 4096), 4096);
+    }
+
+    #[test]
+    fn usize_override_applies_a_positive_value() {
+        assert_eq!(
+            evaluate_usize_override("BC_X", Some("8192".to_string()), 4096),
+            8192
+        );
+    }
+
+    #[test]
+    fn usize_override_tolerates_surrounding_whitespace() {
+        assert_eq!(
+            evaluate_usize_override("BC_X", Some("  8192\n".to_string()), 4096),
+            8192
+        );
+    }
+
+    #[test]
+    fn usize_override_rejects_zero_rather_than_disabling_the_buffer() {
+        // broadcast::channel(0) panics and a zero-byte budget evicts
+        // everything, so zero must never reach a call site.
+        assert_eq!(
+            evaluate_usize_override("BC_X", Some("0".to_string()), 4096),
+            4096
+        );
+    }
+
+    #[test]
+    fn usize_override_falls_back_on_unparseable_values() {
+        for raw in ["", "not-a-number", "-1", "12.5"] {
+            assert_eq!(
+                evaluate_usize_override("BC_X", Some(raw.to_string()), 4096),
+                4096,
+                "expected {raw:?} to fall back"
+            );
+        }
     }
 }
