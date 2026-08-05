@@ -91,6 +91,8 @@ pnpm run prepare-db           # refresh SQLx offline metadata
 | `VK_SHARED_API_BASE` | Runtime | Not set | Base URL of a self-hosted remote API (optional) |
 | `VK_SHARED_RELAY_API_BASE` | Runtime | Not set | Base URL of the relay API for tunnel-mode connections |
 | `VK_TUNNEL` | Runtime | Not set | Enable relay tunnel mode |
+| `BC_MSG_HISTORY_BYTES` | Runtime | `16777216` (16 MiB) | In-memory log scrollback retained per store. Charged per concurrent execution — lower it under memory pressure with many agents, raise it if long runs lose early scrollback |
+| `BC_MSG_BROADCAST_CAPACITY` | Runtime | `32768` | Live log ring size per store, in messages (tokio rounds up to a power of two). Raise it if the logs show `MsgStore broadcast lagged` |
 
 ### Reverse proxy / custom domain
 

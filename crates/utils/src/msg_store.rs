@@ -7,69 +7,51 @@ use futures::{StreamExt, future};
 use tokio::{sync::broadcast, task::JoinHandle};
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
-use crate::{log_msg::LogMsg, stream_lines::LinesStreamExt};
+use crate::{env::env_usize, log_msg::LogMsg, stream_lines::LinesStreamExt};
 
-/// Read a positive `usize` tunable from the environment, falling back to
-/// `default` when unset, unparseable, or zero.
-fn env_usize(name: &str, default: usize) -> usize {
-    evaluate_usize_override(name, std::env::var(name).ok(), default)
-}
-
-/// Resolve a `usize` tunable without reading the environment, so the fallback
-/// and warning behaviour is testable. Mirrors [`crate::env::evaluate_disable_flag`].
+/// Byte budget for the in-memory log history each [`MsgStore`] retains, so a
+/// dashboard client that connects (or reconnects) mid-run gets scrollback.
 ///
-/// Zero is rejected rather than honoured because both call sites would
-/// misbehave: a zero-byte history evicts every message it is handed, and
-/// `broadcast::channel(0)` panics. A caller asking for zero has almost
-/// certainly made a mistake, so the default is used and the surprise reported.
-pub(crate) fn evaluate_usize_override(name: &str, value: Option<String>, default: usize) -> usize {
-    let Some(raw) = value else {
-        return default;
-    };
-
-    match raw.trim().parse::<usize>() {
-        Ok(parsed) if parsed > 0 => parsed,
-        _ => {
-            tracing::warn!(
-                variable = name,
-                value = %raw,
-                default,
-                "expected a positive integer; falling back to the default"
-            );
-            default
-        }
-    }
-}
-
-/// Per-execution in-memory log history, retained so a dashboard client that
-/// connects (or reconnects) mid-run gets scrollback.
-///
-/// This cost is paid PER RUNNING EXECUTION -- the server holds one `MsgStore`
-/// per execution process in a map -- so peak usage is roughly this value times
-/// the number of concurrent agents, not a single global budget.
+/// This is charged PER STORE, and there is more than one kind of store: the
+/// server creates one per running execution (`services::container`), plus a
+/// single process-lifetime events store fed by the DB change hook
+/// (`local_deployment`), plus short-lived stores used to replay a finished
+/// execution. Peak usage is therefore roughly this value times the number of
+/// concurrent agents, plus a constant.
 ///
 /// Lowered from ~100 MB to 16 MB: on a host running 22 concurrent agents the
-/// old value reserved ~2.2 GB for scrollback alone, and resident memory was
-/// observed at 14.5 GB before an operator restarted the server. 16 MB is still
-/// far more than a typical run emits.
+/// old value reserved GBs for scrollback alone and resident memory reached
+/// 14.5 GB before an operator restarted the server. Note the accounting is
+/// approximate — `LogMsg::approx_bytes` measures a patch by its serialized
+/// length, which understates its real heap cost — so treat this as a budget
+/// knob, not an exact resident-memory guarantee.
 ///
-/// Override with `VK_MSG_HISTORY_BYTES` (bytes).
+/// Override with `BC_MSG_HISTORY_BYTES` (bytes).
 static HISTORY_BYTES: LazyLock<usize> =
-    LazyLock::new(|| env_usize("VK_MSG_HISTORY_BYTES", 16 * 1024 * 1024));
+    LazyLock::new(|| env_usize("BC_MSG_HISTORY_BYTES", 16 * 1024 * 1024));
 
-/// Capacity, in messages, of the live broadcast ring for each execution.
+/// Capacity, in messages, of the live broadcast ring each [`MsgStore`] creates.
 ///
-/// Tokio allocates this ring eagerly, so it costs memory per execution even
-/// while idle. It also bounds how far a subscriber may fall behind: one that
-/// lags by more than this many messages gets `Lagged` and permanently misses
-/// them, so this trades memory against tolerance for a slow client.
+/// Tokio rounds this up to a power of two and allocates the ring eagerly, and
+/// each occupied slot retains a clone of the message until every receiver has
+/// consumed it — so this costs memory per store even while idle.
 ///
-/// Lowered from 100_000 to 8_192, which is still thousands of lines of burst
-/// headroom for a websocket consumer that is keeping up.
+/// It also bounds how far a subscriber may fall behind: one that lags past
+/// capacity receives `Lagged` and PERMANENTLY misses those messages.
+/// `history_plus_stream` turns that into a dropped item, so the loss is
+/// silent. The binding constraint is NOT the dashboard — it is
+/// `spawn_stream_raw_logs_to_storage`, which consumes this same stream to
+/// write the durable per-execution JSONL. A lagging writer therefore leaves a
+/// gap in the on-disk record of what an agent did.
 ///
-/// Override with `VK_MSG_BROADCAST_CAPACITY` (messages).
+/// Lowered from 100_000 (131_072 after rounding) to 32_768. That is a 4x cut
+/// rather than the 16x an aggressive value would give, deliberately keeping
+/// headroom for the persistence path until it stops riding a lossy broadcast.
+///
+/// Override with `BC_MSG_BROADCAST_CAPACITY` (messages; rounded up to a power
+/// of two by tokio).
 static BROADCAST_CAPACITY: LazyLock<usize> =
-    LazyLock::new(|| env_usize("VK_MSG_BROADCAST_CAPACITY", 8192));
+    LazyLock::new(|| env_usize("BC_MSG_BROADCAST_CAPACITY", 32 * 1024));
 
 #[derive(Clone)]
 struct StoredMsg {
@@ -249,54 +231,5 @@ impl MsgStore {
                 }
             }
         })
-    }
-}
-
-#[cfg(test)]
-mod buffer_tunable_tests {
-    use super::evaluate_usize_override;
-
-    const DEFAULT: usize = 16 * 1024 * 1024;
-
-    #[test]
-    fn unset_uses_the_default() {
-        assert_eq!(evaluate_usize_override("VK_X", None, DEFAULT), DEFAULT);
-    }
-
-    #[test]
-    fn a_positive_value_overrides() {
-        assert_eq!(
-            evaluate_usize_override("VK_X", Some("4096".to_string()), DEFAULT),
-            4096
-        );
-    }
-
-    #[test]
-    fn surrounding_whitespace_is_tolerated() {
-        assert_eq!(
-            evaluate_usize_override("VK_X", Some("  4096\n".to_string()), DEFAULT),
-            4096
-        );
-    }
-
-    #[test]
-    fn zero_falls_back_rather_than_disabling_the_buffer() {
-        // broadcast::channel(0) panics and a zero-byte history evicts
-        // everything, so zero must never reach the call sites.
-        assert_eq!(
-            evaluate_usize_override("VK_X", Some("0".to_string()), DEFAULT),
-            DEFAULT
-        );
-    }
-
-    #[test]
-    fn unparseable_and_negative_values_fall_back() {
-        for raw in ["", "not-a-number", "-1", "12.5"] {
-            assert_eq!(
-                evaluate_usize_override("VK_X", Some(raw.to_string()), DEFAULT),
-                DEFAULT,
-                "expected {raw:?} to fall back"
-            );
-        }
     }
 }
