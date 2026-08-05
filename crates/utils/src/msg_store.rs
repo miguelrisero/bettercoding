@@ -20,7 +20,8 @@ use crate::{env::env_usize, log_msg::LogMsg, stream_lines::LinesStreamExt};
 /// concurrent agents, plus a constant.
 ///
 /// Lowered from ~100 MB to 16 MB: on a host running 22 concurrent agents the
-/// old value reserved GBs for scrollback alone and resident memory reached
+/// old value allowed scrollback to reach GBs on its own (the deque grows on
+/// demand — this is a ceiling, not a reservation) and resident memory reached
 /// 14.5 GB before an operator restarted the server. Note the accounting is
 /// approximate — `LogMsg::approx_bytes` measures a patch by its serialized
 /// length, which understates its real heap cost — so treat this as a budget
@@ -37,12 +38,18 @@ static HISTORY_BYTES: LazyLock<usize> =
 /// consumed it — so this costs memory per store even while idle.
 ///
 /// It also bounds how far a subscriber may fall behind: one that lags past
-/// capacity receives `Lagged` and PERMANENTLY misses those messages.
-/// `history_plus_stream` turns that into a dropped item, so the loss is
-/// silent. The binding constraint is NOT the dashboard — it is
+/// capacity receives `Lagged` and PERMANENTLY misses those messages. What
+/// happens next depends on the consumer, and the two differ:
+/// `history_plus_stream` logs `MsgStore broadcast lagged` at error level and
+/// then drops the item without surfacing an error downstream, so the gap is
+/// recorded but invisible to the reader; the events SSE streams in
+/// `services::events::streams` discard the error with no log at all.
+///
+/// The binding constraint is NOT the dashboard — it is
 /// `spawn_stream_raw_logs_to_storage`, which consumes this same stream to
 /// write the durable per-execution JSONL. A lagging writer therefore leaves a
-/// gap in the on-disk record of what an agent did.
+/// gap in the on-disk record of what an agent did. That path does at least go
+/// through `history_plus_stream`, so such a gap is greppable.
 ///
 /// Lowered from 100_000 (131_072 after rounding) to 32_768. That is a 4x cut
 /// rather than the 16x an aggressive value would give, deliberately keeping
@@ -50,6 +57,10 @@ static HISTORY_BYTES: LazyLock<usize> =
 ///
 /// Override with `BC_MSG_BROADCAST_CAPACITY` (messages; rounded up to a power
 /// of two by tokio).
+// TODO(bc-msg-buffers): retire the headroom this value is holding open —
+// give the durable-log writer a lossless transport instead of a broadcast
+// subscription, and add `MsgStore::with_limits` so the replay store in
+// `services::container` is not bounded by a knob tuned for live memory.
 static BROADCAST_CAPACITY: LazyLock<usize> =
     LazyLock::new(|| env_usize("BC_MSG_BROADCAST_CAPACITY", 32 * 1024));
 
