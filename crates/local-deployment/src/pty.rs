@@ -2320,9 +2320,42 @@ async fn kill_cli_tmux_home_on(
     .is_ok()
 }
 
+/// How idle a CLI tmux home must be before a guarded kill may touch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReapThresholds {
+    /// Minimum idle time for a home with no attached client.
+    pub detached_idle_secs: i64,
+    /// Minimum idle time for a home that still has a client attached, or
+    /// `None` to never reap an attached home.
+    ///
+    /// Attachment alone is not proof of use. A browser tab left open on a
+    /// workspace holds its attach indefinitely, and while it does, the session
+    /// — and the worktree behind it — can never be reclaimed. tmux's
+    /// `session_activity` is the honest signal: it advances on pane OUTPUT, so
+    /// a session with a live agent, or one a person is actually typing in,
+    /// keeps refreshing it. A home that has produced nothing for a full day is
+    /// dead regardless of who is nominally attached.
+    pub attached_idle_secs: Option<i64>,
+}
+
+impl ReapThresholds {
+    /// Whether a home in this state may be killed.
+    fn permits(&self, attached: bool, idle_secs: i64) -> bool {
+        let threshold = if attached {
+            match self.attached_idle_secs {
+                Some(threshold) => threshold,
+                None => return false,
+            }
+        } else {
+            self.detached_idle_secs
+        };
+        idle_secs >= threshold
+    }
+}
+
 async fn reap_cli_tmux_session_with_liveness_on(
     workspace_id: Uuid,
-    minimum_idle_secs: i64,
+    thresholds: ReapThresholds,
     current_socket: &str,
     legacy_socket: &str,
     legacy_home_enabled: bool,
@@ -2338,10 +2371,18 @@ async fn reap_cli_tmux_session_with_liveness_on(
         }
         match state {
             CliTmuxHomeLiveness::Present {
-                attached: false,
+                attached,
                 idle_secs,
-            } if idle_secs >= minimum_idle_secs => {
+            } if thresholds.permits(attached, idle_secs) => {
                 if kill_cli_tmux_home_on(home, workspace_id, current_socket, legacy_socket).await {
+                    if attached {
+                        tracing::info!(
+                            workspace_id = %workspace_id,
+                            home = ?home,
+                            idle_secs,
+                            "Reaper: killing an ATTACHED but long-silent CLI tmux home"
+                        );
+                    }
                     killed += 1;
                 }
             }
@@ -2357,11 +2398,12 @@ async fn reap_cli_tmux_session_with_liveness_on(
 }
 
 /// Guarded periodic-reaper kill. Unlike explicit workspace cleanup, this makes
-/// an independent fresh decision for each home and never kills an attached,
-/// fresh, or unknown home.
+/// an independent fresh decision for each home and never kills a fresh or
+/// unknown home. An attached home is spared unless
+/// [`ReapThresholds::attached_idle_secs`] says otherwise.
 pub(crate) async fn reap_cli_tmux_session_if_inactive(
     workspace_id: Uuid,
-    minimum_idle_secs: i64,
+    thresholds: ReapThresholds,
 ) -> usize {
     if !tmux_available() {
         return 0;
@@ -2369,7 +2411,7 @@ pub(crate) async fn reap_cli_tmux_session_if_inactive(
     let liveness = cli_tmux_session_liveness(workspace_id).await;
     reap_cli_tmux_session_with_liveness_on(
         workspace_id,
-        minimum_idle_secs,
+        thresholds,
         cli_tmux_socket(),
         legacy_cli_tmux_socket(),
         is_legacy_home_enabled(),
@@ -4522,6 +4564,111 @@ mod tests {
         );
     }
 
+    /// Thresholds matching the pre-existing behaviour: attached is never
+    /// reapable, so tests that predate the attached TTL keep asserting exactly
+    /// what they always did.
+    fn detached_only(detached_idle_secs: i64) -> ReapThresholds {
+        ReapThresholds {
+            detached_idle_secs,
+            attached_idle_secs: None,
+        }
+    }
+
+    #[test]
+    fn attached_home_is_spared_unless_an_attached_threshold_is_set() {
+        let day = 24 * 3600;
+
+        // No attached threshold: attachment is an absolute veto, however stale.
+        assert!(!detached_only(60).permits(true, day * 10));
+
+        let with_attached = ReapThresholds {
+            detached_idle_secs: 60,
+            attached_idle_secs: Some(day),
+        };
+        // Attached and silent past the TTL — a forgotten browser tab.
+        assert!(with_attached.permits(true, day + 1));
+        // Attached and recently active — someone is really using it.
+        assert!(!with_attached.permits(true, day - 1));
+        // The detached threshold is unaffected by the attached one.
+        assert!(with_attached.permits(false, 60));
+        assert!(!with_attached.permits(false, 59));
+    }
+
+    /// The recheck runs against fresh tmux state, so an attached home that
+    /// someone just came back to must survive even though the earlier listing
+    /// said it was stale.
+    #[tokio::test]
+    async fn guarded_reaper_spares_an_attached_home_that_went_active_again() {
+        if !tmux_available() {
+            return;
+        }
+        let pair = scratch_tmux_pair();
+        let workspace_id = Uuid::new_v4();
+        let current_name = cli_tmux_session_name(workspace_id);
+        pair.current.start_session(&current_name);
+
+        let killed = reap_cli_tmux_session_with_liveness_on(
+            workspace_id,
+            ReapThresholds {
+                detached_idle_secs: 60,
+                attached_idle_secs: Some(24 * 3600),
+            },
+            &pair.current.socket,
+            &pair.legacy.socket,
+            true,
+            CliTmuxSessionLiveness {
+                current: CliTmuxHomeLiveness::Present {
+                    attached: true,
+                    idle_secs: 5,
+                },
+                legacy: CliTmuxHomeLiveness::Absent,
+            },
+        )
+        .await;
+
+        assert_eq!(killed, 0);
+        assert_eq!(
+            probe_tmux_session_on(&pair.current.socket, &current_name).await,
+            CliTmuxSessionProbe::Present
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_reaper_kills_an_attached_home_silent_past_the_ttl() {
+        if !tmux_available() {
+            return;
+        }
+        let pair = scratch_tmux_pair();
+        let workspace_id = Uuid::new_v4();
+        let current_name = cli_tmux_session_name(workspace_id);
+        pair.current.start_session(&current_name);
+
+        let killed = reap_cli_tmux_session_with_liveness_on(
+            workspace_id,
+            ReapThresholds {
+                detached_idle_secs: 60,
+                attached_idle_secs: Some(24 * 3600),
+            },
+            &pair.current.socket,
+            &pair.legacy.socket,
+            true,
+            CliTmuxSessionLiveness {
+                current: CliTmuxHomeLiveness::Present {
+                    attached: true,
+                    idle_secs: 24 * 3600 + 1,
+                },
+                legacy: CliTmuxHomeLiveness::Absent,
+            },
+        )
+        .await;
+
+        assert_eq!(killed, 1);
+        assert_eq!(
+            probe_tmux_session_on(&pair.current.socket, &current_name).await,
+            CliTmuxSessionProbe::Absent
+        );
+    }
+
     #[tokio::test]
     async fn guarded_reaper_kills_idle_legacy_but_keeps_fresh_current_home() {
         if !tmux_available() {
@@ -4536,7 +4683,7 @@ mod tests {
 
         let killed = reap_cli_tmux_session_with_liveness_on(
             workspace_id,
-            60,
+            detached_only(60),
             &pair.current.socket,
             &pair.legacy.socket,
             true,
@@ -4576,7 +4723,7 @@ mod tests {
 
         let killed = reap_cli_tmux_session_with_liveness_on(
             workspace_id,
-            0,
+            detached_only(0),
             &pair.current.socket,
             &pair.legacy.socket,
             true,
