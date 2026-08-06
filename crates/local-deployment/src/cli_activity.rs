@@ -228,6 +228,13 @@ fn snapshot_processes() -> ProcSnapshot {
 /// the snapshot so it can be unit tested; bounded to guard against ppid
 /// cycles in a torn /proc scan.
 fn subtree_has_claude(root: u32, procs: &ProcSnapshot) -> bool {
+    subtree_has_agent(root, procs)
+}
+
+/// Whether `root` or any of its descendants is flagged as the agent in
+/// `procs`. Which program counts as "the agent" is baked into the snapshot by
+/// [`snapshot_processes`] / [`snapshot_processes_for`], so this walk is shared.
+fn subtree_has_agent(root: u32, procs: &ProcSnapshot) -> bool {
     // Child lookup is inverted (we store pid → ppid), so walk the table once
     // collecting the descendant set level by level.
     let mut descendants: Vec<u32> = vec![root];
@@ -248,6 +255,143 @@ fn subtree_has_claude(root: u32, procs: &ProcSnapshot) -> bool {
         }
     }
     false
+}
+
+/// Same scan as [`snapshot_processes`], but matching an arbitrary agent binary
+/// instead of hard-coding claude.
+///
+/// The interpreter case is the reason this cannot just compare `comm`: an
+/// npm-shim install runs as `node`, and a uv/pipx install as `python*`, with
+/// the real program name only visible in the cmdline. `cmdline` is read only
+/// for those interpreter processes, so the common case still costs one
+/// `stat` read per pid.
+fn snapshot_processes_for(program: &str) -> ProcSnapshot {
+    const INTERPRETERS: [&str; 4] = ["node", "python", "python3", "bun"];
+
+    let mut map = ProcSnapshot::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return map;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(open) = stat.find('(') else { continue };
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let comm = &stat[open + 1..close];
+        let mut rest = stat[close + 1..].split_whitespace();
+        let _state = rest.next();
+        let Some(ppid) = rest.next().and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+
+        let is_agent = comm == program
+            || (INTERPRETERS.contains(&comm)
+                && std::fs::read_to_string(entry.path().join("cmdline"))
+                    .map(|c| c.contains(program))
+                    .unwrap_or(false));
+
+        map.insert(pid, (ppid, is_agent));
+    }
+    map
+}
+
+/// Whether an agent process is alive inside a workspace's CLI tmux session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentPresence {
+    /// No CLI tmux session exists for this workspace. Attaching creates one and
+    /// runs its bootstrap normally — there is nothing to restart.
+    NoSession,
+    /// An agent process is alive in the session's pane tree.
+    Alive,
+    /// The session exists but holds no agent: the bootstrap's fallback shell,
+    /// or a pane whose agent crashed or was killed.
+    Absent,
+    /// tmux or /proc could not be read. Callers MUST treat this as "do not
+    /// act": never offer a restart on evidence this weak.
+    Unknown,
+}
+
+/// Probe whether `program` is running inside `workspace_id`'s CLI tmux session.
+///
+/// Liveness comes from /proc, never from tmux's `pane_current_command`. The
+/// bootstrap runs the agent under a non-interactive `$SHELL -c` wrapper, which
+/// has no job control, so the agent stays in the wrapper's process group and
+/// the pane's foreground command reads as the shell forever — even while the
+/// agent is running. Reading the tmux field would report every healthy session
+/// as dead.
+///
+/// Fails closed: any unreadable socket yields [`AgentPresence::Unknown`] rather
+/// than a confident "absent" that would offer to kill someone's live pane.
+pub async fn probe_workspace_agent(workspace_id: Uuid, program: &str) -> AgentPresence {
+    if !tmux_available() {
+        return AgentPresence::Unknown;
+    }
+    let mut sockets = vec![cli_tmux_socket()];
+    if is_legacy_home_enabled() {
+        // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+        sockets.push(legacy_cli_tmux_socket());
+    }
+
+    let mut rows = Vec::new();
+    for socket in &sockets {
+        match observe_tmux_socket_on(socket).await {
+            TmuxPaneSocketSnapshot::Rows(bytes) => rows.push(bytes),
+            TmuxPaneSocketSnapshot::Empty => {}
+            TmuxPaneSocketSnapshot::Failed(error) => {
+                tracing::warn!(socket, error, "agent liveness probe could not read tmux");
+                return AgentPresence::Unknown;
+            }
+        }
+    }
+
+    // Collect this workspace's pane pids before touching /proc, so a workspace
+    // with no session never pays for the scan.
+    let mut pane_pids = Vec::new();
+    for output in &rows {
+        for line in String::from_utf8_lossy(output).lines() {
+            let mut fields = line.split('|');
+            let (Some(session_name), Some(pane_pid)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            if workspace_id_from_cli_session_name(session_name) != Some(workspace_id) {
+                continue;
+            }
+            match pane_pid.trim().parse::<u32>() {
+                Ok(pid) => pane_pids.push(pid),
+                // The session is real but its pane pid is unreadable, so
+                // "absent" cannot be established. Fail closed.
+                Err(_) => return AgentPresence::Unknown,
+            }
+        }
+    }
+
+    if pane_pids.is_empty() {
+        return AgentPresence::NoSession;
+    }
+
+    let procs = snapshot_processes_for(program);
+    if procs.is_empty() {
+        // /proc was unreadable; every subtree would falsely look empty.
+        return AgentPresence::Unknown;
+    }
+    if pane_pids
+        .into_iter()
+        .any(|pid| subtree_has_agent(pid, &procs))
+    {
+        AgentPresence::Alive
+    } else {
+        AgentPresence::Absent
+    }
 }
 
 pub struct CliActivityMonitor;
@@ -957,6 +1101,33 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// The agent-agnostic walk must behave exactly like the claude-specific
+    /// one it now backs, including the ppid-cycle bound.
+    #[test]
+    fn agent_subtree_walk_matches_the_claude_walk() {
+        let nested = procs(&[(100, 1, false), (101, 100, false), (102, 101, true)]);
+        assert!(subtree_has_agent(100, &nested));
+        assert_eq!(
+            subtree_has_agent(100, &nested),
+            subtree_has_claude(100, &nested)
+        );
+
+        let shell_only = procs(&[(100, 1, false), (101, 100, false)]);
+        assert!(!subtree_has_agent(100, &shell_only));
+
+        let cyclic = procs(&[(100, 101, false), (101, 100, false)]);
+        assert!(!subtree_has_agent(100, &cyclic));
+    }
+
+    /// A sibling process running the agent is NOT this pane's agent. Without
+    /// the descendant walk, any concurrently running agent anywhere on the box
+    /// would mask a genuinely dead pane and hide the restart banner.
+    #[test]
+    fn an_agent_outside_the_pane_subtree_does_not_count() {
+        let snapshot = procs(&[(100, 1, false), (200, 1, true)]);
+        assert!(!subtree_has_agent(100, &snapshot));
     }
 
     #[test]

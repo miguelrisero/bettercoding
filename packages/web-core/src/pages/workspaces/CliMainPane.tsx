@@ -4,11 +4,14 @@ import {
   ChatsTeardropIcon,
   CircleIcon,
   CircleNotchIcon,
+  WarningCircleIcon,
+  XIcon,
 } from '@phosphor-icons/react';
 
 import { XTermInstance } from '@/shared/components/XTermInstance';
 import { LoopAutomationControl } from '@/shared/components/LoopAutomationControl';
 import { cliTabId, useTerminal } from '@/shared/hooks/useTerminal';
+import { useCliAgentStatus } from '@/shared/hooks/useCliAgentStatus';
 
 interface CliMainPaneProps {
   workspaceId: string;
@@ -70,6 +73,10 @@ export function CliMainPane({
 }: CliMainPaneProps) {
   const { t } = useTranslation('common');
   const { closeTab } = useTerminal();
+  // Only probe once the terminal is actually the thing on screen: while an
+  // executor holds the pane there is no session of ours to judge.
+  const { showRestart, restarting, restartError, restart, dismiss } =
+    useCliAgentStatus(workspaceId, sessionsReady && !executorRunning);
 
   useEffect(() => {
     return () => closeTab(workspaceId, cliTabId(workspaceId));
@@ -168,13 +175,63 @@ export function CliMainPane({
           </div>
         ) : (
           sessionsReady && (
-            <XTermInstance
-              tabId={cliTabId(workspaceId)}
-              workspaceId={workspaceId}
-              isActive
-              mode="cli"
-              sessionId={sessionId ?? undefined}
-            />
+            <div className="h-full flex flex-col">
+              {showRestart && (
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className="flex items-center gap-3 border-b border-border bg-primary px-4 py-2 shrink-0"
+                >
+                  <WarningCircleIcon
+                    className="size-icon-sm text-low shrink-0"
+                    weight="bold"
+                    aria-hidden="true"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs font-medium text-normal">
+                      {t('cliMode.agentStoppedTitle')}
+                    </p>
+                    <p className="text-xs text-low truncate">
+                      {restartError ?? t('cliMode.agentStoppedBody')}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={restart}
+                    disabled={restarting}
+                    className="flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs text-normal hover:bg-secondary transition-colors disabled:opacity-60"
+                  >
+                    {restarting && (
+                      <CircleNotchIcon
+                        className="size-icon-sm animate-spin motion-reduce:animate-none"
+                        weight="bold"
+                        aria-hidden="true"
+                      />
+                    )}
+                    {restarting
+                      ? t('cliMode.agentRestarting')
+                      : t('cliMode.agentRestart')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={dismiss}
+                    aria-label={t('cliMode.agentStoppedDismiss')}
+                    className="rounded-md p-1 text-low hover:bg-secondary transition-colors"
+                  >
+                    <XIcon className="size-icon-sm" weight="bold" />
+                  </button>
+                </div>
+              )}
+              <div className="flex-1 min-h-0">
+                <XTermInstance
+                  tabId={cliTabId(workspaceId)}
+                  workspaceId={workspaceId}
+                  isActive
+                  mode="cli"
+                  sessionId={sessionId ?? undefined}
+                />
+              </div>
+            </div>
           )
         )}
       </div>

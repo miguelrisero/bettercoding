@@ -501,6 +501,126 @@ impl Drop for CliPromptDelivery {
     }
 }
 
+/// Build the bootstrap for a RESTART of an existing session's agent.
+///
+/// Deliberately narrower than the launch bootstrap: no prompt file, no
+/// deferred-paste flag, no busy-resume wait. A restart rejoins the existing
+/// conversation (by resume id when known, otherwise the agent's
+/// continue-fallback) and never delivers a prompt.
+///
+/// That omission is load-bearing. [`CliPromptDelivery`] reasons that a losing
+/// racer may attach without the prompt because "`new-session -A` ignores its
+/// bootstrap anyway" — true only while bootstraps never run against existing
+/// sessions. Respawn breaks that premise, so a restart bootstrap that could
+/// carry a prompt would be able to re-deliver or double-deliver a parked one.
+/// Keeping the prompt out by construction is what makes respawn safe here.
+pub fn cli_restart_bootstrap(spec: &CliLaunchSpec, resume_session_id: Option<&str>) -> String {
+    cli_bootstrap(spec, resume_session_id, None, false, None)
+}
+
+/// Workspaces with a pane respawn currently in flight. See [`CliRespawnClaim`].
+static CLI_RESPAWNS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+
+/// In-process claim that exactly ONE respawn runs for a workspace at a time.
+///
+/// Two browser tabs that both notice a dead agent will both POST the restart.
+/// Without the claim each would run `respawn-pane -k`, and the second would
+/// kill the agent the first had just started — an endless restart loop for as
+/// long as both tabs are open. Modeled on [`CliPromptDelivery`], including its
+/// poison and guard-drop handling.
+#[derive(Debug)]
+pub struct CliRespawnClaim(Uuid);
+
+impl CliRespawnClaim {
+    /// Claim the workspace's respawn, or `None` if one is already running.
+    pub fn try_claim(workspace_id: Uuid) -> Option<Self> {
+        let set = CLI_RESPAWNS.get_or_init(Default::default);
+        // Release the registry guard BEFORE constructing the claim: `Drop`
+        // re-locks this same non-reentrant mutex, so building `Self` while the
+        // guard is alive would self-deadlock on the not-inserted path.
+        let inserted = set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(workspace_id);
+        inserted.then(|| Self(workspace_id))
+    }
+}
+
+impl Drop for CliRespawnClaim {
+    fn drop(&mut self) {
+        if let Some(set) = CLI_RESPAWNS.get() {
+            set.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.0);
+        }
+    }
+}
+
+/// Relaunch the agent inside a workspace's EXISTING CLI tmux session.
+///
+/// `new-session -A` cannot do this: on an existing session it attaches and
+/// silently discards the bootstrap, which is why a session whose agent died
+/// hands the user a dead fallback shell no matter how many times they reload.
+/// `respawn-pane -k` replaces the pane's process with the bootstrap instead,
+/// and allocates a FRESH pty in the process — which also clears the stuck
+/// raw-mode termios left behind by an agent killed mid-TUI.
+///
+/// Current (`bc_`) sessions only. Legacy `vk_` sessions are attach-only by
+/// design and are rejected rather than respawned.
+///
+/// The caller must hold a [`CliRespawnClaim`], and the bootstrap must NOT carry
+/// a parked prompt: see [`CliPromptDelivery`], whose "the loser's bootstrap is
+/// discarded anyway" reasoning stops holding the moment bootstraps run against
+/// existing sessions. A restart resumes the conversation; it never re-delivers.
+pub async fn respawn_cli_tmux_pane(
+    workspace_id: Uuid,
+    _claim: &CliRespawnClaim,
+    working_dir: &Path,
+    bootstrap: &str,
+) -> Result<(), PtyError> {
+    if !tmux_available() {
+        return Err(PtyError::CreateFailed("tmux is not available".to_string()));
+    }
+    let (socket, session_name) = cli_tmux_target(CliTmuxHome::Current, workspace_id);
+    let args = cli_respawn_argv_on(socket, &session_name, working_dir, bootstrap);
+
+    let output = run_cli_tmux_output_os(&args)
+        .await
+        .map_err(PtyError::CreateFailed)?;
+    if output.status.success() {
+        tracing::info!(%workspace_id, session_name, "respawned CLI agent pane");
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(PtyError::CreateFailed(format!(
+        "tmux respawn-pane failed for {session_name}: {stderr}"
+    )))
+}
+
+/// Build the `respawn-pane` argv. Split out so the exact flags are unit
+/// testable without a tmux server: `-k` kills the pane's current process
+/// (the dead agent, or the fallback shell it left behind), `=` anchors the
+/// target to an exact session name, and `-c` re-roots the new process in the
+/// workspace dir.
+fn cli_respawn_argv_on(
+    socket: &str,
+    session_name: &str,
+    working_dir: &Path,
+    bootstrap: &str,
+) -> Vec<std::ffi::OsString> {
+    vec![
+        "-L".into(),
+        socket.into(),
+        "respawn-pane".into(),
+        "-k".into(),
+        "-t".into(),
+        format!("={session_name}").into(),
+        "-c".into(),
+        working_dir.as_os_str().to_owned(),
+        bootstrap.into(),
+    ]
+}
+
 /// How to install each interactive-CLI agent, shown in the pane when its binary
 /// isn't on PATH. Kept here (next to the bootstrap that prints it) rather than on
 /// the spec so the message stays a deployment concern.
@@ -1390,6 +1510,29 @@ async fn locate_cli_tmux_session(workspace_id: Uuid) -> Result<CliTmuxLocation, 
 /// Locate and pin a workspace's tmux target for a multi-step operation. `None`
 /// means tmux is unavailable; when neither session exists, the target is the
 /// current home where a new session would be created.
+/// Whether the workspace's live CLI session lives in the legacy `vk_` home.
+///
+/// Legacy sessions are attach-only: they were created before the current
+/// bootstrap existed, so there is nothing to re-run against them and
+/// `respawn-pane` would replace their pane with an empty command. Callers use
+/// this to refuse a restart rather than break the session.
+///
+/// Fails CLOSED — an unlocatable session reports `true`, so an unreadable tmux
+/// can only ever suppress a restart, never authorize one.
+// TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+pub async fn cli_tmux_session_is_legacy(workspace_id: Uuid) -> bool {
+    if !tmux_available() {
+        return true;
+    }
+    match locate_cli_tmux_session(workspace_id).await {
+        Ok(location) => location.home == CliTmuxHome::Legacy,
+        Err(error) => {
+            tracing::warn!(%workspace_id, %error, "could not classify CLI tmux home; assuming legacy");
+            true
+        }
+    }
+}
+
 pub async fn locate_cli_tmux_target(workspace_id: Uuid) -> Option<CliTmuxTarget> {
     if !tmux_available() {
         return None;
@@ -3111,6 +3254,23 @@ pub(crate) async fn run_cli_tmux_output(args: &[&str]) -> Result<std::process::O
     .map_err(|e| e.to_string())
 }
 
+/// [`run_cli_tmux_output`] for argv that cannot be `&str`: a bootstrap or a
+/// working directory may be non-UTF-8, and both are passed through verbatim.
+pub(crate) async fn run_cli_tmux_output_os(
+    args: &[std::ffi::OsString],
+) -> Result<std::process::Output, String> {
+    tokio::time::timeout(
+        CLI_TMUX_COMMAND_TIMEOUT,
+        tokio::process::Command::new("tmux")
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("tmux command timed out after {CLI_TMUX_COMMAND_TIMEOUT:?}"))?
+    .map_err(|e| e.to_string())
+}
+
 pub(crate) async fn run_cli_tmux(args: &[&str]) -> Result<std::process::Output, String> {
     let output = run_cli_tmux_output(args).await?;
 
@@ -3281,6 +3441,78 @@ mod tests {
         assert!(
             b.ends_with(r#"exec "${SHELL:-/bin/sh}""#),
             "bootstrap must keep the pane alive after the agent exits"
+        );
+    }
+
+    #[test]
+    fn respawn_argv_kills_the_pane_and_anchors_an_exact_session() {
+        let args = argv_strings(cli_respawn_argv_on(
+            "bettercoding",
+            "bc_abc",
+            Path::new("/tmp/ws"),
+            "exec claude",
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "-L",
+                "bettercoding",
+                "respawn-pane",
+                // Without -k the pane's dead shell survives and tmux refuses.
+                "-k",
+                "-t",
+                // '=' anchors an EXACT name; a prefix match could respawn a
+                // different workspace's session.
+                "=bc_abc",
+                "-c",
+                "/tmp/ws",
+                "exec claude",
+            ]
+        );
+    }
+
+    /// The invariant that makes respawn safe next to `CliPromptDelivery`: a
+    /// restart bootstrap must never be able to carry a parked prompt, because
+    /// bootstraps now run against EXISTING sessions.
+    #[test]
+    fn restart_bootstrap_never_carries_a_prompt() {
+        let bootstrap = cli_restart_bootstrap(&claude_spec(&[]), None);
+
+        assert!(!bootstrap.contains("bc_p"), "no prompt-file read stage");
+        assert!(!bootstrap.contains("cat "), "no prompt file is consumed");
+        assert!(
+            bootstrap.contains("--continue"),
+            "a restart with no known session id falls back to continue"
+        );
+    }
+
+    #[test]
+    fn restart_bootstrap_resumes_a_known_session() {
+        let id = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+        let bootstrap = cli_restart_bootstrap(&claude_spec(&[]), Some(id));
+
+        assert!(bootstrap.contains(&format!("--resume {id}")));
+        assert!(!bootstrap.contains("bc_p"));
+    }
+
+    #[test]
+    fn respawn_claim_is_exclusive_and_released_on_drop() {
+        let workspace_id = Uuid::new_v4();
+
+        let first = CliRespawnClaim::try_claim(workspace_id).expect("first claim");
+        assert!(
+            CliRespawnClaim::try_claim(workspace_id).is_none(),
+            "a second tab must not respawn concurrently — it would kill the agent the first just started"
+        );
+
+        // A different workspace is unaffected.
+        assert!(CliRespawnClaim::try_claim(Uuid::new_v4()).is_some());
+
+        drop(first);
+        assert!(
+            CliRespawnClaim::try_claim(workspace_id).is_some(),
+            "claim must be released on drop so a later restart can proceed"
         );
     }
 

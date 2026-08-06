@@ -1,16 +1,21 @@
 {
   "cliMode": {
+    "agentRestart": "エージェントを再起動",
+    "agentRestarting": "再起動中…",
+    "agentRunningBody": "コーディングエージェントがチャットでこのタスクを実行中です。完了するとターミナルが同じ会話を引き継ぎます — ここでプロンプトを繰り返す必要はありません。",
+    "agentRunningTitle": "Claude がプロンプトを処理しています",
+    "agentRunningViewChat": "チャットで進捗を見る",
+    "agentStoppedBody": "このセッションのエージェントが停止しました。再起動して会話を続けてください。",
+    "agentStoppedDismiss": "閉じる",
+    "agentStoppedTitle": "エージェントが停止しています",
+    "backToChat": "チャットに戻る",
+    "idle": "待機中",
+    "persistentHint": "永続的な tmux セッション",
+    "setupRunningBody": "セットアップスクリプトを実行中です。完了するとターミナルがプロンプトとともに開きます。",
+    "setupRunningTitle": "ワークスペースを準備しています",
     "title": "Claude CLI",
     "titleShort": "CLI",
-    "persistentHint": "永続的な tmux セッション",
-    "backToChat": "チャットに戻る",
-    "agentRunningTitle": "Claude がプロンプトを処理しています",
-    "agentRunningBody": "コーディングエージェントがチャットでこのタスクを実行中です。完了するとターミナルが同じ会話を引き継ぎます — ここでプロンプトを繰り返す必要はありません。",
-    "agentRunningViewChat": "チャットで進捗を見る",
-    "setupRunningTitle": "ワークスペースを準備しています",
-    "setupRunningBody": "セットアップスクリプトを実行中です。完了するとターミナルがプロンプトとともに開きます。",
-    "working": "作業中…",
-    "idle": "待機中"
+    "working": "作業中…"
   },
   "loopAutomation": {
     "label": "継続",
