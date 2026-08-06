@@ -582,29 +582,94 @@ pub async fn respawn_cli_tmux_pane(
         return Err(PtyError::CreateFailed("tmux is not available".to_string()));
     }
     let (socket, session_name) = cli_tmux_target(CliTmuxHome::Current, workspace_id);
-    let args = cli_respawn_argv_on(socket, &session_name, working_dir, bootstrap);
+    respawn_cli_tmux_pane_on(socket, &session_name, working_dir, bootstrap).await
+}
+
+/// [`respawn_cli_tmux_pane`] against an explicit socket and session, so the
+/// whole resolve-then-respawn sequence can be driven against a scratch tmux
+/// server in tests. The original defect lived in exactly this wiring — what
+/// gets passed to `-t` — so testing the pieces in isolation could not catch it.
+async fn respawn_cli_tmux_pane_on(
+    socket: &str,
+    session_name: &str,
+    working_dir: &Path,
+    bootstrap: &str,
+) -> Result<(), PtyError> {
+    let pane_id = resolve_cli_pane_id_on(socket, session_name).await?;
+    let args = cli_respawn_argv_on(socket, &pane_id, working_dir, bootstrap);
 
     let output = run_cli_tmux_output_os(&args)
         .await
         .map_err(PtyError::CreateFailed)?;
     if output.status.success() {
-        tracing::info!(%workspace_id, session_name, "respawned CLI agent pane");
+        tracing::info!(session_name, pane_id, "respawned CLI agent pane");
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     Err(PtyError::CreateFailed(format!(
-        "tmux respawn-pane failed for {session_name}: {stderr}"
+        "tmux respawn-pane failed for {session_name} (pane {pane_id}): {stderr}"
     )))
 }
 
+/// Resolve the pane to respawn for an EXACT session name.
+///
+/// `respawn-pane` takes a target-pane, and neither obvious session-shaped
+/// target is safe there:
+/// - `=<session>` is session-target syntax and is rejected outright
+///   ("can't find pane"), which is how every restart failed at first.
+/// - a bare `<session>:` is PREFIX-matched, so `bc_aaaa:` happily resolves to
+///   session `bc_aaaa1111` — it would respawn a DIFFERENT workspace's pane.
+/// - `list-panes -t "=<session>"` does not save it either: `-t` is a window
+///   target there, and `=bc_aaaa` still matched `bc_aaaa1111` in testing.
+///
+/// So the session name is matched in userspace against `list-panes -a` output
+/// and the respawn targets a pane id, which is a unique exact token. This is
+/// the same approach `observe_tmux_socket_on` already uses to attribute panes
+/// to workspaces, rather than trusting tmux target matching.
+///
+/// The FIRST pane of the session is chosen: that is where the bootstrap ran,
+/// so a pane a user split off themselves is never the one replaced.
+async fn resolve_cli_pane_id_on(socket: &str, session_name: &str) -> Result<String, PtyError> {
+    let output = run_cli_tmux_output(&[
+        "-L",
+        socket,
+        "list-panes",
+        "-a",
+        "-F",
+        "#{session_name}\t#{pane_id}",
+    ])
+    .await
+    .map_err(PtyError::CreateFailed)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(PtyError::CreateFailed(format!(
+            "tmux list-panes failed on socket {socket}: {stderr}"
+        )));
+    }
+
+    first_pane_id_for_session(&String::from_utf8_lossy(&output.stdout), session_name).ok_or_else(
+        || PtyError::CreateFailed(format!("no tmux pane found for session {session_name}")),
+    )
+}
+
+/// Pick the first pane id belonging to `session_name`, matching the name in
+/// full. Pure over the listing so the exactness guarantee is unit testable.
+fn first_pane_id_for_session(listing: &str, session_name: &str) -> Option<String> {
+    listing.lines().find_map(|line| {
+        let (name, pane_id) = line.split_once('\t')?;
+        (name == session_name).then(|| pane_id.trim().to_string())
+    })
+}
+
 /// Build the `respawn-pane` argv. Split out so the exact flags are unit
-/// testable without a tmux server: `-k` kills the pane's current process
-/// (the dead agent, or the fallback shell it left behind), `=` anchors the
-/// target to an exact session name, and `-c` re-roots the new process in the
-/// workspace dir.
+/// testable without a tmux server: `-k` kills the pane's current process (the
+/// dead agent, or the fallback shell it left behind), `-t` takes a resolved
+/// PANE id (see [`resolve_cli_pane_id_on`]), and `-c` re-roots the new process
+/// in the workspace dir.
 fn cli_respawn_argv_on(
     socket: &str,
-    session_name: &str,
+    pane_id: &str,
     working_dir: &Path,
     bootstrap: &str,
 ) -> Vec<std::ffi::OsString> {
@@ -614,7 +679,7 @@ fn cli_respawn_argv_on(
         "respawn-pane".into(),
         "-k".into(),
         "-t".into(),
-        format!("={session_name}").into(),
+        pane_id.into(),
         "-c".into(),
         working_dir.as_os_str().to_owned(),
         bootstrap.into(),
@@ -3487,10 +3552,10 @@ mod tests {
     }
 
     #[test]
-    fn respawn_argv_kills_the_pane_and_anchors_an_exact_session() {
+    fn respawn_argv_kills_the_pane_and_targets_a_pane_id() {
         let args = argv_strings(cli_respawn_argv_on(
             "bettercoding",
-            "bc_abc",
+            "%46",
             Path::new("/tmp/ws"),
             "exec claude",
         ));
@@ -3501,17 +3566,118 @@ mod tests {
                 "-L",
                 "bettercoding",
                 "respawn-pane",
-                // Without -k the pane's dead shell survives and tmux refuses.
+                // Without -k the pane's live process survives and tmux refuses.
                 "-k",
                 "-t",
-                // '=' anchors an EXACT name; a prefix match could respawn a
-                // different workspace's session.
-                "=bc_abc",
+                // A PANE id, not a session name. `respawn-pane` takes a
+                // target-pane, where `=name` session syntax is rejected
+                // outright ("can't find pane"), and a bare `name:` is
+                // PREFIX-matched — `bc_aaaa:` resolves to `bc_aaaa1111`.
+                // Pane ids are unique exact tokens, so neither hazard applies.
+                "%46",
                 "-c",
                 "/tmp/ws",
                 "exec claude",
             ]
         );
+    }
+
+    #[test]
+    fn pane_id_lookup_matches_the_session_name_exactly() {
+        let listing = "bc_aaaa1111\t%3\nbc_aaaa\t%7\nbc_bbbb2222\t%9\n";
+
+        assert_eq!(
+            first_pane_id_for_session(listing, "bc_aaaa"),
+            Some("%7".to_string()),
+            "a longer session sharing the prefix must not win"
+        );
+        assert_eq!(
+            first_pane_id_for_session(listing, "bc_aaaa1111"),
+            Some("%3".to_string())
+        );
+        assert_eq!(first_pane_id_for_session(listing, "bc_cccc"), None);
+    }
+
+    #[test]
+    fn pane_id_lookup_takes_the_first_pane_of_a_split_session() {
+        let listing = "bc_aaaa\t%4\nbc_aaaa\t%5\n";
+
+        assert_eq!(
+            first_pane_id_for_session(listing, "bc_aaaa"),
+            Some("%4".to_string()),
+            "the bootstrap runs in the session's first pane; a user's split must not be respawned"
+        );
+    }
+
+    /// The regression this exists for: the original implementation targeted
+    /// `=<session>`, copied from `has-session`/`kill-session` where it IS
+    /// correct. `respawn-pane` takes a target-PANE and rejects that syntax, so
+    /// every restart failed with "can't find pane". An argv-only unit test
+    /// could not catch it — this one drives a real tmux server.
+    #[tokio::test]
+    async fn respawn_replaces_the_pane_process_on_a_real_tmux_server() {
+        if !tmux_available() {
+            return;
+        }
+        let pair = scratch_tmux_pair();
+        let session_name = "bc_respawn_target";
+        pair.current.start_session(session_name);
+
+        let before = pane_pid_of(&pair.current.socket, session_name);
+
+        // Drives the SAME resolve-then-respawn path the route uses, rather
+        // than assembling the pieces here — the defect was in that wiring.
+        respawn_cli_tmux_pane_on(
+            &pair.current.socket,
+            session_name,
+            Path::new("/tmp"),
+            "sleep 600",
+        )
+        .await
+        .expect("respawn should succeed against a live session");
+
+        let after = pane_pid_of(&pair.current.socket, session_name);
+        assert_ne!(
+            before, after,
+            "respawn must replace the pane's process, giving it a fresh pty"
+        );
+    }
+
+    /// A session that does not exist must be reported as such, not as a
+    /// successful no-op.
+    #[tokio::test]
+    async fn resolving_a_pane_for_a_missing_session_is_an_error() {
+        if !tmux_available() {
+            return;
+        }
+        let pair = scratch_tmux_pair();
+
+        assert!(
+            resolve_cli_pane_id_on(&pair.current.socket, "bc_definitely_absent")
+                .await
+                .is_err()
+        );
+    }
+
+    fn pane_pid_of(socket: &str, session_name: &str) -> String {
+        let output = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                socket,
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}\t#{pane_pid}",
+            ])
+            .output()
+            .expect("list panes");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| {
+                let (name, pid) = line.split_once('\t')?;
+                (name == session_name).then(|| pid.to_string())
+            })
+            .expect("pane pid for session")
     }
 
     /// The invariant that makes respawn safe next to `CliPromptDelivery`: a

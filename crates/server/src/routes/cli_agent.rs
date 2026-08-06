@@ -267,7 +267,16 @@ async fn restart_agent(
     };
 
     let bootstrap = cli_restart_bootstrap(&context.spec, context.resume_session_id.as_deref());
-    respawn_cli_tmux_pane(workspace_id, &claim, &context.working_dir, &bootstrap).await?;
+    // Surface the tmux failure verbatim rather than letting `?` fold it into
+    // `ApiError::Pty(_)`, which renders as a bare "An internal error occurred"
+    // with the cause dropped. A failed respawn is an operational condition the
+    // user (or whoever reads the report) can act on — "can't find pane",
+    // "no server running" — and hiding it turns a one-line diagnosis into a
+    // log dig. 502 rather than 500: the failing dependency is the tmux server
+    // we shell out to, not this handler.
+    respawn_cli_tmux_pane(workspace_id, &claim, &context.working_dir, &bootstrap)
+        .await
+        .map_err(|error| ApiError::BadGateway(error.to_string()))?;
 
     Ok(ResponseJson(ApiResponse::success(CliRestartResponse {
         restarted: true,
