@@ -7,6 +7,7 @@ import type {
 
 import { useHostId } from '@/shared/providers/HostIdProvider';
 import { useJsonPatchWsStream } from '@/shared/hooks/useJsonPatchWsStream';
+import { useUserSystem } from '@/shared/hooks/useUserSystem';
 
 export interface UseSessionNativeFeedResult {
   snapshot: NativeFeedSnapshot | undefined;
@@ -50,22 +51,29 @@ function compareNativeEntries(
  * The server publishes every update as a revisioned top-level snapshot
  * replacement. Sorting a copy keeps the transport snapshot immutable while
  * preserving source order for entries produced from the same native record.
+ *
+ * Gated on the server's `cli_handover_enabled` flag. The feature ships dark
+ * because the server rebuilds and re-serializes a session's ENTIRE transcript
+ * on every appended line, and this hook then re-runs an Immer produce plus a
+ * full sort copy over the result — an O(n²) cost in transcript length, paid
+ * once per connected tab. While the flag is off no socket is opened at all: the
+ * hook reports a stable empty snapshot and the conversation renders
+ * executor-only.
  */
 export function useSessionNativeFeed(
   sessionId: string | undefined
 ): UseSessionNativeFeedResult {
   const hostId = useHostId();
-  const endpoint = sessionId
-    ? `${hostId ? `/api/host/${hostId}` : '/api'}/sessions/${sessionId}/native-feed/ws`
-    : undefined;
+  const { cliHandoverEnabled } = useUserSystem();
+  const enabled = Boolean(sessionId) && cliHandoverEnabled;
+  const endpoint =
+    sessionId && cliHandoverEnabled
+      ? `${hostId ? `/api/host/${hostId}` : '/api'}/sessions/${sessionId}/native-feed/ws`
+      : undefined;
   const initialData = useCallback(createEmptyNativeFeedSnapshot, []);
 
   const { data, isConnected, isInitialized, error } =
-    useJsonPatchWsStream<NativeFeedSnapshot>(
-      endpoint,
-      Boolean(sessionId),
-      initialData
-    );
+    useJsonPatchWsStream<NativeFeedSnapshot>(endpoint, enabled, initialData);
 
   const entries = useMemo(
     () => [...(data?.entries ?? [])].sort(compareNativeEntries),

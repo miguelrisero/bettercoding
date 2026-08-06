@@ -9,6 +9,7 @@ pub mod command_ext;
 pub mod diff;
 pub mod env;
 pub mod execution_logs;
+pub mod feature_flags;
 pub mod http_headers;
 pub mod jwt;
 pub mod log_msg;

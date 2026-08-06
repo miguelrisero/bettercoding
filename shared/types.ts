@@ -320,7 +320,15 @@ export type UserSystemInfo = { version: string, config: Config, machine_id: stri
 /**
  * Capabilities supported per executor (e.g., { "CLAUDE_CODE": ["SESSION_FORK"] })
  */
-capabilities: { [key in string]?: Array<BaseAgentCapability> }, shared_api_base: string | null, preview_proxy_port: number | null, executors: { [key in BaseCodingAgent]?: ExecutorProfile }, };
+capabilities: { [key in string]?: Array<BaseAgentCapability> }, shared_api_base: string | null, preview_proxy_port: number | null, 
+/**
+ * Whether the CLI↔UI handover (native transcript feed + collaboration
+ * routing) is active on this server. The feature ships dark, so the web
+ * app must consult this before opening the per-session native-feed
+ * WebSocket — a disabled server accepts the connection only to answer with
+ * an empty snapshot and hang up.
+ */
+cli_handover_enabled: boolean, executors: { [key in BaseCodingAgent]?: ExecutorProfile }, };
 
 export type Environment = { os_type: string, os_version: string, os_architecture: string, bitness: string, };
 
