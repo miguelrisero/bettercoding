@@ -23,6 +23,8 @@ import {
   TagSearchParams,
   UpdateTag,
   UserSystemInfo,
+  CliAgentStatus,
+  CliRestartResponse,
   McpServerQuery,
   UpdateMcpServersBody,
   GetMcpServerResponse,
@@ -1144,6 +1146,30 @@ export const configApi = {
   cliAgentAvailability: async (): Promise<CliAgentAvailability> => {
     const response = await makeRequest('/api/agents/cli-availability');
     return handleApiResponse<CliAgentAvailability>(response);
+  },
+};
+
+/**
+ * Detect and recover a CLI tmux session whose agent has died.
+ *
+ * `tmux new-session -A` discards its bootstrap when the session already
+ * exists, so a pane whose agent crashed stays dead across reloads. Restart
+ * respawns it in place.
+ */
+export const cliAgentApi = {
+  status: async (workspaceId: string): Promise<CliAgentStatus> => {
+    const response = await makeRequest(
+      `/api/workspaces/${workspaceId}/cli/agent-status`
+    );
+    return handleApiResponse<CliAgentStatus>(response);
+  },
+
+  restart: async (workspaceId: string): Promise<CliRestartResponse> => {
+    const response = await makeRequest(
+      `/api/workspaces/${workspaceId}/cli/restart`,
+      { method: 'POST' }
+    );
+    return handleApiResponse<CliRestartResponse>(response);
   },
 };
 

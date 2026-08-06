@@ -398,6 +398,44 @@ export type UnassignedCliSession = { claude_session_id: string, cwd: string, dir
 
 export type AssignNativeCliSessionRequest = { claude_session_id: string, session_id: string, };
 
+export type CliAgentStatus = { 
+/**
+ * `Some(false)` is the only state that warrants offering a restart.
+ * `None` means liveness could not be established and the UI must stay
+ * quiet rather than guess.
+ */
+agent_alive: boolean | null, 
+/**
+ * Present so the UI can distinguish "no session yet" from "session with a
+ * dead agent" without inferring it from `agent_alive`.
+ */
+session_present: boolean, 
+/**
+ * Whether a restart would be accepted right now.
+ */
+restartable: boolean, 
+/**
+ * Why not, when `restartable` is false and the agent is not simply alive.
+ */
+blocker: CliRestartBlocker | null, 
+/**
+ * The agent binary the liveness probe looked for, for diagnostics.
+ */
+program: string, };
+
+export type CliRestartBlocker = "no_session" | "executor_running" | "legacy_session" | "unknown";
+
+export type CliRestartResponse = { 
+/**
+ * Always true on success; a failure is reported as an API error instead.
+ */
+restarted: boolean, 
+/**
+ * Whether the restart resumed a known conversation. When false the agent
+ * falls back to its own continue/fresh behaviour.
+ */
+resumed: boolean, };
+
 export type StartSpake2EnrollmentRequest = { enrollment_code: string, client_message_b64: string, };
 
 export type FinishSpake2EnrollmentRequest = { enrollment_id: string, client_id: string, client_name: string, client_browser: string, client_os: string, client_device: string, public_key_b64: string, client_proof_b64: string, };

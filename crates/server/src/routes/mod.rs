@@ -7,6 +7,7 @@ use tower_http::{compression::CompressionLayer, validate_request::ValidateReques
 use crate::{DeploymentImpl, middleware};
 
 pub mod approvals;
+pub mod cli_agent;
 pub mod config;
 pub mod containers;
 pub mod filesystem;
@@ -55,6 +56,7 @@ pub fn router(deployment: DeploymentImpl) -> IntoMakeService<Router> {
         .merge(releases::router())
         .merge(sessions::router(&deployment))
         .merge(terminal::router())
+        .merge(cli_agent::router())
         .merge(loop_automation::router())
         .merge(native_transcripts::router())
         .route("/ssh-session", get(ssh_session::ssh_session_ws))

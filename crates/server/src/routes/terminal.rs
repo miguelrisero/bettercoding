@@ -99,7 +99,7 @@ enum TerminalMessage {
 /// session; chat/automation sessions fall back to the most recent coding-agent
 /// run's `executor_config`. `(None, None)` means none was found and the launch
 /// uses its own defaults (Opus at max effort).
-async fn resolve_cli_model_effort(
+pub(super) async fn resolve_cli_model_effort(
     pool: &SqlitePool,
     session: Option<&Session>,
 ) -> (Option<String>, Option<String>) {
@@ -145,7 +145,7 @@ async fn resolve_cli_model_effort(
 /// model/effort are folded in as overrides so the interactive launch honors the
 /// same selection as headless mode. Agents without their own interactive CLI
 /// support fall back to a default claude launch so CLI mode always works.
-fn resolve_cli_launch_spec(
+pub(super) fn resolve_cli_launch_spec(
     session: Option<&Session>,
     model_id: Option<String>,
     reasoning_id: Option<String>,

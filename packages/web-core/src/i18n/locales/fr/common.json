@@ -1,16 +1,21 @@
 {
   "cliMode": {
+    "agentRestart": "Redémarrer l'agent",
+    "agentRestarting": "Redémarrage…",
+    "agentRunningBody": "L'agent de code exécute cette tâche dans le chat. Le terminal reprendra la même conversation dès qu'il aura terminé — inutile de répéter le prompt ici.",
+    "agentRunningTitle": "Claude travaille sur votre prompt",
+    "agentRunningViewChat": "Suivre la progression dans le chat",
+    "agentStoppedBody": "L'agent de cette session s'est arrêté. Redémarrez-le pour poursuivre la conversation.",
+    "agentStoppedDismiss": "Ignorer",
+    "agentStoppedTitle": "Agent arrêté",
+    "backToChat": "Retour au chat",
+    "idle": "Inactif",
+    "persistentHint": "session tmux persistante",
+    "setupRunningBody": "Un script d'installation est en cours d'exécution. Le terminal s'ouvrira avec votre prompt dès qu'il sera terminé.",
+    "setupRunningTitle": "Préparation de l'espace de travail",
     "title": "CLI Claude",
     "titleShort": "CLI",
-    "persistentHint": "session tmux persistante",
-    "backToChat": "Retour au chat",
-    "agentRunningTitle": "Claude travaille sur votre prompt",
-    "agentRunningBody": "L'agent de code exécute cette tâche dans le chat. Le terminal reprendra la même conversation dès qu'il aura terminé — inutile de répéter le prompt ici.",
-    "agentRunningViewChat": "Suivre la progression dans le chat",
-    "setupRunningTitle": "Préparation de l'espace de travail",
-    "setupRunningBody": "Un script d'installation est en cours d'exécution. Le terminal s'ouvrira avec votre prompt dès qu'il sera terminé.",
-    "working": "En cours…",
-    "idle": "Inactif"
+    "working": "En cours…"
   },
   "loopAutomation": {
     "label": "Continuer",

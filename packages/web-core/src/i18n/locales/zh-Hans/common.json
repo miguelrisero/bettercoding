@@ -1,16 +1,21 @@
 {
   "cliMode": {
+    "agentRestart": "重启代理",
+    "agentRestarting": "正在重启…",
+    "agentRunningBody": "编码代理正在聊天中执行此任务。完成后终端将接管同一会话 — 无需在此重复提示。",
+    "agentRunningTitle": "Claude 正在处理你的提示",
+    "agentRunningViewChat": "在聊天中查看进度",
+    "agentStoppedBody": "此会话的代理已停止。重新启动以继续对话。",
+    "agentStoppedDismiss": "关闭",
+    "agentStoppedTitle": "代理未运行",
+    "backToChat": "返回聊天",
+    "idle": "空闲",
+    "persistentHint": "持久 tmux 会话",
+    "setupRunningBody": "安装脚本正在运行。完成后终端将带着你的提示打开。",
+    "setupRunningTitle": "正在准备工作区",
     "title": "Claude CLI",
     "titleShort": "CLI",
-    "persistentHint": "持久 tmux 会话",
-    "backToChat": "返回聊天",
-    "agentRunningTitle": "Claude 正在处理你的提示",
-    "agentRunningBody": "编码代理正在聊天中执行此任务。完成后终端将接管同一会话 — 无需在此重复提示。",
-    "agentRunningViewChat": "在聊天中查看进度",
-    "setupRunningTitle": "正在准备工作区",
-    "setupRunningBody": "安装脚本正在运行。完成后终端将带着你的提示打开。",
-    "working": "工作中…",
-    "idle": "空闲"
+    "working": "工作中…"
   },
   "loopAutomation": {
     "label": "继续运行",
