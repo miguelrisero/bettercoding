@@ -268,6 +268,20 @@ impl Workspace {
     /// Find workspaces that are expired and eligible for cleanup.
     /// Uses accelerated cleanup (1 hour) for archived workspaces.
     /// Uses standard cleanup (72 hours) for non-archived workspaces.
+    ///
+    /// Freshness is `max(workspace.updated_at, last completed execution)`, and
+    /// both halves must be NULL-safe. SQLite's SCALAR `max(X, Y)` returns NULL
+    /// when either argument is NULL, so comparing against a bare
+    /// `max(w.updated_at, ep.completed_at)` yields NULL — and `X > NULL` is
+    /// never true — for any workspace that has never had a completed execution
+    /// process. That silently exempted every CLI-mode workspace (the
+    /// interactive tmux agent is not an execution_process) from cleanup for the
+    /// lifetime of the install, stranding tens of GB of worktrees on disk.
+    /// `COALESCE` collapses the missing half onto `updated_at` instead.
+    ///
+    /// Timestamps are stored in UTC, so the threshold is computed in UTC too;
+    /// `datetime('now', 'localtime')` compared cleanup ages against wall-clock
+    /// local time and skewed the TTL by the host's UTC offset.
     pub async fn find_expired_for_cleanup(
         pool: &SqlitePool,
     ) -> Result<Vec<Workspace>, sqlx::Error> {
@@ -299,7 +313,7 @@ impl Workspace {
                     WHERE ep2.completed_at IS NULL
                 )
             GROUP BY w.id, w.container_ref, w.updated_at
-            HAVING datetime('now', 'localtime',
+            HAVING datetime('now',
                 CASE
                     WHEN w.archived = 1
                     THEN '-1 hours'
@@ -309,7 +323,7 @@ impl Workspace {
                 MAX(
                     max(
                         datetime(w.updated_at),
-                        datetime(ep.completed_at)
+                        datetime(COALESCE(ep.completed_at, w.updated_at))
                     )
                 )
             )
@@ -843,6 +857,124 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// Age a workspace so both cleanup TTLs (1h archived / 72h live) are past.
+    async fn backdate_workspace(pool: &SqlitePool, workspace_id: Uuid, hours: i64) {
+        let stamp = format!("-{hours} hours");
+        sqlx::query("UPDATE workspaces SET updated_at = datetime('now', ?) WHERE id = ?")
+            .bind(&stamp)
+            .bind(workspace_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn add_session(pool: &SqlitePool, workspace_id: Uuid) -> Uuid {
+        let session_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO sessions (id, workspace_id, executor) VALUES (?, ?, ?)")
+            .bind(session_id)
+            .bind(workspace_id)
+            .bind("CLAUDE_CODE")
+            .execute(pool)
+            .await
+            .unwrap();
+        session_id
+    }
+
+    /// A CLI-mode workspace: it has a session, but the interactive agent runs
+    /// inside tmux and is never recorded as an `execution_process`, so nothing
+    /// ever populates `ep.completed_at`. SQLite's scalar `max(X, NULL)` is NULL,
+    /// which made the cleanup HAVING clause unsatisfiable and exempted these
+    /// workspaces from cleanup forever.
+    #[tokio::test]
+    async fn expired_cleanup_includes_workspaces_with_no_completed_executions() {
+        let pool = test_pool().await;
+        let workspace = create_test_workspace(&pool).await;
+        Workspace::update_container_ref(&pool, workspace.id, "/tmp/ws/no-executions")
+            .await
+            .unwrap();
+        add_session(&pool, workspace.id).await;
+        backdate_workspace(&pool, workspace.id, 96).await;
+
+        let expired = Workspace::find_expired_for_cleanup(&pool).await.unwrap();
+
+        assert!(
+            expired.iter().any(|w| w.id == workspace.id),
+            "a 96h-old workspace with zero completed executions must be eligible for cleanup"
+        );
+    }
+
+    /// The same shape, archived, against the accelerated 1-hour TTL.
+    #[tokio::test]
+    async fn expired_cleanup_includes_archived_workspace_with_no_executions() {
+        let pool = test_pool().await;
+        let workspace = create_test_workspace(&pool).await;
+        Workspace::update_container_ref(&pool, workspace.id, "/tmp/ws/archived")
+            .await
+            .unwrap();
+        add_session(&pool, workspace.id).await;
+        Workspace::set_archived(&pool, workspace.id, true)
+            .await
+            .unwrap();
+        backdate_workspace(&pool, workspace.id, 4).await;
+
+        let expired = Workspace::find_expired_for_cleanup(&pool).await.unwrap();
+
+        assert!(
+            expired.iter().any(|w| w.id == workspace.id),
+            "a 4h-old archived workspace must be past the 1-hour accelerated TTL"
+        );
+    }
+
+    /// The NULL-safe COALESCE must not make everything eligible: a workspace
+    /// touched inside its TTL still has to be spared.
+    #[tokio::test]
+    async fn expired_cleanup_spares_recently_updated_workspace() {
+        let pool = test_pool().await;
+        let workspace = create_test_workspace(&pool).await;
+        Workspace::update_container_ref(&pool, workspace.id, "/tmp/ws/fresh")
+            .await
+            .unwrap();
+        add_session(&pool, workspace.id).await;
+
+        let expired = Workspace::find_expired_for_cleanup(&pool).await.unwrap();
+
+        assert!(
+            !expired.iter().any(|w| w.id == workspace.id),
+            "a workspace updated just now must not be eligible for cleanup"
+        );
+    }
+
+    /// A completed execution newer than `updated_at` still extends the window,
+    /// so the surviving `max()` half must keep working.
+    #[tokio::test]
+    async fn expired_cleanup_respects_recent_completed_execution() {
+        let pool = test_pool().await;
+        let workspace = create_test_workspace(&pool).await;
+        Workspace::update_container_ref(&pool, workspace.id, "/tmp/ws/recent-exec")
+            .await
+            .unwrap();
+        let session_id = add_session(&pool, workspace.id).await;
+        sqlx::query(
+            "INSERT INTO execution_processes
+                (id, session_id, run_reason, status, created_at, updated_at, started_at, completed_at)
+             VALUES (?, ?, 'codingagent', 'completed', datetime('now'), datetime('now'),
+                     datetime('now'), datetime('now'))",
+        )
+        .bind(Uuid::new_v4())
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        backdate_workspace(&pool, workspace.id, 96).await;
+
+        let expired = Workspace::find_expired_for_cleanup(&pool).await.unwrap();
+
+        assert!(
+            !expired.iter().any(|w| w.id == workspace.id),
+            "a just-completed execution must keep an otherwise-stale workspace alive"
+        );
     }
 
     #[test]
