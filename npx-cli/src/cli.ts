@@ -19,6 +19,31 @@ import {
   cleanOldDesktopVersions,
 } from "./desktop";
 
+// Cap glibc's per-thread malloc arenas before we spawn any binary.
+//
+// glibc gives threads separate 64 MB heaps ("arenas") so they don't contend on
+// a single allocator lock, and allows up to 8 * ncores of them. Freed memory
+// goes back to its arena rather than to the OS, so RSS becomes a high-water
+// mark. A container still reports the HOST cpu count -- a cgroup quota does
+// not change /proc/cpuinfo -- so on a 32-core box that is up to 256 arenas,
+// ~16 GB of headroom for fragmentation, however few cores it may actually use.
+//
+// Measured on a 12-core-quota container reporting 32 cores and running ~170
+// tokio workers: 121 arenas >= 32 MB held 6.58 GB of an 8.66 GB RSS, climbing
+// ~3 GB/h. With the cap, the same workload sat flat at ~0.5 GB. A second
+// container on the same build with 20 threads used 0.05 GB -- that contrast is
+// what identified thread count, not a leak, as the driver.
+//
+// 4 rather than 2: 2 measured marginally smaller, but makes every thread share
+// two allocator locks, and the savings curve is already flat by 4.
+//
+// Setting MALLOC_ARENA_MAX yourself overrides this; it only fills a default.
+// The real fix is a global allocator that returns memory to the OS (jemalloc
+// or mimalloc), which would make this unnecessary.
+if (process.env.MALLOC_ARENA_MAX === undefined) {
+  process.env.MALLOC_ARENA_MAX = "4";
+}
+
 const CLI_VERSION: string = require("../package.json").version;
 
 type RootOptions = {
