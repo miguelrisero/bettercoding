@@ -345,7 +345,7 @@ impl LocalContainerService {
     /// since last activity and no running coding agent, so a freshly-resumed
     /// detached turn is spared. A per-session recheck closes the list→kill race.
     async fn reap_idle_cli_sessions(&self) {
-        const IDLE_REAP_HOURS: i64 = 48;
+        const IDLE_REAP_HOURS: i64 = 24;
         const ACTIVITY_GRACE_SECS: i64 = 60;
 
         if utils::env::disable_flag_set("DISABLE_CLI_SESSION_REAP") {
@@ -368,8 +368,14 @@ impl LocalContainerService {
         let mut reaped = 0usize;
 
         for (workspace_id, attached, idle_secs) in sessions {
-            // Never reap a session a user is currently attached to.
-            if attached {
+            // An attached session is spared unless it has also been completely
+            // silent past the TTL. Attachment alone is not evidence of use: a
+            // browser tab left open on a workspace holds its attach forever,
+            // and while it does neither the session nor its worktree can ever
+            // be reclaimed. `idle_secs` comes from tmux `session_activity`,
+            // which advances on pane OUTPUT — a live agent, or someone
+            // actually typing, keeps it fresh.
+            if attached && idle_secs <= idle_ttl {
                 continue;
             }
             // Fail CLOSED: a transient DB error must never read as "workspace
@@ -427,9 +433,18 @@ impl LocalContainerService {
             // Pre-kill recheck against fresh tmux state (TOCTOU): make the
             // decision independently for each home. A user may have attached,
             // activity may be fresh, or one socket may now be unreadable.
-            let killed =
-                crate::pty::reap_cli_tmux_session_if_inactive(workspace_id, ACTIVITY_GRACE_SECS)
-                    .await;
+            let killed = crate::pty::reap_cli_tmux_session_if_inactive(
+                workspace_id,
+                crate::pty::ReapThresholds {
+                    detached_idle_secs: ACTIVITY_GRACE_SECS,
+                    // The recheck re-derives attachment from FRESH tmux state,
+                    // so an attached home must clear the full TTL again here —
+                    // the settle grace that suffices for a detached home would
+                    // let a session someone just attached to be killed.
+                    attached_idle_secs: Some(idle_ttl),
+                },
+            )
+            .await;
             if killed == 0 {
                 continue;
             }
