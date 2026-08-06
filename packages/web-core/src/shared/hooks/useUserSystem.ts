@@ -18,6 +18,13 @@ export interface UserSystemState {
   machineId: string | null;
   loginStatus: LoginStatus | null;
   remoteAuthDegraded: string | null;
+  /**
+   * Whether the server has the CLI↔UI handover switched on. The feature ships
+   * dark; while it is off the per-session native-feed WebSocket must never be
+   * opened. Defaults to `false` until the config query resolves, so a slow
+   * config load can never transiently open the stream.
+   */
+  cliHandoverEnabled: boolean;
 }
 
 export interface UserSystemContextType {
@@ -39,6 +46,7 @@ export interface UserSystemContextType {
   machineId: string | null;
   loginStatus: LoginStatus | null;
   remoteAuthDegraded: string | null;
+  cliHandoverEnabled: boolean;
   setEnvironment: (env: Environment | null) => void;
   setProfiles: (profiles: Record<string, ExecutorProfile> | null) => void;
   setCapabilities: (caps: Record<string, BaseAgentCapability[]> | null) => void;

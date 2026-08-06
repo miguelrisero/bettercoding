@@ -244,19 +244,32 @@ pub struct ClaudeTranscriptIngest {
 }
 
 impl ClaudeTranscriptIngest {
-    /// Check the kill switch exactly once. A set value of any kind disables
-    /// the entire service and no Claude-store watcher is created.
+    /// Check the feature gate exactly once at startup.
+    ///
+    /// The CLI↔UI handover ships dark, so this returns `None` — no watcher, no
+    /// publisher, no registry reconcile — unless `ENABLE_CLI_HANDOVER` is set.
+    ///
+    /// Retention is the deliberate exception and is spawned either way. It is
+    /// the pruner for `cli_native_record`/`cli_native_file`; gating it behind
+    /// the feature flag would strand every row an earlier enabled run wrote,
+    /// growing the database forever and making every write-lock hold slower.
+    /// Turning the feature off must let the existing data drain, not freeze it.
     pub fn spawn(
         db: DBService,
         writer_probe: Arc<dyn CliWriterProbe>,
         shutdown: CancellationToken,
     ) -> Option<Arc<Self>> {
-        if std::env::var_os("DISABLE_CLI_TRANSCRIPT_INGEST").is_some() {
-            tracing::info!("CLI transcript ingest disabled by environment");
-            return None;
-        }
         let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
         let service = Arc::new(Self::new_with_probe(db, projects_dir, writer_probe));
+
+        if !utils::feature_flags::cli_handover_enabled() {
+            tracing::info!(
+                flag = utils::feature_flags::CLI_HANDOVER_ENV,
+                "CLI transcript ingest is disabled; running retention only"
+            );
+            tokio::spawn(service.run_retention(shutdown.child_token()));
+            return None;
+        }
 
         tokio::spawn(service.clone().run_publisher(shutdown.child_token()));
         let native_link_updates = native_link_events().subscribe();

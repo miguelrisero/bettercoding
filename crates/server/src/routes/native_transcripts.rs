@@ -54,7 +54,18 @@ async fn stream_native_feed_ws(
                         break;
                     }
                 }
-                let _ = socket.close().await;
+                // Close with an EXPLICIT 1000. A bare `close()` sends a close
+                // frame with no status code, which browsers surface as
+                // `CloseEvent.code == 1005`; the client's reconnect guard only
+                // treats `code === 1000 && wasClean` as terminal, so an empty
+                // code read as an unexpected drop and the tab reconnected
+                // forever on the 8s backoff cap against a feature that is off.
+                let _ = socket
+                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: axum::extract::ws::close_code::NORMAL,
+                        reason: "cli transcript ingest disabled".into(),
+                    })))
+                    .await;
                 return;
             }
         };

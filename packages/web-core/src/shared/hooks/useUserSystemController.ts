@@ -44,6 +44,9 @@ export function useUserSystemController({
   const machineId = userSystemInfo?.machine_id || null;
   const loginStatus = userSystemInfo?.login_status || null;
   const remoteAuthDegraded = userSystemInfo?.remote_auth_degraded || null;
+  // Default to off while the config query is in flight: opening the native
+  // feed for even one render defeats the point of shipping the feature dark.
+  const cliHandoverEnabled = userSystemInfo?.cli_handover_enabled ?? false;
   const profiles =
     (userSystemInfo?.executors as Record<string, ExecutorProfile> | null) ||
     null;
@@ -153,6 +156,7 @@ export function useUserSystemController({
         machineId,
         loginStatus,
         remoteAuthDegraded,
+        cliHandoverEnabled,
       },
       appVersion,
       previewProxyPort,
@@ -163,6 +167,7 @@ export function useUserSystemController({
       machineId,
       loginStatus,
       remoteAuthDegraded,
+      cliHandoverEnabled,
       updateConfig,
       saveConfig,
       updateAndSaveConfig,
@@ -182,6 +187,7 @@ export function useUserSystemController({
       previewProxyPort,
       loginStatus,
       remoteAuthDegraded,
+      cliHandoverEnabled,
       profiles,
       reloadSystem,
       saveConfig,

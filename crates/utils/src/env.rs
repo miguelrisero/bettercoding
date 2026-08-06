@@ -96,6 +96,40 @@ pub(crate) fn evaluate_disable_flag(name: &str, value: Option<String>) -> bool {
     true
 }
 
+/// Check an `ENABLE_*` style opt-in flag.
+///
+/// The mirror image of [`disable_flag_set`]: absent means off, and only an
+/// explicitly truthy value turns the gated behaviour on. Opt-in flags guard
+/// features that are off by default precisely because they are not trusted yet,
+/// so `ENABLE_X=0` must mean "off" rather than "present, therefore on" — the
+/// opposite of the opt-out convention. An unrecognized value is treated as off
+/// and reported, so a typo fails safe instead of silently enabling the feature.
+pub fn enable_flag_set(name: &str) -> bool {
+    evaluate_enable_flag(name, std::env::var(name).ok())
+}
+
+/// Evaluate an opt-in flag without reading the environment, so the warning
+/// behaviour is testable.
+pub(crate) fn evaluate_enable_flag(name: &str, value: Option<String>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "" | "0" | "false" | "no" | "off" => false,
+        other => {
+            tracing::warn!(
+                variable = name,
+                value = %other,
+                "Opt-in flag is set to an unrecognized value and is treated as DISABLED; \
+                 use 1/true/yes/on to enable it"
+            );
+            false
+        }
+    }
+}
+
 fn select_env_var_with_legacy<F>(lookup: F, new_name: &str, legacy_name: &str) -> Option<String>
 where
     F: Fn(&str) -> Option<String>,
@@ -173,6 +207,40 @@ mod tests {
                 "{value:?} should still disable"
             );
         }
+    }
+
+    #[test]
+    fn enable_flag_is_off_when_variable_is_absent() {
+        assert!(!evaluate_enable_flag("ENABLE_X", None));
+    }
+
+    #[test]
+    fn enable_flag_is_on_only_for_truthy_values() {
+        for value in ["1", "true", "yes", "on", "  TRUE  "] {
+            assert!(
+                evaluate_enable_flag("ENABLE_X", Some(value.to_string())),
+                "{value:?} should enable"
+            );
+        }
+    }
+
+    /// The inverse of the opt-out convention, and the reason this helper exists
+    /// separately: an opt-in flag guards a feature that is off by default, so
+    /// `ENABLE_X=0` must mean off rather than "present, therefore on".
+    #[test]
+    fn falsy_values_do_not_enable() {
+        for value in ["0", "false", "no", "off", "", "  FALSE  "] {
+            assert!(
+                !evaluate_enable_flag("ENABLE_X", Some(value.to_string())),
+                "{value:?} should not enable"
+            );
+        }
+    }
+
+    /// A typo must fail safe rather than switch the feature on.
+    #[test]
+    fn unrecognized_values_do_not_enable() {
+        assert!(!evaluate_enable_flag("ENABLE_X", Some("ture".to_string())));
     }
 
     #[test]

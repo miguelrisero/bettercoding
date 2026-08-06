@@ -198,6 +198,7 @@ impl CliCollabService {
         ingest: Option<Arc<ClaudeTranscriptIngest>>,
         shutdown: CancellationToken,
     ) -> Arc<Self> {
+        let routing_disabled = !utils::feature_flags::cli_handover_enabled();
         let service = Arc::new(Self {
             db,
             probe,
@@ -209,9 +210,20 @@ impl CliCollabService {
             executor_claim_owner: Uuid::new_v4().to_string(),
             paste_claim_owner: Uuid::new_v4().to_string(),
             notify: Notify::new(),
-            routing_disabled: std::env::var_os("DISABLE_CLI_COLLAB_ROUTING").is_some(),
+            routing_disabled,
             shutdown,
         });
+        // With routing disabled the drain loop has nothing to dispatch and the
+        // ingest wakeup has nothing to observe, so neither task is spawned at
+        // all. Previously `run_drain` ran unconditionally and woke on every
+        // notify even when the gate rejected everything it found.
+        if routing_disabled {
+            tracing::info!(
+                flag = utils::feature_flags::CLI_HANDOVER_ENV,
+                "CLI collaboration routing is disabled; no drain or ingest-wakeup task started"
+            );
+            return service;
+        }
         tokio::spawn(service.clone().run_drain());
         if let Some(ingest) = &service.ingest {
             let updates = ingest.subscribe();
