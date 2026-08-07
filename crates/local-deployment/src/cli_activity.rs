@@ -321,6 +321,112 @@ pub enum AgentPresence {
     Unknown,
 }
 
+/// Interactive shells the bootstrap drops a pane into once its agent exits.
+/// A pane running only one of these has nothing worth protecting.
+const PANE_SHELLS: [&str; 8] = ["sh", "bash", "zsh", "dash", "fish", "ash", "ksh", "tcsh"];
+
+/// Whether a workspace's CLI pane still runs anything besides its shell.
+///
+/// The reaper needs this because its DB-based guard
+/// (`has_running_non_dev_server_processes_for_workspace`) cannot see CLI
+/// agents at all: an interactive agent lives inside tmux and is never recorded
+/// as an `execution_process`. Judging "is anything running here" from the
+/// process tree is the only check that covers it.
+///
+/// Deliberately agent-agnostic. It answers "is this pane doing something",
+/// not "is claude alive", so it protects a codex pane, a gemini pane, and a
+/// long `cargo build` a user started in the fallback shell.
+pub async fn probe_workspace_pane_busy(workspace_id: Uuid) -> AgentPresence {
+    let Some(pane_pids) = cli_pane_pids_for(workspace_id).await else {
+        return AgentPresence::Unknown;
+    };
+    if pane_pids.is_empty() {
+        return AgentPresence::NoSession;
+    }
+
+    let procs = snapshot_processes_matching(|comm| !PANE_SHELLS.contains(&comm));
+    if procs.is_empty() {
+        return AgentPresence::Unknown;
+    }
+    if pane_pids
+        .into_iter()
+        .any(|pid| subtree_has_agent(pid, &procs))
+    {
+        AgentPresence::Alive
+    } else {
+        AgentPresence::Absent
+    }
+}
+
+/// Pane pids for one workspace across both sockets, or `None` when tmux could
+/// not be read (so callers fail closed rather than assume "no session").
+async fn cli_pane_pids_for(workspace_id: Uuid) -> Option<Vec<u32>> {
+    if !tmux_available() {
+        return None;
+    }
+    let mut sockets = vec![cli_tmux_socket()];
+    if is_legacy_home_enabled() {
+        // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
+        sockets.push(legacy_cli_tmux_socket());
+    }
+
+    let mut pane_pids = Vec::new();
+    for socket in &sockets {
+        match observe_tmux_socket_on(socket).await {
+            TmuxPaneSocketSnapshot::Rows(bytes) => {
+                for line in String::from_utf8_lossy(&bytes).lines() {
+                    let mut fields = line.split('|');
+                    let (Some(name), Some(pid)) = (fields.next(), fields.next()) else {
+                        continue;
+                    };
+                    if workspace_id_from_cli_session_name(name) != Some(workspace_id) {
+                        continue;
+                    }
+                    pane_pids.push(pid.trim().parse::<u32>().ok()?);
+                }
+            }
+            TmuxPaneSocketSnapshot::Empty => {}
+            TmuxPaneSocketSnapshot::Failed(error) => {
+                tracing::warn!(socket, error, "pane-busy probe could not read tmux");
+                return None;
+            }
+        }
+    }
+    Some(pane_pids)
+}
+
+/// One /proc scan flagging every process whose `comm` satisfies `is_match`.
+fn snapshot_processes_matching(is_match: impl Fn(&str) -> bool) -> ProcSnapshot {
+    let mut map = ProcSnapshot::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return map;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(open) = stat.find('(') else { continue };
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let comm = &stat[open + 1..close];
+        let mut rest = stat[close + 1..].split_whitespace();
+        let _state = rest.next();
+        let Some(ppid) = rest.next().and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        map.insert(pid, (ppid, is_match(comm)));
+    }
+    map
+}
+
 /// Probe whether `program` is running inside `workspace_id`'s CLI tmux session.
 ///
 /// Liveness comes from /proc, never from tmux's `pane_current_command`. The
@@ -1101,6 +1207,65 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// The reaper's busy guard must protect ANY work in the pane, not just a
+    /// known agent binary. A pane holding only its fallback shell is idle; a
+    /// pane running anything else is busy.
+    #[test]
+    fn pane_busy_matcher_ignores_shells_and_catches_everything_else() {
+        let is_busy = |comm: &str| !PANE_SHELLS.contains(&comm);
+
+        for shell in PANE_SHELLS {
+            assert!(
+                !is_busy(shell),
+                "{shell} is a bare fallback shell, not work"
+            );
+        }
+        // The agent this was built for, plus agents the claude-only probe
+        // would have missed, plus ordinary user work in the fallback shell.
+        for busy in [
+            "claude", "codex", "gemini", "node", "cargo", "pytest", "vim",
+        ] {
+            assert!(is_busy(busy), "{busy} must count as a busy pane");
+        }
+    }
+
+    /// The guard is agent-agnostic on purpose: a codex pane must be protected
+    /// even though `subtree_has_claude` would report nothing.
+    #[test]
+    fn pane_busy_protects_a_non_claude_agent() {
+        let procs =
+            snapshot_processes_matching_for_test(&[(100, 1, "zsh"), (101, 100, "codex")], |comm| {
+                !PANE_SHELLS.contains(&comm)
+            });
+        assert!(subtree_has_agent(100, &procs));
+        // The claude-specific view sees nothing here — hence the separate probe.
+        let claude_view =
+            snapshot_processes_matching_for_test(&[(100, 1, "zsh"), (101, 100, "codex")], |comm| {
+                comm == "claude"
+            });
+        assert!(!subtree_has_agent(100, &claude_view));
+    }
+
+    #[test]
+    fn pane_holding_only_its_fallback_shell_is_not_busy() {
+        let procs =
+            snapshot_processes_matching_for_test(&[(100, 1, "zsh"), (101, 100, "sh")], |comm| {
+                !PANE_SHELLS.contains(&comm)
+            });
+        assert!(!subtree_has_agent(100, &procs));
+    }
+
+    /// Mirrors `snapshot_processes_matching` over a fixture instead of /proc.
+    fn snapshot_processes_matching_for_test(
+        entries: &[(u32, u32, &str)],
+        is_match: impl Fn(&str) -> bool,
+    ) -> ProcSnapshot {
+        entries
+            .iter()
+            .map(|(pid, ppid, comm)| (*pid, (*ppid, is_match(comm))))
+            .collect()
     }
 
     /// The agent-agnostic walk must behave exactly like the claude-specific
