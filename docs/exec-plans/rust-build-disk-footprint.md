@@ -165,10 +165,21 @@ whole cache. Complements option 1 rather than replacing it.
 one per branch is what lets several agents work bettercoding simultaneously.
 Capping them caps concurrent agent work — which is the capability the whole
 setup exists to provide — in exchange for disk, which is the cheapest resource
-to buy. It also targets the wrong thing: a worktree's *source* is ~1G, while its
-*generated* output is 3-5G (`target/` is 70-82% of every Rust worktree measured
-here). Nine worktrees at 1G of source is a rounding error; nine stale `target/`
-dirs is not.
+to buy. It also targets the wrong thing. Measured per worktree (2026-08-12):
+
+```
+worktree            TOTAL   target/  node_modules   SOURCE
+vk-deploy-build     6.11G     5.02G         0.95G    0.15G
+main-deploy         5.92G     4.83G         0.94G    0.15G
+bc-seamless-p2      4.27G     3.06G         1.03G    0.18G
+bc-archive-buckets  1.26G     0.00G         1.12G    0.15G
+bc-subagent-tabs    1.20G     0.00G         1.12G    0.08G
+```
+
+**The source checkout is 80-180 MB. Everything else is regenerable.** Generated
+output is ~97% of a Rust worktree and ~93% of a frontend-only one. Nine
+worktrees of source is roughly 1G in total — genuinely a rounding error against
+a 876G disk. Nine stale `target/` dirs is 12.9G.
 
 The rule this plan asserts: **retention belongs on generated artifacts, keyed on
 age, never on the count of the thing that generates them.** Sweep a cold
