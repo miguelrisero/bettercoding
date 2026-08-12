@@ -161,6 +161,24 @@ whole cache. Complements option 1 rather than replacing it.
 
 ## What NOT to do
 
+**Do not cap the number of worktrees.** Worktrees are the parallelism mechanism:
+one per branch is what lets several agents work bettercoding simultaneously.
+Capping them caps concurrent agent work — which is the capability the whole
+setup exists to provide — in exchange for disk, which is the cheapest resource
+to buy. It also targets the wrong thing: a worktree's *source* is ~1G, while its
+*generated* output is 3-5G (`target/` is 70-82% of every Rust worktree measured
+here). Nine worktrees at 1G of source is a rounding error; nine stale `target/`
+dirs is not.
+
+The rule this plan asserts: **retention belongs on generated artifacts, keyed on
+age, never on the count of the thing that generates them.** Sweep a cold
+`target/` and the worktree stays usable — the next build just takes longer.
+Delete a worktree and you have deleted someone's branch checkout.
+
+This is the same error as "reduce `RUNNER_CPUS` to lower load average" on the
+devpod side: throttling the mechanism instead of fixing the artifact it leaves
+behind. Both look like capacity management and are really just capacity removal.
+
 **Do not set a shared `CARGO_TARGET_DIR` across worktrees.** It looks like the
 obvious fix — one `target/` instead of N — and it would genuinely eliminate the
 duplication. But cargo takes an **exclusive file lock** on the target directory
@@ -184,10 +202,9 @@ a disk problem for a concurrency problem, on the axis we care about most.
    touched, so check with whoever owns `chief/bc-seamless-p2` first: it is
    **unmerged**, so that worktree is real work-in-progress even though its build
    is cold.
-5. **Bound the worktree count.** Nine worktrees exist and nothing prunes them.
-   The Rust ones cost ~5G each once built; the `seo-*` ones cost ~2-7G each in
-   `node_modules` with no `target/` at all (~20G across six). Neither has a
-   retention policy.
+5. **Put a retention policy on generated artifacts — NOT on the worktree count.**
+   See "What NOT to do" below. Sweep `target/` and `node_modules/` on age, and
+   let worktrees accumulate freely.
 
 ## How to verify any of this
 
@@ -212,6 +229,10 @@ find /var/tmp/vk-deploy-build/target/release/deps -name '*.rlib' -printf '%s\n' 
   omission? The comment reads deliberate; the `live_exe` gate suggests it may no
   longer be necessary.
 - What fraction of `deps/` is debug info? Unmeasured — gates option 3.
-- How many Rust worktrees run concurrently at peak? The footprint is
-  `N × ~5G`, and nobody has bounded N. That number, not the per-worktree size,
-  is what determines whether this recurs.
+- What is the right age threshold for sweeping a cold `target/`? The host's
+  existing cargo sweep uses `TARGET_KEEP_DAYS=3`; the dirs measured here were
+  cold for 8-19 days, so 3 would have caught all of them comfortably. Reusing
+  that number keeps one policy instead of two.
+- The six `seo-*` worktrees carry ~20G of `node_modules` with no `target/` at
+  all. Same missing retention, different ecosystem — worth covering in the same
+  sweep rather than as a separate effort.
