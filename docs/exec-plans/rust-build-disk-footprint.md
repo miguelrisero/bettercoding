@@ -2,21 +2,35 @@
 
 ## Why
 
-Every agent task gets its own git worktree, and cargo builds **per worktree**.
-With 33 crates and 1139 resolved dependencies, a full build materialises ~5G of
-`target/` that belongs to exactly one task and is thrown away when that task
-ends. Run four Rust tasks at once and that is ~20G of transient build output.
+`bettercoding` is a Rust workspace — 33 crates, 1139 resolved dependencies — so
+anything that builds it materialises a multi-gigabyte `target/`. On ded02
+(2026-08-12) three build directories hold **12.9G** between them.
 
-On ded02 (2026-08-11) this is the single largest consumer of the host disk, and
-disk — not RAM, not CPU — is the binding constraint on that box: `/` sat at 91%
-on 2026-08-07 and the memory-pressure incident that started this investigation
-was survivable only because there was still disk to swap onto.
+The framing that prompted this plan was wrong in a way worth recording, because
+it changes the fix:
 
-The point of this plan is **not** that the build output is garbage. It is live
-work, it frees itself when the task finishes, and the box recovered on its own
-(91% → 86% over four days). The point is that the cost is (a) larger than it
-needs to be, (b) invisible to the host's automated cleanup, and (c) scales
-linearly with agent concurrency, which is the thing we keep increasing.
+> "Each agent task gets its own worktree, cargo builds per worktree, and the
+> output frees itself when the task ends."
+
+That describes VK task worktrees under `.vk-worktrees/`, which are ephemeral and
+**contain no Rust at all** (they hold `patricia-monorepo`, `runflow-docs`,
+`mr_docs`). The Rust build output lives somewhere else entirely: **long-lived
+`git worktree` checkouts of this repo**, registered against
+`~/projects/bettercoding/.git` and parked in `/var/tmp`. They are created by the
+chief tooling for parallel branch work, plus two detached-HEAD build dirs.
+
+They do not clean themselves up, and the measured ones are **cold, not live**:
+
+```
+5.02G  vk-deploy-build/target            last built 19 days ago  (detached HEAD)
+4.83G  chief-deploy/main-deploy/target   last built  8 days ago  (detached HEAD)
+3.06G  chief-worktrees/bc-seamless-p2    last built  8 days ago  (chief/bc-seamless-p2, UNMERGED)
+```
+
+No process is parked in any of the three. So this is not the running cost of
+concurrent agent work — it is stale build output from branch work that finished
+or paused, sitting on a host where disk is the binding constraint (`/` hit 91%
+on 2026-08-07).
 
 ## Today (verified 2026-08-11, ded02 / team-miguel)
 
@@ -29,6 +43,10 @@ linearly with agent concurrency, which is the thing we keep increasing.
 ────
 12.9G  total across 3 live build dirs
 ```
+
+All nine worktrees are registered and none are prunable (`git worktree prune
+--dry-run` reports nothing), so `git worktree` has no opinion about them — they
+are live checkouts whose *build output* is stale, not orphaned directories.
 
 Breakdown of the largest, `vk-deploy-build/target/release` (5.02G):
 
@@ -160,8 +178,16 @@ a disk problem for a concurrency problem, on the axis we care about most.
    small, drop it.
 3. **Evaluate `sccache` on build-time grounds**, separately, and do not count it
    as disk relief.
-4. **Revisit only if disk climbs again.** As of 2026-08-11 `/` is at 86% with
-   119G free and trending down on its own.
+4. **Delete the three cold `target/` dirs now** — 12.9G, regenerable, nothing
+   using them. This is a one-off; options 1-3 are what stop it recurring. Cost
+   is one full rebuild (33 crates / 1139 deps) the next time each branch is
+   touched, so check with whoever owns `chief/bc-seamless-p2` first: it is
+   **unmerged**, so that worktree is real work-in-progress even though its build
+   is cold.
+5. **Bound the worktree count.** Nine worktrees exist and nothing prunes them.
+   The Rust ones cost ~5G each once built; the `seo-*` ones cost ~2-7G each in
+   `node_modules` with no `target/` at all (~20G across six). Neither has a
+   retention policy.
 
 ## How to verify any of this
 
