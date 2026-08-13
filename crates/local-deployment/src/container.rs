@@ -64,7 +64,7 @@ use utils::{
 use uuid::Uuid;
 use workspace_manager::{RepoWorkspaceInput, WorkspaceError, WorkspaceManager};
 
-use crate::{command, copy};
+use crate::{cli_activity::AgentPresence, command, copy};
 
 fn queued_action_type(
     queued_data: &DraftFollowUpData,
@@ -404,10 +404,40 @@ impl LocalContainerService {
                 continue; // live, recent workspace — leave it alone
             };
 
+            // NEVER kill a pane that is still doing something, whatever the
+            // reason says. This guard applies to orphans too: "the worktree is
+            // gone" does not mean "the agent stopped", and killing a working
+            // agent mid-task was disruptive enough that operators disabled the
+            // whole reaper with DISABLE_CLI_SESSION_REAP to stop it.
+            //
+            // The DB guard below cannot cover this. An interactive CLI agent
+            // lives in tmux and is never an `execution_process`, so it is
+            // invisible to `has_running_non_dev_server_processes_for_workspace`.
+            // Only the pane's own process tree can answer.
+            //
+            // A busy pane is still reapable once it passes the full idle TTL, so
+            // a wedged agent cannot pin a session forever. Unknown fails closed.
+            match crate::cli_activity::probe_workspace_pane_busy(workspace_id).await {
+                AgentPresence::Alive if idle_secs <= idle_ttl => {
+                    tracing::debug!(
+                        %workspace_id, reason, idle_secs,
+                        "Reaper: pane still running something; leaving it"
+                    );
+                    continue;
+                }
+                AgentPresence::Unknown => {
+                    tracing::warn!(
+                        %workspace_id,
+                        "Reaper: could not determine whether the pane is busy; leaving it"
+                    );
+                    continue;
+                }
+                AgentPresence::Alive | AgentPresence::Absent | AgentPresence::NoSession => {}
+            }
+
             // Non-terminal sessions get extra protection: a settle grace since
-            // last activity, and no running coding agent (the interactive
-            // session isn't an execution_process, so this guards the rarer case
-            // of a tracked agent process tied to the same workspace).
+            // last activity, and no running coding agent (this catches a
+            // tracked headless executor tied to the same workspace).
             if !terminal {
                 if idle_secs < ACTIVITY_GRACE_SECS {
                     continue;
