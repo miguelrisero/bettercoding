@@ -218,8 +218,15 @@ fn cli_bootstrap(
         None => format!("printf '\\n  [!] %s is not installed or not on PATH.\\n\\n' {prog}"),
     };
 
+    // Agent environment first, so it applies to every launch form below (and
+    // to the fallback shell the pane drops into).
+    let env: String = cli_launch_env(&spec.program)
+        .iter()
+        .map(|(key, value)| format!("export {key}={}; ", shell_single_quote(value)))
+        .collect();
+
     format!(
-        r#"if command -v {prog} >/dev/null 2>&1; then {launch}; else {missing}; fi; exec "${{SHELL:-/bin/sh}}""#
+        r#"{env}if command -v {prog} >/dev/null 2>&1; then {launch}; else {missing}; fi; exec "${{SHELL:-/bin/sh}}""#
     )
 }
 
@@ -568,6 +575,9 @@ impl Drop for CliRespawnClaim {
 /// Current (`bc_`) sessions only. Legacy `vk_` sessions are attach-only by
 /// design and are rejected rather than respawned.
 ///
+/// Pre-accepts the agent's folder-trust / first-run dialogs for `working_dir`
+/// first, exactly as the attach path does.
+///
 /// The caller must hold a [`CliRespawnClaim`], and the bootstrap must NOT carry
 /// a parked prompt: see [`CliPromptDelivery`], whose "the loser's bootstrap is
 /// discarded anyway" reasoning stops holding the moment bootstraps run against
@@ -575,12 +585,17 @@ impl Drop for CliRespawnClaim {
 pub async fn respawn_cli_tmux_pane(
     workspace_id: Uuid,
     _claim: &CliRespawnClaim,
+    program: &str,
     working_dir: &Path,
     bootstrap: &str,
 ) -> Result<(), PtyError> {
     if !tmux_available() {
         return Err(PtyError::CreateFailed("tmux is not available".to_string()));
     }
+    // A restart launches the agent exactly like a fresh attach does, so it
+    // needs the same pre-accepted trust / first-run state. Without this the
+    // dialog the attach path suppressed comes back on the first restart.
+    maybe_seed_cli_trust(program, working_dir);
     let (socket, session_name) = cli_tmux_target(CliTmuxHome::Current, workspace_id);
     respawn_cli_tmux_pane_on(socket, &session_name, working_dir, bootstrap).await
 }
@@ -704,6 +719,27 @@ fn cli_install_hint(program: &str) -> Option<&'static str> {
     })
 }
 
+/// Environment the pane exports before it launches the selected agent. Kept
+/// here (next to the bootstrap that emits it) rather than on the spec, for the
+/// same reason as [`cli_install_hint`]: it is local-environment friction, not
+/// part of the agent's launch contract.
+///
+/// `CLAUDE_CODE_SANDBOXED` is claude's own "this directory is already trusted"
+/// short-circuit: it suppresses the folder-trust dialog and the gated
+/// project-grant prompt, and is read nowhere else. It backstops
+/// [`ensure_claude_folder_trusted`], which has been observed to lose its key:
+/// `~/.claude.json` is one global file that every running claude rewrites in
+/// full, so a seeded workspace can still meet the dialog. Env cannot be raced.
+///
+/// This grants no capability the pane did not already have — CLI mode launches
+/// claude with `--dangerously-skip-permissions`.
+fn cli_launch_env(program: &str) -> &'static [(&'static str, &'static str)] {
+    match program {
+        "claude" => &[("CLAUDE_CODE_SANDBOXED", "1")],
+        _ => &[],
+    }
+}
+
 /// Pre-accept per-folder trust / first-run dialogs the selected agent's CLI
 /// would otherwise block on, for this app-created (trusted) worktree. Keyed by
 /// the launch program so each agent's local-environment friction is handled in
@@ -727,39 +763,29 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// Pre-accept claude's per-directory "Do you trust the files in this folder?"
-/// dialog for an app-created workspace, so CLI mode never blocks the user on it.
+/// Pre-accept claude's per-directory folder-trust dialog for an app-created
+/// workspace, so CLI mode never blocks the user on it.
 ///
-/// claude exposes no flag/setting/env to suppress this — `--dangerously-skip-permissions`
-/// only covers per-tool approval — and records trust per directory in the global
-/// `~/.claude.json`. BetterCoding created this worktree, so the user implicitly
-/// trusts it; we pre-seed the very key claude writes on "Yes". Best-effort and
-/// per-process memoized: any failure just means the dialog shows as before.
+/// claude records trust per directory in the global `~/.claude.json` — the
+/// `--dangerously-skip-permissions` flag only covers per-tool approval.
+/// BetterCoding created this worktree, so the user implicitly trusts it; we
+/// pre-seed the very key claude writes on "Yes".
+///
+/// Deliberately NOT memoized. Seeded keys have been observed missing again at
+/// launch time — `~/.claude.json` is one global file that every running claude
+/// rewrites in full — and a per-process "already seeded" set would make that
+/// loss permanent for the lifetime of the server. Re-checking on each attach
+/// makes the seed self-healing instead; [`seed_claude_trust`] skips the write
+/// when the key is already there, so the steady-state cost is one read.
+///
+/// Best-effort: a failure here just means the dialog shows as before, and
+/// [`cli_launch_env`] still backstops it.
 fn ensure_claude_folder_trusted(dir: &Path) {
-    static SEEDED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    let seeded = SEEDED.get_or_init(|| Mutex::new(HashSet::new()));
-
-    if seeded
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .contains(dir)
-    {
-        return;
-    }
-
-    match seed_claude_trust(dir) {
-        Ok(()) => {
-            seeded
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(dir.to_path_buf());
-        }
-        Err(e) => {
-            tracing::debug!(
-                "Could not pre-trust {} in ~/.claude.json (folder-trust dialog may show): {e}",
-                dir.display()
-            );
-        }
+    if let Err(e) = seed_claude_trust(dir) {
+        tracing::debug!(
+            "Could not pre-trust {} in ~/.claude.json (folder-trust dialog may show): {e}",
+            dir.display()
+        );
     }
 }
 
@@ -4256,6 +4282,34 @@ mod tests {
         assert!(!pane_subtree_has_program(ps_npm, 100, "codex"));
         // A sibling subtree's agent (different pane) is out of scope.
         assert!(!pane_subtree_has_program(ps, 400, "codex"));
+    }
+
+    #[test]
+    fn cli_bootstrap_exports_claude_trust_env_on_every_form() {
+        // The folder-trust dialog is suppressed by env as well as by the
+        // ~/.claude.json seed, so a lost/raced seed can never surface it. The
+        // export leads the command, so it applies to the resume, prompt,
+        // continue and fallback-shell forms alike.
+        let spec = claude_spec(&["--dangerously-skip-permissions"]);
+        let id = "28b98f08-5f5f-4b1e-8c4e-41ae87c0c706";
+        for bootstrap in [
+            cli_bootstrap(&spec, None, None, false, None),
+            cli_bootstrap(&spec, Some(id), None, false, None),
+            cli_bootstrap(&spec, None, Some(Path::new("/tmp/p.txt")), false, None),
+            cli_bootstrap(&spec, None, None, true, None),
+        ] {
+            assert!(
+                bootstrap.starts_with("export CLAUDE_CODE_SANDBOXED='1'; "),
+                "claude trust env must lead the command: {bootstrap}"
+            );
+        }
+
+        // Agents that need no environment get no export noise at all.
+        let codex = CliLaunchSpec::new("codex", vec![]);
+        assert!(
+            cli_bootstrap(&codex, None, None, false, None).starts_with("if command -v 'codex'"),
+            "only agents with an env entry get an export prefix"
+        );
     }
 
     #[test]

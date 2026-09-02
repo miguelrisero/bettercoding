@@ -274,9 +274,15 @@ async fn restart_agent(
     // "no server running" — and hiding it turns a one-line diagnosis into a
     // log dig. 502 rather than 500: the failing dependency is the tmux server
     // we shell out to, not this handler.
-    respawn_cli_tmux_pane(workspace_id, &claim, &context.working_dir, &bootstrap)
-        .await
-        .map_err(|error| ApiError::BadGateway(error.to_string()))?;
+    respawn_cli_tmux_pane(
+        workspace_id,
+        &claim,
+        &context.program,
+        &context.working_dir,
+        &bootstrap,
+    )
+    .await
+    .map_err(|error| ApiError::BadGateway(error.to_string()))?;
 
     Ok(ResponseJson(ApiResponse::success(CliRestartResponse {
         restarted: true,
