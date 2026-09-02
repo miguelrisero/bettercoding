@@ -1119,57 +1119,108 @@ impl LocalContainerService {
         Ok(())
     }
 
-    /// Create workspace-level CLAUDE.md and AGENTS.md files that import from each repo.
-    /// Uses the @import syntax to reference each repo's config files.
-    /// Skips creating files if they already exist or if no repos have the source file.
+    /// Marker that identifies the hygiene block we generate, so a workspace
+    /// config file that already carries it is left alone instead of growing a
+    /// duplicate copy every time the workspace is created or restored.
+    const HYGIENE_MARKER: &'static str = "<!-- bettercoding:workspace-hygiene -->";
+
+    /// Directory agents are told to keep scratch work in. It sits at the
+    /// workspace root, next to the repo checkouts rather than inside one, so
+    /// nothing written there can dirty `git status` or reach a commit — and
+    /// `cleanup_workspace` removes it with the rest of the workspace.
+    const SCRATCH_DIR: &'static str = ".scratch";
+
+    /// Tells the agent where it may write and where it may not. Agents that
+    /// scatter notes, logs and downloads across `/tmp` or `$HOME` leave files
+    /// behind that no workspace cleanup ever reaches, because cleanup only
+    /// deletes the workspace directory.
+    fn workspace_hygiene_block() -> String {
+        format!(
+            "{marker}\n\
+             ## Workspace file hygiene\n\n\
+             This directory is a disposable workspace. It is deleted whole when the \
+             workspace is cleaned up, and nothing outside it is ever deleted.\n\n\
+             - Keep every file you create inside this directory.\n\
+             - Put scratch work in `{scratch}/`: plans, notes, logs, reports, downloads, \
+             screenshots, one-off scripts, analysis output. It sits outside every repo \
+             checkout, so it never appears in `git status` and never lands in a commit.\n\
+             - Do not write outside this directory. Files left in `/tmp`, `/var/tmp`, \
+             `$HOME`, `$HOME/.cache` or any parent of this directory survive cleanup as \
+             orphans nobody finds again. If a tool needs a temp path, point it at \
+             `{scratch}/`.\n\
+             - Do not park scratch files in a repo checkout. A repo directory is for the \
+             changes the task actually asks for.\n\
+             - Create any extra git worktree inside this directory too, not beside it.\n",
+            marker = Self::HYGIENE_MARKER,
+            scratch = Self::SCRATCH_DIR,
+        )
+    }
+
+    /// Create workspace-level CLAUDE.md and AGENTS.md files: `@import` lines for
+    /// each repo's own config file, plus the workspace hygiene block that keeps
+    /// agent-created files inside the workspace.
+    ///
+    /// Both files live at the workspace root, above every repo checkout, which
+    /// is where each agent picks up parent-directory project instructions from.
+    /// An existing file is appended to rather than replaced, so a file the user
+    /// (or a prior run) edited keeps its content and still gains the block.
     async fn create_workspace_config_files(
         workspace_dir: &Path,
         repos: &[Repo],
     ) -> Result<(), ContainerError> {
         const CONFIG_FILES: [&str; 2] = ["CLAUDE.md", "AGENTS.md"];
 
+        if let Err(e) = tokio::fs::create_dir_all(workspace_dir.join(Self::SCRATCH_DIR)).await {
+            tracing::warn!("Failed to create workspace scratch directory: {}", e);
+        }
+
+        let hygiene = Self::workspace_hygiene_block();
+
         for config_file in CONFIG_FILES {
             let workspace_config_path = workspace_dir.join(config_file);
 
-            if workspace_config_path.exists() {
+            let existing = tokio::fs::read_to_string(&workspace_config_path)
+                .await
+                .unwrap_or_default();
+
+            if existing.contains(Self::HYGIENE_MARKER) {
                 tracing::trace!(
-                    "Workspace config file {} already exists, skipping",
+                    "Workspace config file {} already carries the hygiene block, skipping",
                     config_file
                 );
                 continue;
             }
 
-            let mut import_lines = Vec::new();
-            for repo in repos {
-                let repo_config_path = workspace_dir.join(&repo.name).join(config_file);
-                if repo_config_path.exists() {
-                    import_lines.push(format!("@{}/{}", repo.name, config_file));
+            let mut sections = Vec::new();
+
+            if existing.trim().is_empty() {
+                let mut import_lines = Vec::new();
+                for repo in repos {
+                    let repo_config_path = workspace_dir.join(&repo.name).join(config_file);
+                    if repo_config_path.exists() {
+                        import_lines.push(format!("@{}/{}", repo.name, config_file));
+                    }
                 }
+                if !import_lines.is_empty() {
+                    sections.push(import_lines.join("\n"));
+                }
+            } else {
+                sections.push(existing.trim_end().to_string());
             }
 
-            if import_lines.is_empty() {
-                tracing::trace!(
-                    "No repos have {}, skipping workspace config creation",
-                    config_file
-                );
-                continue;
-            }
+            sections.push(hygiene.clone());
+            let content = sections.join("\n\n");
 
-            let content = import_lines.join("\n") + "\n";
             if let Err(e) = tokio::fs::write(&workspace_config_path, &content).await {
                 tracing::warn!(
-                    "Failed to create workspace config file {}: {}",
+                    "Failed to write workspace config file {}: {}",
                     config_file,
                     e
                 );
                 continue;
             }
 
-            tracing::info!(
-                "Created workspace {} with {} import(s)",
-                config_file,
-                import_lines.len()
-            );
+            tracing::info!("Wrote workspace {}", config_file);
         }
 
         Ok(())
@@ -1848,6 +1899,43 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[tokio::test]
+    async fn workspace_config_files_carry_hygiene_and_stay_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        LocalContainerService::create_workspace_config_files(root, &[])
+            .await
+            .unwrap();
+
+        // Every agent that reads parent-directory project instructions gets the
+        // rules, and the directory they point at exists before the agent starts.
+        assert!(root.join(".scratch").is_dir());
+        let claude = std::fs::read_to_string(root.join("CLAUDE.md")).unwrap();
+        let agents = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        for content in [&claude, &agents] {
+            assert!(content.contains("## Workspace file hygiene"), "{content}");
+            assert!(content.contains("`.scratch/`"), "{content}");
+        }
+
+        // Workspace restore runs this again; the block must not accumulate.
+        LocalContainerService::create_workspace_config_files(root, &[])
+            .await
+            .unwrap();
+        let again = std::fs::read_to_string(root.join("CLAUDE.md")).unwrap();
+        assert_eq!(again, claude);
+        assert_eq!(again.matches("## Workspace file hygiene").count(), 1);
+
+        // A file that already has content keeps it and gains the block.
+        std::fs::write(root.join("AGENTS.md"), "@repo/AGENTS.md\n").unwrap();
+        LocalContainerService::create_workspace_config_files(root, &[])
+            .await
+            .unwrap();
+        let appended = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(appended.starts_with("@repo/AGENTS.md"), "{appended}");
+        assert!(appended.contains("## Workspace file hygiene"), "{appended}");
+    }
 
     #[test]
     fn retry_threads_transcript_truncation_into_follow_up_action() {
