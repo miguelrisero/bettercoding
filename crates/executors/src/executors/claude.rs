@@ -1,5 +1,6 @@
 // SDK submodules
 pub mod client;
+mod model_discovery;
 pub mod native;
 pub mod protocol;
 pub mod slash_commands;
@@ -659,44 +660,76 @@ mod cli_launch_tests {
     }
 }
 
-fn default_discovered_options() -> crate::executor_discovery::ExecutorDiscoveredOptions {
-    // Derived from the ClaudeEffort enum (strum `VariantNames`, lowercased) so a
-    // future effort tier automatically appears in the picker instead of silently
-    // missing from this list. `from_names_with_default` sorts by rank, so the
-    // declaration order here is irrelevant.
+/// Aliases offered when the CLI bundle cannot be read (not installed yet, an
+/// `npx` cache that has not been populated, an unfamiliar bundle layout).
+///
+/// Deliberately the pre-discovery list rather than the union of every alias we
+/// have seen: on the degraded path it is better to under-offer than to list a
+/// model the pinned CLI would reject at launch.
+const FALLBACK_MODEL_ALIASES: &[&str] = &["fable", "opus", "opus[1m]", "sonnet", "haiku"];
+
+/// Effort tiers offered in the picker.
+///
+/// Derived from the `ClaudeEffort` enum (strum `VariantNames`, lowercased) so a
+/// future effort tier automatically appears instead of silently missing from a
+/// hand-written list. `from_names_with_default` sorts by rank, so declaration
+/// order is irrelevant.
+fn default_effort_options() -> Vec<crate::model_selector::ReasoningOption> {
     use strum::VariantNames;
 
-    use crate::{
-        executor_discovery::ExecutorDiscoveredOptions,
-        model_selector::{ModelInfo, ModelSelectorConfig, ReasoningOption},
-    };
-    let effort_options = ReasoningOption::from_names_with_default(
+    crate::model_selector::ReasoningOption::from_names_with_default(
         ClaudeEffort::VARIANTS.iter().copied(),
         CLI_DEFAULT_EFFORT,
+    )
+}
+
+/// Build picker entries from CLI model aliases, attaching the effort tiers to
+/// the models whose CLI accepts `--effort`.
+fn models_from_aliases(
+    aliases: impl IntoIterator<Item = String>,
+    effort_options: &[crate::model_selector::ReasoningOption],
+) -> Vec<crate::model_selector::ModelInfo> {
+    aliases
+        .into_iter()
+        .map(|id| crate::model_selector::ModelInfo {
+            name: model_discovery::label_for_alias(&id),
+            reasoning_options: if model_supports_effort(&id) {
+                effort_options.to_vec()
+            } else {
+                vec![]
+            },
+            provider_id: None,
+            id,
+        })
+        .collect()
+}
+
+/// The model aliases the configured CLI actually accepts, or `None` to keep the
+/// static fallback. Blocking file IO — callers run it off the async runtime.
+fn discover_cli_models(base_command: &str) -> Option<Vec<String>> {
+    let bundle = model_discovery::resolve_cli_bundle(base_command)?;
+    let aliases = model_discovery::extract_model_aliases(&bundle)?;
+    tracing::debug!(
+        "Discovered {} Claude Code model aliases from {}",
+        aliases.len(),
+        bundle.display()
     );
+    Some(aliases)
+}
+
+fn default_discovered_options() -> crate::executor_discovery::ExecutorDiscoveredOptions {
+    use crate::{
+        executor_discovery::ExecutorDiscoveredOptions, model_selector::ModelSelectorConfig,
+    };
+    let effort_options = default_effort_options();
 
     ExecutorDiscoveredOptions {
         model_selector: ModelSelectorConfig {
             providers: vec![],
-            models: [
-                ("fable", "Fable"),
-                ("opus", "Opus"),
-                ("opus[1m]", "Opus (1M context)"),
-                ("sonnet", "Sonnet"),
-                ("haiku", "Haiku"),
-            ]
-            .into_iter()
-            .map(|(id, name)| ModelInfo {
-                id: id.to_string(),
-                name: name.to_string(),
-                provider_id: None,
-                reasoning_options: if model_supports_effort(id) {
-                    effort_options.clone()
-                } else {
-                    vec![]
-                },
-            })
-            .collect(),
+            models: models_from_aliases(
+                FALLBACK_MODEL_ALIASES.iter().map(|a| a.to_string()),
+                &effort_options,
+            ),
             default_model: Some("opus".to_string()),
             agents: vec![],
             permissions: vec![
@@ -862,14 +895,14 @@ impl StandardCodingAgentExecutor for ClaudeCode {
                 provisional
                     .map(|p| {
                         let mut opts = p.as_ref().clone();
-                        opts.loading_models = false;
+                        opts.loading_models = true;
                         opts.loading_agents = true;
                         opts.loading_slash_commands = true;
                         opts
                     })
                     .unwrap_or_else(|| {
                         let mut opts = default_discovered_options();
-                        opts.loading_models = false;
+                        opts.loading_models = true;
                         opts.loading_agents = true;
                         opts.loading_slash_commands = true;
                         opts
@@ -891,14 +924,14 @@ impl StandardCodingAgentExecutor for ClaudeCode {
                 provisional
                     .map(|p| {
                         let mut opts = p.as_ref().clone();
-                        opts.loading_models = false;
+                        opts.loading_models = true;
                         opts.loading_agents = true;
                         opts.loading_slash_commands = true;
                         opts
                     })
                     .unwrap_or_else(|| {
                         let mut opts = default_discovered_options();
-                        opts.loading_models = false;
+                        opts.loading_models = true;
                         opts.loading_agents = true;
                         opts.loading_slash_commands = true;
                         opts
@@ -912,7 +945,7 @@ impl StandardCodingAgentExecutor for ClaudeCode {
                 })));
             }
             let mut opts = default_discovered_options();
-            opts.loading_models = false;
+            opts.loading_models = true;
             opts.loading_agents = true;
             opts.loading_slash_commands = true;
             (None, opts)
@@ -926,6 +959,30 @@ impl StandardCodingAgentExecutor for ClaudeCode {
         let discovery_stream = async_stream::stream! {
             let discovery_path = target_path.as_deref().unwrap_or(Path::new(".")).to_path_buf();
             let mut final_options = default_discovered_options();
+
+            // Models come from the CLI bundle this executor will actually launch,
+            // so a version-pinned base command is described by its own alias set
+            // rather than by whatever was hardcoded when the picker was written.
+            // Reading a ~240 MB bundle is blocking IO; keep it off the runtime.
+            let base_cmd = this
+                .cmd
+                .base_command_override
+                .clone()
+                .unwrap_or_else(|| {
+                    base_command(this.claude_code_router.unwrap_or(false)).to_string()
+                });
+            let discovered = tokio::task::spawn_blocking(move || discover_cli_models(&base_cmd))
+                .await
+                .ok()
+                .flatten();
+            if let Some(aliases) = discovered {
+                let models = models_from_aliases(aliases, &default_effort_options());
+                final_options.model_selector.models = models.clone();
+                yield patch::update_models(models);
+            }
+            // Always resolve the loading state, so a failed read settles the UI
+            // on the fallback list instead of spinning forever.
+            yield patch::models_loaded();
 
             match this.discover_agents_and_slash_commands_initial(&discovery_path).await {
                 Ok((mut agent_options, slash_commands_initial, plugins)) => {
