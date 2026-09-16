@@ -21,6 +21,11 @@ const BOOKKEEPING_KINDS: &[&str] = &[
     "permission-mode",
     // Native `system` records are store bookkeeping, not stream-json init.
     "system",
+    // Session display-name records (claude's own /rename writes both; the
+    // workspace-rename propagation writes `custom-title`): pure metadata, and
+    // classifying them as unknown would pollute the ingest health counter.
+    "custom-title",
+    "agent-name",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

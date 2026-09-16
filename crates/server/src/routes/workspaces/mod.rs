@@ -1,4 +1,5 @@
 pub mod attachments;
+pub mod claude_rename;
 pub mod codex_setup;
 pub mod core;
 pub mod create;

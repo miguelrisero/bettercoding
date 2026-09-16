@@ -2153,7 +2153,7 @@ fn cli_tmux_prompt_buffer_name(workspace_id: Uuid, sequence: u64) -> String {
 /// Seconds since the Unix epoch (best-effort; 0 if the system clock is before
 /// the epoch). Used to turn tmux's `session_activity` and `client_activity`
 /// epochs into idle ages.
-pub(crate) fn now_unix_secs() -> i64 {
+pub fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -2175,6 +2175,31 @@ enum CliTmuxSocketSnapshot {
     Rows(Vec<CliTmuxSessionRow>),
     Empty,
     Failed(String),
+}
+
+/// Newest `client_activity` (unix secs) across tmux clients on the target's
+/// socket — the same field the CLI activity poller reads. It advances on
+/// every keystroke from any attached client (browser terminal or manual
+/// attach), so a half-typed prompt always reads as recent. `None` when the
+/// command fails or no client reports it: callers gating on "input is
+/// definitely old" must treat that as unknown, never idle.
+pub async fn latest_cli_client_activity(target: &CliTmuxTarget) -> Option<i64> {
+    let output = run_cli_tmux_output(&[
+        "-L",
+        &target.socket,
+        "list-clients",
+        "-F",
+        "#{client_activity}",
+    ])
+    .await
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<i64>().ok())
+        .max()
 }
 
 /// List our CLI tmux sessions for the reaper: `(workspace_id, attached,
