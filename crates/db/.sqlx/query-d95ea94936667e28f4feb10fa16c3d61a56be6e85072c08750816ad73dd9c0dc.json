@@ -1,0 +1,74 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                 workspace_id as \"workspace_id!: Uuid\",\n                 state,\n                 updated_at as \"updated_at!: DateTime<Utc>\",\n                 phase,\n                 tasks,\n                 crons,\n                 agent_session_id,\n                 transcript_path,\n                 seq,\n                 hook_at as \"hook_at?: DateTime<Utc>\"\n               FROM workspace_cli_activity",
+  "describe": {
+    "columns": [
+      {
+        "name": "workspace_id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "state",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "updated_at!: DateTime<Utc>",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "phase",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "tasks",
+        "ordinal": 4,
+        "type_info": "Integer"
+      },
+      {
+        "name": "crons",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "agent_session_id",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "transcript_path",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "seq",
+        "ordinal": 8,
+        "type_info": "Integer"
+      },
+      {
+        "name": "hook_at?: DateTime<Utc>",
+        "ordinal": 9,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "d95ea94936667e28f4feb10fa16c3d61a56be6e85072c08750816ad73dd9c0dc"
+}

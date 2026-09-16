@@ -155,8 +155,15 @@ async fn cli_context(
     };
 
     let (model_id, reasoning_id) = terminal::resolve_cli_model_effort(pool, session.as_ref()).await;
-    let spec =
-        terminal::resolve_cli_launch_spec(session.as_ref(), model_id, reasoning_id, &working_dir);
+    let spec = terminal::resolve_cli_launch_spec(
+        session.as_ref(),
+        model_id,
+        reasoning_id,
+        &working_dir,
+        workspace_id,
+        workspace.name.as_deref(),
+    )
+    .await;
 
     Ok(CliContext {
         program: spec.program.clone(),

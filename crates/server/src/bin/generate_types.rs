@@ -56,6 +56,7 @@ fn generate_types_content() -> String {
         db::models::workspace_spawn_reservation::WorkspaceSpawnReservation::decl(),
         db::models::execution_process::ExecutionProcess::decl(),
         db::models::execution_process::ExecutionProcessStatus::decl(),
+        db::models::workspace_cli_activity::CliPhase::decl(),
         db::models::execution_process::ExecutionProcessRunReason::decl(),
         db::models::execution_process_repo_state::ExecutionProcessRepoState::decl(),
         db::models::merge::Merge::decl(),

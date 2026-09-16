@@ -218,6 +218,8 @@ dropped: boolean, started_at: string, completed_at: string | null, created_at: s
 
 export enum ExecutionProcessStatus { running = "running", completed = "completed", failed = "failed", killed = "killed" }
 
+export type CliPhase = "ready" | "working" | "question" | "approval" | "attention" | "stopped" | "compacting" | "tool_failed" | "rate_limit" | "error" | "ended";
+
 export type ExecutionProcessRunReason = "setupscript" | "cleanupscript" | "archivescript" | "codingagent" | "devserver";
 
 export type ExecutionProcessRepoState = { id: string, execution_process_id: string, repo_id: string, before_head_commit: string | null, after_head_commit: string | null, merge_commit: string | null, created_at: Date, updated_at: Date, };
@@ -659,6 +661,13 @@ has_unseen_turns: boolean,
  * was attached? (Cleared when the user opens the pane again.)
  */
 cli_attention: boolean, 
+/**
+ * What the CLI-mode agent last reported it is doing, for agents that
+ * report at all (see `reduce_hook`). `None` for an agent that reports
+ * nothing, or for a report too old to still describe the pane — in which
+ * case `cli_attention` and the running flags remain the only signal.
+ */
+cli_phase: CliPhase | null, 
 /**
  * PR status for this workspace (if any PR exists)
  */
