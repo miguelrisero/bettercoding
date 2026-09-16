@@ -65,7 +65,8 @@ pub fn should_inject_rename_keys(
     latest_client_activity: Option<i64>,
     now: i64,
 ) -> bool {
-    if name.chars().any(|c| c.is_control() || c == '\u{7f}') || name.is_empty() {
+    // Cc covers C0 (incl. Tab/Esc/Ctrl-C/EOT), DEL, and the C1 block (incl. CSI).
+    if name.chars().any(char::is_control) || name.is_empty() {
         return false;
     }
     let Some(activity) = latest_client_activity else {
@@ -233,7 +234,7 @@ fn write_sidecar(
 
 /// Append the transcript record claude re-reads to learn the new title.
 /// Append-only, one line, never opened for writing elsewhere: the ingest
-/// tailer treats the unknown `custom-title` kind as an ignorable record.
+/// tailer classifies the `custom-title` kind as bookkeeping (ignorable).
 fn append_transcript_record(
     transcript_path: &Path,
     claude_session_id: &str,
