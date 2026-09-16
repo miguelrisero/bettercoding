@@ -2153,7 +2153,7 @@ fn cli_tmux_prompt_buffer_name(workspace_id: Uuid, sequence: u64) -> String {
 /// Seconds since the Unix epoch (best-effort; 0 if the system clock is before
 /// the epoch). Used to turn tmux's `session_activity` and `client_activity`
 /// epochs into idle ages.
-pub(crate) fn now_unix_secs() -> i64 {
+pub fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
