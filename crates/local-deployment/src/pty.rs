@@ -2177,6 +2177,31 @@ enum CliTmuxSocketSnapshot {
     Failed(String),
 }
 
+/// Newest `client_activity` (unix secs) across tmux clients on the target's
+/// socket — the same field the CLI activity poller reads. It advances on
+/// every keystroke from any attached client (browser terminal or manual
+/// attach), so a half-typed prompt always reads as recent. `None` when the
+/// command fails or no client reports it: callers gating on "input is
+/// definitely old" must treat that as unknown, never idle.
+pub async fn latest_cli_client_activity(target: &CliTmuxTarget) -> Option<i64> {
+    let output = run_cli_tmux_output(&[
+        "-L",
+        &target.socket,
+        "list-clients",
+        "-F",
+        "#{client_activity}",
+    ])
+    .await
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<i64>().ok())
+        .max()
+}
+
 /// List our CLI tmux sessions for the reaper: `(workspace_id, attached,
 /// idle_secs)` for every current `bc_*` and legacy `vk_*` session across both
 /// sockets, merged per workspace with the safest liveness values. An unreadable

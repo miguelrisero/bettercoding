@@ -93,6 +93,7 @@ pub async fn update_workspace(
     let pool = &deployment.db().pool;
     let is_archiving = request.archived == Some(true) && !workspace.archived;
 
+    let old_name = workspace.name.clone();
     Workspace::update(
         pool,
         workspace.id,
@@ -104,6 +105,19 @@ pub async fn update_workspace(
     let updated = Workspace::find_by_id(pool, workspace.id)
         .await?
         .ok_or(WorkspaceError::WorkspaceNotFound)?;
+
+    // Reach the running Claude session with the new name (sidecar + transcript
+    // record always; /rename keystrokes only if the pane is input-idle).
+    // Spawned, best-effort: a propagation failure must never fail the rename.
+    if let Some(name) = updated.name.as_deref()
+        && old_name.as_deref() != Some(name)
+    {
+        super::claude_rename::spawn_rename_propagation(
+            deployment.db().pool.clone(),
+            workspace.id,
+            name.to_string(),
+        );
+    }
 
     if (request.archived.is_some() || request.name.is_some())
         && let Ok(client) = deployment.remote_client()
