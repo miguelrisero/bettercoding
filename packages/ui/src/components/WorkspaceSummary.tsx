@@ -91,15 +91,15 @@ export function WorkspaceSummary({
   return (
     <div
       className={cn(
-        'group relative rounded-sm transition-all duration-100 overflow-hidden',
-        isActive ? 'bg-tertiary' : '',
+        'group relative rounded-sm transition-colors duration-100 overflow-hidden',
+        isActive ? 'is-active bg-brand/10 dark:bg-brand/20' : '',
         className
       )}
     >
-      {/* Selection indicator - thin colored tab on the left */}
+      {/* Selection indicator - colored rail on the left */}
       <div
         className={cn(
-          'absolute left-0 top-1 bottom-1 w-0.5 rounded-full transition-colors duration-100',
+          'absolute left-0 top-0 bottom-0 w-1 rounded-r-sm transition-colors duration-100',
           isActive ? 'bg-brand' : 'bg-transparent'
         )}
       />
@@ -107,13 +107,14 @@ export function WorkspaceSummary({
         type="button"
         onClick={onClick}
         aria-label={actionLabel}
+        aria-current={isActive ? 'location' : undefined}
         title={actionLabel}
         className={cn(
-          'flex w-full cursor-pointer flex-col text-left px-base py-half transition-all duration-150',
+          'flex w-full cursor-pointer flex-col text-left px-base py-half transition-colors duration-150',
           mutedSummary
             ? 'text-low opacity-50 hover:opacity-80'
             : isActive
-              ? 'text-normal'
+              ? 'text-high font-medium'
               : 'text-low sm:opacity-60 sm:hover:opacity-100 sm:hover:text-normal'
         )}
       >
@@ -235,14 +236,19 @@ export function WorkspaceSummary({
       {/* Right-side hover action - more options only */}
       {workspaceId && onOpenWorkspaceActions && (
         <div className="absolute right-0 top-0 bottom-0 flex items-center sm:opacity-0 sm:group-hover:opacity-100">
-          {/* Gradient fade from transparent to background */}
-          <div className="h-full w-6 pointer-events-none bg-gradient-to-r from-transparent to-secondary" />
+          {/* Gradient fade from transparent to the row surface (dropped on active rows, which are brand-tinted) */}
+          <div className="h-full w-6 pointer-events-none bg-gradient-to-r from-transparent to-secondary group-[.is-active]:bg-none" />
           {/* Single action button */}
-          <div className="flex items-center pr-base h-full bg-secondary">
+          <div
+            className={cn(
+              'flex items-center pr-base h-full',
+              isActive ? 'bg-brand/10 dark:bg-brand/20' : 'bg-secondary'
+            )}
+          >
             <button
               onClick={handleOpenCommandBar}
               onPointerDown={(e) => e.stopPropagation()}
-              className="p-1.5 rounded-sm text-low hover:text-normal hover:bg-tertiary"
+              className="p-1.5 rounded-sm text-low hover:text-normal hover:bg-panel"
               title={t('workspaces.more')}
             >
               <DotsThreeIcon className="size-5" weight="bold" />
