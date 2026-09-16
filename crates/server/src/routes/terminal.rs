@@ -195,6 +195,24 @@ pub(super) async fn resolve_cli_launch_spec(
     spec
 }
 
+/// The hook command itself: POST stdin to the workspace's activity endpoint.
+///
+/// Every part of this is about NOT being able to hurt the agent. Claude reads
+/// a non-zero exit from a hook as a block, so the command ends in `|| true`;
+/// `-m 2` keeps it under the 3s hook timeout even against a wedged socket; and
+/// the output goes to /dev/null so nothing is ever injected into the
+/// conversation. `date +%s%N` orders reports by when they FIRED rather than
+/// when they arrived; a `date` without `%N` just leaves the server to order
+/// them by receipt.
+fn hook_report_command(port: u16, workspace_id: Uuid) -> String {
+    format!(
+        "curl -s -m 2 -o /dev/null -X POST -H 'Content-Type: application/json' \
+         --data-binary @- \
+         \"http://127.0.0.1:{port}/api/workspaces/{workspace_id}/cli-activity?seq=$(date +%s%N)\" \
+         || true"
+    )
+}
+
 /// Write the per-workspace settings file that registers the activity hooks, and
 /// return its path for `claude --settings`.
 ///
@@ -216,18 +234,12 @@ async fn write_cli_hook_settings(workspace_id: Uuid) -> Option<PathBuf> {
         }
     };
 
-    // Reports stdin and exits 0 no matter what. A hook that can exit non-zero
-    // is a hook that can block the agent's turn, and this one only paints a
-    // sidebar. `-m 2` under the 3s hook timeout, output discarded, `|| true`
-    // for a server that is simply gone.
-    let command = format!(
-        "curl -s -m 2 -o /dev/null -X POST -H 'Content-Type: application/json' \
-         --data-binary @- \
-         \"http://127.0.0.1:{port}/api/workspaces/{workspace_id}/cli-activity?seq=$(date +%s%N)\" \
-         || true"
-    );
     let entry = serde_json::json!([{
-        "hooks": [{ "type": "command", "command": command, "timeout": 3 }]
+        "hooks": [{
+            "type": "command",
+            "command": hook_report_command(port, workspace_id),
+            "timeout": 3,
+        }]
     }]);
     let hooks: serde_json::Map<String, serde_json::Value> = HOOK_EVENTS
         .iter()
@@ -1250,7 +1262,7 @@ mod tests {
 mod tripwire_tests {
     use uuid::Uuid;
 
-    use super::{AttachInputTripwire, hex_dump};
+    use super::{AttachInputTripwire, HOOK_EVENTS, hex_dump, hook_report_command};
 
     fn tripwire() -> AttachInputTripwire {
         AttachInputTripwire::new("bc_test".to_string(), Uuid::new_v4())
@@ -1317,5 +1329,33 @@ mod tripwire_tests {
                 assert_eq!(dumped, "..", "byte {byte:#04x} must be masked");
             }
         }
+    }
+    /// The one property that matters about this hook: Claude reads a non-zero
+    /// exit as a BLOCK on the turn. Point it at a port nothing is listening on
+    /// — the worst realistic case, a server that went away under a live pane —
+    /// and it must still succeed and print nothing.
+    #[test]
+    fn the_report_hook_cannot_block_a_turn() {
+        // Port 1 is privileged and unbound: connecting to it always fails.
+        let command = hook_report_command(1, Uuid::nil());
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .output()
+            .expect("sh is available");
+        assert!(
+            output.status.success(),
+            "hook exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty(), "hook must not emit into the turn");
+    }
+
+    #[test]
+    fn every_reduced_event_is_registered() {
+        // The reducer and the registration read the same list, so an event can
+        // never be understood but not subscribed to.
+        assert_eq!(HOOK_EVENTS.len(), 15);
     }
 }
