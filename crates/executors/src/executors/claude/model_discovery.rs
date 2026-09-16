@@ -3,17 +3,22 @@
 //!
 //! The picker's models used to be a hardcoded array in `default_discovered_options`.
 //! It drifted in both directions, because the alias set is a property of the CLI
-//! *version* and the default base command pins one:
+//! *version*:
 //!
 //! ```text
-//! 2.1.152 (the pinned npx default)  sonnet opus haiku best sonnet[1m] opus[1m] opusplan
-//! 2.1.270 (a current local install) + fable fable[1m]
+//! 2.1.152  sonnet opus haiku best sonnet[1m] opus[1m] opusplan
+//! 2.1.270  + fable fable[1m]
 //! ```
 //!
 //! so the old list simultaneously offered `fable` to a CLI that rejects it and
 //! hid `best` / `opusplan` / `sonnet[1m]` from one that accepts them. Effort
 //! tiers already avoid this by deriving from `ClaudeEffort::VARIANTS`; this is
 //! the same idea for models, with the CLI binary as the source of truth.
+//!
+//! The default base command tracks `@latest`, so that version changes underneath
+//! us with no code change at all — which makes a hardcoded list not merely
+//! stale-prone but impossible to keep correct. Discovery is what makes `@latest`
+//! safe to point at.
 //!
 //! The CLI ships as a single compiled bundle (npm's `bin/claude.exe`, or the
 //! native installer's `~/.local/share/claude/versions/<v>`), and the alias array
@@ -159,42 +164,75 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// the default is a version-pinned `npx`, and a user can point
 /// `base_command_override` anywhere. A miss returns `None` (static fallback).
 pub(crate) fn resolve_cli_bundle(base_command: &str) -> Option<PathBuf> {
-    if let Some(version) = pinned_npm_version(base_command) {
-        return npx_cached_bundle(&version);
+    if let Some(spec) = npm_version_spec(base_command) {
+        return npx_cached_bundle(&spec);
     }
     let program = base_command.split_whitespace().next()?;
     resolve_program(program)
 }
 
-/// `npx -y @anthropic-ai/claude-code@2.1.154 ...` -> `2.1.154`.
-fn pinned_npm_version(base_command: &str) -> Option<String> {
+/// `npx -y @anthropic-ai/claude-code@<spec> ...` -> `<spec>`.
+///
+/// The spec is an exact version (`2.1.267`) or a dist-tag (`latest`, `next`).
+fn npm_version_spec(base_command: &str) -> Option<String> {
     const PKG: &str = "@anthropic-ai/claude-code@";
     let rest = base_command.split(PKG).nth(1)?;
-    let version: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
-    (!version.is_empty()).then_some(version)
+    let spec: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
+    (!spec.is_empty()).then_some(spec)
 }
 
-/// Find a version in npx's package cache.
+/// An exact version, as opposed to a dist-tag or range. Versions start with a
+/// digit; `latest`, `next` and `^2.1` do not.
+fn is_exact_version(spec: &str) -> bool {
+    spec.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// Find the bundle for a version spec in npx's package cache.
 ///
-/// npx keys its cache directories by an opaque hash, so the version is read
-/// back out of each candidate's `package.json` rather than derived. Returns
-/// `None` before the first `npx` run has populated the cache; discovery simply
+/// npx keys its cache directories by an opaque hash, so versions are read back
+/// out of each candidate's `package.json` rather than derived.
+///
+/// An exact spec matches that version. A dist-tag cannot be matched this way —
+/// nothing on disk records that a directory was installed as `latest`, and the
+/// tag moves — so the most recently written entry wins: npx refreshes the cache
+/// when it resolves a tag, making mtime the best available proxy for "what the
+/// next launch will use". A newly published version therefore shows up in the
+/// picker on the run after npx picks it up, not before.
+///
+/// Returns `None` before the first `npx` run has populated the cache; discovery
 /// falls back until then, and the result is cached once it succeeds.
-fn npx_cached_bundle(version: &str) -> Option<PathBuf> {
+fn npx_cached_bundle(spec: &str) -> Option<PathBuf> {
     let root = home_dir()?.join(".npm/_npx");
+    let exact = is_exact_version(spec);
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+
     for entry in std::fs::read_dir(root).ok()?.flatten() {
         let pkg = entry.path().join("node_modules/@anthropic-ai/claude-code");
         if !pkg.is_dir() {
             continue;
         }
-        if package_version(&pkg.join("package.json")).as_deref() != Some(version) {
+        let manifest = pkg.join("package.json");
+        let Some(version) = package_version(&manifest) else {
+            continue;
+        };
+        if exact && version != spec {
             continue;
         }
-        if let Some(bin) = bundle_in_package(&pkg) {
+        let Some(bin) = bundle_in_package(&pkg) else {
+            continue;
+        };
+        if exact {
             return Some(bin);
         }
+        let Ok(mtime) = manifest.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(best, _)| mtime > *best) {
+            newest = Some((mtime, bin));
+        }
     }
-    None
+
+    newest.map(|(_, bin)| bin)
 }
 
 fn package_version(manifest: &Path) -> Option<String> {
@@ -363,19 +401,31 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_pinned_version_out_of_the_default_base_command() {
+    fn reads_the_version_spec_out_of_the_base_command() {
+        // The shipped default: a dist-tag, not a version.
         assert_eq!(
-            pinned_npm_version("npx -y @anthropic-ai/claude-code@2.1.154").as_deref(),
-            Some("2.1.154")
+            npm_version_spec("npx -y @anthropic-ai/claude-code@latest").as_deref(),
+            Some("latest")
         );
         assert_eq!(
-            pinned_npm_version("npx -y @anthropic-ai/claude-code@2.1.154 --foo").as_deref(),
-            Some("2.1.154")
+            npm_version_spec("npx -y @anthropic-ai/claude-code@2.1.267 --foo").as_deref(),
+            Some("2.1.267")
         );
-        assert!(pinned_npm_version("claude").is_none());
+        assert!(npm_version_spec("claude").is_none());
         // The router wrapper is a different package and must not be mistaken
-        // for a pinned Claude Code.
-        assert!(pinned_npm_version("npx -y @musistudio/claude-code-router@1.0.66 code").is_none());
+        // for Claude Code.
+        assert!(npm_version_spec("npx -y @musistudio/claude-code-router@1.0.66 code").is_none());
+    }
+
+    #[test]
+    fn separates_exact_versions_from_dist_tags() {
+        // Exact specs select a matching cache entry; everything else falls back
+        // to "most recently written", since a tag matches nothing on disk.
+        assert!(is_exact_version("2.1.267"));
+        assert!(!is_exact_version("latest"));
+        assert!(!is_exact_version("next"));
+        assert!(!is_exact_version("stable"));
+        assert!(!is_exact_version("^2.1.0"));
     }
 
     /// End-to-end check against a real install, which is the only thing that

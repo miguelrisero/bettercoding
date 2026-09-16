@@ -142,11 +142,24 @@ impl TeardownNoiseFilter {
     }
 }
 
+/// `@latest` rather than a pinned version, deliberately: a pin goes stale the
+/// day it lands, and the one it replaced (2.1.154) had drifted far enough behind
+/// that the CLI it selected no longer offered the models people expected.
+///
+/// What makes this safe to point at is that nothing downstream hardcodes the
+/// CLI's capabilities any more — `model_discovery` reads the model aliases back
+/// out of whichever bundle npx resolved, so the picker follows the CLI instead
+/// of asserting what it should contain. The cost is that builds are no longer
+/// reproducible across time and the CLI can change under a running container;
+/// pin an exact version here to trade that back.
+///
+/// The router wrapper stays pinned: it is a third-party shim around the CLI, so
+/// its blast radius on an unexpected release is different.
 pub(crate) fn base_command(claude_code_router: bool) -> &'static str {
     if claude_code_router {
         "npx -y @musistudio/claude-code-router@1.0.66 code"
     } else {
-        "npx -y @anthropic-ai/claude-code@2.1.154"
+        "npx -y @anthropic-ai/claude-code@latest"
     }
 }
 
