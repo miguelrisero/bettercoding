@@ -535,20 +535,13 @@ impl CliActivityMonitor {
                 return;
             }
 
-            // Seed from the DB so a server restart doesn't replay transitions
-            // that already happened (and so a run that survived the restart
-            // inside tmux can still graduate to `attention`).
-            let mut states: HashMap<Uuid, CliActivityState> =
-                match WorkspaceCliActivity::find_all(&db.pool).await {
-                    Ok(rows) => rows
-                        .into_iter()
-                        .map(|r| (r.workspace_id, r.state))
-                        .collect(),
-                    Err(e) => {
-                        tracing::warn!("Failed to seed CLI activity states: {e}");
-                        HashMap::new()
-                    }
-                };
+            // Read back from the DB every tick, not just at startup. It keeps a
+            // server restart from replaying transitions that already happened,
+            // and — because the hook path writes `state` too — it keeps this
+            // loop from declining to correct a bucket it did not write. A
+            // poller that compared against its own last write would see "no
+            // change" and leave the other writer's value standing forever.
+            let mut states: HashMap<Uuid, CliActivityState> = HashMap::new();
 
             // When each workspace was last observed transitioning to
             // detached (None while attached).
@@ -604,21 +597,23 @@ impl CliActivityMonitor {
                 // table per tick; a failed read just means nobody reported and
                 // the pane heuristics decide this round.
                 let now_utc = chrono::Utc::now();
-                let hooks: HashMap<Uuid, (CliPhase, i64)> =
-                    match WorkspaceCliActivity::find_all(&db.pool).await {
-                        Ok(rows) => rows
-                            .into_iter()
+                let mut hooks: HashMap<Uuid, (CliPhase, i64)> = HashMap::new();
+                match WorkspaceCliActivity::find_all(&db.pool).await {
+                    Ok(rows) => {
+                        hooks = rows
+                            .iter()
                             .filter_map(|row| {
                                 let phase = row.fresh_phase(now_utc)?;
                                 let seq = row.hook.as_ref().map(|h| h.seq)?;
                                 Some((row.workspace_id, (phase, seq)))
                             })
-                            .collect(),
-                        Err(e) => {
-                            tracing::debug!("Failed to read reported CLI phases: {e}");
-                            HashMap::new()
-                        }
-                    };
+                            .collect();
+                        states = rows.iter().map(|r| (r.workspace_id, r.state)).collect();
+                    }
+                    // Keep the last known buckets: an unreadable table must not
+                    // read as "every workspace is idle" and replay transitions.
+                    Err(e) => tracing::debug!("Failed to read CLI activity rows: {e}"),
+                }
 
                 // Sessions present in tmux: run the state machine.
                 for (workspace_id, obs) in observations {

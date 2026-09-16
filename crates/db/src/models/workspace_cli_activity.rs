@@ -171,6 +171,23 @@ fn payload_str<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str>
     payload.get(key).and_then(|v| v.as_str())
 }
 
+/// Is a payload field set, in the sense the reference implementation means it?
+///
+/// It tests `agent_id` for plain truthiness, so an empty or zero value counts
+/// as absent. Spelled out here rather than narrowed to "a non-empty string",
+/// because this guard's job is to behave identically to the reducer it was
+/// ported from for every payload shape, not just the shapes seen so far.
+fn payload_truthy(payload: &serde_json::Value, key: &str) -> bool {
+    match payload.get(key) {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(set)) => *set,
+        Some(serde_json::Value::Number(n)) => n.as_f64().is_some_and(|n| n != 0.0),
+        Some(serde_json::Value::String(s)) => !s.is_empty(),
+        Some(serde_json::Value::Array(items)) => !items.is_empty(),
+        Some(serde_json::Value::Object(fields)) => !fields.is_empty(),
+    }
+}
+
 /// Reduce one Claude Code hook payload into the workspace's new session state,
 /// or `None` when the event must not change anything.
 ///
@@ -190,10 +207,7 @@ pub fn reduce_hook(
 
     // A subagent's events describe the subagent, not the pane. Only its
     // terminal event is useful, and only for refreshing background counts.
-    let subagent = payload
-        .get("agent_id")
-        .is_some_and(|v| !v.is_null() && v.as_str() != Some(""));
-    if subagent && event != "SubagentStop" {
+    if payload_truthy(payload, "agent_id") && event != "SubagentStop" {
         return None;
     }
     // Cursor ships a fork of the hook protocol whose payloads mean other things.
@@ -530,8 +544,104 @@ impl WorkspaceCliActivity {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use sqlx::sqlite::SqlitePoolOptions;
 
     use super::*;
+    use crate::models::workspace::{CreateWorkspace, Workspace};
+
+    async fn test_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::run_migrations_for_tests(&pool).await.unwrap();
+        pool
+    }
+
+    /// The coarse `state` column has two writers: this hook path, which knows
+    /// the phase, and the tmux poller, which knows whether anyone is looking at
+    /// the pane. A reported `stopped` buckets to attention, which is right
+    /// until the user opens the pane — at which point the poller's correction
+    /// has to stick, or the sidebar bell stays lit for work already seen.
+    #[tokio::test]
+    async fn the_poller_can_clear_a_bucket_the_hook_path_raised() {
+        let pool = test_pool().await;
+        let workspace = Workspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "cli-activity-two-writers".to_string(),
+                name: Some("Two writers".to_string()),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+
+        let hook = CliHookState {
+            agent_session_id: "s1".to_string(),
+            transcript_path: Some("/tmp/s1.jsonl".to_string()),
+            phase: CliPhase::Stopped,
+            tasks: Some(1),
+            crons: None,
+            seq: 7,
+        };
+        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, Utc::now())
+            .await
+            .unwrap();
+
+        let row = WorkspaceCliActivity::find_by_workspace_id(&pool, workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, CliActivityState::Attention);
+        assert_eq!(row.phase, Some(CliPhase::Stopped));
+
+        WorkspaceCliActivity::upsert(&pool, workspace.id, CliActivityState::Idle)
+            .await
+            .unwrap();
+
+        let row = WorkspaceCliActivity::find_by_workspace_id(&pool, workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, CliActivityState::Idle);
+        // The correction clears the bell without erasing what the agent said.
+        assert_eq!(row.phase, Some(CliPhase::Stopped));
+        assert_eq!(row.hook.as_ref().unwrap().seq, 7);
+        assert_eq!(row.hook.as_ref().unwrap().tasks, Some(1));
+
+        let needing = WorkspaceCliActivity::find_workspaces_needing_attention(&pool, false)
+            .await
+            .unwrap();
+        assert!(!needing.contains(&workspace.id));
+    }
+
+    #[test]
+    fn a_falsy_agent_id_is_not_a_subagent() {
+        // The reference guard tests `agent_id` for truthiness, so every empty
+        // or zero form is a parent event and must still be reduced.
+        for empty in [
+            json!(null),
+            json!(""),
+            json!(false),
+            json!(0),
+            json!([]),
+            json!({}),
+        ] {
+            let mut payload = event("PostToolUse");
+            payload["agent_id"] = empty.clone();
+            let state = run(&[event("SessionStart"), payload]);
+            assert_eq!(
+                state.map(|s| s.phase),
+                Some(CliPhase::Working),
+                "agent_id {empty}"
+            );
+        }
+        let mut payload = event("PostToolUse");
+        payload["agent_id"] = json!("child");
+        assert!(run(&[event("SessionStart"), payload]).is_none());
+    }
 
     fn event(event: &str) -> serde_json::Value {
         json!({"session_id": "s1", "hook_event_name": event})
