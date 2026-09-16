@@ -1,5 +1,6 @@
 pub mod attachments;
 pub mod claude_rename;
+pub mod cli_activity;
 pub mod codex_setup;
 pub mod core;
 pub mod create;
@@ -56,6 +57,13 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
             post(core::bulk_delete_archived_workspaces),
         )
         .route("/streams/ws", get(streams::stream_workspaces_ws))
+        // Deliberately OUTSIDE the /{id} group's load_workspace_middleware:
+        // Claude Code calls this from a hook on its own critical path, so the
+        // path stays a reduce and an upsert with nothing else loaded first.
+        .route(
+            "/{id}/cli-activity",
+            post(cli_activity::report_cli_activity),
+        )
         .route(
             "/summaries",
             post(workspace_summary::get_workspace_summaries),

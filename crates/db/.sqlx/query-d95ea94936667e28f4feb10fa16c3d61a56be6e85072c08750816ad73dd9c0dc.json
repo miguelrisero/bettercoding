@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT\n                 workspace_id as \"workspace_id!: Uuid\",\n                 state,\n                 updated_at as \"updated_at!: DateTime<Utc>\",\n                 phase,\n                 tasks,\n                 crons,\n                 agent_session_id,\n                 transcript_path,\n                 seq\n               FROM workspace_cli_activity",
+  "query": "SELECT\n                 workspace_id as \"workspace_id!: Uuid\",\n                 state,\n                 updated_at as \"updated_at!: DateTime<Utc>\",\n                 phase,\n                 tasks,\n                 crons,\n                 agent_session_id,\n                 transcript_path,\n                 seq,\n                 hook_at as \"hook_at?: DateTime<Utc>\"\n               FROM workspace_cli_activity",
   "describe": {
     "columns": [
       {
@@ -47,6 +47,11 @@
         "name": "seq",
         "ordinal": 8,
         "type_info": "Integer"
+      },
+      {
+        "name": "hook_at?: DateTime<Utc>",
+        "ordinal": 9,
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -61,8 +66,9 @@
       true,
       true,
       true,
-      false
+      false,
+      true
     ]
   },
-  "hash": "75f74eb5c228b047bbd27712fe2f88db5415a55f7f2410d03e1f2a91b0ef74de"
+  "hash": "d95ea94936667e28f4feb10fa16c3d61a56be6e85072c08750816ad73dd9c0dc"
 }

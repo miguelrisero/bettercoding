@@ -18,6 +18,7 @@ use db::models::{
     session::Session,
     workspace::Workspace,
     workspace_repo::WorkspaceRepo,
+    workspace_cli_activity::HOOK_EVENTS,
     workspace_spawn_reservation::{SpawnReservationHolder, WorkspaceSpawnReservation},
 };
 use deployment::Deployment;
@@ -145,11 +146,13 @@ pub(super) async fn resolve_cli_model_effort(
 /// model/effort are folded in as overrides so the interactive launch honors the
 /// same selection as headless mode. Agents without their own interactive CLI
 /// support fall back to a default claude launch so CLI mode always works.
-pub(super) fn resolve_cli_launch_spec(
+pub(super) async fn resolve_cli_launch_spec(
     session: Option<&Session>,
     model_id: Option<String>,
     reasoning_id: Option<String>,
     dir: &Path,
+    workspace_id: Uuid,
+    workspace_name: Option<&str>,
 ) -> CliLaunchSpec {
     let executor = session
         .and_then(|s| s.executor.as_deref())
@@ -166,7 +169,7 @@ pub(super) fn resolve_cli_launch_spec(
         agent.apply_overrides(&config);
     }
 
-    agent.interactive_cli_spec(dir).unwrap_or_else(|| {
+    let mut spec = agent.interactive_cli_spec(dir).unwrap_or_else(|| {
         // The selected agent has no interactive CLI support (yet) — fall back to
         // a default claude launch so the CLI pane is never left without an agent.
         let claude = ExecutorConfig::new(BaseCodingAgent::ClaudeCode);
@@ -174,7 +177,77 @@ pub(super) fn resolve_cli_launch_spec(
             .get_coding_agent_or_default(&claude.profile_id())
             .interactive_cli_spec(dir)
             .expect("claude always provides an interactive CLI spec")
-    })
+    });
+
+    // claude is the only agent that reports its own state, and the only one
+    // that takes these flags. Everything else keeps the tmux poller's guess.
+    if spec.program == "claude" {
+        if let Some(settings) = write_cli_hook_settings(workspace_id).await {
+            spec.base_args.push("--settings".to_string());
+            spec.base_args.push(settings.to_string_lossy().into_owned());
+        }
+        if let Some(name) = workspace_name.map(str::trim).filter(|n| !n.is_empty()) {
+            spec.base_args.push("--name".to_string());
+            spec.base_args.push(name.to_string());
+        }
+    }
+
+    spec
+}
+
+/// Write the per-workspace settings file that registers the activity hooks, and
+/// return its path for `claude --settings`.
+///
+/// `--settings` MERGES with the user's own `~/.claude/settings.json` rather
+/// than replacing it, which is the whole reason to use it: bettercoding never
+/// edits the user's global config, and never puts a settings file in the
+/// worktree where it would show up in `git status`. The file is rewritten on
+/// every launch, so the baked-in port is the port of the server doing the
+/// launching.
+///
+/// Returns `None` on any failure. A missing activity signal is a worse sidebar,
+/// not a broken launch.
+async fn write_cli_hook_settings(workspace_id: Uuid) -> Option<PathBuf> {
+    let port = match utils::port_file::read_port_file("vibe-kanban").await {
+        Ok(port) => port,
+        Err(error) => {
+            tracing::debug!(?error, "no port file; CLI activity hooks not registered");
+            return None;
+        }
+    };
+
+    // Reports stdin and exits 0 no matter what. A hook that can exit non-zero
+    // is a hook that can block the agent's turn, and this one only paints a
+    // sidebar. `-m 2` under the 3s hook timeout, output discarded, `|| true`
+    // for a server that is simply gone.
+    let command = format!(
+        "curl -s -m 2 -o /dev/null -X POST -H 'Content-Type: application/json' \
+         --data-binary @- \
+         \"http://127.0.0.1:{port}/api/workspaces/{workspace_id}/cli-activity?seq=$(date +%s%N)\" \
+         || true"
+    );
+    let entry = serde_json::json!([{
+        "hooks": [{ "type": "command", "command": command, "timeout": 3 }]
+    }]);
+    let hooks: serde_json::Map<String, serde_json::Value> = HOOK_EVENTS
+        .iter()
+        .map(|event| ((*event).to_string(), entry.clone()))
+        .collect();
+    let settings = serde_json::json!({ "hooks": hooks });
+
+    let dir = utils::assets::asset_dir().join("cli-hooks");
+    if let Err(error) = tokio::fs::create_dir_all(&dir).await {
+        tracing::debug!(?error, "could not create the CLI hook settings directory");
+        return None;
+    }
+    let path = dir.join(format!("{workspace_id}.json"));
+    match tokio::fs::write(&path, settings.to_string()).await {
+        Ok(()) => Some(path),
+        Err(error) => {
+            tracing::debug!(?error, "could not write the CLI hook settings file");
+            None
+        }
+    }
 }
 
 async fn terminal_ws(
@@ -390,7 +463,15 @@ async fn terminal_ws(
             // Honor the workspace's selected agent + model/effort at launch
             // (defaults to claude at Opus/max when nothing was selected).
             let (model_id, reasoning_id) = resolve_cli_model_effort(pool, session.as_ref()).await;
-            let spec = resolve_cli_launch_spec(session.as_ref(), model_id, reasoning_id, &dir);
+            let spec = resolve_cli_launch_spec(
+                session.as_ref(),
+                model_id,
+                reasoning_id,
+                &dir,
+                query.workspace_id,
+                attempt.name.as_deref(),
+            )
+            .await;
 
             // How the parked prompt travels:
             // - Genuine first attach (no tmux session yet, nothing to resume):

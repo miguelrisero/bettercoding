@@ -149,7 +149,7 @@ pub struct CliHookState {
 
 /// Hook events a CLI-mode session reports. Anything else is ignored outright,
 /// so a future event cannot be mistaken for one of these.
-const HOOK_EVENTS: &[&str] = &[
+pub const HOOK_EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
@@ -287,9 +287,28 @@ pub struct WorkspaceCliActivity {
     /// report nothing (codex, gemini, a claude too old for the hook).
     pub phase: Option<CliPhase>,
     pub hook: Option<CliHookState>,
+    /// When the phase was last reported. `None` for a row the poller alone
+    /// has ever written.
+    pub hook_at: Option<DateTime<Utc>>,
 }
 
+/// How long a reported phase keeps describing the pane. Ported from the
+/// reference implementation's one-hour metadata TTL: a session that has not
+/// reported for an hour is no longer making a claim about itself, so the tmux
+/// poller's guess takes over again.
+pub const HOOK_PHASE_TTL_SECS: i64 = 3600;
+
 impl WorkspaceCliActivity {
+    /// The agent's own phase, but only while its last report is recent enough
+    /// to still be about the current pane. Every consumer of `phase` goes
+    /// through this, so "how stale is too stale" is decided in one place.
+    pub fn fresh_phase(&self, now: DateTime<Utc>) -> Option<CliPhase> {
+        let at = self.hook_at?;
+        (now.signed_duration_since(at).num_seconds() < HOOK_PHASE_TTL_SECS)
+            .then_some(self.phase)
+            .flatten()
+    }
+
     /// Set a workspace's CLI activity state. No-op write avoidance is the
     /// caller's job (the monitor only calls this on transitions).
     pub async fn upsert(
@@ -369,7 +388,8 @@ impl WorkspaceCliActivity {
                  crons,
                  agent_session_id,
                  transcript_path,
-                 seq
+                 seq,
+                 hook_at as "hook_at?: DateTime<Utc>"
                FROM workspace_cli_activity"#
         )
         .fetch_all(pool)
@@ -390,6 +410,7 @@ impl WorkspaceCliActivity {
                     crons: r.crons,
                     seq: r.seq,
                 }),
+                hook_at: r.hook_at,
             })
             .collect())
     }
@@ -413,6 +434,52 @@ impl WorkspaceCliActivity {
         Ok(result.into_iter().collect())
     }
 
+    /// One workspace's row, for reducing the next hook report against the
+    /// state the previous one left.
+    pub async fn find_by_workspace_id(
+        pool: &SqlitePool,
+        workspace_id: Uuid,
+    ) -> Result<Option<Self>, sqlx::Error> {
+        let row = sqlx::query!(
+            r#"SELECT
+                 workspace_id as "workspace_id!: Uuid",
+                 state,
+                 updated_at as "updated_at!: DateTime<Utc>",
+                 phase,
+                 tasks,
+                 crons,
+                 agent_session_id,
+                 transcript_path,
+                 seq,
+                 hook_at as "hook_at?: DateTime<Utc>"
+               FROM workspace_cli_activity
+               WHERE workspace_id = $1"#,
+            workspace_id
+        )
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(row.map(|r| Self {
+            workspace_id: r.workspace_id,
+            state: CliActivityState::parse(&r.state),
+            updated_at: r.updated_at,
+            phase: r.phase.as_deref().and_then(CliPhase::parse),
+            hook: r.agent_session_id.map(|agent_session_id| CliHookState {
+                agent_session_id,
+                transcript_path: r.transcript_path,
+                phase: r
+                    .phase
+                    .as_deref()
+                    .and_then(CliPhase::parse)
+                    .unwrap_or(CliPhase::Ready),
+                tasks: r.tasks,
+                crons: r.crons,
+                seq: r.seq,
+            }),
+            hook_at: r.hook_at,
+        }))
+    }
+
     /// Row lookup for the SQLite update hook (hooks only get a rowid).
     pub async fn find_by_rowid(pool: &SqlitePool, rowid: i64) -> Result<Option<Self>, sqlx::Error> {
         let row = sqlx::query!(
@@ -425,7 +492,8 @@ impl WorkspaceCliActivity {
                  crons,
                  agent_session_id,
                  transcript_path,
-                 seq
+                 seq,
+                 hook_at as "hook_at?: DateTime<Utc>"
                FROM workspace_cli_activity
                WHERE rowid = $1"#,
             rowid
@@ -446,6 +514,7 @@ impl WorkspaceCliActivity {
                 crons: r.crons,
                 seq: r.seq,
             }),
+            hook_at: r.hook_at,
         }))
     }
 }
