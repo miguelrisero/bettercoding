@@ -236,8 +236,8 @@ export function WorkspaceSummary({
       {/* Right-side hover action - more options only */}
       {workspaceId && onOpenWorkspaceActions && (
         <div className="absolute right-0 top-0 bottom-0 flex items-center sm:opacity-0 sm:group-hover:opacity-100">
-          {/* Gradient fade from transparent to the row surface (active rows are brand-tinted) */}
-          <div className="h-full w-6 pointer-events-none bg-gradient-to-r from-transparent to-secondary group-[.is-active]:bg-none group-[.is-active]:bg-gradient-to-r group-[.is-active]:from-transparent group-[.is-active]:to-brand/10 dark:group-[.is-active]:to-brand/20" />
+          {/* Gradient fade from transparent to the row surface (dropped on active rows, which are brand-tinted) */}
+          <div className="h-full w-6 pointer-events-none bg-gradient-to-r from-transparent to-secondary group-[.is-active]:bg-none" />
           {/* Single action button */}
           <div
             className={cn(
