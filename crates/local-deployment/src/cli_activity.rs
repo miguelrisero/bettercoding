@@ -1392,19 +1392,37 @@ mod tests {
 
     #[test]
     fn fresh_output_means_running() {
-        let next = next_state(CliActivityState::Idle, obs(true, 0, false), false, NOW, None);
+        let next = next_state(
+            CliActivityState::Idle,
+            obs(true, 0, false),
+            false,
+            NOW,
+            None,
+        );
         assert_eq!(next, CliActivityState::Running);
     }
 
     #[test]
     fn run_that_kept_going_after_departure_raises_attention() {
-        let next = next_state(CliActivityState::Running, obs(true, 30, false), true, NOW, None);
+        let next = next_state(
+            CliActivityState::Running,
+            obs(true, 30, false),
+            true,
+            NOW,
+            None,
+        );
         assert_eq!(next, CliActivityState::Attention);
     }
 
     #[test]
     fn run_going_quiet_while_watched_is_idle() {
-        let next = next_state(CliActivityState::Running, obs(true, 30, true), false, NOW, None);
+        let next = next_state(
+            CliActivityState::Running,
+            obs(true, 30, true),
+            false,
+            NOW,
+            None,
+        );
         assert_eq!(next, CliActivityState::Idle);
     }
 
@@ -1412,7 +1430,13 @@ mod tests {
     fn departure_repaint_blip_does_not_raise_attention() {
         // The only post-detach output was the focus-out repaint (inside the
         // settle window), so ran_while_detached is false.
-        let next = next_state(CliActivityState::Running, obs(true, 30, false), false, NOW, None);
+        let next = next_state(
+            CliActivityState::Running,
+            obs(true, 30, false),
+            false,
+            NOW,
+            None,
+        );
         assert_eq!(next, CliActivityState::Idle);
     }
 

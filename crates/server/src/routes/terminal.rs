@@ -17,8 +17,8 @@ use db::models::{
     execution_process::ExecutionProcess,
     session::Session,
     workspace::Workspace,
-    workspace_repo::WorkspaceRepo,
     workspace_cli_activity::HOOK_EVENTS,
+    workspace_repo::WorkspaceRepo,
     workspace_spawn_reservation::{SpawnReservationHolder, WorkspaceSpawnReservation},
 };
 use deployment::Deployment;

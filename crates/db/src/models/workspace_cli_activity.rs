@@ -405,7 +405,11 @@ impl WorkspaceCliActivity {
                 hook: r.agent_session_id.map(|agent_session_id| CliHookState {
                     agent_session_id,
                     transcript_path: r.transcript_path,
-                    phase: r.phase.as_deref().and_then(CliPhase::parse).unwrap_or(CliPhase::Ready),
+                    phase: r
+                        .phase
+                        .as_deref()
+                        .and_then(CliPhase::parse)
+                        .unwrap_or(CliPhase::Ready),
                     tasks: r.tasks,
                     crons: r.crons,
                     seq: r.seq,
@@ -509,7 +513,11 @@ impl WorkspaceCliActivity {
             hook: r.agent_session_id.map(|agent_session_id| CliHookState {
                 agent_session_id,
                 transcript_path: r.transcript_path,
-                phase: r.phase.as_deref().and_then(CliPhase::parse).unwrap_or(CliPhase::Ready),
+                phase: r
+                    .phase
+                    .as_deref()
+                    .and_then(CliPhase::parse)
+                    .unwrap_or(CliPhase::Ready),
                 tasks: r.tasks,
                 crons: r.crons,
                 seq: r.seq,
@@ -521,8 +529,9 @@ impl WorkspaceCliActivity {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     fn event(event: &str) -> serde_json::Value {
         json!({"session_id": "s1", "hook_event_name": event})
@@ -561,11 +570,13 @@ mod tests {
     #[test]
     fn missing_or_empty_session_id_is_dropped() {
         assert!(run(&[json!({"hook_event_name": "SessionStart"})]).is_none());
-        assert!(run(&[json!({
-            "hook_event_name": "SessionStart",
-            "session_id": ""
-        })])
-        .is_none());
+        assert!(
+            run(&[json!({
+                "hook_event_name": "SessionStart",
+                "session_id": ""
+            })])
+            .is_none()
+        );
     }
 
     #[test]
@@ -820,10 +831,7 @@ mod tests {
             "s1",
         );
         let state = run(&[with_path, event("UserPromptSubmit")]).unwrap();
-        assert_eq!(
-            state.transcript_path.as_deref(),
-            Some("/tmp/s1.jsonl")
-        );
+        assert_eq!(state.transcript_path.as_deref(), Some("/tmp/s1.jsonl"));
     }
 
     #[test]
