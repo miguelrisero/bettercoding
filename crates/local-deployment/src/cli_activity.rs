@@ -12,6 +12,12 @@
 //! - attached client views the session         → back to `idle`
 //! - pane fell back to a plain shell           → `idle` (claude exited)
 //!
+//! A CLI-mode claude also reports its own phase through its hooks. Where a
+//! workspace has a fresh report, that phase decides the bucket and the pane
+//! heuristics above are not consulted: the agent knows whether it is working,
+//! and a user typing into the pane does not. Everything else (codex, gemini, a
+//! claude too old for the hooks) keeps the guess.
+//!
 //! States are written to the DB only on transitions; the SQLite update hook
 //! then re-broadcasts the owning workspace's status patch, so the sidebar
 //! moves in near-real-time without any new streaming plumbing.
@@ -26,7 +32,7 @@ use std::{
 
 use db::{
     DBService,
-    models::workspace_cli_activity::{CliActivityState, WorkspaceCliActivity},
+    models::workspace_cli_activity::{CliActivityState, CliPhase, WorkspaceCliActivity},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -548,6 +554,11 @@ impl CliActivityMonitor {
             // detached (None while attached).
             let mut detached_since: HashMap<Uuid, i64> = HashMap::new();
 
+            // Highest hook `seq` the user has demonstrably seen, per workspace
+            // (they had the pane open when it arrived). Everything up to it has
+            // been acknowledged and must not raise a hand again.
+            let mut hook_acked: HashMap<Uuid, i64> = HashMap::new();
+
             let mut interval = tokio::time::interval(POLL_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut size_sweep_ticks = 0;
@@ -589,6 +600,26 @@ impl CliActivityMonitor {
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
 
+                // What each agent last said about itself. A read of one small
+                // table per tick; a failed read just means nobody reported and
+                // the pane heuristics decide this round.
+                let now_utc = chrono::Utc::now();
+                let hooks: HashMap<Uuid, (CliPhase, i64)> =
+                    match WorkspaceCliActivity::find_all(&db.pool).await {
+                        Ok(rows) => rows
+                            .into_iter()
+                            .filter_map(|row| {
+                                let phase = row.fresh_phase(now_utc)?;
+                                let seq = row.hook.as_ref().map(|h| h.seq)?;
+                                Some((row.workspace_id, (phase, seq)))
+                            })
+                            .collect(),
+                        Err(e) => {
+                            tracing::debug!("Failed to read reported CLI phases: {e}");
+                            HashMap::new()
+                        }
+                    };
+
                 // Sessions present in tmux: run the state machine.
                 for (workspace_id, obs) in observations {
                     let prev = states
@@ -605,7 +636,21 @@ impl CliActivityMonitor {
                     let ran_while_detached = detached_since
                         .get(workspace_id)
                         .is_some_and(|since| obs.last_activity >= since + DETACH_SETTLE_SECS);
-                    let next = next_state(prev, *obs, ran_while_detached, now);
+                    // Having the pane open acknowledges everything reported so
+                    // far, which is the hook-side form of "attention clears the
+                    // moment a terminal attaches".
+                    let hook = hooks.get(workspace_id).map(|(phase, seq)| {
+                        if obs.attached {
+                            hook_acked.insert(*workspace_id, *seq);
+                        }
+                        HookView {
+                            phase: *phase,
+                            acked: hook_acked
+                                .get(workspace_id)
+                                .is_some_and(|acked| *seq <= *acked),
+                        }
+                    });
+                    let next = next_state(prev, *obs, ran_while_detached, now, hook);
                     if next != prev {
                         Self::record(&db, &mut states, *workspace_id, next).await;
                     }
@@ -858,18 +903,42 @@ fn sizing_presence(presence: CliClientPresence, now: std::time::Instant) -> Sizi
     }
 }
 
+/// What the workspace's agent last reported about itself, as the poller sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HookView {
+    phase: CliPhase,
+    /// True once the user has attached to the pane at or after this report.
+    /// Without it a phase like `stopped` would re-raise the hand every time
+    /// the user navigated away from a workspace they had already looked at.
+    acked: bool,
+}
+
 /// Pure transition function — kept free of I/O so it can be unit tested.
 /// `ran_while_detached`: the pane produced output meaningfully after the
 /// user detached (see DETACH_SETTLE_SECS).
+/// `hook`: the agent's own fresh report, when it makes one.
 fn next_state(
     prev: CliActivityState,
     obs: Observation,
     ran_while_detached: bool,
     now: i64,
+    hook: Option<HookView>,
 ) -> CliActivityState {
     // Bootstrap fell back to a plain shell: claude is not running here.
     if !obs.claude_like {
         return CliActivityState::Idle;
+    }
+
+    // The agent's own account beats every pane heuristic below. It is the only
+    // input that can tell "waiting for approval" from "idle", and the only one
+    // a user typing in the pane cannot fake.
+    if let Some(hook) = hook {
+        return match hook.phase.bucket() {
+            // Attention still clears the moment a terminal attaches, and stays
+            // cleared for a report the user has already seen.
+            CliActivityState::Attention if obs.attached || hook.acked => CliActivityState::Idle,
+            bucket => bucket,
+        };
     }
 
     let active = now - obs.last_activity <= ACTIVE_WINDOW_SECS;
@@ -1323,19 +1392,19 @@ mod tests {
 
     #[test]
     fn fresh_output_means_running() {
-        let next = next_state(CliActivityState::Idle, obs(true, 0, false), false, NOW);
+        let next = next_state(CliActivityState::Idle, obs(true, 0, false), false, NOW, None);
         assert_eq!(next, CliActivityState::Running);
     }
 
     #[test]
     fn run_that_kept_going_after_departure_raises_attention() {
-        let next = next_state(CliActivityState::Running, obs(true, 30, false), true, NOW);
+        let next = next_state(CliActivityState::Running, obs(true, 30, false), true, NOW, None);
         assert_eq!(next, CliActivityState::Attention);
     }
 
     #[test]
     fn run_going_quiet_while_watched_is_idle() {
-        let next = next_state(CliActivityState::Running, obs(true, 30, true), false, NOW);
+        let next = next_state(CliActivityState::Running, obs(true, 30, true), false, NOW, None);
         assert_eq!(next, CliActivityState::Idle);
     }
 
@@ -1343,7 +1412,7 @@ mod tests {
     fn departure_repaint_blip_does_not_raise_attention() {
         // The only post-detach output was the focus-out repaint (inside the
         // settle window), so ran_while_detached is false.
-        let next = next_state(CliActivityState::Running, obs(true, 30, false), false, NOW);
+        let next = next_state(CliActivityState::Running, obs(true, 30, false), false, NOW, None);
         assert_eq!(next, CliActivityState::Idle);
     }
 
@@ -1354,6 +1423,7 @@ mod tests {
             obs(true, 300, false),
             true,
             NOW,
+            None,
         );
         assert_eq!(held, CliActivityState::Attention);
         let cleared = next_state(
@@ -1361,8 +1431,104 @@ mod tests {
             obs(true, 300, true),
             false,
             NOW,
+            None,
         );
         assert_eq!(cleared, CliActivityState::Idle);
+    }
+
+    fn hook(phase: CliPhase, acked: bool) -> Option<HookView> {
+        Some(HookView { phase, acked })
+    }
+
+    #[test]
+    fn a_reported_phase_beats_the_pane_guess_in_both_directions() {
+        // Quiet pane, but the agent says it is working (a long tool call that
+        // prints nothing): the guess would have said idle.
+        assert_eq!(
+            next_state(
+                CliActivityState::Idle,
+                obs(true, 300, false),
+                false,
+                NOW,
+                hook(CliPhase::Working, false),
+            ),
+            CliActivityState::Running
+        );
+        // Repainting pane, but the agent says it is waiting at its prompt —
+        // this is the user typing, which the guess reads as the agent working.
+        assert_eq!(
+            next_state(
+                CliActivityState::Running,
+                obs(true, 0, true),
+                false,
+                NOW,
+                hook(CliPhase::Ready, false),
+            ),
+            CliActivityState::Idle
+        );
+    }
+
+    #[test]
+    fn a_reported_wait_raises_attention_until_the_user_looks() {
+        for phase in [
+            CliPhase::Stopped,
+            CliPhase::Approval,
+            CliPhase::Question,
+            CliPhase::RateLimit,
+        ] {
+            assert_eq!(
+                next_state(
+                    CliActivityState::Idle,
+                    obs(true, 300, false),
+                    false,
+                    NOW,
+                    hook(phase, false),
+                ),
+                CliActivityState::Attention,
+                "phase {phase:?}"
+            );
+            // Attention clears the moment a terminal attaches…
+            assert_eq!(
+                next_state(
+                    CliActivityState::Attention,
+                    obs(true, 300, true),
+                    false,
+                    NOW,
+                    hook(phase, false),
+                ),
+                CliActivityState::Idle,
+                "phase {phase:?}"
+            );
+            // …and stays cleared afterwards: navigating away from a workspace
+            // must not re-ring the bell for a report already seen.
+            assert_eq!(
+                next_state(
+                    CliActivityState::Idle,
+                    obs(true, 300, false),
+                    false,
+                    NOW,
+                    hook(phase, true),
+                ),
+                CliActivityState::Idle,
+                "phase {phase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dead_pane_beats_a_report_that_outlived_it() {
+        // claude exited without a SessionEnd (killed, crashed): whatever it
+        // last reported, there is nothing running here.
+        assert_eq!(
+            next_state(
+                CliActivityState::Running,
+                obs(false, 0, false),
+                false,
+                NOW,
+                hook(CliPhase::Working, false),
+            ),
+            CliActivityState::Idle
+        );
     }
 
     #[test]
@@ -1373,7 +1539,7 @@ mod tests {
             CliActivityState::Attention,
         ] {
             assert_eq!(
-                next_state(prev, obs(false, 0, false), false, NOW),
+                next_state(prev, obs(false, 0, false), false, NOW, None),
                 CliActivityState::Idle
             );
         }

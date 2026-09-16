@@ -835,6 +835,34 @@ mod tests {
         assert_eq!(state.agent_session_id, "s1");
     }
 
+    fn row(phase: Option<CliPhase>, hook_at: Option<DateTime<Utc>>) -> WorkspaceCliActivity {
+        WorkspaceCliActivity {
+            workspace_id: Uuid::nil(),
+            state: CliActivityState::Idle,
+            updated_at: Utc::now(),
+            phase,
+            hook: None,
+            hook_at,
+        }
+    }
+
+    #[test]
+    fn a_phase_stops_describing_the_pane_once_its_report_ages_out() {
+        let now = Utc::now();
+        let ago = |secs: i64| Some(now - chrono::Duration::seconds(secs));
+        assert_eq!(
+            row(Some(CliPhase::Working), ago(HOOK_PHASE_TTL_SECS - 1)).fresh_phase(now),
+            Some(CliPhase::Working)
+        );
+        assert_eq!(
+            row(Some(CliPhase::Working), ago(HOOK_PHASE_TTL_SECS)).fresh_phase(now),
+            None
+        );
+        // A row the poller alone has ever written never claims a phase.
+        assert_eq!(row(None, ago(0)).fresh_phase(now), None);
+        assert_eq!(row(Some(CliPhase::Working), None).fresh_phase(now), None);
+    }
+
     #[test]
     fn phase_strings_round_trip_and_bucket() {
         for phase in [

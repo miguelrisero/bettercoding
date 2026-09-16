@@ -7,7 +7,7 @@ use db::models::{
     merge::MergeStatus,
     pull_request::PullRequest,
     workspace::Workspace,
-    workspace_cli_activity::WorkspaceCliActivity,
+    workspace_cli_activity::{CliPhase, WorkspaceCliActivity},
     workspace_repo::WorkspaceRepo,
 };
 use deployment::Deployment;
@@ -52,6 +52,11 @@ pub struct WorkspaceSummary {
     /// Did this workspace's CLI-mode claude session finish while no terminal
     /// was attached? (Cleared when the user opens the pane again.)
     pub cli_attention: bool,
+    /// What the CLI-mode agent last reported it is doing, for agents that
+    /// report at all (see `reduce_hook`). `None` for an agent that reports
+    /// nothing, or for a report too old to still describe the pane — in which
+    /// case `cli_attention` and the running flags remain the only signal.
+    pub cli_phase: Option<CliPhase>,
     /// PR status for this workspace (if any PR exists)
     pub pr_status: Option<MergeStatus>,
     /// PR number for this workspace (if any PR exists)
@@ -120,6 +125,14 @@ pub async fn get_workspace_summaries(
     let cli_attention_workspaces =
         WorkspaceCliActivity::find_workspaces_needing_attention(pool, archived).await?;
 
+    // 5c. What each CLI-mode agent last reported about itself
+    let now = chrono::Utc::now();
+    let cli_phases: HashMap<Uuid, CliPhase> = WorkspaceCliActivity::find_all(pool)
+        .await?
+        .into_iter()
+        .filter_map(|row| Some((row.workspace_id, row.fresh_phase(now)?)))
+        .collect();
+
     // 6. Get PR status for each workspace
     let pr_statuses = PullRequest::get_latest_for_workspaces(pool, archived).await?;
 
@@ -180,6 +193,7 @@ pub async fn get_workspace_summaries(
                 has_running_dev_server: dev_server_workspaces.contains(&id),
                 has_unseen_turns: unseen_workspaces.contains(&id),
                 cli_attention: cli_attention_workspaces.contains(&id),
+                cli_phase: cli_phases.get(&id).copied(),
                 pr_status: pr_statuses.get(&id).map(|pr| pr.pr_status.clone()),
                 pr_number: pr_statuses.get(&id).map(|pr| pr.pr_number),
                 pr_url: pr_statuses.get(&id).map(|pr| pr.pr_url.clone()),
