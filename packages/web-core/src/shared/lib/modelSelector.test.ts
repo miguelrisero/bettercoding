@@ -77,6 +77,21 @@ describe('appendPresetModel', () => {
     ]);
   });
 
+  it('does not duplicate a preset the executor already lists', () => {
+    const config = claudeConfig();
+    config.models.push({
+      id: 'claude-opus-5-5',
+      name: 'Opus 5.5',
+      provider_id: null,
+      reasoning_options: effortOptions,
+    });
+    const result = appendPresetModel(config, 'claude-opus-5-5', true);
+    expect(result).toBe(config);
+    expect(
+      result!.models.filter((m) => m.id === 'claude-opus-5-5')
+    ).toHaveLength(1);
+  });
+
   it('does not inherit effort options when the fallback is disabled', () => {
     // Non-Claude executors pass enableEffortFallback=false (the default): even a
     // provider-less id containing "opus" must not invent effort options.

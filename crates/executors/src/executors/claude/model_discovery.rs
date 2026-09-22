@@ -294,6 +294,7 @@ pub(crate) fn label_for_alias(alias: &str) -> String {
         "opus" => "Opus".to_string(),
         "haiku" => "Haiku".to_string(),
         "fable" => "Fable".to_string(),
+        "claude-opus-5-5" => "Opus 5.5".to_string(),
         // Not model names: `best` lets the CLI pick, `opusplan` plans on Opus
         // and executes on Sonnet.
         "best" => "Best available".to_string(),
