@@ -459,8 +459,8 @@ pub fn interactive_cli_args(model_id: Option<&str>, reasoning_id: Option<&str>) 
 #[cfg(test)]
 mod cli_launch_tests {
     use super::{
-        default_effort_options, interactive_cli_args, models_from_aliases,
-        normalize_claude_model_id,
+        default_discovered_options, default_effort_options, interactive_cli_args,
+        models_from_aliases, normalize_claude_model_id,
     };
 
     fn v(items: &[&str]) -> Vec<String> {
@@ -478,8 +478,8 @@ mod cli_launch_tests {
     #[test]
     fn respects_explicit_selection() {
         assert_eq!(
-            interactive_cli_args(Some("sonnet"), Some("high")),
-            v(&["--model", "sonnet", "--effort", "high"])
+            interactive_cli_args(Some("claude-opus-5-5"), Some("high")),
+            v(&["--model", "claude-opus-5-5", "--effort", "high"])
         );
     }
 
@@ -645,13 +645,14 @@ mod cli_launch_tests {
 
     #[test]
     fn interactive_spec_carries_model_effort_and_skips_permissions() {
-        let claude = claude_from(serde_json::json!({ "model": "sonnet", "effort": "high" }));
+        let claude =
+            claude_from(serde_json::json!({ "model": "claude-opus-5-5", "effort": "high" }));
         let spec = claude.interactive_cli_spec(Path::new("/tmp")).unwrap();
         assert_eq!(spec.program, "claude");
         assert!(
             spec.base_args
                 .windows(2)
-                .any(|w| w == ["--model", "sonnet"])
+                .any(|w| w == ["--model", "claude-opus-5-5"])
         );
         assert!(spec.base_args.windows(2).any(|w| w == ["--effort", "high"]));
         assert!(
@@ -680,6 +681,20 @@ mod cli_launch_tests {
     }
 
     #[test]
+    fn fallback_picker_offers_opus_5_5_without_sonnet() {
+        let ids: Vec<String> = default_discovered_options()
+            .model_selector
+            .models
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(
+            ids,
+            ["fable", "opus", "opus[1m]", "haiku", "claude-opus-5-5"]
+        );
+    }
+
+    #[test]
     fn interactive_spec_defaults_to_opus_max() {
         let claude = claude_from(serde_json::json!({}));
         let spec = claude.interactive_cli_spec(Path::new("/tmp")).unwrap();
@@ -691,10 +706,10 @@ mod cli_launch_tests {
 /// Aliases offered when the CLI bundle cannot be read (not installed yet, an
 /// `npx` cache that has not been populated, an unfamiliar bundle layout).
 ///
-/// Deliberately the pre-discovery list rather than the union of every alias we
+/// Deliberately a short curated list rather than the union of every alias we
 /// have seen: on the degraded path it is better to under-offer than to list a
 /// model the pinned CLI would reject at launch.
-const FALLBACK_MODEL_ALIASES: &[&str] = &["fable", "opus", "opus[1m]", "sonnet", "haiku"];
+const FALLBACK_MODEL_ALIASES: &[&str] = &["fable", "opus", "opus[1m]", "haiku"];
 
 /// Full model ids offered after the aliases on both the discovered and the
 /// fallback path. The CLI forwards a full id to the API unchanged, so these do
