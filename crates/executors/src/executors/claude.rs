@@ -458,7 +458,10 @@ pub fn interactive_cli_args(model_id: Option<&str>, reasoning_id: Option<&str>) 
 
 #[cfg(test)]
 mod cli_launch_tests {
-    use super::{interactive_cli_args, normalize_claude_model_id};
+    use super::{
+        default_effort_options, interactive_cli_args, models_from_aliases,
+        normalize_claude_model_id,
+    };
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -665,6 +668,18 @@ mod cli_launch_tests {
     }
 
     #[test]
+    fn pinned_opus_5_5_is_offered_with_effort() {
+        let models = models_from_aliases(["opus".to_string()], &default_effort_options());
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["opus", "claude-opus-5-5"]);
+        assert_eq!(models[1].name, "Opus 5.5");
+        assert!(!models[1].reasoning_options.is_empty());
+
+        let deduped = models_from_aliases(["claude-opus-5-5".to_string()], &[]);
+        assert_eq!(deduped.len(), 1);
+    }
+
+    #[test]
     fn interactive_spec_defaults_to_opus_max() {
         let claude = claude_from(serde_json::json!({}));
         let spec = claude.interactive_cli_spec(Path::new("/tmp")).unwrap();
@@ -680,6 +695,11 @@ mod cli_launch_tests {
 /// have seen: on the degraded path it is better to under-offer than to list a
 /// model the pinned CLI would reject at launch.
 const FALLBACK_MODEL_ALIASES: &[&str] = &["fable", "opus", "opus[1m]", "sonnet", "haiku"];
+
+/// Full model ids offered after the aliases on both the discovered and the
+/// fallback path. The CLI forwards a full id to the API unchanged, so these do
+/// not depend on the bundle's alias table.
+const PINNED_MODEL_IDS: &[&str] = &["claude-opus-5-5"];
 
 /// Effort tiers offered in the picker.
 ///
@@ -702,8 +722,13 @@ fn models_from_aliases(
     aliases: impl IntoIterator<Item = String>,
     effort_options: &[crate::model_selector::ReasoningOption],
 ) -> Vec<crate::model_selector::ModelInfo> {
-    aliases
-        .into_iter()
+    let mut ids: Vec<String> = aliases.into_iter().collect();
+    for pinned in PINNED_MODEL_IDS {
+        if !ids.iter().any(|id| id == pinned) {
+            ids.push(pinned.to_string());
+        }
+    }
+    ids.into_iter()
         .map(|id| crate::model_selector::ModelInfo {
             name: model_discovery::label_for_alias(&id),
             reasoning_options: if model_supports_effort(&id) {
