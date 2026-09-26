@@ -519,6 +519,7 @@
       "sortDialogDescription": "Choose how workspaces are ordered in the sidebar.",
       "sortByLabel": "Sort by",
       "sortOrderLabel": "Sort order",
+      "sortStatus": "Status",
       "sortUpdatedAt": "Updated at",
       "sortCreatedAt": "Created at",
       "filterDialogTitle": "Filter workspaces",

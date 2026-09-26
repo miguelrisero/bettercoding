@@ -54,6 +54,7 @@ import {
 import { useRemoteCloudHostsAppBarModel } from '@/shared/hooks/useRemoteCloudHosts';
 import { workspacesApi } from '@/shared/lib/api';
 import { isArchivedRecently } from '@/shared/lib/archiveBuckets';
+import { NO_TAG_RANK } from '@/shared/lib/workspaceStatusTag';
 import { useActions } from '@/shared/hooks/useActions';
 import { Actions } from '@/shared/actions';
 
@@ -64,13 +65,23 @@ const DRAFT_WORKSPACE_ID = '00000000-0000-0000-0000-000000000001';
 
 const PAGE_SIZE = 50;
 const DEFAULT_WORKSPACE_SORT = {
-  sortBy: 'updated_at' as WorkspaceSortBy,
+  sortBy: 'status' as WorkspaceSortBy,
   sortOrder: 'desc' as WorkspaceSortOrder,
 };
 
 const PR_FILTER_OPTIONS: WorkspacePrFilter[] = ['all', 'has_pr', 'no_pr'];
 
-const SORT_BY_OPTIONS: WorkspaceSortBy[] = ['updated_at', 'created_at'];
+const SORT_BY_OPTIONS: WorkspaceSortBy[] = [
+  'status',
+  'updated_at',
+  'created_at',
+];
+
+const SORT_BY_LABEL_KEYS: Record<WorkspaceSortBy, string> = {
+  status: 'kanban.workspaceSidebar.sortStatus',
+  updated_at: 'kanban.workspaceSidebar.sortUpdatedAt',
+  created_at: 'kanban.workspaceSidebar.sortCreatedAt',
+};
 
 interface WorkspacesSidebarContainerProps {
   onScrollToBottom?: (behavior?: 'auto' | 'smooth') => void;
@@ -119,10 +130,7 @@ function WorkspacesSortDialog({
                 value={sortBy}
                 options={SORT_BY_OPTIONS.map((option) => ({
                   value: option,
-                  label:
-                    option === 'updated_at'
-                      ? t('kanban.workspaceSidebar.sortUpdatedAt')
-                      : t('kanban.workspaceSidebar.sortCreatedAt'),
+                  label: t(SORT_BY_LABEL_KEYS[option]),
                 }))}
                 onChange={onSortByChange}
               />
@@ -233,7 +241,8 @@ function getWorkspaceSortTimestamp(
   workspace: Workspace,
   sortBy: WorkspaceSortBy
 ): number | null {
-  if (sortBy === 'updated_at') {
+  // Status sorts break ties by recency.
+  if (sortBy === 'updated_at' || sortBy === 'status') {
     return toTimestamp(workspace.latestProcessCompletedAt);
   }
 
@@ -357,6 +366,16 @@ export function WorkspacesSidebarContainer({
         // Always keep pinned workspaces at the top.
         if (a.isPinned !== b.isPinned) {
           return a.isPinned ? -1 : 1;
+        }
+
+        if (workspaceSort.sortBy === 'status') {
+          const aRank = a.statusTag?.rank ?? NO_TAG_RANK;
+          const bRank = b.statusTag?.rank ?? NO_TAG_RANK;
+          if (aRank !== bRank) {
+            return workspaceSort.sortOrder === 'desc'
+              ? aRank - bRank
+              : bRank - aRank;
+          }
         }
 
         const aTimestamp = getWorkspaceSortTimestamp(a, workspaceSort.sortBy);

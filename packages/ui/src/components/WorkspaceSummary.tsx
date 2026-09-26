@@ -27,6 +27,23 @@ const formatRelativeElapsed = (dateString: string): string => {
   return `${diffDays}d ago`;
 };
 
+/** A workspace's status, as the agent reports it or the user set it. */
+export interface WorkspaceStatusTag {
+  key: string;
+  label: string;
+  tone: 'attention' | 'working' | 'done' | 'error' | 'muted';
+  /** Sort rank, most urgent first. */
+  rank: number;
+}
+
+const STATUS_TAG_TONE: Record<WorkspaceStatusTag['tone'], string> = {
+  attention: 'text-brand',
+  working: 'text-normal',
+  done: 'text-success',
+  error: 'text-error',
+  muted: 'text-low',
+};
+
 export interface WorkspaceSummaryProps {
   name: string;
   workspaceId?: string;
@@ -42,6 +59,7 @@ export interface WorkspaceSummaryProps {
   latestProcessCompletedAt?: string;
   latestProcessStatus?: 'running' | 'completed' | 'failed' | 'killed';
   prStatus?: 'open' | 'merged' | 'closed' | 'unknown';
+  statusTag?: WorkspaceStatusTag | null;
   onClick?: () => void;
   className?: string;
   summary?: boolean;
@@ -68,6 +86,7 @@ export function WorkspaceSummary({
   latestProcessCompletedAt,
   latestProcessStatus,
   prStatus,
+  statusTag,
   onClick,
   className,
   summary = false,
@@ -158,8 +177,22 @@ export function WorkspaceSummary({
               />
             )}
 
+            {/* Status tag replaces the running/approval/unseen glyphs */}
+            {statusTag && (
+              <span
+                className={cn(
+                  'min-w-0 shrink truncate text-xs',
+                  STATUS_TAG_TONE[statusTag.tone]
+                )}
+                title={statusTag.label}
+              >
+                {statusTag.label}
+              </span>
+            )}
+
             {/* Running dots OR hand icon for pending approval */}
-            {isRunning &&
+            {!statusTag &&
+              isRunning &&
               (hasPendingApproval ? (
                 <HandIcon
                   className="size-icon-xs text-brand shrink-0"
@@ -170,7 +203,7 @@ export function WorkspaceSummary({
               ))}
 
             {/* Unseen activity indicator (only when not running and not failed) */}
-            {hasUnseenActivity && !isRunning && !isFailed && (
+            {!statusTag && hasUnseenActivity && !isRunning && !isFailed && (
               <CircleIcon
                 className="size-icon-xs text-brand shrink-0"
                 weight="fill"

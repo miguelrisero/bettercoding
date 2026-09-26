@@ -188,7 +188,7 @@ function scratchDataToStore(data: UiPreferencesData): {
         (data.workspace_filters?.pr_filter as WorkspacePrFilter) ?? 'all',
     },
     workspaceSort: {
-      sortBy: (data.workspace_sort?.sort_by as WorkspaceSortBy) ?? 'updated_at',
+      sortBy: (data.workspace_sort?.sort_by as WorkspaceSortBy) ?? 'status',
       sortOrder:
         (data.workspace_sort?.sort_order as WorkspaceSortOrder) ?? 'desc',
     },

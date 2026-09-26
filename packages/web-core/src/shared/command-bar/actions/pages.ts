@@ -61,6 +61,7 @@ export const Pages: Record<StaticPageId, CommandBarPage> = {
           { type: 'action', action: Actions.DuplicateWorkspace },
           { type: 'action', action: Actions.SpinOffWorkspace },
           { type: 'action', action: Actions.PinWorkspace },
+          { type: 'action', action: Actions.SetWorkspaceStatus },
           { type: 'action', action: Actions.ArchiveWorkspace },
           { type: 'action', action: Actions.DeleteWorkspace },
         ],

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO workspace_cli_activity\n                 (workspace_id, state, updated_at, phase, tasks, crons,\n                  agent_session_id, transcript_path, seq, hook_at)\n               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)\n               ON CONFLICT(workspace_id) DO UPDATE SET\n                 state = excluded.state,\n                 updated_at = excluded.updated_at,\n                 phase = excluded.phase,\n                 tasks = excluded.tasks,\n                 crons = excluded.crons,\n                 agent_session_id = excluded.agent_session_id,\n                 transcript_path = excluded.transcript_path,\n                 seq = excluded.seq,\n                 hook_at = excluded.hook_at,\n                 manual_kind = CASE WHEN $11 THEN NULL ELSE workspace_cli_activity.manual_kind END,\n                 manual_note = CASE WHEN $11 THEN NULL ELSE workspace_cli_activity.manual_note END\n               WHERE excluded.seq >= workspace_cli_activity.seq",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": []
+  },
+  "hash": "28aa61496cc39d36543e2adaeaf592db9217d86d61bd705fe874507a9bf712fd"
+}

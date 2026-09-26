@@ -4,6 +4,8 @@ import { useJsonPatchWsStream } from '@/shared/hooks/useJsonPatchWsStream';
 import { workspaceSummaryKeys } from '@/shared/hooks/workspaceSummaryKeys';
 import { makeLocalApiRequest } from '@/shared/lib/localApiTransport';
 import { useHostId } from '@/shared/providers/HostIdProvider';
+import { workspaceStatusTag } from '@/shared/lib/workspaceStatusTag';
+import type { WorkspaceStatusTag } from '@vibe/ui/components/WorkspaceSummary';
 import type {
   WorkspaceWithStatus,
   WorkspaceSummary,
@@ -40,6 +42,8 @@ export interface SidebarWorkspace {
   prStatus?: 'open' | 'merged' | 'closed' | 'unknown';
   prNumber?: number;
   prUrl?: string;
+  /** What the agent reports it is doing, or a state the user set. */
+  statusTag?: WorkspaceStatusTag | null;
 }
 
 // Keep the old export name for backwards compatibility
@@ -89,12 +93,26 @@ function toSidebarWorkspace(
     // CLI-mode claude finishing unattended raises a hand exactly like unseen
     // chat turns do.
     hasUnseenActivity: summary?.has_unseen_turns || summary?.cli_attention,
-    latestProcessCompletedAt: summary?.latest_process_completed_at ?? undefined,
+    // CLI-mode workspaces run no execution process; their last activity is
+    // the CLI session's.
+    latestProcessCompletedAt:
+      summary?.latest_process_completed_at ??
+      summary?.cli_activity_at ??
+      undefined,
     latestProcessStatus: summary?.latest_process_status ?? undefined,
     prStatus: summary?.pr_status ?? undefined,
     prNumber:
       summary?.pr_number != null ? Number(summary.pr_number) : undefined,
     prUrl: summary?.pr_url ?? undefined,
+    statusTag: workspaceStatusTag({
+      cliPhase: summary?.cli_phase,
+      cliTasks: summary?.cli_tasks == null ? null : Number(summary.cli_tasks),
+      cliCrons: summary?.cli_crons == null ? null : Number(summary.cli_crons),
+      cliManual: summary?.cli_manual,
+      isRunning: ws.is_running,
+      hasPendingApproval: summary?.has_pending_approval,
+      hasUnseenActivity: summary?.has_unseen_turns || summary?.cli_attention,
+    }),
   };
 }
 

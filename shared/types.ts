@@ -67,7 +67,7 @@ main_pane_mode: string | null, };
 
 export type WorkspacePrFilterData = "all" | "has_pr" | "no_pr";
 
-export type WorkspaceSortByData = "updated_at" | "created_at";
+export type WorkspaceSortByData = "status" | "updated_at" | "created_at";
 
 export type WorkspaceSortOrderData = "asc" | "desc";
 
@@ -219,6 +219,10 @@ dropped: boolean, started_at: string, completed_at: string | null, created_at: s
 export enum ExecutionProcessStatus { running = "running", completed = "completed", failed = "failed", killed = "killed" }
 
 export type CliPhase = "ready" | "working" | "question" | "approval" | "attention" | "stopped" | "compacting" | "tool_failed" | "rate_limit" | "error" | "ended";
+
+export type CliManualKind = "locked" | "seen";
+
+export type CliManual = { kind: CliManualKind, note: string | null, };
 
 export type ExecutionProcessRunReason = "setupscript" | "cleanupscript" | "archivescript" | "codingagent" | "devserver";
 
@@ -669,6 +673,19 @@ cli_attention: boolean,
  */
 cli_phase: CliPhase | null, 
 /**
+ * Background tasks / scheduled jobs armed at the last turn end, while
+ * `cli_phase` is fresh. `None` means unknown, never zero.
+ */
+cli_tasks: bigint | null, cli_crons: bigint | null, 
+/**
+ * When the CLI session last changed state (hook report or poller).
+ */
+cli_activity_at?: string, 
+/**
+ * A state the user set by hand (locked / seen).
+ */
+cli_manual: CliManual | null, 
+/**
  * PR status for this workspace (if any PR exists)
  */
 pr_status: MergeStatus | null, 
@@ -680,6 +697,8 @@ pr_number: bigint | null,
  * PR URL for this workspace (if any PR exists)
  */
 pr_url: string | null, };
+
+export type SetCliManualRequest = { kind: CliManualKind | null, note: string | null, };
 
 export type WorkspaceSummaryResponse = { summaries: Array<WorkspaceSummary>, };
 

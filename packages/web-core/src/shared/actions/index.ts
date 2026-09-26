@@ -37,6 +37,7 @@ import {
   MegaphoneIcon,
   QuestionIcon,
   LinkIcon,
+  LockSimpleIcon,
 } from '@phosphor-icons/react';
 import { useDiffViewStore } from '@/shared/stores/useDiffViewStore';
 import { useWorkspaceDiffStore } from '@/shared/stores/useWorkspaceDiffStore';
@@ -56,6 +57,7 @@ import { DeleteWorkspaceDialog } from '@vibe/ui/components/DeleteWorkspaceDialog
 import { RebaseDialog } from '@/shared/dialogs/command-bar/RebaseDialog';
 import { ResolveConflictsDialog } from '@/shared/dialogs/tasks/ResolveConflictsDialog';
 import { RenameWorkspaceDialog } from '@vibe/ui/components/RenameWorkspaceDialog';
+import { WorkspaceStatusDialog } from '@vibe/ui/components/WorkspaceStatusDialog';
 import { CreatePRDialog } from '@/shared/dialogs/command-bar/CreatePRDialog';
 import { getIdeName } from '@/shared/lib/ideName';
 import { EditorSelectionDialog } from '@/shared/dialogs/command-bar/EditorSelectionDialog';
@@ -204,6 +206,21 @@ export const Actions = {
         currentName: workspace.name || workspace.branch,
         onRename: async (newName) => {
           await workspacesApi.update(workspaceId, { name: newName });
+          invalidateWorkspaceQueries(ctx.queryClient, workspaceId);
+        },
+      });
+    },
+  },
+
+  SetWorkspaceStatus: {
+    id: 'set-workspace-status',
+    label: 'Set status…',
+    icon: LockSimpleIcon,
+    requiresTarget: ActionTargetType.WORKSPACE,
+    execute: async (ctx, workspaceId) => {
+      await WorkspaceStatusDialog.show({
+        onSubmit: async (kind, note) => {
+          await workspacesApi.setStatus(workspaceId, { kind, note });
           invalidateWorkspaceQueries(ctx.queryClient, workspaceId);
         },
       });

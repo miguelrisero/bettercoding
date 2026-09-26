@@ -7,7 +7,7 @@ use db::models::{
     merge::MergeStatus,
     pull_request::PullRequest,
     workspace::Workspace,
-    workspace_cli_activity::{CliPhase, WorkspaceCliActivity},
+    workspace_cli_activity::{CliManual, CliPhase, WorkspaceCliActivity},
     workspace_repo::WorkspaceRepo,
 };
 use deployment::Deployment;
@@ -57,6 +57,15 @@ pub struct WorkspaceSummary {
     /// nothing, or for a report too old to still describe the pane — in which
     /// case `cli_attention` and the running flags remain the only signal.
     pub cli_phase: Option<CliPhase>,
+    /// Background tasks / scheduled jobs armed at the last turn end, while
+    /// `cli_phase` is fresh. `None` means unknown, never zero.
+    pub cli_tasks: Option<i64>,
+    pub cli_crons: Option<i64>,
+    /// When the CLI session last changed state (hook report or poller).
+    #[ts(optional)]
+    pub cli_activity_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// A state the user set by hand (locked / seen).
+    pub cli_manual: Option<CliManual>,
     /// PR status for this workspace (if any PR exists)
     pub pr_status: Option<MergeStatus>,
     /// PR number for this workspace (if any PR exists)
@@ -127,11 +136,12 @@ pub async fn get_workspace_summaries(
 
     // 5c. What each CLI-mode agent last reported about itself
     let now = chrono::Utc::now();
-    let cli_phases: HashMap<Uuid, CliPhase> = WorkspaceCliActivity::find_all(pool)
+    let cli_rows: HashMap<Uuid, WorkspaceCliActivity> = WorkspaceCliActivity::find_all(pool)
         .await?
         .into_iter()
-        .filter_map(|row| Some((row.workspace_id, row.fresh_phase(now)?)))
+        .map(|row| (row.workspace_id, row))
         .collect();
+    let mut cli_manuals = WorkspaceCliActivity::find_all_manual(pool).await?;
 
     // 6. Get PR status for each workspace
     let pr_statuses = PullRequest::get_latest_for_workspaces(pool, archived).await?;
@@ -179,6 +189,12 @@ pub async fn get_workspace_summaries(
                 .map(|p| pending_approval_eps.contains(&p.execution_process_id))
                 .unwrap_or(false);
             let stats = diff_stats.get(&id);
+            let cli = cli_rows.get(&id);
+            let cli_phase = cli.and_then(|row| row.fresh_phase(now));
+            // Counts describe the pane only while the phase that carried them does.
+            let cli_hook = cli
+                .and_then(|row| row.hook.as_ref())
+                .filter(|_| cli_phase.is_some());
 
             WorkspaceSummary {
                 workspace_id: id,
@@ -193,7 +209,11 @@ pub async fn get_workspace_summaries(
                 has_running_dev_server: dev_server_workspaces.contains(&id),
                 has_unseen_turns: unseen_workspaces.contains(&id),
                 cli_attention: cli_attention_workspaces.contains(&id),
-                cli_phase: cli_phases.get(&id).copied(),
+                cli_phase,
+                cli_tasks: cli_hook.and_then(|hook| hook.tasks),
+                cli_crons: cli_hook.and_then(|hook| hook.crons),
+                cli_activity_at: cli.map(|row| row.updated_at),
+                cli_manual: cli_manuals.remove(&id),
                 pr_status: pr_statuses.get(&id).map(|pr| pr.pr_status.clone()),
                 pr_number: pr_statuses.get(&id).map(|pr| pr.pr_number),
                 pr_url: pr_statuses.get(&id).map(|pr| pr.pr_url.clone()),
