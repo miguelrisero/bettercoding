@@ -68,7 +68,9 @@ pub enum WorkspacePrFilterData {
 #[derive(Debug, Clone, Serialize, Deserialize, TS, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceSortByData {
+    /// By status tag, most urgent first.
     #[default]
+    Status,
     UpdatedAt,
     CreatedAt,
 }

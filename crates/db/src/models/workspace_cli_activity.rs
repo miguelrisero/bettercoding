@@ -292,6 +292,70 @@ pub fn reduce_hook(
     Some(state)
 }
 
+/// A state the user sets on a workspace by hand (ported from Herdr's manual
+/// pane states). It replaces what the phase would show until the session is
+/// engaged again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum CliManualKind {
+    /// Parked, usually waiting on something outside this workspace.
+    Locked,
+    /// A finished turn the user has looked at and dismissed.
+    Seen,
+}
+
+impl CliManualKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CliManualKind::Locked => "locked",
+            CliManualKind::Seen => "seen",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "locked" => Some(CliManualKind::Locked),
+            "seen" => Some(CliManualKind::Seen),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct CliManual {
+    pub kind: CliManualKind,
+    pub note: Option<String>,
+}
+
+/// Hook events that mean someone is working in the session, and so clear a
+/// manual state. A background reply that makes no tool call fires none of
+/// these and leaves the state alone. `SessionStart` is deliberately absent:
+/// restarting the agent inside a parked workspace keeps it parked.
+pub const CLEARING_EVENTS: &[&str] = &[
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "ElicitationResult",
+    "PostCompact",
+];
+
+/// Does this (accepted) hook payload clear the workspace's manual state?
+pub fn clears_manual(payload: &serde_json::Value) -> bool {
+    payload_str(payload, "hook_event_name").is_some_and(|event| CLEARING_EVENTS.contains(&event))
+}
+
+/// Longest manual note kept, in characters.
+pub const MANUAL_NOTE_MAX_CHARS: usize = 48;
+
+/// Collapse a note to one line of at most [`MANUAL_NOTE_MAX_CHARS`]
+/// characters. An empty result is no note.
+pub fn normalize_manual_note(note: &str) -> Option<String> {
+    let line = note.split_whitespace().collect::<Vec<_>>().join(" ");
+    let note: String = line.chars().take(MANUAL_NOTE_MAX_CHARS).collect();
+    let note = note.trim_end().to_string();
+    (!note.is_empty()).then_some(note)
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkspaceCliActivity {
     pub workspace_id: Uuid,
@@ -353,6 +417,7 @@ impl WorkspaceCliActivity {
         pool: &SqlitePool,
         workspace_id: Uuid,
         hook: &CliHookState,
+        clear_manual: bool,
         at: DateTime<Utc>,
     ) -> Result<(), sqlx::Error> {
         let state = hook.phase.bucket().as_str();
@@ -372,7 +437,9 @@ impl WorkspaceCliActivity {
                  agent_session_id = excluded.agent_session_id,
                  transcript_path = excluded.transcript_path,
                  seq = excluded.seq,
-                 hook_at = excluded.hook_at
+                 hook_at = excluded.hook_at,
+                 manual_kind = CASE WHEN $11 THEN NULL ELSE workspace_cli_activity.manual_kind END,
+                 manual_note = CASE WHEN $11 THEN NULL ELSE workspace_cli_activity.manual_note END
                WHERE excluded.seq >= workspace_cli_activity.seq"#,
             workspace_id,
             state,
@@ -384,10 +451,64 @@ impl WorkspaceCliActivity {
             transcript_path,
             hook.seq,
             at,
+            clear_manual,
         )
         .execute(pool)
         .await?;
         Ok(())
+    }
+
+    /// Set (`Some`) or clear (`None`) a workspace's manual state. `seen` does
+    /// not replace a lock: dismissing a parked workspace leaves it parked.
+    pub async fn set_manual(
+        pool: &SqlitePool,
+        workspace_id: Uuid,
+        manual: Option<&CliManual>,
+    ) -> Result<(), sqlx::Error> {
+        let kind = manual.map(|m| m.kind.as_str());
+        let note = manual.and_then(|m| m.note.as_deref());
+        sqlx::query!(
+            r#"INSERT INTO workspace_cli_activity (workspace_id, manual_kind, manual_note)
+               VALUES ($1, $2, $3)
+               ON CONFLICT(workspace_id) DO UPDATE SET
+                 manual_kind = excluded.manual_kind,
+                 manual_note = excluded.manual_note
+               WHERE NOT (excluded.manual_kind IS 'seen'
+                          AND workspace_cli_activity.manual_kind IS 'locked')"#,
+            workspace_id,
+            kind,
+            note
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Every workspace's manual state, for the summary endpoint.
+    pub async fn find_all_manual(
+        pool: &SqlitePool,
+    ) -> Result<std::collections::HashMap<Uuid, CliManual>, sqlx::Error> {
+        let rows = sqlx::query!(
+            r#"SELECT workspace_id as "workspace_id!: Uuid", manual_kind as "manual_kind!", manual_note
+               FROM workspace_cli_activity
+               WHERE manual_kind IS NOT NULL"#
+        )
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let kind = CliManualKind::parse(&r.manual_kind)?;
+                Some((
+                    r.workspace_id,
+                    CliManual {
+                        kind,
+                        note: r.manual_note,
+                    },
+                ))
+            })
+            .collect())
     }
 
     /// Current states for all workspaces that have a row.
@@ -586,7 +707,7 @@ mod tests {
             crons: None,
             seq: 7,
         };
-        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, Utc::now())
+        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, false, Utc::now())
             .await
             .unwrap();
 
@@ -615,6 +736,114 @@ mod tests {
             .await
             .unwrap();
         assert!(!needing.contains(&workspace.id));
+    }
+
+    #[tokio::test]
+    async fn manual_state_follows_the_lock_seen_rules() {
+        let pool = test_pool().await;
+        let workspace = Workspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "cli-activity-manual".to_string(),
+                name: Some("Manual".to_string()),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        let manual = |pool: SqlitePool| async move {
+            WorkspaceCliActivity::find_all_manual(&pool)
+                .await
+                .unwrap()
+                .remove(&workspace.id)
+        };
+        let locked = CliManual {
+            kind: CliManualKind::Locked,
+            note: Some("waiting on c2".to_string()),
+        };
+        let seen = CliManual {
+            kind: CliManualKind::Seen,
+            note: None,
+        };
+
+        // A lock works before the agent ever reported (no row yet).
+        WorkspaceCliActivity::set_manual(&pool, workspace.id, Some(&locked))
+            .await
+            .unwrap();
+        assert_eq!(manual(pool.clone()).await, Some(locked.clone()));
+
+        // `seen` leaves a lock alone.
+        WorkspaceCliActivity::set_manual(&pool, workspace.id, Some(&seen))
+            .await
+            .unwrap();
+        assert_eq!(manual(pool.clone()).await, Some(locked.clone()));
+
+        // A non-engaging hook report (e.g. SessionStart, Stop) keeps it.
+        let mut hook = CliHookState {
+            agent_session_id: "s1".to_string(),
+            transcript_path: None,
+            phase: CliPhase::Stopped,
+            tasks: Some(0),
+            crons: Some(0),
+            seq: 1,
+        };
+        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, false, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(manual(pool.clone()).await, Some(locked.clone()));
+
+        // An engaging report clears it.
+        hook.seq = 2;
+        hook.phase = CliPhase::Working;
+        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, true, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(manual(pool.clone()).await, None);
+
+        // `seen` on an unlocked row sets it; clearing removes it.
+        WorkspaceCliActivity::set_manual(&pool, workspace.id, Some(&seen))
+            .await
+            .unwrap();
+        assert_eq!(manual(pool.clone()).await, Some(seen));
+        WorkspaceCliActivity::set_manual(&pool, workspace.id, None)
+            .await
+            .unwrap();
+        assert_eq!(manual(pool.clone()).await, None);
+    }
+
+    #[test]
+    fn only_engaging_events_clear_a_manual_state() {
+        for event in CLEARING_EVENTS {
+            assert!(clears_manual(&event_json(event)), "{event}");
+        }
+        for event in [
+            "SessionStart",
+            "Stop",
+            "SubagentStop",
+            "Notification",
+            "SessionEnd",
+            "PreCompact",
+        ] {
+            assert!(!clears_manual(&event_json(event)), "{event}");
+        }
+    }
+
+    fn event_json(event: &str) -> serde_json::Value {
+        json!({ "hook_event_name": event, "session_id": "s1" })
+    }
+
+    #[test]
+    fn manual_notes_collapse_to_one_short_line() {
+        assert_eq!(
+            normalize_manual_note("  waiting\n on   c2 \t"),
+            Some("waiting on c2".to_string())
+        );
+        assert_eq!(normalize_manual_note(" \n "), None);
+        let long = "é".repeat(60);
+        assert_eq!(
+            normalize_manual_note(&long).unwrap().chars().count(),
+            MANUAL_NOTE_MAX_CHARS
+        );
     }
 
     #[test]

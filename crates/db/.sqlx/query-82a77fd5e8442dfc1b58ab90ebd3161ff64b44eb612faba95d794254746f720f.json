@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT workspace_id as \"workspace_id!: Uuid\", manual_kind as \"manual_kind!\", manual_note\n               FROM workspace_cli_activity\n               WHERE manual_kind IS NOT NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "workspace_id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "manual_kind!",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "manual_note",
+        "ordinal": 2,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "82a77fd5e8442dfc1b58ab90ebd3161ff64b44eb612faba95d794254746f720f"
+}

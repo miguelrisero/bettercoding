@@ -4,12 +4,17 @@ use axum::{
     http::StatusCode,
 };
 use chrono::Utc;
-use db::models::workspace_cli_activity::{WorkspaceCliActivity, reduce_hook};
+use db::models::workspace_cli_activity::{
+    CliManual, CliManualKind, WorkspaceCliActivity, clears_manual, normalize_manual_note,
+    reduce_hook,
+};
 use deployment::Deployment;
 use serde::Deserialize;
+use ts_rs::TS;
+use utils::response::ApiResponse;
 use uuid::Uuid;
 
-use crate::DeploymentImpl;
+use crate::{DeploymentImpl, error::ApiError};
 
 #[derive(Debug, Deserialize)]
 pub struct HookReportQuery {
@@ -67,9 +72,37 @@ pub async fn report_cli_activity(
 
     // FK failures are expected when the workspace was deleted while its tmux
     // session lingered; nothing here is worth failing the agent's hook over.
-    if let Err(error) = WorkspaceCliActivity::upsert_hook(pool, workspace_id, &next, now).await {
+    if let Err(error) =
+        WorkspaceCliActivity::upsert_hook(pool, workspace_id, &next, clears_manual(&payload), now)
+            .await
+    {
         tracing::debug!(?error, %workspace_id, "failed to record a CLI hook report");
     }
 
     StatusCode::NO_CONTENT
+}
+
+/// Body of `PUT /workspaces/{id}/cli-activity/manual`. `kind: null` clears.
+#[derive(Debug, Deserialize, TS)]
+pub struct SetCliManualRequest {
+    pub kind: Option<CliManualKind>,
+    pub note: Option<String>,
+}
+
+/// Lock, mark seen, or clear a workspace's manual state from the UI.
+pub async fn set_cli_manual(
+    State(deployment): State<DeploymentImpl>,
+    Path(workspace_id): Path<Uuid>,
+    Json(request): Json<SetCliManualRequest>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let manual = request.kind.map(|kind| CliManual {
+        kind,
+        // Only a lock carries a note.
+        note: match kind {
+            CliManualKind::Locked => request.note.as_deref().and_then(normalize_manual_note),
+            CliManualKind::Seen => None,
+        },
+    });
+    WorkspaceCliActivity::set_manual(&deployment.db().pool, workspace_id, manual.as_ref()).await?;
+    Ok(Json(ApiResponse::success(())))
 }

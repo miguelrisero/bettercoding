@@ -20,7 +20,7 @@ pub mod workspace_summary;
 use axum::{
     Router,
     middleware::from_fn_with_state,
-    routing::{get, post},
+    routing::{get, post, put},
 };
 
 use crate::{DeploymentImpl, middleware::load_workspace_middleware};
@@ -63,6 +63,10 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
         .route(
             "/{id}/cli-activity",
             post(cli_activity::report_cli_activity),
+        )
+        .route(
+            "/{id}/cli-activity/manual",
+            put(cli_activity::set_cli_manual),
         )
         .route(
             "/summaries",

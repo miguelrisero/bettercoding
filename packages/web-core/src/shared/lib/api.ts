@@ -113,6 +113,7 @@ import {
   CreateWakeupRequest,
   BulkDeleteArchivedWorkspacesRequest,
   BulkDeleteArchivedWorkspacesResponse,
+  SetCliManualRequest,
 } from 'shared/types';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
 import { createWorkspaceWithSession } from '@/shared/types/attempt';
@@ -482,6 +483,18 @@ export const workspacesApi = {
       body: JSON.stringify(data),
     });
     return handleApiResponse<Workspace>(response);
+  },
+
+  /** Lock, mark seen, or clear (`kind: null`) a workspace's manual status. */
+  setStatus: async (
+    workspaceId: string,
+    data: SetCliManualRequest
+  ): Promise<void> => {
+    const response = await makeRequest(
+      `/api/workspaces/${workspaceId}/cli-activity/manual`,
+      { method: 'PUT', body: JSON.stringify(data) }
+    );
+    await handleApiResponse<void>(response);
   },
 
   /** Get workspace with latest session */

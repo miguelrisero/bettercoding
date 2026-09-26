@@ -21,7 +21,7 @@ import {
   type BulkDeleteArchivedWorkspaceDetails,
 } from '../lib/bulkDeleteArchivedWorkspaces';
 import { InputField } from './InputField';
-import { WorkspaceSummary } from './WorkspaceSummary';
+import { WorkspaceSummary, type WorkspaceStatusTag } from './WorkspaceSummary';
 export type WorkspacesSidebarHostStatus = 'online' | 'offline' | 'unpaired';
 import {
   CollapsibleSectionHeader,
@@ -76,6 +76,7 @@ export interface WorkspacesSidebarWorkspace {
   latestProcessCompletedAt?: string;
   latestProcessStatus?: 'running' | 'completed' | 'failed' | 'killed';
   prStatus?: 'open' | 'merged' | 'closed' | 'unknown';
+  statusTag?: WorkspaceStatusTag | null;
 }
 
 export interface WorkspacesSidebarPersistKeys {
@@ -215,6 +216,7 @@ function WorkspaceList({
           latestProcessCompletedAt={workspace.latestProcessCompletedAt}
           latestProcessStatus={workspace.latestProcessStatus}
           prStatus={workspace.prStatus}
+          statusTag={workspace.statusTag}
           onOpenWorkspaceActions={onOpenWorkspaceActions}
           onClick={() => onSelectWorkspace(workspace.id)}
         />
@@ -548,6 +550,7 @@ export function WorkspacesSidebar({
                           }
                           latestProcessStatus={workspace.latestProcessStatus}
                           prStatus={workspace.prStatus}
+                          statusTag={workspace.statusTag}
                           onOpenWorkspaceActions={handleOpenWorkspaceActions}
                           onClick={() => onSelectWorkspace(workspace.id)}
                         />
@@ -675,6 +678,7 @@ export function WorkspacesSidebar({
                     }
                     latestProcessStatus={workspace.latestProcessStatus}
                     prStatus={workspace.prStatus}
+                    statusTag={workspace.statusTag}
                     onOpenWorkspaceActions={handleOpenWorkspaceActions}
                     onClick={() => onSelectWorkspace(workspace.id)}
                   />

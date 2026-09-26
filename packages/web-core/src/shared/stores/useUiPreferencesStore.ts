@@ -222,7 +222,7 @@ export const resolveKanbanProjectState = (
 
 // Workspace sidebar filter state
 export type WorkspacePrFilter = 'all' | 'has_pr' | 'no_pr';
-export type WorkspaceSortBy = 'updated_at' | 'created_at';
+export type WorkspaceSortBy = 'status' | 'updated_at' | 'created_at';
 export type WorkspaceSortOrder = 'asc' | 'desc';
 
 export type WorkspaceFilterState = {
@@ -241,7 +241,7 @@ const DEFAULT_WORKSPACE_FILTER_STATE: WorkspaceFilterState = {
 };
 
 const DEFAULT_WORKSPACE_SORT_STATE: WorkspaceSortState = {
-  sortBy: 'updated_at',
+  sortBy: 'status',
   sortOrder: 'desc',
 };
 

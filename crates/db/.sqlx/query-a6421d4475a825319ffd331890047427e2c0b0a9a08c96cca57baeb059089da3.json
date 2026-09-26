@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO workspace_cli_activity (workspace_id, manual_kind, manual_note)\n               VALUES ($1, $2, $3)\n               ON CONFLICT(workspace_id) DO UPDATE SET\n                 manual_kind = excluded.manual_kind,\n                 manual_note = excluded.manual_note\n               WHERE NOT (excluded.manual_kind IS 'seen'\n                          AND workspace_cli_activity.manual_kind IS 'locked')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "a6421d4475a825319ffd331890047427e2c0b0a9a08c96cca57baeb059089da3"
+}
