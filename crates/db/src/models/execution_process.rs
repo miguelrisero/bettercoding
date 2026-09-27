@@ -814,4 +814,102 @@ mod tests {
             Some(expected)
         );
     }
+
+    /// Rows written by a release that shipped other agents (here Gemini) must
+    /// still load. The action is kept verbatim so it renders as history.
+    #[tokio::test]
+    async fn rows_naming_a_removed_agent_still_load() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::run_migrations_for_tests(&pool).await.unwrap();
+        let workspace_id = Uuid::new_v4();
+        Workspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "main".to_string(),
+                name: Some("legacy agent fixture".to_string()),
+            },
+            workspace_id,
+        )
+        .await
+        .unwrap();
+        let session_id = Uuid::new_v4();
+        Session::create(
+            &pool,
+            &CreateSession {
+                executor: Some("GEMINI".to_string()),
+                name: None,
+            },
+            session_id,
+            workspace_id,
+        )
+        .await
+        .unwrap();
+        let process_id = Uuid::new_v4();
+        ExecutionProcess::create(
+            &pool,
+            &CreateExecutionProcess {
+                session_id,
+                executor_action: ExecutorAction::new(
+                    ExecutorActionType::ReviewRequest(ReviewRequest {
+                        executor_config: ExecutorConfig::new(BaseCodingAgent::ClaudeCode),
+                        context: None,
+                        prompt: "review".to_string(),
+                        session_id: None,
+                        working_dir: None,
+                    }),
+                    None,
+                ),
+                run_reason: ExecutionProcessRunReason::CodingAgent,
+            },
+            process_id,
+            &[],
+        )
+        .await
+        .unwrap();
+        let legacy_action = serde_json::json!({
+            "typ": {
+                "type": "ReviewRequest",
+                "executor_config": { "executor": "GEMINI", "variant": "FLASH" },
+                "context": null,
+                "prompt": "review",
+            },
+            "next_action": null,
+        });
+        sqlx::query("UPDATE execution_processes SET executor_action = ? WHERE id = ?")
+            .bind(legacy_action.to_string())
+            .bind(process_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let sessions = Session::find_by_workspace_id(&pool, workspace_id)
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].executor.as_deref(), Some("GEMINI"));
+
+        let processes = ExecutionProcess::find_by_session_id(&pool, session_id, true)
+            .await
+            .unwrap();
+        assert_eq!(processes.len(), 1);
+        assert!(matches!(
+            processes[0].executor_action.0,
+            ExecutorActionField::Other(_)
+        ));
+        assert_eq!(
+            serde_json::to_value(&processes[0].executor_action).unwrap(),
+            legacy_action
+        );
+
+        // A follow-up cannot run a removed agent; it is refused, not a panic.
+        assert!(
+            ExecutionProcess::latest_executor_config_for_session(&pool, session_id)
+                .await
+                .is_err()
+        );
+    }
 }

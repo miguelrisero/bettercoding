@@ -36,6 +36,7 @@ pub enum SendMessageShortcut {
 pub struct Config {
     pub config_version: String,
     pub theme: ThemeMode,
+    #[serde(deserialize_with = "executors::profile::deserialize_or_default")]
     pub executor_profile: ExecutorProfileId,
     pub disclaimer_acknowledged: bool,
     pub onboarding_acknowledged: bool,
@@ -191,5 +192,23 @@ mod tests {
 
         assert_eq!(config.config_version, "v8");
         assert!(!config.auto_archive_on_merge);
+    }
+
+    #[test]
+    fn config_naming_a_removed_agent_keeps_other_settings() {
+        let mut value = serde_json::to_value(Config {
+            git_branch_prefix: "keep".to_string(),
+            ..Config::default()
+        })
+        .unwrap();
+        value["executor_profile"] = serde_json::json!({ "executor": "GEMINI", "variant": "FLASH" });
+
+        let config = Config::from(serde_json::to_string(&value).unwrap());
+
+        assert_eq!(config.git_branch_prefix, "keep");
+        assert_eq!(
+            config.executor_profile,
+            ExecutorProfileId::new(BaseCodingAgent::ClaudeCode)
+        );
     }
 }

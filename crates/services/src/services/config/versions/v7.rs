@@ -31,6 +31,7 @@ pub enum ThemeMode {
 pub(crate) struct Config {
     pub config_version: String,
     pub theme: ThemeMode,
+    #[serde(deserialize_with = "executors::profile::deserialize_or_default")]
     pub executor_profile: ExecutorProfileId,
     pub disclaimer_acknowledged: bool,
     pub onboarding_acknowledged: bool,
