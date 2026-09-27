@@ -1,6 +1,6 @@
 # Vibe Kanban
 
-> A visual project management tool for developers that integrates with git repositories and coding agents like Claude Code and Amp.
+> A visual project management tool for developers that integrates with git repositories and coding agents like Claude Code and Codex.
 
 ## Quick Start
 
@@ -44,7 +44,7 @@ Vibe Kanban is a modern project management tool designed specifically for develo
 **🤖 AI Agent Integration**
 
 - **Claude**: Advanced AI coding assistant
-- **Amp**: Powerful development agent
+- **Codex**: OpenAI's coding agent
 - **Echo**: Simple testing/debugging agent
 - Create tasks and immediately start agent execution
 - Follow-up task execution for iterative development

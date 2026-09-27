@@ -15,8 +15,8 @@
 //! A CLI-mode claude also reports its own phase through its hooks. Where a
 //! workspace has a fresh report, that phase decides the bucket and the pane
 //! heuristics above are not consulted: the agent knows whether it is working,
-//! and a user typing into the pane does not. Everything else (codex, gemini, a
-//! claude too old for the hooks) keeps the guess.
+//! and a user typing into the pane does not. Everything else (codex, a claude
+//! too old for the hooks) keeps the guess.
 //!
 //! States are written to the DB only on transitions; the SQLite update hook
 //! then re-broadcasts the owning workspace's status patch, so the sidebar
@@ -340,8 +340,8 @@ const PANE_SHELLS: [&str; 8] = ["sh", "bash", "zsh", "dash", "fish", "ash", "ksh
 /// process tree is the only check that covers it.
 ///
 /// Deliberately agent-agnostic. It answers "is this pane doing something",
-/// not "is claude alive", so it protects a codex pane, a gemini pane, and a
-/// long `cargo build` a user started in the fallback shell.
+/// not "is claude alive", so it protects a codex pane and a long `cargo build`
+/// a user started in the fallback shell.
 pub async fn probe_workspace_pane_busy(workspace_id: Uuid) -> AgentPresence {
     let Some(pane_pids) = cli_pane_pids_for(workspace_id).await else {
         return AgentPresence::Unknown;
@@ -1292,9 +1292,7 @@ mod tests {
         }
         // The agent this was built for, plus agents the claude-only probe
         // would have missed, plus ordinary user work in the fallback shell.
-        for busy in [
-            "claude", "codex", "gemini", "node", "cargo", "pytest", "vim",
-        ] {
+        for busy in ["claude", "codex", "node", "cargo", "pytest", "vim"] {
             assert!(is_busy(busy), "{busy} must count as a busy pane");
         }
     }

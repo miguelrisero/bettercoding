@@ -81,15 +81,6 @@ impl ConversationPatch {
         from_value(json!([patch_entry])).unwrap()
     }
 
-    /// Create a REMOVE patch for removing a diff.
-    pub fn remove_diff(entry_index: String) -> Patch {
-        from_value(json!([{
-            "op": PatchOperation::Remove,
-            "path": format!("/entries/{entry_index}"),
-        }]))
-        .unwrap()
-    }
-
     /// Add a diff entry under a repo namespace: `/entries/<repo>/<file>`
     pub fn add_repo_diff(repo_key: &str, file_path: &str, diff: Diff) -> Patch {
         let patch_entry = PatchEntry {
@@ -298,20 +289,6 @@ pub fn update_slash_commands(
 pub fn slash_commands_loaded() -> Patch {
     serde_json::from_value(json!([
         {"op": "replace", "path": "/options/loading_slash_commands", "value": false},
-    ]))
-    .unwrap_or_default()
-}
-
-pub fn update_providers(providers: Vec<crate::model_selector::ModelProvider>) -> Patch {
-    serde_json::from_value(json!([
-        {"op": "replace", "path": "/options/model_selector/providers", "value": providers},
-    ]))
-    .unwrap_or_default()
-}
-
-pub fn update_default_model(default_model: Option<String>) -> Patch {
-    serde_json::from_value(json!([
-        {"op": "replace", "path": "/options/model_selector/default_model", "value": default_model},
     ]))
     .unwrap_or_default()
 }
