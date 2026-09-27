@@ -633,18 +633,6 @@ latest_session_id: string | null,
  */
 has_pending_approval: boolean, 
 /**
- * Number of files with changes
- */
-files_changed: number | null, 
-/**
- * Total lines added across all files
- */
-lines_added: number | null, 
-/**
- * Total lines removed across all files
- */
-lines_removed: number | null, 
-/**
  * When the latest execution process completed
  */
 latest_process_completed_at?: string, 
@@ -666,15 +654,18 @@ has_unseen_turns: boolean,
  */
 cli_attention: boolean, 
 /**
- * What the CLI-mode agent last reported it is doing, for agents that
- * report at all (see `reduce_hook`). `None` for an agent that reports
- * nothing, or for a report too old to still describe the pane — in which
- * case `cli_attention` and the running flags remain the only signal.
+ * What the CLI-mode agent last reported it is doing (see `reduce_hook`),
+ * however old: the UI ages it with `cli_phase_at`. `None` for an agent
+ * that has never reported.
  */
 cli_phase: CliPhase | null, 
 /**
- * Background tasks / scheduled jobs armed at the last turn end, while
- * `cli_phase` is fresh. `None` means unknown, never zero.
+ * When `cli_phase` was reported.
+ */
+cli_phase_at?: string, 
+/**
+ * Background tasks / scheduled jobs armed at the last turn end. `None`
+ * means unknown, never zero.
  */
 cli_tasks: bigint | null, cli_crons: bigint | null, 
 /**
@@ -698,11 +689,11 @@ pr_number: bigint | null,
  */
 pr_url: string | null, };
 
+export type DiffStats = { files_changed: number, lines_added: number, lines_removed: number, };
+
 export type SetCliManualRequest = { kind: CliManualKind | null, note: string | null, };
 
 export type WorkspaceSummaryResponse = { summaries: Array<WorkspaceSummary>, };
-
-export type DiffStats = { files_changed: number, lines_added: number, lines_removed: number, };
 
 export type DirectoryEntry = { name: string, path: string, is_directory: boolean, is_git_repo: boolean, last_modified: bigint | null, };
 

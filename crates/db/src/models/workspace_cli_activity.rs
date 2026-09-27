@@ -125,6 +125,18 @@ impl CliPhase {
     }
 }
 
+/// The sidebar bucket for a reported phase, given the background tasks the
+/// turn left armed. A turn that ended with background tasks still running is
+/// working, not waiting for the user. Scheduled wake-ups alone are not work in
+/// progress, so they keep the stopped phase's bucket.
+pub fn hook_bucket(phase: CliPhase, tasks: Option<i64>) -> CliActivityState {
+    if phase == CliPhase::Stopped && tasks.unwrap_or(0) > 0 {
+        CliActivityState::Running
+    } else {
+        phase.bucket()
+    }
+}
+
 /// One workspace's hook-reported CLI session state — the reduced form of every
 /// hook event the session has sent so far.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,7 +432,7 @@ impl WorkspaceCliActivity {
         clear_manual: bool,
         at: DateTime<Utc>,
     ) -> Result<(), sqlx::Error> {
-        let state = hook.phase.bucket().as_str();
+        let state = hook_bucket(hook.phase, hook.tasks).as_str();
         let phase = hook.phase.as_str();
         let transcript_path = hook.transcript_path.as_deref();
         sqlx::query!(
@@ -703,7 +715,7 @@ mod tests {
             agent_session_id: "s1".to_string(),
             transcript_path: Some("/tmp/s1.jsonl".to_string()),
             phase: CliPhase::Stopped,
-            tasks: Some(1),
+            tasks: Some(0),
             crons: None,
             seq: 7,
         };
@@ -730,7 +742,7 @@ mod tests {
         // The correction clears the bell without erasing what the agent said.
         assert_eq!(row.phase, Some(CliPhase::Stopped));
         assert_eq!(row.hook.as_ref().unwrap().seq, 7);
-        assert_eq!(row.hook.as_ref().unwrap().tasks, Some(1));
+        assert_eq!(row.hook.as_ref().unwrap().tasks, Some(0));
 
         let needing = WorkspaceCliActivity::find_workspaces_needing_attention(&pool, false)
             .await
@@ -843,6 +855,26 @@ mod tests {
         assert_eq!(
             normalize_manual_note(&long).unwrap().chars().count(),
             MANUAL_NOTE_MAX_CHARS
+        );
+    }
+
+    #[test]
+    fn a_turn_with_background_tasks_is_running_not_waiting() {
+        assert_eq!(
+            hook_bucket(CliPhase::Stopped, Some(2)),
+            CliActivityState::Running
+        );
+        assert_eq!(
+            hook_bucket(CliPhase::Stopped, Some(0)),
+            CliActivityState::Attention
+        );
+        assert_eq!(
+            hook_bucket(CliPhase::Stopped, None),
+            CliActivityState::Attention
+        );
+        assert_eq!(
+            hook_bucket(CliPhase::Working, Some(0)),
+            CliActivityState::Running
         );
     }
 
