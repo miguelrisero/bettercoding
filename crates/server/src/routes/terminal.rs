@@ -17,7 +17,7 @@ use db::models::{
     execution_process::ExecutionProcess,
     session::Session,
     workspace::Workspace,
-    workspace_cli_activity::HOOK_EVENTS,
+    workspace_cli_activity::{CODEX_HOOK_EVENTS, HOOK_EVENTS},
     workspace_repo::WorkspaceRepo,
     workspace_spawn_reservation::{SpawnReservationHolder, WorkspaceSpawnReservation},
 };
@@ -179,8 +179,13 @@ pub(super) async fn resolve_cli_launch_spec(
             .expect("claude always provides an interactive CLI spec")
     });
 
-    // claude is the only agent that reports its own state, and the only one
-    // that takes these flags. Everything else keeps the tmux poller's guess.
+    // Codex reports its state through the same hook endpoint, registered
+    // inline with `-c` so neither ~/.codex nor the worktree is touched.
+    if spec.program == "codex" {
+        spec.session_args = codex_hook_args(&spec.base_args, workspace_id).await;
+    }
+
+    // Everything else keeps the tmux poller's guess.
     if spec.program == "claude" {
         if let Some(settings) = write_cli_hook_settings(workspace_id).await {
             spec.base_args.push("--settings".to_string());
@@ -211,6 +216,42 @@ fn hook_report_command(port: u16, workspace_id: Uuid) -> String {
          \"http://127.0.0.1:{port}/api/workspaces/{workspace_id}/cli-activity?seq=$(date +%s%N)\" \
          || true"
     )
+}
+
+/// Codex flags that register the activity hooks for this launch, or none.
+///
+/// Codex runs an inline hook only with `--dangerously-bypass-hook-trust`,
+/// which also stops it asking before it runs hooks a repository ships. That
+/// adds nothing to a `danger-full-access` session, which can already run any
+/// command unasked, so hooks are only registered in that sandbox mode; a
+/// restricted session keeps the tmux poller's guess and its trust prompts.
+async fn codex_hook_args(base_args: &[String], workspace_id: Uuid) -> Vec<String> {
+    let full_access = base_args
+        .windows(2)
+        .any(|pair| pair[0] == "-s" && pair[1] == "danger-full-access");
+    if !full_access {
+        return Vec::new();
+    }
+    let Ok(port) = utils::port_file::read_port_file("vibe-kanban").await else {
+        tracing::debug!("no port file; codex activity hooks not registered");
+        return Vec::new();
+    };
+    codex_hook_args_for(port, workspace_id)
+}
+
+/// The inline `-c hooks.<Event>=[...]` overrides, one per event Codex fires.
+fn codex_hook_args_for(port: u16, workspace_id: Uuid) -> Vec<String> {
+    // A JSON string literal is a valid TOML basic string.
+    let command = serde_json::to_string(&hook_report_command(port, workspace_id))
+        .expect("a string always serializes");
+    let mut args = vec!["--dangerously-bypass-hook-trust".to_string()];
+    for event in CODEX_HOOK_EVENTS {
+        args.push("-c".to_string());
+        args.push(format!(
+            "hooks.{event}=[{{hooks=[{{type=\"command\",command={command},timeout=3}}]}}]"
+        ));
+    }
+    args
 }
 
 /// Write the per-workspace settings file that registers the activity hooks, and
@@ -1262,7 +1303,9 @@ mod tests {
 mod tripwire_tests {
     use uuid::Uuid;
 
-    use super::{AttachInputTripwire, HOOK_EVENTS, hex_dump, hook_report_command};
+    use super::{
+        AttachInputTripwire, HOOK_EVENTS, codex_hook_args_for, hex_dump, hook_report_command,
+    };
 
     fn tripwire() -> AttachInputTripwire {
         AttachInputTripwire::new("bc_test".to_string(), Uuid::new_v4())
@@ -1301,6 +1344,28 @@ mod tripwire_tests {
             AttachInputTripwire::MAX_BYTES,
             "expiry must latch the budget as spent without logging"
         );
+    }
+
+    /// Codex reads each `-c key=value` as a line of TOML: every hook override
+    /// must parse, and must carry the report command byte for byte.
+    #[test]
+    fn codex_hook_overrides_are_valid_toml_carrying_the_report_command() {
+        let id = Uuid::nil();
+        let args = codex_hook_args_for(4111, id);
+        assert_eq!(args[0], "--dangerously-bypass-hook-trust");
+        let overrides: Vec<&String> = args[1..].iter().skip(1).step_by(2).collect();
+        assert_eq!(overrides.len(), super::CODEX_HOOK_EVENTS.len());
+        for value in overrides {
+            let doc: toml::Table = value.parse().unwrap_or_else(|e| panic!("{value}: {e}"));
+            let (event, groups) = doc["hooks"].as_table().unwrap().iter().next().unwrap();
+            assert!(super::CODEX_HOOK_EVENTS.contains(&event.as_str()));
+            let hook = &groups[0]["hooks"][0];
+            assert_eq!(hook["type"].as_str(), Some("command"));
+            assert_eq!(
+                hook["command"].as_str(),
+                Some(hook_report_command(4111, id).as_str())
+            );
+        }
     }
 
     #[test]

@@ -179,6 +179,21 @@ pub const HOOK_EVENTS: &[&str] = &[
     "ElicitationResult",
 ];
 
+/// The subset of [`HOOK_EVENTS`] Codex fires. Codex rejects a hook config that
+/// names an event it does not know, so it is only ever registered for these.
+pub const CODEX_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PermissionRequest",
+    "Stop",
+    "SubagentStop",
+    "PreCompact",
+    "PostCompact",
+    "SessionEnd",
+];
+
 fn payload_str<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     payload.get(key).and_then(|v| v.as_str())
 }
@@ -273,7 +288,8 @@ pub fn reduce_hook(
             CliPhase::Working
         }
         "PreToolUse" => match payload_str(payload, "tool_name") {
-            Some("AskUserQuestion") => CliPhase::Question,
+            // Claude's and Codex's ask-the-user tools.
+            Some("AskUserQuestion" | "request_user_input") => CliPhase::Question,
             _ => CliPhase::Working,
         },
         "PostToolUseFailure" => CliPhase::ToolFailed,
@@ -876,6 +892,22 @@ mod tests {
             hook_bucket(CliPhase::Working, Some(0)),
             CliActivityState::Running
         );
+    }
+
+    #[test]
+    fn codex_events_are_a_subset_and_its_question_tool_is_a_question() {
+        for event in CODEX_HOOK_EVENTS {
+            assert!(HOOK_EVENTS.contains(event), "{event}");
+        }
+        let state = run(&[
+            with_session(event("SessionStart"), "s1"),
+            with_session(
+                json!({ "hook_event_name": "PreToolUse", "tool_name": "request_user_input" }),
+                "s1",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(state.phase, CliPhase::Question);
     }
 
     #[test]

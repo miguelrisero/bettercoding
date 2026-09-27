@@ -98,6 +98,11 @@ fn cli_bootstrap(
     // The program is a bare binary name from our own code; quote it anyway so
     // it can never be anything but a single command word.
     let prog = shell_single_quote(&spec.program);
+    // The program plus the flags every launch form carries (resume included).
+    let head: String = std::iter::once(prog.clone())
+        .chain(spec.session_args.iter().map(|arg| shell_single_quote(arg)))
+        .collect::<Vec<_>>()
+        .join(" ");
 
     // Agent flags (model/effort/sandbox/approval/autonomy) applied to every
     // launch form except resume-by-subcommand, shell-quoted so a value can
@@ -107,7 +112,7 @@ fn cli_bootstrap(
         .iter()
         .map(|arg| format!(" {}", shell_single_quote(arg)))
         .collect();
-    let base = format!("{prog}{flags}");
+    let base = format!("{head}{flags}");
 
     // Nothing explicit to run (a CLI-first workspace whose tmux session died):
     // continue the most recent conversation in this cwd if the agent can,
@@ -115,7 +120,7 @@ fn cli_bootstrap(
     let continue_launch = || match &spec.continue_fallback {
         CliContinue::Flag(flag) => format!("{base} {flag} || {base}"),
         CliContinue::ResumeLast { subcommand } => {
-            format!("{prog} {subcommand} --last || {prog}")
+            format!("{head} {subcommand} --last || {head}")
         }
         CliContinue::Fresh => base.clone(),
     };
@@ -124,7 +129,7 @@ fn cli_bootstrap(
         let qfile = shell_single_quote(&file.to_string_lossy());
         let resume = match &spec.resume {
             CliResume::Flag(flag) => format!("{base} {flag} \"$bc_sid\""),
-            CliResume::Subcommand(sub) => format!("{prog} {sub} \"$bc_sid\""),
+            CliResume::Subcommand(sub) => format!("{head} {sub} \"$bc_sid\""),
             CliResume::Unsupported => base.clone(),
         };
         format!(
@@ -150,7 +155,7 @@ fn cli_bootstrap(
             CliResume::Flag(flag) => format!("{base} {flag} {id}"),
             // `<program> resume <id>` — a resume subcommand restores the
             // session's own settings, so the base flags are NOT replayed (codex).
-            CliResume::Subcommand(sub) => format!("{prog} {sub} {id}"),
+            CliResume::Subcommand(sub) => format!("{head} {sub} {id}"),
             CliResume::Unsupported => continue_launch(),
         }
     } else if let Some(file) = prompt_file {
@@ -3897,6 +3902,22 @@ mod tests {
         // Continue fallback uses `resume --last`, falling back to a fresh TUI.
         let cont = cli_bootstrap(&spec, None, None, false, None);
         assert!(cont.contains("'codex' resume --last || 'codex'"));
+    }
+
+    #[test]
+    fn cli_bootstrap_session_args_ride_every_launch_form() {
+        // Activity hooks must load on resume too, which never replays base flags.
+        let id = "28b98f08-5f5f-4b1e-8c4e-41ae87c0c706";
+        let mut spec = codex_spec(&["-m", "gpt-5.5"]);
+        spec.session_args = vec!["-c".to_string(), "hooks.Stop=[]".to_string()];
+        let resume = cli_bootstrap(&spec, Some(id), None, false, None);
+        assert!(resume.contains(&format!("'codex' '-c' 'hooks.Stop=[]' resume {id}")));
+        let fresh = cli_bootstrap(&spec, None, None, false, None);
+        assert!(fresh.contains(
+            "'codex' '-c' 'hooks.Stop=[]' resume --last || 'codex' '-c' 'hooks.Stop=[]'"
+        ));
+        // The install gate still checks the bare program.
+        assert!(fresh.contains("command -v 'codex'"));
     }
 
     #[test]
