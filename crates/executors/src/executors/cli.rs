@@ -66,6 +66,10 @@ pub struct CliLaunchSpec {
     /// (model / reasoning effort / sandbox / approval / autonomy / cwd …).
     /// Returned as discrete argv entries; the bootstrap shell-quotes each.
     pub base_args: Vec<String>,
+    /// Flags applied to EVERY launch form, including resume-by-subcommand,
+    /// placed right after the program (e.g. `codex <session_args> resume <id>`).
+    /// For per-session plumbing such as activity hooks, never agent settings.
+    pub session_args: Vec<String>,
     /// How to resume a prior session by id (handover from the chat UI).
     pub resume: CliResume,
     /// How the workspace's initial prompt is delivered (CLI-first creation).
@@ -80,6 +84,7 @@ impl CliLaunchSpec {
         Self {
             program: program.into(),
             base_args,
+            session_args: Vec::new(),
             resume: CliResume::Unsupported,
             prompt_arg: CliPromptArg::Positional,
             continue_fallback: CliContinue::Fresh,
