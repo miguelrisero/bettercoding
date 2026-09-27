@@ -6,7 +6,10 @@ use std::{
 };
 
 use convert_case::{Case, Casing};
-use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{DeserializeOwned, Error as DeError},
+};
 use thiserror::Error;
 use ts_rs::TS;
 
@@ -61,7 +64,7 @@ const DEFAULT_PROFILES_JSON: &str = include_str!("../default_profiles.json");
 // Executor-centric profile identifier
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS, Hash, Eq)]
 pub struct ExecutorProfileId {
-    /// The executor type (e.g., "CLAUDE_CODE", "AMP")
+    /// The executor type (e.g., "CLAUDE_CODE", "CODEX")
     #[serde(alias = "profile", deserialize_with = "de_base_coding_agent_kebab")]
     // Backwards compatibility with ProfileVariantIds, esp stored in DB under ExecutorAction
     pub executor: BaseCodingAgent,
@@ -82,6 +85,12 @@ where
         .map_err(|_| D::Error::custom(format!("unknown executor '{raw}' (normalized to '{norm}')")))
 }
 
+impl Default for ExecutorProfileId {
+    fn default() -> Self {
+        Self::new(BaseCodingAgent::ClaudeCode)
+    }
+}
+
 impl ExecutorProfileId {
     /// Create a new executor profile ID with default variant
     pub fn new(executor: BaseCodingAgent) -> Self {
@@ -96,14 +105,6 @@ impl ExecutorProfileId {
         Self {
             executor,
             variant: Some(variant),
-        }
-    }
-
-    /// Get cache key for this executor profile
-    pub fn cache_key(&self) -> String {
-        match &self.variant {
-            Some(variant) => format!("{}:{}", self.executor, variant),
-            None => self.executor.clone().to_string(),
         }
     }
 }
@@ -123,7 +124,7 @@ impl std::fmt::Display for ExecutorProfileId {
 /// scratch persistence, and frontend state whenever an executor is used.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 pub struct ExecutorConfig {
-    /// The executor type (e.g., CLAUDE_CODE, AMP)
+    /// The executor type (e.g., CLAUDE_CODE, CODEX)
     #[serde(alias = "profile", deserialize_with = "de_base_coding_agent_kebab")]
     pub executor: BaseCodingAgent,
     /// Optional variant/preset name (e.g., "PLAN", "ROUTER")
@@ -141,6 +142,12 @@ pub struct ExecutorConfig {
     /// Permission policy override
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_policy: Option<PermissionPolicy>,
+}
+
+impl Default for ExecutorConfig {
+    fn default() -> Self {
+        Self::new(BaseCodingAgent::ClaudeCode)
+    }
 }
 
 impl ExecutorConfig {
@@ -238,9 +245,46 @@ pub struct ExecutorRecentModels {
     pub reasoning_by_model: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[derive(Debug, Clone, Serialize, PartialEq, TS)]
 pub struct ExecutorConfigs {
     pub executors: HashMap<BaseCodingAgent, ExecutorProfile>,
+}
+
+/// A `profiles.json` written by an older release can name an agent this build
+/// no longer ships. That entry is skipped so the other agents' settings load.
+impl<'de> Deserialize<'de> for ExecutorConfigs {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            executors: HashMap<String, serde_json::Value>,
+        }
+
+        let mut executors = HashMap::new();
+        for (key, profile) in Raw::deserialize(de)?.executors {
+            let Ok(agent) = BaseCodingAgent::from_str(&key) else {
+                tracing::warn!("Skipping profiles for unsupported coding agent '{key}'");
+                continue;
+            };
+            let profile = ExecutorProfile::deserialize(profile).map_err(D::Error::custom)?;
+            executors.insert(agent, profile);
+        }
+        Ok(Self { executors })
+    }
+}
+
+/// Deserializes a stored executor preference (user config, drafts). A value
+/// that names an agent this build does not ship falls back to `T::default()`.
+/// Execution history does not use this: it keeps the raw stored action.
+pub fn deserialize_or_default<'de, D, T>(de: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(de)?;
+    Ok(T::deserialize(value).unwrap_or_else(|err| {
+        tracing::warn!("Replacing unsupported executor preference with the default: {err}");
+        T::default()
+    }))
 }
 
 impl ExecutorConfigs {
@@ -554,5 +598,65 @@ impl ExecutorConfigs {
         let selected = agents_with_info[0].0;
         tracing::info!("Recommended executor: {}", selected);
         Ok(ExecutorProfileId::new(selected))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profiles_naming_a_removed_agent_keep_the_supported_ones() {
+        let raw = r#"{
+            "executors": {
+                "GEMINI": { "DEFAULT": { "GEMINI": { "yolo": true } } },
+                "CURSOR": { "DEFAULT": { "CURSOR": { "force": true } } },
+                "CLAUDE_CODE": { "PLAN": { "CLAUDE_CODE": { "dangerously_skip_permissions": true } } }
+            }
+        }"#;
+
+        let configs: ExecutorConfigs = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(configs.executors.len(), 1);
+        assert!(
+            configs.executors[&BaseCodingAgent::ClaudeCode]
+                .get_variant("PLAN")
+                .is_some()
+        );
+    }
+
+    #[derive(Deserialize)]
+    struct Stored {
+        #[serde(deserialize_with = "deserialize_or_default")]
+        config: ExecutorConfig,
+        #[serde(default, deserialize_with = "deserialize_or_default")]
+        draft: Option<ExecutorConfig>,
+    }
+
+    #[test]
+    fn preferences_naming_a_removed_agent_fall_back_to_the_default() {
+        let stored: Stored = serde_json::from_value(serde_json::json!({
+            "config": { "executor": "OPENCODE", "model_id": "x" },
+            "draft": { "executor": "amp" },
+        }))
+        .unwrap();
+
+        assert_eq!(
+            stored.config,
+            ExecutorConfig::new(BaseCodingAgent::ClaudeCode)
+        );
+        assert_eq!(stored.draft, None);
+    }
+
+    #[test]
+    fn supported_preferences_are_kept() {
+        let stored: Stored = serde_json::from_value(serde_json::json!({
+            "config": { "executor": "codex", "reasoning_id": "high" },
+        }))
+        .unwrap();
+
+        assert_eq!(stored.config.executor, BaseCodingAgent::Codex);
+        assert_eq!(stored.config.reasoning_id.as_deref(), Some("high"));
+        assert_eq!(stored.draft, None);
     }
 }

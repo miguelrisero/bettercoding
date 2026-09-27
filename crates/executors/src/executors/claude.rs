@@ -1246,8 +1246,6 @@ impl ClaudeCode {
 pub enum HistoryStrategy {
     // Claude-code format
     Default,
-    // Amp threads format which includes logs from previous executions
-    AmpResume,
     // Claude's on-disk native store. Unlike executor history, it is the only
     // source for CLI-authored user turns, so plain user content is renderable.
     NativeClaude,
@@ -2026,37 +2024,6 @@ impl ClaudeLogProcessor {
                     return patches;
                 }
 
-                if matches!(self.strategy, HistoryStrategy::AmpResume)
-                    && message
-                        .content
-                        .items()
-                        .any(|c| matches!(c, ClaudeContentItem::Text { .. }))
-                {
-                    let cur = entry_index_provider.current();
-                    if cur > 0 {
-                        for _ in 0..cur {
-                            patches.push(ConversationPatch::remove_diff(0.to_string()));
-                        }
-                        entry_index_provider.reset();
-                        self.tool_map.clear();
-                    }
-
-                    for item in message.content.items() {
-                        if let ClaudeContentItem::Text { text } = item {
-                            let entry = NormalizedEntry {
-                                timestamp: None,
-                                entry_type: NormalizedEntryType::UserMessage,
-                                content: text.clone(),
-                                metadata: Some(
-                                    serde_json::to_value(item).unwrap_or(serde_json::Value::Null),
-                                ),
-                            };
-                            let id = entry_index_provider.next();
-                            patches.push(ConversationPatch::add_normalized_entry(id, entry));
-                        }
-                    }
-                }
-
                 if matches!(self.strategy, HistoryStrategy::NativeClaude) && !*is_synthetic {
                     for item in message.content.items() {
                         if let ClaudeContentItem::Text { text } = item {
@@ -2379,7 +2346,6 @@ impl ClaudeLogProcessor {
                 ClaudeStreamEvent::Unknown => {}
             },
             ClaudeJson::Result {
-                is_error,
                 model_usage,
                 subtype,
                 result,
@@ -2396,22 +2362,7 @@ impl ClaudeLogProcessor {
                     patches.push(self.add_token_usage_entry(entry_index_provider));
                 }
 
-                if matches!(self.strategy, HistoryStrategy::AmpResume) && is_error.unwrap_or(false)
-                {
-                    let entry = NormalizedEntry {
-                        timestamp: None,
-                        entry_type: NormalizedEntryType::ErrorMessage {
-                            error_type: NormalizedEntryError::Other,
-                        },
-                        content: serde_json::to_string(claude_json)
-                            .unwrap_or_else(|_| "error".to_string()),
-                        metadata: Some(
-                            serde_json::to_value(claude_json).unwrap_or(serde_json::Value::Null),
-                        ),
-                    };
-                    let idx = entry_index_provider.next();
-                    patches.push(ConversationPatch::add_normalized_entry(idx, entry));
-                } else if matches!(subtype.as_deref(), Some("success"))
+                if matches!(subtype.as_deref(), Some("success"))
                     && let Some(text) = result.as_ref().and_then(|v| v.as_str())
                     && (self.last_assistant_message.is_none()
                         || matches!(&self.last_assistant_message, Some(message) if !message.contains(text)))

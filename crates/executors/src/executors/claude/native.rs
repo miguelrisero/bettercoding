@@ -328,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn strategy_matrix_keeps_default_and_amp_behavior() {
+    fn strategy_matrix_keeps_default_and_native_behavior() {
         let string_line = adapt_native_claude_line(&user_line(r#""hello""#), "sid").unwrap();
 
         let default_entries = normalize_with_strategy(&string_line, HistoryStrategy::Default);
@@ -343,24 +343,11 @@ mod tests {
                 .any(|entry| matches!(entry.entry_type, NormalizedEntryType::SystemMessage))
         );
 
-        let amp_string_entries = normalize_with_strategy(&string_line, HistoryStrategy::AmpResume);
-        assert!(
-            amp_string_entries
-                .iter()
-                .all(|entry| !matches!(entry.entry_type, NormalizedEntryType::UserMessage))
-        );
-
         let array_line =
             adapt_native_claude_line(&user_line(r#"[{"type":"text","text":"hello"}]"#), "sid")
                 .unwrap();
         let default_array = normalize_with_strategy(&array_line, HistoryStrategy::Default);
         assert!(default_array.is_empty());
-        let amp_array = normalize_with_strategy(&array_line, HistoryStrategy::AmpResume);
-        assert!(
-            amp_array
-                .iter()
-                .any(|entry| matches!(entry.entry_type, NormalizedEntryType::UserMessage))
-        );
         let native_array = normalize_with_strategy(&array_line, HistoryStrategy::NativeClaude);
         assert!(
             native_array

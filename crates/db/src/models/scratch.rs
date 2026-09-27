@@ -21,7 +21,11 @@ pub enum ScratchError {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct DraftFollowUpData {
     pub message: String,
-    #[serde(alias = "executor_profile_id", alias = "config")]
+    #[serde(
+        alias = "executor_profile_id",
+        alias = "config",
+        deserialize_with = "executors::profile::deserialize_or_default"
+    )]
     pub executor_config: ExecutorConfig,
 }
 
@@ -190,7 +194,12 @@ pub struct DraftWorkspaceData {
     pub message: String,
     #[serde(default)]
     pub repos: Vec<DraftWorkspaceRepo>,
-    #[serde(default, alias = "selected_profile", alias = "config")]
+    #[serde(
+        default,
+        alias = "selected_profile",
+        alias = "config",
+        deserialize_with = "executors::profile::deserialize_or_default"
+    )]
     pub executor_config: Option<ExecutorConfig>,
     #[serde(default)]
     pub linked_issue: Option<DraftWorkspaceLinkedIssue>,

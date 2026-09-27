@@ -13,7 +13,7 @@ BetterCoding is a hard fork of [Vibe Kanban](https://github.com/BloopAI/vibe-kan
 
 - **Workspaces** — each task gets an isolated git worktree with its own branch, agent session, terminal, and dev server. Work on many things in parallel without stepping on yourself.
 - **CLI mode** — turn the main pane into a persistent, tmux-backed interactive `claude` session. Survives page reloads, container restarts, and WebSocket drops; resumes the exact conversation from the chat UI and hands it back (`claude --resume` under the hood). Interactive terminal use stays covered by your subscription, unlike headless/API usage.
-- **Chat-driven agent sessions** — drive Claude Code, Codex, Gemini CLI, GitHub Copilot, Amp, Cursor, OpenCode, Droid, CCR, or Qwen Code through a structured chat with full tool-call visibility.
+- **Chat-driven agent sessions** — drive Claude Code (optionally through CCR) or Codex through a structured chat with full tool-call visibility.
 - **Diff review** — side-by-side or inline diffs with inline comments that go straight back to the agent.
 - **Preview browser** — built-in preview with devtools, inspect mode, and device emulation for testing what the agent built.
 - **Git integration** — create branches, rebase, resolve conflicts, open PRs with generated descriptions, and merge without leaving the app.

@@ -4,7 +4,6 @@ pub mod cli_activity;
 pub mod codex_setup;
 pub mod core;
 pub mod create;
-pub mod cursor_setup;
 pub mod execution;
 pub mod file_policy;
 pub mod files;

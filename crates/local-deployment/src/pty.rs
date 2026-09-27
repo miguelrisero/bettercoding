@@ -174,24 +174,6 @@ fn cli_bootstrap(
             CliPromptArg::Positional => {
                 format!(r#"{read_rm} {base} "$bc_p""#)
             }
-            // Prompt as a flag value (e.g. gemini/copilot `-i "<prompt>"`); a
-            // leading '-' is harmless after the flag. The flag is one of our
-            // own spec constants, but quote it anyway (like the program and
-            // base args) so it can never be more than a single command word.
-            CliPromptArg::Flag(flag) => {
-                let qflag = shell_single_quote(flag);
-                format!(r#"{read_rm} {base} {qflag} "$bc_p""#)
-            }
-            // Prompt piped on stdin (e.g. amp); the TUI stays interactive
-            // because the tmux pane keeps stdout a TTY. No argv-length ceiling
-            // at all. The file already carries the trailing newline printf
-            // added. The `rm` runs inside the pipeline's producer — right after
-            // `cat` streams the file — so consumption is acknowledged (file
-            // gone) as soon as the prompt is handed off, not when the agent
-            // eventually exits.
-            CliPromptArg::StdinPipe => {
-                format!("{{ cat {qfile}; rm -f -- {qfile}; }} | {base}")
-            }
             // No CLI way to seed the prompt — start the TUI and rely on a
             // post-launch keystroke delivery (loop automation / send-keys).
             CliPromptArg::Unsupported => continue_launch(),
@@ -231,7 +213,7 @@ fn cli_bootstrap(
 }
 
 /// Largest prompt (bytes) baked into the launch command via the temp-file
-/// `$(cat)` transport for argv-passing agents. Positional/Flag agents hand the
+/// `$(cat)` transport for argv-passing agents. Positional agents hand the
 /// prompt to the pane shell as a single argv entry, bounded by Linux
 /// `MAX_ARG_STRLEN` (~131072 bytes); a conservative cap keeps clear of `E2BIG`
 /// (and of macOS's smaller shared `ARG_MAX`). Larger prompts are delivered
@@ -249,13 +231,11 @@ fn active_resume_id(resume_session_id: Option<&str>) -> Option<&str> {
 
 /// Whether an initial prompt of `byte_len` bytes can be baked into the launch
 /// command for an agent with this `prompt_arg`, or must be delivered after the
-/// TUI is up (via [`send_cli_keys`]). `StdinPipe` has no argv ceiling;
-/// `Positional`/`Flag` pass the prompt as one argv entry and are capped;
-/// `Unsupported` has no launch-time transport at all.
+/// TUI is up (via [`send_cli_keys`]). `Positional` passes the prompt as one
+/// argv entry and is capped; `Unsupported` has no launch-time transport at all.
 fn cli_prompt_fits_inline(prompt_arg: &CliPromptArg, byte_len: usize) -> bool {
     match prompt_arg {
-        CliPromptArg::Positional | CliPromptArg::Flag(_) => byte_len <= MAX_INLINE_PROMPT_BYTES,
-        CliPromptArg::StdinPipe => true,
+        CliPromptArg::Positional => byte_len <= MAX_INLINE_PROMPT_BYTES,
         CliPromptArg::Unsupported => false,
     }
 }
@@ -316,8 +296,7 @@ pub fn route_followup_prompt(prompt: &str) -> CliPromptRouting {
 /// or `None` when the (trimmed) prompt is blank — mirroring the old in-command
 /// quoting semantics so small prompts behave identically: the leading-dash
 /// guard for `Positional` (so a prompt like `-rf` can't parse as a flag) is a
-/// literal leading space in the file; `StdinPipe` keeps the trailing newline the
-/// old `printf '%s\n'` added. The content is stored verbatim (never
+/// literal leading space in the file. The content is stored verbatim (never
 /// shell-escaped) — the bootstrap reads it back inside double quotes.
 fn cli_prompt_file_content(prompt_arg: &CliPromptArg, prompt: &str) -> Option<String> {
     let prompt = prompt.trim();
@@ -332,8 +311,6 @@ fn cli_prompt_file_content(prompt_arg: &CliPromptArg, prompt: &str) -> Option<St
                 prompt.to_string()
             }
         }
-        CliPromptArg::Flag(_) => prompt.to_string(),
-        CliPromptArg::StdinPipe => format!("{prompt}\n"),
         CliPromptArg::Unsupported => return None,
     })
 }
@@ -708,13 +685,6 @@ fn cli_install_hint(program: &str) -> Option<&'static str> {
     Some(match program {
         "claude" => "npm i -g @anthropic-ai/claude-code",
         "codex" => "npm i -g @openai/codex",
-        "gemini" => "npm i -g @google/gemini-cli",
-        "qwen" => "npm i -g @qwen-code/qwen-code",
-        "opencode" => "npm i -g opencode-ai",
-        "copilot" => "npm i -g @github/copilot",
-        "amp" => "npm i -g @sourcegraph/amp",
-        "cursor-agent" => "curl https://cursor.com/install -fsS | bash",
-        "droid" => "curl -fsSL https://app.factory.ai/cli | sh",
         _ => return None,
     })
 }
@@ -751,8 +721,6 @@ fn maybe_seed_cli_trust(program: &str, dir: &Path) {
             ensure_codex_folder_trusted(dir);
             ensure_codex_update_nag_dismissed();
         }
-        // copilot / cursor / gemini / qwen onboarding seeding is added
-        // alongside each agent's CLI support.
         _ => {}
     }
 }
@@ -3941,26 +3909,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_bootstrap_flag_and_stdin_prompt_forms_read_from_file() {
-        let file = Path::new("/tmp/vk/p.txt");
-
-        // Flag agents expand the file into the flag's value, double-quoted;
-        // the flag itself is quoted like every other word we emit.
-        let flag_spec = CliLaunchSpec::new("gemini", vec![])
-            .with_prompt_arg(CliPromptArg::Flag("-i".to_string()));
-        let b = cli_bootstrap(&flag_spec, None, Some(file), false, None);
-        assert!(b.contains("rm -f -- '/tmp/vk/p.txt'; 'gemini' '-i' \"$bc_p\""));
-
-        // StdinPipe agents pipe the file into the program — no argv ceiling.
-        // The `rm` runs inside the producer group, right after `cat` streams
-        // the file, so consumption is acknowledged (file gone) immediately —
-        // not when the agent eventually exits.
-        let pipe_spec = CliLaunchSpec::new("amp", vec![]).with_prompt_arg(CliPromptArg::StdinPipe);
-        let b = cli_bootstrap(&pipe_spec, None, Some(file), false, None);
-        assert!(b.contains("{ cat '/tmp/vk/p.txt'; rm -f -- '/tmp/vk/p.txt'; } | 'amp'"));
-    }
-
-    #[test]
     fn cli_bootstrap_no_prompt_file_falls_through_to_continue() {
         // No prompt file (blank prompt filtered out by the caller) -> the
         // no-prompt continue/fresh path, exactly as before.
@@ -4089,18 +4037,6 @@ mod tests {
             Some(" -rf is a prompt")
         );
 
-        // Flag: no dash guard needed (the value follows a flag).
-        assert_eq!(
-            cli_prompt_file_content(&CliPromptArg::Flag("-i".to_string()), "-x").as_deref(),
-            Some("-x")
-        );
-
-        // StdinPipe keeps the trailing newline the old `printf '%s\n'` added.
-        assert_eq!(
-            cli_prompt_file_content(&CliPromptArg::StdinPipe, "hello").as_deref(),
-            Some("hello\n")
-        );
-
         // Unsupported agents have no launch-time transport.
         assert_eq!(
             cli_prompt_file_content(&CliPromptArg::Unsupported, "hi"),
@@ -4160,19 +4096,9 @@ mod tests {
 
     #[test]
     fn cli_prompt_fits_inline_caps_argv_agents_only() {
-        // Positional/Flag are capped (single argv entry, Linux MAX_ARG_STRLEN).
+        // Positional is capped (single argv entry, Linux MAX_ARG_STRLEN).
         assert!(cli_prompt_fits_inline(&CliPromptArg::Positional, 100_000));
         assert!(!cli_prompt_fits_inline(&CliPromptArg::Positional, 100_001));
-        assert!(cli_prompt_fits_inline(
-            &CliPromptArg::Flag("-i".to_string()),
-            100_000
-        ));
-        assert!(!cli_prompt_fits_inline(
-            &CliPromptArg::Flag("-i".to_string()),
-            200_000
-        ));
-        // StdinPipe has no argv ceiling.
-        assert!(cli_prompt_fits_inline(&CliPromptArg::StdinPipe, 5_000_000));
         // Unsupported never bakes in.
         assert!(!cli_prompt_fits_inline(&CliPromptArg::Unsupported, 1));
     }
@@ -4202,13 +4128,7 @@ mod tests {
         let big = "x".repeat(MAX_INLINE_PROMPT_BYTES + 1);
         assert_eq!(
             route_initial_prompt(Some(format!("  {big}  ")), &CliPromptArg::Positional),
-            CliPromptRouting::Deferred(big.clone())
-        );
-
-        // StdinPipe has no argv ceiling, so even a huge prompt bakes in.
-        assert_eq!(
-            route_initial_prompt(Some(big.clone()), &CliPromptArg::StdinPipe),
-            CliPromptRouting::Baked(big)
+            CliPromptRouting::Deferred(big)
         );
 
         // Unsupported agents have no launch-time transport -> always Deferred

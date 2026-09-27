@@ -28,10 +28,6 @@ impl EntryIndexProvider {
         self.0.load(Ordering::Relaxed)
     }
 
-    pub fn reset(&self) {
-        self.0.store(0, Ordering::Relaxed);
-    }
-
     /// Create a provider starting from the maximum existing normalized-entry index
     /// observed in prior JSON patches in `MsgStore`.
     pub fn start_from(msg_store: &MsgStore) -> Self {
