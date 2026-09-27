@@ -24,9 +24,6 @@ export interface SidebarWorkspace {
   worktreeDeleted: boolean;
   description: string;
   repoCount?: number;
-  filesChanged?: number;
-  linesAdded?: number;
-  linesRemoved?: number;
   isRunning?: boolean;
   /** An executor process (setup/cleanup/coding agent) is running right now. */
   isExecutorRunning?: boolean;
@@ -77,10 +74,6 @@ function toSidebarWorkspace(
     worktreeDeleted: ws.worktree_deleted,
     description: '',
     repoCount: summary?.repo_count,
-    // Use real stats from summary if available
-    filesChanged: summary?.files_changed ?? undefined,
-    linesAdded: summary?.lines_added ?? undefined,
-    linesRemoved: summary?.lines_removed ?? undefined,
     // Real data from stream
     isRunning: ws.is_running,
     isExecutorRunning: ws.is_executor_running,
@@ -106,9 +99,12 @@ function toSidebarWorkspace(
     prUrl: summary?.pr_url ?? undefined,
     statusTag: workspaceStatusTag({
       cliPhase: summary?.cli_phase,
+      cliPhaseAt: summary?.cli_phase_at,
       cliTasks: summary?.cli_tasks == null ? null : Number(summary.cli_tasks),
       cliCrons: summary?.cli_crons == null ? null : Number(summary.cli_crons),
       cliManual: summary?.cli_manual,
+      activityAt:
+        summary?.latest_process_completed_at ?? summary?.cli_activity_at,
       isRunning: ws.is_running,
       hasPendingApproval: summary?.has_pending_approval,
       hasUnseenActivity: summary?.has_unseen_turns || summary?.cli_attention,

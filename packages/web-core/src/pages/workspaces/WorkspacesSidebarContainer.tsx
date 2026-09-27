@@ -557,6 +557,7 @@ export function WorkspacesSidebarContainer({
     raisedHand: PERSIST_KEYS.workspacesSidebarRaisedHand,
     notRunning: PERSIST_KEYS.workspacesSidebarNotRunning,
     running: PERSIST_KEYS.workspacesSidebarRunning,
+    older: PERSIST_KEYS.workspacesSidebarOlder,
   };
 
   const searchControls = (

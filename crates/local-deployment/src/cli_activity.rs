@@ -32,7 +32,7 @@ use std::{
 
 use db::{
     DBService,
-    models::workspace_cli_activity::{CliActivityState, CliPhase, WorkspaceCliActivity},
+    models::workspace_cli_activity::{CliActivityState, WorkspaceCliActivity, hook_bucket},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -597,15 +597,16 @@ impl CliActivityMonitor {
                 // table per tick; a failed read just means nobody reported and
                 // the pane heuristics decide this round.
                 let now_utc = chrono::Utc::now();
-                let mut hooks: HashMap<Uuid, (CliPhase, i64)> = HashMap::new();
+                let mut hooks: HashMap<Uuid, (CliActivityState, i64)> = HashMap::new();
                 match WorkspaceCliActivity::find_all(&db.pool).await {
                     Ok(rows) => {
                         hooks = rows
                             .iter()
                             .filter_map(|row| {
                                 let phase = row.fresh_phase(now_utc)?;
-                                let seq = row.hook.as_ref().map(|h| h.seq)?;
-                                Some((row.workspace_id, (phase, seq)))
+                                let hook = row.hook.as_ref()?;
+                                let bucket = hook_bucket(phase, hook.tasks);
+                                Some((row.workspace_id, (bucket, hook.seq)))
                             })
                             .collect();
                         states = rows.iter().map(|r| (r.workspace_id, r.state)).collect();
@@ -634,12 +635,12 @@ impl CliActivityMonitor {
                     // Having the pane open acknowledges everything reported so
                     // far, which is the hook-side form of "attention clears the
                     // moment a terminal attaches".
-                    let hook = hooks.get(workspace_id).map(|(phase, seq)| {
+                    let hook = hooks.get(workspace_id).map(|(bucket, seq)| {
                         if obs.attached {
                             hook_acked.insert(*workspace_id, *seq);
                         }
                         HookView {
-                            phase: *phase,
+                            bucket: *bucket,
                             acked: hook_acked
                                 .get(workspace_id)
                                 .is_some_and(|acked| *seq <= *acked),
@@ -901,7 +902,8 @@ fn sizing_presence(presence: CliClientPresence, now: std::time::Instant) -> Sizi
 /// What the workspace's agent last reported about itself, as the poller sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HookView {
-    phase: CliPhase,
+    /// The bucket the agent's own report implies (see `hook_bucket`).
+    bucket: CliActivityState,
     /// True once the user has attached to the pane at or after this report.
     /// Without it a phase like `stopped` would re-raise the hand every time
     /// the user navigated away from a workspace they had already looked at.
@@ -928,7 +930,7 @@ fn next_state(
     // input that can tell "waiting for approval" from "idle", and the only one
     // a user typing in the pane cannot fake.
     if let Some(hook) = hook {
-        return match hook.phase.bucket() {
+        return match hook.bucket {
             // Attention still clears the moment a terminal attaches, and stays
             // cleared for a report the user has already seen.
             CliActivityState::Attention if obs.attached || hook.acked => CliActivityState::Idle,
@@ -1091,6 +1093,8 @@ fn tmux_list_panes_exit_is_definitively_empty(stderr: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use db::models::workspace_cli_activity::CliPhase;
+
     use super::*;
 
     const NOW: i64 = 1_000_000;
@@ -1454,7 +1458,10 @@ mod tests {
     }
 
     fn hook(phase: CliPhase, acked: bool) -> Option<HookView> {
-        Some(HookView { phase, acked })
+        Some(HookView {
+            bucket: phase.bucket(),
+            acked,
+        })
     }
 
     #[test]

@@ -17,7 +17,6 @@ import {
   HandIcon,
   TriangleIcon,
   PlayIcon,
-  FileIcon,
   CircleIcon,
   GitPullRequestIcon,
   PushPinIcon,
@@ -105,9 +104,6 @@ function MobileWorkspacesList() {
               const isFailed =
                 workspace.latestProcessStatus === "failed" ||
                 workspace.latestProcessStatus === "killed";
-              const hasChanges =
-                workspace.filesChanged !== undefined &&
-                workspace.filesChanged > 0;
 
               return (
                 <div
@@ -207,24 +203,6 @@ function MobileWorkspacesList() {
                             )}
                           </span>
                         )}
-
-                      {/* File changes */}
-                      {hasChanges && (
-                        <span className="shrink-0 flex items-center gap-half">
-                          <FileIcon className="size-icon-xs" weight="fill" />
-                          <span>{workspace.filesChanged}</span>
-                          {workspace.linesAdded !== undefined && (
-                            <span className="text-success">
-                              +{workspace.linesAdded}
-                            </span>
-                          )}
-                          {workspace.linesRemoved !== undefined && (
-                            <span className="text-error">
-                              -{workspace.linesRemoved}
-                            </span>
-                          )}
-                        </span>
-                      )}
                     </span>
                   </button>
                   {/* Workspace actions menu */}

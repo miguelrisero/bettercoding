@@ -21,7 +21,11 @@ import {
   type BulkDeleteArchivedWorkspaceDetails,
 } from '../lib/bulkDeleteArchivedWorkspaces';
 import { InputField } from './InputField';
-import { WorkspaceSummary, type WorkspaceStatusTag } from './WorkspaceSummary';
+import {
+  WorkspaceSummary,
+  type WorkspaceStatusGroup,
+  type WorkspaceStatusTag,
+} from './WorkspaceSummary';
 export type WorkspacesSidebarHostStatus = 'online' | 'offline' | 'unpaired';
 import {
   CollapsibleSectionHeader,
@@ -65,9 +69,6 @@ export interface WorkspacesSidebarWorkspace {
   archivedAt: string | null;
   worktreeDeleted?: boolean;
   repoCount?: number;
-  filesChanged?: number;
-  linesAdded?: number;
-  linesRemoved?: number;
   isRunning?: boolean;
   isPinned?: boolean;
   hasPendingApproval?: boolean;
@@ -82,12 +83,21 @@ export interface WorkspacesSidebarWorkspace {
 export interface WorkspacesSidebarPersistKeys {
   raisedHand: string;
   notRunning: string;
+  older: string;
   running: string;
 }
+
+const GROUP_TITLE_KEYS: Record<WorkspaceStatusGroup, string> = {
+  needs_you: 'common:workspaces.needsYou',
+  running: 'common:workspaces.running',
+  idle: 'common:workspaces.idle',
+  older: 'common:workspaces.older',
+};
 
 const DEFAULT_PERSIST_KEYS: WorkspacesSidebarPersistKeys = {
   raisedHand: 'workspaces-sidebar-raised-hand',
   notRunning: 'workspaces-sidebar-not-running',
+  older: 'workspaces-sidebar-older',
   running: 'workspaces-sidebar-running',
 };
 
@@ -204,9 +214,6 @@ function WorkspaceList({
           key={workspace.id}
           name={workspace.name}
           workspaceId={workspace.id}
-          filesChanged={workspace.filesChanged}
-          linesAdded={workspace.linesAdded}
-          linesRemoved={workspace.linesRemoved}
           isActive={selectedWorkspaceId === workspace.id}
           isRunning={workspace.isRunning}
           isPinned={workspace.isPinned}
@@ -279,23 +286,27 @@ export function WorkspacesSidebar({
     }
   };
 
-  // Categorize workspaces for accordion layout
-  const { raisedHandWorkspaces, idleWorkspaces, runningWorkspaces } =
-    useMemo(() => {
-      // Running workspaces should stay in the "Running" section even if unseen.
-      const needsAttention = (ws: WorkspacesSidebarWorkspace) =>
-        ws.hasPendingApproval || (ws.hasUnseenActivity && !ws.isRunning);
-
-      return {
-        raisedHandWorkspaces: workspaces.filter((ws) => needsAttention(ws)),
-        idleWorkspaces: workspaces.filter(
-          (ws) => !ws.isRunning && !needsAttention(ws)
-        ),
-        runningWorkspaces: workspaces.filter(
-          (ws) => ws.isRunning && !needsAttention(ws)
-        ),
-      };
-    }, [workspaces]);
+  // Group workspaces for the accordion layout by their status tag. A
+  // workspace without a tag falls back to the coarse running/attention flags.
+  const groupedWorkspaces = useMemo(() => {
+    const groups: Record<WorkspaceStatusGroup, WorkspacesSidebarWorkspace[]> = {
+      needs_you: [],
+      running: [],
+      idle: [],
+      older: [],
+    };
+    for (const ws of workspaces) {
+      const group: WorkspaceStatusGroup =
+        ws.statusTag?.group ??
+        (ws.hasPendingApproval || (ws.hasUnseenActivity && !ws.isRunning)
+          ? 'needs_you'
+          : ws.isRunning
+            ? 'running'
+            : 'idle');
+      groups[group].push(ws);
+    }
+    return groups;
+  }, [workspaces]);
 
   const archivedBuckets = useMemo(() => {
     const nowMilliseconds = Date.now();
@@ -536,9 +547,6 @@ export function WorkspacesSidebar({
                           key={workspace.id}
                           name={workspace.name}
                           workspaceId={workspace.id}
-                          filesChanged={workspace.filesChanged}
-                          linesAdded={workspace.linesAdded}
-                          linesRemoved={workspace.linesRemoved}
                           isActive={selectedWorkspaceId === workspace.id}
                           isRunning={workspace.isRunning}
                           isPinned={workspace.isPinned}
@@ -566,79 +574,48 @@ export function WorkspacesSidebar({
             {layoutMode === 'accordion' ? (
               /* Accordion layout view */
               <div className="flex flex-col gap-base">
-                {/* Needs Attention section */}
-                <CollapsibleSectionHeader
-                  title={t('common:workspaces.needsAttention')}
-                  persistKey={persistKeys.raisedHand}
-                  defaultExpanded={true}
-                >
-                  <div className="flex flex-col gap-base py-half">
-                    {draftTitle && (
-                      <WorkspaceSummary
-                        name={draftTitle}
-                        isActive={isCreateMode}
-                        isDraft={true}
-                        onClick={onSelectCreate}
-                      />
-                    )}
-                    {raisedHandWorkspaces.length === 0 && !draftTitle ? (
-                      <span className="text-sm text-low opacity-60 pl-base">
-                        {t('common:workspaces.noWorkspaces')}
-                      </span>
-                    ) : (
-                      <WorkspaceList
-                        workspaces={raisedHandWorkspaces}
-                        selectedWorkspaceId={selectedWorkspaceId}
-                        onSelectWorkspace={onSelectWorkspace}
-                        onOpenWorkspaceActions={handleOpenWorkspaceActions}
-                      />
-                    )}
-                  </div>
-                </CollapsibleSectionHeader>
-
-                {/* Running section */}
-                <CollapsibleSectionHeader
-                  title={t('common:workspaces.running')}
-                  persistKey={persistKeys.running}
-                  defaultExpanded={true}
-                >
-                  <div className="flex flex-col gap-base py-half">
-                    {runningWorkspaces.length === 0 ? (
-                      <span className="text-sm text-low opacity-60 pl-base">
-                        {t('common:workspaces.noWorkspaces')}
-                      </span>
-                    ) : (
-                      <WorkspaceList
-                        workspaces={runningWorkspaces}
-                        selectedWorkspaceId={selectedWorkspaceId}
-                        onSelectWorkspace={onSelectWorkspace}
-                        onOpenWorkspaceActions={handleOpenWorkspaceActions}
-                      />
-                    )}
-                  </div>
-                </CollapsibleSectionHeader>
-
-                {/* Idle section */}
-                <CollapsibleSectionHeader
-                  title={t('common:workspaces.idle')}
-                  persistKey={persistKeys.notRunning}
-                  defaultExpanded={true}
-                >
-                  <div className="flex flex-col gap-base py-half">
-                    {idleWorkspaces.length === 0 ? (
-                      <span className="text-sm text-low opacity-60 pl-base">
-                        {t('common:workspaces.noWorkspaces')}
-                      </span>
-                    ) : (
-                      <WorkspaceList
-                        workspaces={idleWorkspaces}
-                        selectedWorkspaceId={selectedWorkspaceId}
-                        onSelectWorkspace={onSelectWorkspace}
-                        onOpenWorkspaceActions={handleOpenWorkspaceActions}
-                      />
-                    )}
-                  </div>
-                </CollapsibleSectionHeader>
+                {(
+                  [
+                    ['needs_you', persistKeys.raisedHand, true],
+                    ['running', persistKeys.running, true],
+                    ['idle', persistKeys.notRunning, true],
+                    ['older', persistKeys.older, false],
+                  ] as const
+                ).map(([group, persistKey, defaultExpanded]) => {
+                  const groupWorkspaces = groupedWorkspaces[group];
+                  const showDraft = group === 'needs_you' && !!draftTitle;
+                  return (
+                    <CollapsibleSectionHeader
+                      key={group}
+                      title={`${t(GROUP_TITLE_KEYS[group])} · ${groupWorkspaces.length}`}
+                      persistKey={persistKey}
+                      defaultExpanded={defaultExpanded}
+                    >
+                      <div className="flex flex-col gap-base py-half">
+                        {showDraft && (
+                          <WorkspaceSummary
+                            name={draftTitle}
+                            isActive={isCreateMode}
+                            isDraft={true}
+                            onClick={onSelectCreate}
+                          />
+                        )}
+                        {groupWorkspaces.length === 0 && !showDraft ? (
+                          <span className="text-sm text-low opacity-60 pl-base">
+                            {t('common:workspaces.noWorkspaces')}
+                          </span>
+                        ) : (
+                          <WorkspaceList
+                            workspaces={groupWorkspaces}
+                            selectedWorkspaceId={selectedWorkspaceId}
+                            onSelectWorkspace={onSelectWorkspace}
+                            onOpenWorkspaceActions={handleOpenWorkspaceActions}
+                          />
+                        )}
+                      </div>
+                    </CollapsibleSectionHeader>
+                  );
+                })}
               </div>
             ) : (
               /* Active workspaces flat view */
@@ -664,9 +641,6 @@ export function WorkspacesSidebar({
                     key={workspace.id}
                     name={workspace.name}
                     workspaceId={workspace.id}
-                    filesChanged={workspace.filesChanged}
-                    linesAdded={workspace.linesAdded}
-                    linesRemoved={workspace.linesRemoved}
                     isActive={selectedWorkspaceId === workspace.id}
                     isRunning={workspace.isRunning}
                     isPinned={workspace.isPinned}
