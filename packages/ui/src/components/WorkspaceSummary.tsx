@@ -3,7 +3,6 @@ import {
   HandIcon,
   TriangleIcon,
   PlayIcon,
-  FileIcon,
   CircleIcon,
   GitPullRequestIcon,
   DotsThreeIcon,
@@ -27,6 +26,9 @@ const formatRelativeElapsed = (dateString: string): string => {
   return `${diffDays}d ago`;
 };
 
+/** Sidebar section a status belongs to, in display order. */
+export type WorkspaceStatusGroup = 'needs_you' | 'running' | 'idle' | 'older';
+
 /** A workspace's status, as the agent reports it or the user set it. */
 export interface WorkspaceStatusTag {
   key: string;
@@ -34,6 +36,7 @@ export interface WorkspaceStatusTag {
   tone: 'attention' | 'working' | 'done' | 'error' | 'muted';
   /** Sort rank, most urgent first. */
   rank: number;
+  group: WorkspaceStatusGroup;
 }
 
 const STATUS_TAG_TONE: Record<WorkspaceStatusTag['tone'], string> = {
@@ -47,9 +50,6 @@ const STATUS_TAG_TONE: Record<WorkspaceStatusTag['tone'], string> = {
 export interface WorkspaceSummaryProps {
   name: string;
   workspaceId?: string;
-  filesChanged?: number;
-  linesAdded?: number;
-  linesRemoved?: number;
   isActive?: boolean;
   isRunning?: boolean;
   isPinned?: boolean;
@@ -74,9 +74,6 @@ export interface WorkspaceSummaryProps {
 export function WorkspaceSummary({
   name,
   workspaceId,
-  filesChanged,
-  linesAdded,
-  linesRemoved,
   isActive = false,
   isRunning = false,
   isPinned = false,
@@ -97,7 +94,6 @@ export function WorkspaceSummary({
   onOpenWorkspaceActions,
 }: WorkspaceSummaryProps) {
   const { t } = useTranslation('common');
-  const hasChanges = filesChanged !== undefined && filesChanged > 0;
   const isFailed =
     latestProcessStatus === 'failed' || latestProcessStatus === 'killed';
 
@@ -248,20 +244,6 @@ export function WorkspaceSummary({
 
             {/* Spacer when running (no elapsed time shown) */}
             {isRunning && <span className="flex-1" />}
-
-            {/* File count + lines changed on the right */}
-            {hasChanges && (
-              <span className="shrink-0 text-right flex items-center gap-half">
-                <FileIcon className="size-icon-xs" weight="fill" />
-                <span>{filesChanged}</span>
-                {linesAdded !== undefined && (
-                  <span className="text-success">+{linesAdded}</span>
-                )}
-                {linesRemoved !== undefined && (
-                  <span className="text-error">-{linesRemoved}</span>
-                )}
-              </span>
-            )}
           </div>
         )}
       </button>

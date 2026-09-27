@@ -34,12 +34,6 @@ pub struct WorkspaceSummary {
     pub latest_session_id: Option<Uuid>,
     /// Is a tool approval currently pending?
     pub has_pending_approval: bool,
-    /// Number of files with changes
-    pub files_changed: Option<usize>,
-    /// Total lines added across all files
-    pub lines_added: Option<usize>,
-    /// Total lines removed across all files
-    pub lines_removed: Option<usize>,
     /// When the latest execution process completed
     #[ts(optional)]
     pub latest_process_completed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -52,13 +46,15 @@ pub struct WorkspaceSummary {
     /// Did this workspace's CLI-mode claude session finish while no terminal
     /// was attached? (Cleared when the user opens the pane again.)
     pub cli_attention: bool,
-    /// What the CLI-mode agent last reported it is doing, for agents that
-    /// report at all (see `reduce_hook`). `None` for an agent that reports
-    /// nothing, or for a report too old to still describe the pane — in which
-    /// case `cli_attention` and the running flags remain the only signal.
+    /// What the CLI-mode agent last reported it is doing (see `reduce_hook`),
+    /// however old: the UI ages it with `cli_phase_at`. `None` for an agent
+    /// that has never reported.
     pub cli_phase: Option<CliPhase>,
-    /// Background tasks / scheduled jobs armed at the last turn end, while
-    /// `cli_phase` is fresh. `None` means unknown, never zero.
+    /// When `cli_phase` was reported.
+    #[ts(optional)]
+    pub cli_phase_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Background tasks / scheduled jobs armed at the last turn end. `None`
+    /// means unknown, never zero.
     pub cli_tasks: Option<i64>,
     pub cli_crons: Option<i64>,
     /// When the CLI session last changed state (hook report or poller).
@@ -80,6 +76,7 @@ pub struct WorkspaceSummaryResponse {
     pub summaries: Vec<WorkspaceSummary>,
 }
 
+/// Diff totals for one workspace, as the workspace view displays them.
 #[derive(Debug, Clone, Default, Serialize, TS)]
 pub struct DiffStats {
     pub files_changed: usize,
@@ -135,7 +132,6 @@ pub async fn get_workspace_summaries(
         WorkspaceCliActivity::find_workspaces_needing_attention(pool, archived).await?;
 
     // 5c. What each CLI-mode agent last reported about itself
-    let now = chrono::Utc::now();
     let cli_rows: HashMap<Uuid, WorkspaceCliActivity> = WorkspaceCliActivity::find_all(pool)
         .await?
         .into_iter()
@@ -157,29 +153,7 @@ pub async fn get_workspace_summaries(
         .into_iter()
         .collect::<Result<_, _>>()?;
 
-    // 8. Compute diff stats for each workspace (in parallel)
-    let diff_futures: Vec<_> = workspaces
-        .iter()
-        .map(|ws| {
-            let workspace = ws.clone();
-            let deployment = deployment.clone();
-            async move {
-                if workspace.container_ref.is_some() {
-                    compute_workspace_diff_stats(&deployment, &workspace)
-                        .await
-                        .map(|stats| (workspace.id, stats))
-                } else {
-                    None
-                }
-            }
-        })
-        .collect();
-
-    let diff_results: Vec<Option<(Uuid, DiffStats)>> =
-        futures_util::future::join_all(diff_futures).await;
-    let diff_stats: HashMap<Uuid, DiffStats> = diff_results.into_iter().flatten().collect();
-
-    // 9. Assemble response
+    // 8. Assemble response
     let summaries: Vec<WorkspaceSummary> = workspaces
         .iter()
         .map(|ws| {
@@ -188,28 +162,21 @@ pub async fn get_workspace_summaries(
             let has_pending = latest
                 .map(|p| pending_approval_eps.contains(&p.execution_process_id))
                 .unwrap_or(false);
-            let stats = diff_stats.get(&id);
             let cli = cli_rows.get(&id);
-            let cli_phase = cli.and_then(|row| row.fresh_phase(now));
-            // Counts describe the pane only while the phase that carried them does.
-            let cli_hook = cli
-                .and_then(|row| row.hook.as_ref())
-                .filter(|_| cli_phase.is_some());
+            let cli_hook = cli.and_then(|row| row.hook.as_ref());
 
             WorkspaceSummary {
                 workspace_id: id,
                 repo_count: repo_counts.get(&id).copied().unwrap_or_default(),
                 latest_session_id: latest.map(|p| p.session_id),
                 has_pending_approval: has_pending,
-                files_changed: stats.map(|s| s.files_changed),
-                lines_added: stats.map(|s| s.lines_added),
-                lines_removed: stats.map(|s| s.lines_removed),
                 latest_process_completed_at: latest.and_then(|p| p.completed_at),
                 latest_process_status: latest.map(|p| p.status.clone()),
                 has_running_dev_server: dev_server_workspaces.contains(&id),
                 has_unseen_turns: unseen_workspaces.contains(&id),
                 cli_attention: cli_attention_workspaces.contains(&id),
-                cli_phase,
+                cli_phase: cli.and_then(|row| row.phase),
+                cli_phase_at: cli.and_then(|row| row.hook_at),
                 cli_tasks: cli_hook.and_then(|hook| hook.tasks),
                 cli_crons: cli_hook.and_then(|hook| hook.crons),
                 cli_activity_at: cli.map(|row| row.updated_at),
@@ -224,23 +191,4 @@ pub async fn get_workspace_summaries(
     Ok(ResponseJson(ApiResponse::success(
         WorkspaceSummaryResponse { summaries },
     )))
-}
-
-/// Compute diff stats for a workspace.
-pub async fn compute_workspace_diff_stats(
-    deployment: &DeploymentImpl,
-    workspace: &Workspace,
-) -> Option<DiffStats> {
-    let stats = services::services::diff_stream::compute_diff_stats(
-        &deployment.db().pool,
-        deployment.git(),
-        workspace,
-    )
-    .await?;
-
-    Some(DiffStats {
-        files_changed: stats.files_changed,
-        lines_added: stats.lines_added,
-        lines_removed: stats.lines_removed,
-    })
 }
