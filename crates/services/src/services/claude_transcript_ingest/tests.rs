@@ -324,6 +324,7 @@ fn writer_report(
     ProbeReport {
         pane_session_exists,
         agent_running,
+        agent_program: (agent_running == Some(true)).then(|| "claude".to_string()),
         sid_evidence,
         probe_failed: false,
         only_active_claude_in_cwd,

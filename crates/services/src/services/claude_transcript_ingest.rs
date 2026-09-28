@@ -334,6 +334,7 @@ impl CliWriterProbe for TestNoPaneWriterProbe {
         crate::services::cli_collab::ProbeReport {
             pane_session_exists: false,
             agent_running: Some(false),
+            agent_program: None,
             sid_evidence: SidEvidence::Unknown,
             probe_failed: false,
             only_active_claude_in_cwd: Some(false),
@@ -1220,10 +1221,10 @@ impl ClaudeTranscriptIngest {
             self.quarantined_paths.lock().unwrap().remove(path);
         }
 
-        // The writer probe only recognises a Claude process, so a live Codex
-        // pane would read as absent; Codex keeps the fail-closed default and
-        // is never flagged as a foreign writer.
-        let import_context = if link.is_some() && !is_codex {
+        // The writer probe recognises the pane's Claude or Codex process, so a
+        // user turn written while no app pane agent runs marks a foreign
+        // writer for either agent.
+        let import_context = if link.is_some() {
             let report = self
                 .writer_probe
                 .probe(

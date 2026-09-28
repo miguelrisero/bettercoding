@@ -1016,3 +1016,81 @@ async fn measure_codex_on_copied_database() {
         );
     }
 }
+
+struct CodexPaneProbe {
+    agent_running: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::services::cli_collab::CliWriterProbe for CodexPaneProbe {
+    async fn probe(
+        &self,
+        _workspace_id: Uuid,
+        _effective_dir: &Path,
+        _expected_sid: Option<&str>,
+        _binding: Option<&CliPaneBinding>,
+        _check_cwd_uniqueness: bool,
+    ) -> crate::services::cli_collab::ProbeReport {
+        crate::services::cli_collab::ProbeReport {
+            pane_session_exists: true,
+            agent_running: Some(self.agent_running),
+            agent_program: self.agent_running.then(|| "codex".to_string()),
+            sid_evidence: crate::services::cli_collab::SidEvidence::NoResumeArg,
+            probe_failed: false,
+            only_active_claude_in_cwd: None,
+        }
+    }
+}
+
+/// A user turn in a linked Codex thread while no app pane agent runs and no
+/// executor runs came from a writer outside the app.
+async fn codex_foreign_writer_flagged(pane_agent_running: bool) -> bool {
+    let mut case = codex_case().await;
+    let mut service = ClaudeTranscriptIngest::new_with_probe(
+        case.db.clone(),
+        case.temp.path().join("projects"),
+        Arc::new(CodexPaneProbe {
+            agent_running: pane_agent_running,
+        }),
+    );
+    service.codex_sessions_dir = Some(case.root.clone());
+    case.service = Arc::new(service);
+    let created = fixture_created_at();
+    let thread = thread_id_at(created, 7);
+    write_rollout(
+        &rollout_path(&case.root, &thread, created),
+        &[
+            session_meta(&thread, &case.cwd, created, "cli"),
+            user_turn(
+                &thread,
+                "foreign-turn",
+                created,
+                "typed in another terminal",
+            ),
+        ]
+        .concat(),
+    );
+    bind_resumed(&case, &thread).await;
+
+    reconcile(&case).await;
+
+    assert_eq!(
+        texts(&entries(&case).await),
+        [
+            "typed in another terminal",
+            "answer to typed in another terminal"
+        ]
+    );
+    ClaudeSessionLink::find(&case.db.pool, &thread)
+        .await
+        .unwrap()
+        .unwrap()
+        .foreign_writer_seen_at
+        .is_some()
+}
+
+#[tokio::test]
+async fn a_codex_turn_written_outside_the_app_pane_marks_a_foreign_writer() {
+    assert!(codex_foreign_writer_flagged(false).await);
+    assert!(!codex_foreign_writer_flagged(true).await);
+}

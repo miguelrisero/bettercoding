@@ -5,13 +5,10 @@ use db::{DBService, models::cli_pane_binding::CliPaneBinding};
 use services::services::cli_collab::{CliWriterProbe, ProbeReport, SidEvidence};
 use uuid::Uuid;
 
-use crate::pty::{CliPaneAgentProcess, cli_pane_agent_processes, cli_tmux_session_exists_checked};
-
-/// The agent collaboration routing drives. The lease probe matches Claude's
-/// `--resume <sid>` command line, so the paste transport must gate on the
-/// same program; a transport that also accepted Codex would report a pane
-/// busy that this probe reports free.
-pub(crate) const COLLAB_AGENT_PROGRAM: &str = "claude";
+use crate::pty::{
+    CLI_AGENT_PROGRAMS, CliPaneAgentProcess, cli_pane_agent_processes,
+    cli_tmux_session_exists_checked,
+};
 
 #[derive(Clone)]
 pub struct LocalCliWriterProbe {
@@ -63,33 +60,126 @@ fn resume_evidence(cmdlines: &[String]) -> SidEvidence {
     }
 }
 
+/// Codex options that take a separate value (`codex --help`, `codex resume
+/// --help`, codex-cli 0.158). Needed to find the first positional argument,
+/// which names the subcommand.
+const CODEX_VALUE_OPTIONS: &[&str] = &[
+    "-c",
+    "--config",
+    "-m",
+    "--model",
+    "-s",
+    "--sandbox",
+    "-a",
+    "--ask-for-approval",
+    "-p",
+    "--profile",
+    "-i",
+    "--image",
+    "-C",
+    "--cd",
+    "--enable",
+    "--disable",
+    "--add-dir",
+    "--local-provider",
+    "--remote",
+    "--remote-auth-token-env",
+];
+
+/// The positional arguments of a Codex command line, and whether `--last`
+/// appears. `argv[0]` is the binary.
+fn codex_positionals(argv: &[String]) -> (Vec<&str>, bool) {
+    let mut positionals = Vec::new();
+    let mut last = false;
+    let mut args = argv.iter().skip(1).map(String::as_str);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            positionals.extend(args.by_ref());
+        } else if arg == "--last" {
+            last = true;
+        } else if CODEX_VALUE_OPTIONS.contains(&arg) {
+            args.next();
+        } else if !arg.starts_with('-') || arg == "-" {
+            positionals.push(arg);
+        }
+    }
+    (positionals, last)
+}
+
+/// Resume evidence from Codex argument vectors. `codex resume <uuid>` names
+/// the thread. `codex resume --last`, a session name, or the resume picker
+/// name no verifiable thread, so they are ambiguous. Any other launch
+/// (`codex`, `codex <prompt>`, `codex fork …`) starts a new thread.
+fn codex_resume_evidence(argvs: &[Vec<String>]) -> SidEvidence {
+    let mut ids = HashSet::new();
+    let mut ambiguous = false;
+    for argv in argvs {
+        let (positionals, last) = codex_positionals(argv);
+        if positionals.first() != Some(&"resume") {
+            continue;
+        }
+        match (positionals.get(1), last) {
+            (Some(candidate), false) => match Uuid::parse_str(candidate) {
+                Ok(id) => {
+                    ids.insert(id.to_string());
+                }
+                Err(_) => ambiguous = true,
+            },
+            _ => ambiguous = true,
+        }
+    }
+    if ambiguous || ids.len() > 1 {
+        SidEvidence::Ambiguous
+    } else if let Some(id) = ids.into_iter().next() {
+        SidEvidence::ConfirmedResume(id)
+    } else {
+        SidEvidence::NoResumeArg
+    }
+}
+
 // `_expected_sid` and `_binding` are load-bearing for `probe_path_never_replaces_live_evidence_with_matching_database_sid`.
 fn live_process_report(
+    program: Option<&str>,
     processes: &[CliPaneAgentProcess],
     only_active_claude_in_cwd: Option<bool>,
     _expected_sid: Option<&str>,
     _binding: Option<&CliPaneBinding>,
 ) -> ProbeReport {
-    let agent_running = !processes.is_empty();
-    let cmdlines: Vec<_> = processes
-        .iter()
-        .map(|process| process.cmdline.clone())
-        .collect();
+    let program = program.filter(|_| !processes.is_empty());
+    let sid_evidence = match program {
+        None => SidEvidence::Unknown,
+        Some("codex") => codex_resume_evidence(
+            &processes
+                .iter()
+                .map(|process| process.argv.clone())
+                .collect::<Vec<_>>(),
+        ),
+        Some(_) => resume_evidence(
+            &processes
+                .iter()
+                .map(|process| process.cmdline.clone())
+                .collect::<Vec<_>>(),
+        ),
+    };
     ProbeReport {
         pane_session_exists: true,
-        agent_running: Some(agent_running),
-        sid_evidence: if agent_running {
-            resume_evidence(&cmdlines)
-        } else {
-            SidEvidence::Unknown
-        },
+        agent_running: Some(program.is_some()),
+        agent_program: program.map(str::to_string),
+        sid_evidence,
         probe_failed: false,
         only_active_claude_in_cwd,
     }
 }
 
+/// Whether exactly one live `program` process has `effective_dir` as its cwd,
+/// and it is one of the pane's processes. A node launcher counts only when no
+/// native `program` binary runs in that cwd.
 #[cfg(target_os = "linux")]
-fn only_active_claude_in_cwd(effective_dir: &Path, pane_pids: &HashSet<u32>) -> Option<bool> {
+fn only_active_agent_in_cwd(
+    effective_dir: &Path,
+    pane_pids: &HashSet<u32>,
+    program: &str,
+) -> Option<bool> {
     let effective_dir = effective_dir
         .canonicalize()
         .unwrap_or_else(|_| effective_dir.to_path_buf());
@@ -117,9 +207,13 @@ fn only_active_claude_in_cwd(effective_dir: &Path, pane_pids: &HashSet<u32>) -> 
         let comm = &stat[open + 1..close];
         let is_wrapper = comm == "node"
             && std::fs::read(entry.path().join("cmdline"))
-                .map(|bytes| bytes.windows(b"claude".len()).any(|part| part == b"claude"))
+                .map(|bytes| {
+                    bytes
+                        .windows(program.len())
+                        .any(|part| part == program.as_bytes())
+                })
                 .unwrap_or(false);
-        if comm != "claude" && !is_wrapper {
+        if comm != program && !is_wrapper {
             continue;
         }
         let Ok(cwd) = std::fs::read_link(entry.path().join("cwd")) else {
@@ -128,7 +222,7 @@ fn only_active_claude_in_cwd(effective_dir: &Path, pane_pids: &HashSet<u32>) -> 
         if cwd != effective_dir {
             continue;
         }
-        if comm == "claude" {
+        if comm == program {
             native.push(pid);
         } else {
             wrappers.push(pid);
@@ -139,7 +233,11 @@ fn only_active_claude_in_cwd(effective_dir: &Path, pane_pids: &HashSet<u32>) -> 
 }
 
 #[cfg(not(target_os = "linux"))]
-fn only_active_claude_in_cwd(_effective_dir: &Path, _pane_pids: &HashSet<u32>) -> Option<bool> {
+fn only_active_agent_in_cwd(
+    _effective_dir: &Path,
+    _pane_pids: &HashSet<u32>,
+    _program: &str,
+) -> Option<bool> {
     None
 }
 
@@ -170,26 +268,25 @@ impl CliWriterProbe for LocalCliWriterProbe {
             return ProbeReport {
                 pane_session_exists: false,
                 agent_running: Some(false),
+                agent_program: None,
                 sid_evidence: SidEvidence::Unknown,
                 probe_failed: false,
                 only_active_claude_in_cwd: check_cwd_uniqueness.then_some(false),
             };
         }
 
-        let processes = match cli_pane_agent_processes(workspace_id, COLLAB_AGENT_PROGRAM).await {
-            Some(processes) => processes,
-            None => return ProbeReport::failed(),
-        };
-        let agent_running = !processes.is_empty();
+        let (program, processes) =
+            match cli_pane_agent_processes(workspace_id, CLI_AGENT_PROGRAMS).await {
+                Some(found) => found,
+                None => return ProbeReport::failed(),
+            };
         let cwd_uniqueness = if !check_cwd_uniqueness {
             None
-        } else if !agent_running {
-            Some(false)
-        } else {
+        } else if let Some(program) = program.filter(|_| !processes.is_empty()) {
             let effective_dir = effective_dir.to_path_buf();
             let pane_pids = processes.iter().map(|process| process.pid).collect();
             match tokio::task::spawn_blocking(move || {
-                only_active_claude_in_cwd(&effective_dir, &pane_pids)
+                only_active_agent_in_cwd(&effective_dir, &pane_pids, program)
             })
             .await
             {
@@ -199,8 +296,10 @@ impl CliWriterProbe for LocalCliWriterProbe {
                     None
                 }
             }
+        } else {
+            Some(false)
         };
-        live_process_report(&processes, cwd_uniqueness, expected_sid, binding)
+        live_process_report(program, &processes, cwd_uniqueness, expected_sid, binding)
     }
 }
 
@@ -233,9 +332,11 @@ mod tests {
         let observed = "22222222-2222-4222-8222-222222222222";
 
         let mismatched = live_process_report(
+            Some("claude"),
             &[CliPaneAgentProcess {
                 pid: 42,
                 cmdline: format!("claude --resume {observed}"),
+                argv: Vec::new(),
             }],
             None,
             None,
@@ -251,9 +352,11 @@ mod tests {
         );
 
         let no_resume = live_process_report(
+            Some("claude"),
             &[CliPaneAgentProcess {
                 pid: 43,
                 cmdline: "claude --model opus".to_string(),
+                argv: Vec::new(),
             }],
             None,
             None,
@@ -281,9 +384,11 @@ mod tests {
         };
 
         let mismatched = live_process_report(
+            Some("claude"),
             &[CliPaneAgentProcess {
                 pid: 44,
                 cmdline: format!("claude --resume {observed}"),
+                argv: Vec::new(),
             }],
             None,
             Some(expected),
@@ -295,14 +400,135 @@ mod tests {
         );
 
         let no_resume = live_process_report(
+            Some("claude"),
             &[CliPaneAgentProcess {
                 pid: 45,
                 cmdline: "claude --model opus".to_string(),
+                argv: Vec::new(),
             }],
             None,
             Some(expected),
             Some(&binding),
         );
         assert_eq!(no_resume.sid_evidence, SidEvidence::NoResumeArg);
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    const THREAD: &str = "019e6f10-4f27-7d02-9a4b-4f3c2d1e0a55";
+
+    #[test]
+    fn codex_resume_subcommand_names_the_thread_past_global_options() {
+        let hook = r#"hooks.Stop=[{hooks=[{type="command",command="curl resume x",timeout=3}]}]"#;
+        let launched = argv(&[
+            "/opt/codex/bin/codex",
+            "--dangerously-bypass-hook-trust",
+            "-c",
+            hook,
+            "resume",
+            &THREAD.to_uppercase(),
+        ]);
+        assert_eq!(
+            codex_resume_evidence(&[launched]),
+            SidEvidence::ConfirmedResume(THREAD.to_string())
+        );
+        let options_after = argv(&[
+            "codex",
+            "resume",
+            THREAD,
+            "-c",
+            "model=o3",
+            "--no-alt-screen",
+        ]);
+        assert_eq!(
+            codex_resume_evidence(&[options_after]),
+            SidEvidence::ConfirmedResume(THREAD.to_string())
+        );
+    }
+
+    #[test]
+    fn codex_resume_without_a_thread_id_is_ambiguous() {
+        for args in [
+            &["codex", "-s", "danger-full-access", "resume", "--last"][..],
+            &["codex", "resume"][..],
+            &["codex", "resume", "my-session-name"][..],
+            &["codex", "resume", "--last", THREAD][..],
+        ] {
+            assert_eq!(
+                codex_resume_evidence(&[argv(args)]),
+                SidEvidence::Ambiguous,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_launches_without_the_resume_subcommand_start_a_new_thread() {
+        for args in [
+            &[
+                "codex",
+                "-m",
+                "gpt-5.5",
+                "-s",
+                "danger-full-access",
+                "--no-alt-screen",
+            ][..],
+            // A prompt that mentions resuming is one argument, never a subcommand.
+            &["codex", "-a", "never", &format!("resume {THREAD}")][..],
+            &["codex", "fork", THREAD][..],
+            // The value of a value option is never a positional.
+            &["codex", "-m", "resume", "hello"][..],
+        ] {
+            assert_eq!(
+                codex_resume_evidence(&[argv(args)]),
+                SidEvidence::NoResumeArg,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_processes_that_disagree_are_ambiguous() {
+        let other = "019e6f10-4f27-7d02-9a4b-4f3c2d1e0a66";
+        assert_eq!(
+            codex_resume_evidence(&[
+                argv(&["codex", "resume", THREAD]),
+                argv(&["codex", "resume", other]),
+            ]),
+            SidEvidence::Ambiguous
+        );
+        assert_eq!(
+            codex_resume_evidence(&[
+                argv(&["codex", "resume", THREAD]),
+                argv(&["codex", "app-server"]),
+            ]),
+            SidEvidence::ConfirmedResume(THREAD.to_string())
+        );
+    }
+
+    #[test]
+    fn live_report_reads_codex_evidence_from_argv_and_names_the_program() {
+        let report = live_process_report(
+            Some("codex"),
+            &[CliPaneAgentProcess {
+                pid: 46,
+                // `ps` joins argv with spaces; the argv is authoritative.
+                cmdline: format!("codex -a never resume {THREAD} tail"),
+                argv: argv(&["codex", "-a", "never", &format!("resume {THREAD} tail")]),
+            }],
+            None,
+            None,
+            None,
+        );
+        assert_eq!(report.agent_running, Some(true));
+        assert_eq!(report.agent_program.as_deref(), Some("codex"));
+        assert_eq!(report.sid_evidence, SidEvidence::NoResumeArg);
+
+        let idle = live_process_report(Some("codex"), &[], None, None, None);
+        assert_eq!(idle.agent_running, Some(false));
+        assert_eq!(idle.agent_program, None);
+        assert_eq!(idle.sid_evidence, SidEvidence::Unknown);
     }
 }
