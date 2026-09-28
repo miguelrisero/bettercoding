@@ -832,6 +832,54 @@ mod tests {
     }
 
     #[test]
+    fn codex_rows_extend_exactly_like_a_full_build() {
+        const CODEX: &str = include_str!(
+            "../../../../executors/src/executors/codex/testdata/rollout-0.157.1.redacted.jsonl"
+        );
+        let file_id = Uuid::from_u128(7);
+        let rows = CODEX
+            .lines()
+            .enumerate()
+            .map(|(index, raw)| SessionNativeRecord {
+                file_id,
+                line_seq: index as i64,
+                claude_session_id: "01a0e7f5-9f42-73e0-9b4d-2dfa51b6f868".to_string(),
+                uuid: None,
+                parent_uuid: None,
+                kind: String::new(),
+                ts: None,
+                raw: raw.to_string(),
+                disposition: CliNativeRecordDisposition::Renderable.as_str().to_string(),
+                linked_execution_process_id: None,
+                bound_turn_execution_process_id: None,
+                bound_queued_message_id: None,
+                seq: index as i64 + 1,
+                dir_path: "/sessions/2026/09/28".to_string(),
+                file_name: "rollout-2026-09-28T12-20-29-01a0e7f5-9f42-73e0-9b4d-2dfa51b6f868.jsonl"
+                    .to_string(),
+                generation: 0,
+                last_import_at: None,
+                link_cwd: "/workspace/demo".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let full = NativeProjection::build(&rows, 0);
+        assert_eq!(full.entries().len(), 10);
+        assert!(full.forks().is_empty());
+        for split in 0..rows.len() {
+            let mut projection = NativeProjection::build(&rows[..split], 0);
+            let cursor = projection.cursor();
+            assert!(projection.can_extend(&rows[split..]));
+            projection.extend(&rows[split..]);
+            assert_eq!(
+                entries_json(projection.entries()),
+                entries_json(full.entries())
+            );
+            let delta = projection.delta_since(cursor).unwrap();
+            assert!(delta.replaced.is_empty() && !delta.forks_changed);
+        }
+    }
+
+    #[test]
     fn pasted_content_wrappers_unwrap_to_the_pasted_text() {
         assert_eq!(
             unwrap_pasted_content(

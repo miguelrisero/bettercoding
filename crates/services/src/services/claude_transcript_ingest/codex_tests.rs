@@ -417,6 +417,20 @@ async fn turns_written_while_the_executor_ran_are_attributed_to_it() {
             .all(|entry| entry.linked_execution_process_id != Some(forked)),
         "a run on another thread never claims the pane's turns"
     );
+
+    // A reset drops the run; its turns stay out of chat with it.
+    sqlx::query("UPDATE execution_processes SET dropped = TRUE WHERE id = ?")
+        .bind(on_thread)
+        .execute(&case.db.pool)
+        .await
+        .unwrap();
+    let still_claimed = CliNativeRecord::list_for_session(&case.db.pool, case.session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.linked_execution_process_id == Some(on_thread))
+        .count();
+    assert_eq!(still_claimed, 2);
 }
 
 /// A coding-agent run of this session on Codex `thread`, between the given

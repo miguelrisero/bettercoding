@@ -53,8 +53,6 @@ pub struct CodexRolloutLine {
     pub item_id: Option<String>,
     pub turn_id: Option<String>,
     pub timestamp: Option<String>,
-    /// The user's own text, for a user message.
-    pub user_text: Option<String>,
     pub entries: Vec<NormalizedEntry>,
 }
 
@@ -66,7 +64,6 @@ impl CodexRolloutLine {
             item_id: None,
             turn_id: None,
             timestamp: str_at(record, "timestamp"),
-            user_text: None,
             entries: Vec::new(),
         }
     }
@@ -157,11 +154,10 @@ fn adapt_item(record: &Value, payload: &Value, worktree_path: &str) -> CodexRoll
         metadata: None,
     };
 
-    let (kind, entries, user_text) = match item_type {
+    let (kind, entries) = match item_type {
         "UserMessage" => {
             let text = joined_text(item.get("content"), "text");
-            let entries = vec![entry(NormalizedEntryType::UserMessage, text.clone())];
-            ("user", entries, Some(text))
+            ("user", vec![entry(NormalizedEntryType::UserMessage, text)])
         }
         "AgentMessage" => {
             let text = joined_text(item.get("content"), "Text");
@@ -170,7 +166,7 @@ fn adapt_item(record: &Value, payload: &Value, worktree_path: &str) -> CodexRoll
             } else {
                 vec![entry(NormalizedEntryType::AssistantMessage, text)]
             };
-            ("assistant", entries, None)
+            ("assistant", entries)
         }
         "Reasoning" => {
             let summary = item
@@ -189,7 +185,7 @@ fn adapt_item(record: &Value, payload: &Value, worktree_path: &str) -> CodexRoll
             } else {
                 vec![entry(NormalizedEntryType::Thinking, summary)]
             };
-            ("thinking", entries, None)
+            ("thinking", entries)
         }
         "CommandExecution" => {
             let command = display_command(item.get("command"));
@@ -211,7 +207,7 @@ fn adapt_item(record: &Value, payload: &Value, worktree_path: &str) -> CodexRoll
                 },
                 status: item_status(item),
             };
-            ("tool", vec![entry(entry_type, command)], None)
+            ("tool", vec![entry(entry_type, command)])
         }
         "McpToolCall" => {
             let server = str_at(item, "server").unwrap_or_default();
@@ -226,7 +222,7 @@ fn adapt_item(record: &Value, payload: &Value, worktree_path: &str) -> CodexRoll
                 },
                 status: item_status(item),
             };
-            ("tool", vec![entry(entry_type, tool)], None)
+            ("tool", vec![entry(entry_type, tool)])
         }
         "FileChange" => {
             let status = item_status(item);
@@ -251,7 +247,7 @@ fn adapt_item(record: &Value, payload: &Value, worktree_path: &str) -> CodexRoll
                         .collect()
                 })
                 .unwrap_or_default();
-            ("tool", entries, None)
+            ("tool", entries)
         }
         "Extension" if item.get("kind").and_then(Value::as_str) == Some("web.search") => {
             let query = str_at(item, "query").unwrap_or_else(|| "Web search".to_string());
@@ -260,7 +256,7 @@ fn adapt_item(record: &Value, payload: &Value, worktree_path: &str) -> CodexRoll
                 action_type: ActionType::WebFetch { url: query.clone() },
                 status: ToolStatus::Success,
             };
-            ("tool", vec![entry(entry_type, query)], None)
+            ("tool", vec![entry(entry_type, query)])
         }
         "ImageView" => {
             let path = str_at(item, "path").unwrap_or_default();
@@ -273,7 +269,7 @@ fn adapt_item(record: &Value, payload: &Value, worktree_path: &str) -> CodexRoll
                 },
                 status: ToolStatus::Success,
             };
-            ("tool", vec![entry(entry_type, relative)], None)
+            ("tool", vec![entry(entry_type, relative)])
         }
         "ContextCompaction" => (
             "system",
@@ -281,7 +277,6 @@ fn adapt_item(record: &Value, payload: &Value, worktree_path: &str) -> CodexRoll
                 NormalizedEntryType::SystemMessage,
                 "Context compacted".to_string(),
             )],
-            None,
         ),
         "Extension"
             if item
@@ -289,9 +284,9 @@ fn adapt_item(record: &Value, payload: &Value, worktree_path: &str) -> CodexRoll
                 .and_then(Value::as_str)
                 .is_some_and(|kind| BOOKKEEPING_EXTENSIONS.contains(&kind)) =>
         {
-            ("bookkeeping", Vec::new(), None)
+            ("bookkeeping", Vec::new())
         }
-        known if BOOKKEEPING_ITEMS.contains(&known) => ("bookkeeping", Vec::new(), None),
+        known if BOOKKEEPING_ITEMS.contains(&known) => ("bookkeeping", Vec::new()),
         _ => {
             let mut line =
                 CodexRolloutLine::new(CodexRolloutDisposition::Unknown, "unknown", record);
@@ -312,7 +307,6 @@ fn adapt_item(record: &Value, payload: &Value, worktree_path: &str) -> CodexRoll
         item_id: str_at(item, "id"),
         turn_id: str_at(payload, "turn_id"),
         timestamp,
-        user_text,
         entries,
     }
 }
@@ -474,8 +468,6 @@ mod tests {
                 .filter(|line| line.disposition == CodexRolloutDisposition::Renderable)
                 .all(|line| line.item_id.is_some() && line.turn_id.is_some())
         );
-        let user = lines.iter().find(|line| line.kind == "user").unwrap();
-        assert_eq!(user.user_text.as_deref(), Some("Reply with OK only."));
     }
 
     #[test]

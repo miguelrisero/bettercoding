@@ -2023,7 +2023,10 @@ fn codex_native_record(
                 ts: line.timestamp,
                 raw: raw.to_string(),
                 disposition: CliNativeRecordDisposition::Renderable,
-                user_prompt: line.user_text,
+                // No prompt-equality reconciliation: it would hide a pane turn
+                // that repeats a recent chat prompt, and executor turns in a
+                // rollout are attributed by their run window instead.
+                user_prompt: None,
             }),
             false,
         ),

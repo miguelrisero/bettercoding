@@ -623,7 +623,8 @@ impl CliNativeRecord {
     /// thread replays its whole history, stamped when the fork writes it),
     /// which chat already renders from the executor's logs. Only a process
     /// that ran this very thread qualifies: a chat follow-up forks a new
-    /// thread, so a pane turn typed while it runs stays the pane's.
+    /// thread, so a pane turn typed while it runs stays the pane's. A run a
+    /// reset dropped keeps its rows, so they stay out of chat with it.
     pub async fn list_for_session_after(
         pool: &SqlitePool,
         session_id: Uuid,
@@ -655,7 +656,6 @@ impl CliNativeRecord {
                               FROM execution_processes window_ep
                               WHERE window_ep.session_id = l.session_id
                                 AND window_ep.run_reason = 'codingagent'
-                                AND window_ep.dropped = FALSE
                                 AND EXISTS (
                                     SELECT 1 FROM coding_agent_turns window_cat
                                     WHERE window_cat.execution_process_id = window_ep.id
