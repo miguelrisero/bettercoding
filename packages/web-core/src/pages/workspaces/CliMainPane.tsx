@@ -1,4 +1,3 @@
-import { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   ChatsTeardropIcon,
@@ -10,7 +9,7 @@ import {
 
 import { XTermInstance } from '@/shared/components/XTermInstance';
 import { LoopAutomationControl } from '@/shared/components/LoopAutomationControl';
-import { cliTabId, useTerminal } from '@/shared/hooks/useTerminal';
+import { cliTabId } from '@/shared/hooks/useTerminal';
 import { useCliAgentStatus } from '@/shared/hooks/useCliAgentStatus';
 
 interface CliMainPaneProps {
@@ -51,16 +50,25 @@ interface CliMainPaneProps {
    * while the agent works.
    */
   cliRunning?: boolean;
+  /**
+   * False while this workspace is in chat mode. The layout keeps the pane
+   * mounted under `hidden` so toggling back is instant (same socket, same
+   * xterm buffer), and the status probe pauses. This flag tracks the
+   * chat/CLI mode only: tmux presence follows the pane's measured box, so
+   * any hidden pane (chat mode or another mobile tab) reports hidden.
+   */
+  visible?: boolean;
 }
 
 /**
  * Terminal-first main pane: hosts the workspace's persistent tmux-backed
  * interactive `claude` session (see docs/exec-plans/cli-mode-tmux.md).
  *
- * Persistence lives in tmux, NOT in this client: on unmount (navigate away,
- * back to chat) the WebSocket/xterm instance is torn down so hidden
- * workspaces don't accumulate live sockets and server-side PTYs. Remounting
- * reattaches the same tmux session with scrollback intact.
+ * The WebSocket/xterm instance belongs to the selected workspace, not to this
+ * pane: WorkspacesLayout closes the CLI tab when the selected workspace
+ * changes or the layout unmounts, so only one workspace ever holds a live
+ * socket. Persistence beyond that lives in tmux — reselecting a workspace
+ * reattaches the same session with scrollback intact.
  */
 export function CliMainPane({
   workspaceId,
@@ -70,17 +78,16 @@ export function CliMainPane({
   executorRunning = false,
   codingAgentRunning = false,
   cliRunning = false,
+  visible = true,
 }: CliMainPaneProps) {
   const { t } = useTranslation('common');
-  const { closeTab } = useTerminal();
   // Only probe once the terminal is actually the thing on screen: while an
   // executor holds the pane there is no session of ours to judge.
   const { showRestart, restarting, restartError, restart, dismiss } =
-    useCliAgentStatus(workspaceId, sessionsReady && !executorRunning);
-
-  useEffect(() => {
-    return () => closeTab(workspaceId, cliTabId(workspaceId));
-  }, [workspaceId, closeTab]);
+    useCliAgentStatus(
+      workspaceId,
+      visible && sessionsReady && !executorRunning
+    );
 
   return (
     <div className="h-full bg-secondary flex flex-col">
@@ -226,7 +233,7 @@ export function CliMainPane({
                 <XTermInstance
                   tabId={cliTabId(workspaceId)}
                   workspaceId={workspaceId}
-                  isActive
+                  isActive={visible}
                   mode="cli"
                   sessionId={sessionId ?? undefined}
                 />

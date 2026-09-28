@@ -116,9 +116,16 @@ export function XTermInstance({
   // remounts (CliMainPane gate flips, hidden side tabs) — so they resolve the
   // terminal through the provider REGISTRY (same lifetime), never through this
   // component's refs, which are nulled on unmount.
+  //
+  // Never fit an unmeasurable pane: FitAddon reads a display:none parent's
+  // computed "100%" width as 100px and shrinks the grid to ~11 columns,
+  // reflowing the whole local buffer. A pane kept mounted while hidden (the
+  // CLI pane behind chat) must keep its grid so showing it needs no resize.
   const fitInstance = useCallback(() => {
     const instance = getTerminalInstance(tabId);
-    instance?.fitAddon.fit();
+    if (instance && isTerminalMeasurable(instance.terminal)) {
+      instance.fitAddon.fit();
+    }
     return instance;
   }, [tabId, getTerminalInstance]);
 
@@ -244,7 +251,7 @@ export function XTermInstance({
       fitAddon = existing.fitAddon;
       if (terminal.element) {
         container.appendChild(terminal.element);
-        fitAddon.fit();
+        if (isTerminalMeasurable(terminal)) fitAddon.fit();
       }
     } else {
       terminal = new Terminal({

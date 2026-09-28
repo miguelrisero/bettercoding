@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { CliAgentStatus } from 'shared/types';
 
@@ -57,6 +57,15 @@ export function useCliAgentStatus(
     onError: (error: Error) =>
       setRestartError(error.message || 'Restart failed'),
   });
+
+  // The CLI pane stays mounted while chat is shown, so a dismissal would
+  // otherwise outlive every later visit. Each time the probe re-arms (pane
+  // shown again, executor finished) the banner may reappear.
+  useEffect(() => {
+    if (!enabled) return;
+    setDismissed(false);
+    setRestartError(null);
+  }, [enabled]);
 
   const dismiss = useCallback(() => setDismissed(true), []);
   const restart = useCallback(() => {
