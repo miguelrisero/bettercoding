@@ -34,7 +34,7 @@ use local_deployment::pty::{
     cli_tmux_available, cli_tmux_session_exists_checked, cli_tmux_target_exists,
     kill_cli_tmux_session, locate_cli_tmux_target, remove_cli_prompt_file,
     remove_cli_resume_ready_file, resolved_cli_tmux_session_name, route_followup_prompt,
-    route_initial_prompt, send_cli_keys_to, send_cli_keys_to_live_agent,
+    route_initial_prompt, send_cli_keys_to_live_agent,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -1037,7 +1037,12 @@ async fn deliver_deferred_prompt(workspace_id: Uuid, text: &str, program: &str) 
                         stable = 0;
                         continue;
                     }
-                    if !send_cli_keys_to(&target, text).await.delivered() {
+                    // Re-probed under the send lock: a send queued behind
+                    // another must not paste into a shell the agent left.
+                    if !send_cli_keys_to_live_agent(&target, &[program], text)
+                        .await
+                        .is_some_and(CliSendResult::delivered)
+                    {
                         return false;
                     }
                     // Post-paste ack: the agent must have survived receiving
@@ -1159,7 +1164,7 @@ const MAX_CLI_SEND_BYTES: usize = 256 * 1024;
 /// Check composer text before it reaches the pane. Control characters other
 /// than newline and tab are refused: an ESC could end the bracketed paste
 /// early (`ESC [201~`) and turn the rest of the text into TUI key input.
-/// Surrounding blank lines are dropped; everything else is sent verbatim.
+/// Surrounding newlines are dropped; everything else is sent verbatim.
 fn validate_cli_send_text(text: &str) -> Result<&str, String> {
     if text.len() > MAX_CLI_SEND_BYTES {
         return Err(format!(
@@ -1215,7 +1220,7 @@ async fn send_cli_text(
     match send_cli_keys_to_live_agent(&target, &programs, text).await {
         None => Err(no_agent()),
         Some(CliSendResult::NotDelivered) => Err(ApiError::BadGateway(
-            "tmux did not accept the text; nothing was sent".to_string(),
+            "tmux did not confirm the paste; check the CLI pane before sending again".to_string(),
         )),
         Some(result) => Ok(Json(ApiResponse::success(SendCliTextResponse {
             submitted: result == CliSendResult::Submitted,

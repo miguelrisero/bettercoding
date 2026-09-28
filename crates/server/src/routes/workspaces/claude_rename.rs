@@ -28,8 +28,8 @@ use db::models::{
     claude_session_link::ClaudeSessionLink, coding_agent_turn::CodingAgentTurn, session::Session,
 };
 use local_deployment::pty::{
-    cli_pane_agent_running_at, latest_cli_client_activity, locate_cli_tmux_target, now_unix_secs,
-    send_cli_keys_to,
+    CliSendResult, cli_pane_agent_running_at, latest_cli_client_activity, locate_cli_tmux_target,
+    now_unix_secs, send_cli_keys_to_live_agent,
 };
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -142,7 +142,10 @@ async fn propagate_rename(pool: &SqlitePool, workspace_id: Uuid, name: &str) -> 
         && should_inject_rename_keys(name, Some(latest_activity), now_unix_secs())
     {
         let command = format!("/rename {name}");
-        if !send_cli_keys_to(&target, &command).await.delivered() {
+        if !send_cli_keys_to_live_agent(&target, &["claude"], &command)
+            .await
+            .is_some_and(CliSendResult::delivered)
+        {
             tracing::debug!(
                 %workspace_id,
                 "Claude /rename keystrokes not delivered; files carry the rename"

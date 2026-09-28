@@ -1988,12 +1988,15 @@ pub async fn capture_cli_pane(workspace_id: Uuid) -> Option<String> {
 /// used: Codex reads a fast burst of typed characters as a paste and turns
 /// the Enter that follows into a newline, leaving the text unsubmitted, and
 /// multi-line text typed as keys would submit at its first newline. A paste
-/// has no argv size limit either. Best-effort.
+/// has no argv size limit either. Sends only when a CLI agent owns the pane,
+/// so text never reaches the fallback shell. Best-effort.
 pub async fn send_cli_keys(workspace_id: Uuid, text: &str) -> bool {
     let Some(target) = locate_cli_tmux_target(workspace_id).await else {
         return false;
     };
-    send_cli_keys_to(&target, text).await.delivered()
+    send_cli_keys_to_live_agent(&target, CLI_AGENT_PROGRAMS, text)
+        .await
+        .is_some_and(CliSendResult::delivered)
 }
 
 /// How far a CLI send got. Text that reached the pane but whose Enter failed
@@ -2033,8 +2036,9 @@ fn cli_send_lock(workspace_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
 /// Send and submit text to one already-located target without allowing a
 /// second locator pass to switch homes midway through the transaction.
 pub async fn send_cli_keys_to(target: &CliTmuxTarget, text: &str) -> CliSendResult {
-    let _guard = cli_send_lock(target.workspace_id).lock_owned().await;
-    send_cli_keys_locked(target, text).await
+    send_detached(target, None, text)
+        .await
+        .unwrap_or(CliSendResult::NotDelivered)
 }
 
 /// Like [`send_cli_keys_to`], but only when one of `programs` owns the pane,
@@ -2046,14 +2050,52 @@ pub async fn send_cli_keys_to_live_agent(
     programs: &[&str],
     text: &str,
 ) -> Option<CliSendResult> {
-    let _guard = cli_send_lock(target.workspace_id).lock_owned().await;
-    cli_pane_agent_program_at(target, programs)
-        .await
-        .flatten()?;
-    Some(send_cli_keys_locked(target, text).await)
+    send_detached(target, Some(programs), text).await
 }
 
+/// Run lock, optional ownership probe, paste and Enter as one spawned task. A
+/// caller whose future is dropped (an HTTP client disconnecting) then cannot
+/// release the lock between paste and Enter, which would let the next sender
+/// join its text to this one, or skip the staged buffer's cleanup.
+async fn send_detached(
+    target: &CliTmuxTarget,
+    programs: Option<&[&str]>,
+    text: &str,
+) -> Option<CliSendResult> {
+    let target = target.clone();
+    let programs: Option<Vec<String>> =
+        programs.map(|programs| programs.iter().map(|p| p.to_string()).collect());
+    let text = text.to_owned();
+    let workspace_id = target.workspace_id;
+    tokio::spawn(async move {
+        let _guard = cli_send_lock(target.workspace_id).lock_owned().await;
+        if let Some(programs) = programs {
+            let programs: Vec<&str> = programs.iter().map(String::as_str).collect();
+            cli_pane_agent_program_at(&target, &programs)
+                .await
+                .flatten()?;
+        }
+        Some(send_cli_keys_locked(&target, &text).await)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(%workspace_id, %error, "CLI send task failed");
+        Some(CliSendResult::NotDelivered)
+    })
+}
+
+/// Bracketed-paste end marker. Text holding it would close the paste early
+/// and the rest would reach the TUI as key input.
+const BRACKETED_PASTE_END: &str = "\x1b[201~";
+
 async fn send_cli_keys_locked(target: &CliTmuxTarget, text: &str) -> CliSendResult {
+    if text.contains(BRACKETED_PASTE_END) {
+        tracing::warn!(
+            "CLI send to workspace {} refused: text holds the bracketed-paste end marker",
+            target.workspace_id
+        );
+        return CliSendResult::NotDelivered;
+    }
     // Bare name (not `=exact`): send-keys/paste-buffer take a pane target, for
     // which the `=` session-target syntax is rejected. Unambiguous given
     // full-hex names.
@@ -4100,6 +4142,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_refuses_text_holding_the_paste_end_marker() {
+        // Refused before any tmux call, so the socket need not exist.
+        let target = owned_cli_tmux_target_on(
+            CliTmuxHome::Current,
+            Uuid::new_v4(),
+            "bc-never-started",
+            "bc-never-started-legacy",
+        );
+        assert_eq!(
+            send_cli_keys_to(&target, "a\x1b[201~rm -rf x").await,
+            CliSendResult::NotDelivered
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_sends_to_one_pane_never_interleave() {
         if !tmux_available() {
             return;
@@ -4134,17 +4191,25 @@ mod tests {
         assert!(output.status.success());
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        let sends = (0..8).map(|i| {
-            let target = target.clone();
-            tokio::spawn(async move {
-                let text = format!("s{i}-first\ns{i}-second");
-                send_cli_keys_to(&target, &text).await
+        let sends: Vec<_> = (0..8)
+            .map(|i| {
+                let target = target.clone();
+                tokio::spawn(async move {
+                    let text = format!("s{i}-first\ns{i}-second");
+                    send_cli_keys_to(&target, &text).await
+                })
             })
-        });
-        for send in futures::future::join_all(sends).await {
-            assert_eq!(send.unwrap(), CliSendResult::Submitted);
+            .collect();
+        // Callers that go away mid-send (a dropped HTTP request) must still
+        // leave a whole paste + Enter, never half of one for the next sender.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        for send in sends.iter().skip(1).step_by(2) {
+            send.abort();
         }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        for send in sends.into_iter().step_by(2) {
+            assert_eq!(send.await.unwrap(), CliSendResult::Submitted);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
         let captured = run_cli_tmux(&[
             "-L",

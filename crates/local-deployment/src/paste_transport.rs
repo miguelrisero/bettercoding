@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use services::services::cli_collab::CliPasteTransport;
 use uuid::Uuid;
 
-use crate::pty;
+use crate::{pty, writer_probe::COLLAB_AGENT_PROGRAM};
 
 #[derive(Debug, Clone, Default)]
 pub struct LocalCliPasteTransport;
@@ -16,7 +16,7 @@ impl CliPasteTransport for LocalCliPasteTransport {
         let Some(target) = pty::locate_cli_tmux_target(workspace_id).await else {
             return false;
         };
-        pty::send_cli_keys_to_live_agent(&target, pty::CLI_AGENT_PROGRAMS, text)
+        pty::send_cli_keys_to_live_agent(&target, &[COLLAB_AGENT_PROGRAM], text)
             .await
             .is_some_and(pty::CliSendResult::delivered)
     }
@@ -27,7 +27,7 @@ impl CliPasteTransport for LocalCliPasteTransport {
 
     async fn agent_running(&self, workspace_id: Uuid) -> Option<bool> {
         let target = pty::locate_cli_tmux_target(workspace_id).await?;
-        pty::cli_pane_agent_program_at(&target, pty::CLI_AGENT_PROGRAMS)
+        pty::cli_pane_agent_program_at(&target, &[COLLAB_AGENT_PROGRAM])
             .await
             .map(|program| program.is_some())
     }

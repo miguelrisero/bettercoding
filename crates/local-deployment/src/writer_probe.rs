@@ -7,6 +7,12 @@ use uuid::Uuid;
 
 use crate::pty::{CliPaneAgentProcess, cli_pane_agent_processes, cli_tmux_session_exists_checked};
 
+/// The agent collaboration routing drives. The lease probe matches Claude's
+/// `--resume <sid>` command line, so the paste transport must gate on the
+/// same program; a transport that also accepted Codex would report a pane
+/// busy that this probe reports free.
+pub(crate) const COLLAB_AGENT_PROGRAM: &str = "claude";
+
 #[derive(Clone)]
 pub struct LocalCliWriterProbe {
     db: DBService,
@@ -170,7 +176,7 @@ impl CliWriterProbe for LocalCliWriterProbe {
             };
         }
 
-        let processes = match cli_pane_agent_processes(workspace_id, "claude").await {
+        let processes = match cli_pane_agent_processes(workspace_id, COLLAB_AGENT_PROGRAM).await {
             Some(processes) => processes,
             None => return ProbeReport::failed(),
         };
