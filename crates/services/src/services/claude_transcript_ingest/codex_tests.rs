@@ -1094,3 +1094,53 @@ async fn a_codex_turn_written_outside_the_app_pane_marks_a_foreign_writer() {
     assert!(codex_foreign_writer_flagged(false).await);
     assert!(!codex_foreign_writer_flagged(true).await);
 }
+
+#[tokio::test]
+async fn a_codex_turn_acknowledges_the_collaboration_paste_of_its_prompt() {
+    use db::models::session_queued_message::{
+        QueuedMessageSource, QueuedMessageState, SessionQueuedMessage, StoreQueuedMessageResult,
+    };
+    let case = codex_case().await;
+    let now = Utc::now();
+    let thread = thread_id_at(now, 3);
+    bind_resumed(&case, &thread).await;
+    let prompt = "routed from chat";
+    let StoreQueuedMessageResult::Stored(row) = SessionQueuedMessage::store(
+        &case.db.pool,
+        case.session.id,
+        prompt,
+        None,
+        QueuedMessageSource::Ui,
+        false,
+    )
+    .await
+    .unwrap() else {
+        unreachable!("the session has no queued message");
+    };
+    SessionQueuedMessage::claim_for_paste(&case.db.pool, row.id, Some(&thread), "paster")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        SessionQueuedMessage::mark_pasted(&case.db.pool, row.id, "paster")
+            .await
+            .unwrap()
+    );
+    write_rollout(
+        &rollout_path(&case.root, &thread, now),
+        &[
+            session_meta(&thread, &case.cwd, now, "cli"),
+            user_turn(&thread, "routed-turn", now, prompt),
+        ]
+        .concat(),
+    );
+
+    reconcile(&case).await;
+
+    let acknowledged = SessionQueuedMessage::find_by_id(&case.db.pool, row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(acknowledged.state, QueuedMessageState::Imported);
+    assert!(acknowledged.acked_at.is_some());
+}

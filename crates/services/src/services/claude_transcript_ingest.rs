@@ -1338,6 +1338,7 @@ impl ClaudeTranscriptIngest {
                             raw: complete.raw.clone(),
                             disposition,
                             user_prompt: line.plain_user_text(),
+                            paste_ack_prompt: None,
                             recorded_at: envelope
                                 .timestamp
                                 .as_deref()
@@ -1356,6 +1357,7 @@ impl ClaudeTranscriptIngest {
                             raw: complete.raw.clone(),
                             disposition: CliNativeRecordDisposition::Unknown,
                             user_prompt: None,
+                            paste_ack_prompt: None,
                             recorded_at: None,
                         });
                     }
@@ -2075,6 +2077,7 @@ fn codex_native_record(
         raw: raw.to_string(),
         disposition: CliNativeRecordDisposition::Unknown,
         user_prompt: None,
+        paste_ack_prompt: None,
         recorded_at: None,
     };
     let Ok(line) = adapt_codex_rollout_line(raw, cwd) else {
@@ -2083,24 +2086,38 @@ fn codex_native_record(
     match line.disposition {
         CodexRolloutDisposition::Bookkeeping => (None, false),
         CodexRolloutDisposition::Unknown => (Some(unknown(line.timestamp)), true),
-        CodexRolloutDisposition::Renderable => (
-            Some(NewCliNativeRecord {
-                line_seq,
-                claude_session_id: thread_id.to_string(),
-                uuid: line.item_id,
-                parent_uuid: line.turn_id,
-                kind: line.kind,
-                recorded_at: line.timestamp.as_deref().and_then(parse_native_timestamp),
-                ts: line.timestamp,
-                raw: raw.to_string(),
-                disposition: CliNativeRecordDisposition::Renderable,
-                // No prompt-equality reconciliation: it would hide a pane turn
-                // that repeats a recent chat prompt, and executor turns in a
-                // rollout are attributed by their run window instead.
-                user_prompt: None,
-            }),
-            false,
-        ),
+        CodexRolloutDisposition::Renderable => {
+            let paste_ack_prompt = line
+                .entries
+                .iter()
+                .find(|entry| {
+                    matches!(
+                        entry.entry_type,
+                        executors::logs::NormalizedEntryType::UserMessage
+                    )
+                })
+                .map(|entry| entry.content.clone());
+            (
+                Some(NewCliNativeRecord {
+                    line_seq,
+                    claude_session_id: thread_id.to_string(),
+                    uuid: line.item_id,
+                    parent_uuid: line.turn_id,
+                    kind: line.kind,
+                    recorded_at: line.timestamp.as_deref().and_then(parse_native_timestamp),
+                    ts: line.timestamp,
+                    raw: raw.to_string(),
+                    disposition: CliNativeRecordDisposition::Renderable,
+                    // No prompt-equality reconciliation: it would hide a pane turn
+                    // that repeats a recent chat prompt, and executor turns in a
+                    // rollout are attributed by their run window instead. The
+                    // text still acknowledges a collaboration paste of it.
+                    user_prompt: None,
+                    paste_ack_prompt,
+                }),
+                false,
+            )
+        }
     }
 }
 

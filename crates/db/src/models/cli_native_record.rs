@@ -55,6 +55,11 @@ pub struct NewCliNativeRecord {
     pub disposition: CliNativeRecordDisposition,
     /// Plain user text used only for durable app-turn reconciliation.
     pub user_prompt: Option<String>,
+    /// Plain user text that may acknowledge a CLI paste of the same prompt
+    /// when `user_prompt` is withheld. Codex sets only this: its turns are
+    /// matched to executor runs by run window, never by prompt, but a
+    /// collaboration paste still needs its acknowledgement.
+    pub paste_ack_prompt: Option<String>,
     pub recorded_at: Option<DateTime<Utc>>,
 }
 
@@ -433,7 +438,11 @@ impl CliNativeRecord {
 
             let bound_queued_message_id =
                 if record.kind == "user" && !linked_to_execution && bound_turn_id.is_none() {
-                    match (record.user_prompt.as_deref(), session_id) {
+                    let prompt = record
+                        .user_prompt
+                        .as_deref()
+                        .or(record.paste_ack_prompt.as_deref());
+                    match (prompt, session_id) {
                         (Some(prompt), Some(session_id)) => {
                             let reference_time = record.recorded_at.unwrap_or(imported_at);
                             let earliest_paste = reference_time
