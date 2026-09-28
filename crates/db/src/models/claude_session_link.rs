@@ -4,7 +4,7 @@ use sqlx::{FromRow, SqlitePool, Type};
 use ts_rs::TS;
 use uuid::Uuid;
 
-use super::cli_ingest_outbox::CliIngestOutbox;
+use super::{cli_ingest_outbox::CliIngestOutbox, cli_native_record::begin_immediate};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, TS)]
 #[sqlx(type_name = "TEXT", rename_all = "kebab-case")]
@@ -211,7 +211,8 @@ impl ClaudeSessionLink {
         cwd: &str,
         bound_via: ClaudeSessionBoundVia,
     ) -> Result<ClaudeSessionLinkMutation, sqlx::Error> {
-        let mut tx = pool.begin().await?;
+        // Reads before it writes, like a transcript import.
+        let mut tx = begin_immediate(pool).await?;
         let previous_session_id = sqlx::query_scalar!(
             r#"SELECT session_id AS "session_id!: Uuid"
                FROM claude_session_links
@@ -316,5 +317,90 @@ impl ClaudeSessionLink {
         )
         .fetch_all(pool)
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+
+    use super::*;
+    use crate::models::{
+        session::{CreateSession, Session},
+        workspace::{CreateWorkspace, Workspace},
+    };
+
+    /// Another connection commits after the upsert has read but before it
+    /// writes. A deferred transaction then fails with `SQLITE_BUSY_SNAPSHOT`
+    /// without waiting; the upsert must wait for the writer and succeed.
+    #[tokio::test]
+    async fn upsert_waits_for_a_writer_that_commits_after_its_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(crate::tune(
+                SqliteConnectOptions::new()
+                    .filename(dir.path().join("links.sqlite"))
+                    .create_if_missing(true),
+                SqliteJournalMode::Wal,
+            ))
+            .await
+            .unwrap();
+        crate::run_migrations_for_tests(&pool).await.unwrap();
+        let workspace_id = Uuid::new_v4();
+        Workspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "main".to_string(),
+                name: None,
+            },
+            workspace_id,
+        )
+        .await
+        .unwrap();
+        let session = Session::create(
+            &pool,
+            &CreateSession {
+                executor: None,
+                name: None,
+            },
+            Uuid::new_v4(),
+            workspace_id,
+        )
+        .await
+        .unwrap();
+
+        let mut writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("CREATE TABLE contention (v INTEGER)")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        let upsert = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                ClaudeSessionLink::upsert(
+                    &pool,
+                    "66666666-6666-4666-8666-666666666666",
+                    session.id,
+                    workspace_id,
+                    "/w",
+                    ClaudeSessionBoundVia::CliResume,
+                )
+                .await
+            }
+        });
+        // Let the upsert start while the writer holds the lock.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        writer.commit().await.unwrap();
+
+        let mutation = upsert
+            .await
+            .unwrap()
+            .expect("the upsert waits for the writer instead of failing");
+        assert_eq!(mutation.link.session_id, session.id);
+        assert_eq!(mutation.previous_session_id, None);
+        pool.close().await;
     }
 }

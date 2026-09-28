@@ -94,7 +94,9 @@ pub struct ReplacedGenerationImport {
 /// `SQLITE_BUSY` at once, without waiting on the busy timeout, so under
 /// concurrent API writes an import could fail on every attempt. Taking the
 /// write lock up front makes it wait its turn instead.
-async fn begin_immediate(pool: &SqlitePool) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
+pub(crate) async fn begin_immediate(
+    pool: &SqlitePool,
+) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
     pool.begin_with("BEGIN IMMEDIATE").await
 }
 
