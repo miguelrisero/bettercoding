@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -36,4 +37,18 @@ pub struct UpdateWorkspaceRequest {
     pub lines_added: Option<Option<i32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lines_removed: Option<Option<i32>>,
+}
+
+/// Body of `POST /workspaces/{id}/cli/send`: composer text for the
+/// workspace's live CLI agent pane.
+#[derive(Debug, Deserialize, Serialize, TS)]
+pub struct SendCliTextRequest {
+    pub text: String,
+}
+
+/// `submitted: false` means the text reached the agent's input box but Enter
+/// did not go through; the turn is not submitted.
+#[derive(Debug, Deserialize, Serialize, TS)]
+pub struct SendCliTextResponse {
+    pub submitted: bool,
 }

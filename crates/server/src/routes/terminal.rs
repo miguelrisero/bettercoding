@@ -3,11 +3,12 @@ use std::{
     str::FromStr,
 };
 
+use api_types::{SendCliTextRequest, SendCliTextResponse};
 use axum::{
     Router,
     extract::{Query, State, ws::Message},
-    response::IntoResponse,
-    routing::get,
+    response::{IntoResponse, Json},
+    routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use db::models::{
@@ -28,14 +29,16 @@ use executors::{
     profile::{ExecutorConfig, ExecutorConfigs},
 };
 use local_deployment::pty::{
-    CLI_PROMPT_PARKED_NOTICE, CliPromptDelivery, CliPromptRouting, PtyCommand,
-    cli_pane_agent_running_at, cli_prompt_file_exists, cli_tmux_available,
-    cli_tmux_session_exists_checked, cli_tmux_target_exists, kill_cli_tmux_session,
-    locate_cli_tmux_target, remove_cli_prompt_file, remove_cli_resume_ready_file,
-    resolved_cli_tmux_session_name, route_followup_prompt, route_initial_prompt, send_cli_keys_to,
+    CLI_AGENT_PROGRAMS, CLI_PROMPT_PARKED_NOTICE, CliPromptDelivery, CliPromptRouting,
+    CliSendResult, PtyCommand, cli_pane_agent_running_at, cli_prompt_file_exists,
+    cli_tmux_available, cli_tmux_session_exists_checked, cli_tmux_target_exists,
+    kill_cli_tmux_session, locate_cli_tmux_target, remove_cli_prompt_file,
+    remove_cli_resume_ready_file, resolved_cli_tmux_session_name, route_followup_prompt,
+    route_initial_prompt, send_cli_keys_to, send_cli_keys_to_live_agent,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use utils::response::ApiResponse;
 use uuid::Uuid;
 
 use crate::{
@@ -154,30 +157,7 @@ pub(super) async fn resolve_cli_launch_spec(
     workspace_id: Uuid,
     workspace_name: Option<&str>,
 ) -> CliLaunchSpec {
-    let executor = session
-        .and_then(|s| s.executor.as_deref())
-        .and_then(|e| BaseCodingAgent::from_str(e).ok())
-        .unwrap_or(BaseCodingAgent::ClaudeCode);
-
-    let profiles = ExecutorConfigs::get_cached();
-
-    let mut config = ExecutorConfig::new(executor);
-    config.model_id = model_id;
-    config.reasoning_id = reasoning_id;
-    let mut agent = profiles.get_coding_agent_or_default(&config.profile_id());
-    if config.has_overrides() {
-        agent.apply_overrides(&config);
-    }
-
-    let mut spec = agent.interactive_cli_spec(dir).unwrap_or_else(|| {
-        // The selected agent has no interactive CLI support (yet) — fall back to
-        // a default claude launch so the CLI pane is never left without an agent.
-        let claude = ExecutorConfig::new(BaseCodingAgent::ClaudeCode);
-        profiles
-            .get_coding_agent_or_default(&claude.profile_id())
-            .interactive_cli_spec(dir)
-            .expect("claude always provides an interactive CLI spec")
-    });
+    let mut spec = resolve_cli_agent_spec(session, model_id, reasoning_id, dir);
 
     // Codex reports its state through the same hook endpoint, registered
     // inline with `-c` so neither ~/.codex nor the worktree is touched.
@@ -198,6 +178,41 @@ pub(super) async fn resolve_cli_launch_spec(
     }
 
     spec
+}
+
+/// The side-effect-free part of [`resolve_cli_launch_spec`]: the selected
+/// agent's interactive spec with model/effort folded in, before any hook
+/// settings are written. Its `program` is the binary CLI mode launches.
+fn resolve_cli_agent_spec(
+    session: Option<&Session>,
+    model_id: Option<String>,
+    reasoning_id: Option<String>,
+    dir: &Path,
+) -> CliLaunchSpec {
+    let executor = session
+        .and_then(|s| s.executor.as_deref())
+        .and_then(|e| BaseCodingAgent::from_str(e).ok())
+        .unwrap_or(BaseCodingAgent::ClaudeCode);
+
+    let profiles = ExecutorConfigs::get_cached();
+
+    let mut config = ExecutorConfig::new(executor);
+    config.model_id = model_id;
+    config.reasoning_id = reasoning_id;
+    let mut agent = profiles.get_coding_agent_or_default(&config.profile_id());
+    if config.has_overrides() {
+        agent.apply_overrides(&config);
+    }
+
+    agent.interactive_cli_spec(dir).unwrap_or_else(|| {
+        // The selected agent has no interactive CLI support (yet) — fall back to
+        // a default claude launch so the CLI pane is never left without an agent.
+        let claude = ExecutorConfig::new(BaseCodingAgent::ClaudeCode);
+        profiles
+            .get_coding_agent_or_default(&claude.profile_id())
+            .interactive_cli_spec(dir)
+            .expect("claude always provides an interactive CLI spec")
+    })
 }
 
 /// The hook command itself: POST stdin to the workspace's activity endpoint.
@@ -1022,7 +1037,7 @@ async fn deliver_deferred_prompt(workspace_id: Uuid, text: &str, program: &str) 
                         stable = 0;
                         continue;
                     }
-                    if !send_cli_keys_to(&target, text).await {
+                    if !send_cli_keys_to(&target, text).await.delivered() {
                         return false;
                     }
                     // Post-paste ack: the agent must have survived receiving
@@ -1138,8 +1153,80 @@ async fn send_error(socket: &mut MaybeSignedWebSocket, message: &str) -> anyhow:
     Ok(())
 }
 
+/// Largest composer text `POST /workspaces/{id}/cli/send` accepts, in bytes.
+const MAX_CLI_SEND_BYTES: usize = 256 * 1024;
+
+/// Check composer text before it reaches the pane. Control characters other
+/// than newline and tab are refused: an ESC could end the bracketed paste
+/// early (`ESC [201~`) and turn the rest of the text into TUI key input.
+/// Surrounding blank lines are dropped; everything else is sent verbatim.
+fn validate_cli_send_text(text: &str) -> Result<&str, String> {
+    if text.len() > MAX_CLI_SEND_BYTES {
+        return Err(format!(
+            "Text is {} bytes; the limit is {MAX_CLI_SEND_BYTES} bytes",
+            text.len()
+        ));
+    }
+    if text.trim().is_empty() {
+        return Err("Text is empty".to_string());
+    }
+    if text
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return Err("Text contains control characters".to_string());
+    }
+    Ok(text.trim_matches('\n'))
+}
+
+/// Type composer text into the workspace's live CLI agent pane and submit it.
+/// 409 when no Claude/Codex agent owns the pane; the ownership probe runs
+/// under the per-workspace send lock, immediately before the paste.
+async fn send_cli_text(
+    State(deployment): State<DeploymentImpl>,
+    axum::extract::Path(workspace_id): axum::extract::Path<Uuid>,
+    Json(request): Json<SendCliTextRequest>,
+) -> Result<Json<ApiResponse<SendCliTextResponse>>, ApiError> {
+    let text = validate_cli_send_text(&request.text).map_err(ApiError::BadRequest)?;
+
+    let pool = &deployment.db().pool;
+    let workspace = Workspace::find_by_id(pool, workspace_id)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("Workspace not found".to_string()))?;
+    let dir = PathBuf::from(workspace.container_ref.unwrap_or_default());
+    let session = Session::find_latest_by_workspace_id(pool, workspace_id).await?;
+
+    // The program the attach path launches comes first; the other known
+    // agents follow because the pane keeps whichever agent launched it even
+    // after the workspace's latest session switches executor.
+    let expected = resolve_cli_agent_spec(session.as_ref(), None, None, &dir).program;
+    let mut programs = vec![expected.as_str()];
+    programs.extend(CLI_AGENT_PROGRAMS.iter().filter(|p| **p != expected));
+
+    let no_agent = || {
+        ApiError::Conflict(
+            "No live Claude Code or Codex agent is running in this workspace's CLI pane"
+                .to_string(),
+        )
+    };
+    let target = locate_cli_tmux_target(workspace_id)
+        .await
+        .ok_or_else(no_agent)?;
+    match send_cli_keys_to_live_agent(&target, &programs, text).await {
+        None => Err(no_agent()),
+        Some(CliSendResult::NotDelivered) => Err(ApiError::BadGateway(
+            "tmux did not accept the text; nothing was sent".to_string(),
+        )),
+        Some(result) => Ok(Json(ApiResponse::success(SendCliTextResponse {
+            submitted: result == CliSendResult::Submitted,
+        }))),
+    }
+}
+
 pub(super) fn router() -> Router<DeploymentImpl> {
-    Router::new().route("/terminal/ws", get(terminal_ws))
+    Router::new()
+        .route("/terminal/ws", get(terminal_ws))
+        .route("/workspaces/{workspace_id}/cli/send", post(send_cli_text))
 }
 
 #[cfg(test)]
@@ -1147,6 +1234,37 @@ mod tests {
     use db::models::session::Session;
     use sqlx::SqlitePool;
     use uuid::Uuid;
+
+    use super::{MAX_CLI_SEND_BYTES, validate_cli_send_text};
+
+    #[test]
+    fn cli_send_rejects_empty_and_whitespace_text() {
+        for empty in ["", " ", "\n\n", " \t \n "] {
+            assert!(validate_cli_send_text(empty).is_err(), "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn cli_send_caps_text_at_256_kib() {
+        let at_cap = "x".repeat(MAX_CLI_SEND_BYTES);
+        assert_eq!(validate_cli_send_text(&at_cap), Ok(at_cap.as_str()));
+        assert!(validate_cli_send_text(&"x".repeat(MAX_CLI_SEND_BYTES + 1)).is_err());
+        // The cap counts bytes, not chars.
+        let multibyte = "é".repeat(MAX_CLI_SEND_BYTES / 2 + 1);
+        assert!(validate_cli_send_text(&multibyte).is_err());
+    }
+
+    #[test]
+    fn cli_send_refuses_control_characters_but_keeps_newlines_and_tabs() {
+        // ESC [201~ would close the bracketed paste early.
+        for bad in ["a\x1b[201~b", "a\rb", "a\x03", "a\u{9b}b"] {
+            assert!(validate_cli_send_text(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            validate_cli_send_text("\n  line one\n\tline two ünï 🚀\n\n"),
+            Ok("  line one\n\tline two ünï 🚀")
+        );
+    }
 
     /// Minimal in-memory slice of the `sessions` table — just the columns the
     /// parked-prompt primitives touch — so the CAS/park semantics that guard
