@@ -734,10 +734,10 @@ async fn a_fresh_pane_is_matched_in_its_own_sessions_directory() {
 }
 
 #[tokio::test]
-async fn a_pass_interrupted_after_linking_binds_on_the_next_pass() {
+async fn a_thread_already_linked_to_the_pane_session_binds() {
     let pane = fresh_codex_pane().await;
     let own = started_rollout(&pane, 10, chrono::Duration::seconds(2), "cli");
-    // The state a pass leaves when it stops between the link and the binding.
+    // Linked earlier (a CLI launch, a manual assignment) but not yet bound.
     ClaudeSessionLink::assign_cli(
         &pane.case.db.pool,
         &own,
@@ -759,6 +759,81 @@ async fn a_pass_interrupted_after_linking_binds_on_the_next_pass() {
     assert_eq!(
         texts(&entries(&pane.case).await),
         ["prompt 10", "answer to prompt 10"]
+    );
+}
+
+#[tokio::test]
+async fn fresh_pane_assignment_writes_nothing_for_a_taken_thread_or_released_pane() {
+    let pane = fresh_codex_pane().await;
+    let pool = &pane.case.db.pool;
+    let other = Session::create(
+        pool,
+        &CreateSession {
+            executor: Some("CODEX".to_string()),
+            name: None,
+        },
+        Uuid::new_v4(),
+        pane.case.workspace.id,
+    )
+    .await
+    .unwrap();
+    let taken = thread_id_at(pane.launched, 12);
+    let cwd = pane.case.cwd.to_string_lossy().into_owned();
+    ClaudeSessionLink::assign_cli(
+        pool,
+        &taken,
+        other.id,
+        pane.case.workspace.id,
+        &cwd,
+        ClaudeSessionBoundVia::CliFresh,
+    )
+    .await
+    .unwrap();
+
+    // Another session took the thread after the candidate was chosen.
+    let assigned = ClaudeSessionLink::assign_fresh_pane(
+        pool,
+        &taken,
+        pane.binding.id,
+        pane.case.session.id,
+        pane.case.workspace.id,
+        &cwd,
+    )
+    .await
+    .unwrap();
+    assert!(assigned.is_none());
+    let link = ClaudeSessionLink::find(pool, &taken)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(link.session_id, other.id, "the existing owner is kept");
+    let binding = CliPaneBinding::find_by_id(pool, pane.binding.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(binding.claude_session_id.is_none());
+
+    // The pane was released after the candidate was chosen.
+    CliPaneBinding::release(pool, pane.binding.id)
+        .await
+        .unwrap();
+    let free = thread_id_at(pane.launched, 13);
+    let assigned = ClaudeSessionLink::assign_fresh_pane(
+        pool,
+        &free,
+        pane.binding.id,
+        pane.case.session.id,
+        pane.case.workspace.id,
+        &cwd,
+    )
+    .await
+    .unwrap();
+    assert!(assigned.is_none());
+    assert!(
+        ClaudeSessionLink::find(pool, &free)
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 

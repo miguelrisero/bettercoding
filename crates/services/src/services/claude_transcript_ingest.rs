@@ -346,9 +346,10 @@ pub struct ClaudeTranscriptIngest {
     projects_dir: PathBuf,
     /// `$CODEX_HOME/sessions`; `None` disables Codex rollout import.
     codex_sessions_dir: Option<PathBuf>,
-    /// Codex rollouts to import, by path. Codex keeps every thread of every
-    /// project in shared day directories, so only these files are read there.
-    codex_files: RwLock<HashMap<PathBuf, DirectoryContext>>,
+    /// Codex rollouts to import, by day directory and path. Codex keeps every
+    /// thread of every project in shared day directories, so only these files
+    /// are read there.
+    codex_files: RwLock<HashMap<PathBuf, HashMap<PathBuf, DirectoryContext>>>,
     /// Size and mtime at the last import of each Codex rollout, so events for
     /// other threads in a shared day directory cost one `stat` per file.
     /// Codex only appends to a rollout; a rewrite that keeps both is caught by
@@ -623,9 +624,10 @@ impl ClaudeTranscriptIngest {
             directories
                 .get(path)
                 .is_some_and(|context| context.workspace_id == session.workspace_id)
-                || codex_files.iter().any(|(file, context)| {
-                    file.parent() == Some(path.as_path())
-                        && context.workspace_id == session.workspace_id
+                || codex_files.get(path).is_some_and(|files| {
+                    files
+                        .values()
+                        .any(|context| context.workspace_id == session.workspace_id)
                 })
         });
         drop(directories);
@@ -898,7 +900,16 @@ impl ClaudeTranscriptIngest {
         // This pass served every earlier request; a thread that still cannot
         // be bound may ask again, at most once per pass.
         self.codex_nudged.lock().unwrap().clear();
-        *self.codex_files.write().await = codex_desired;
+        let mut codex_by_dir = HashMap::<PathBuf, HashMap<PathBuf, DirectoryContext>>::new();
+        for (path, context) in codex_desired {
+            if let Some(dir) = path.parent() {
+                codex_by_dir
+                    .entry(dir.to_path_buf())
+                    .or_default()
+                    .insert(path, context);
+            }
+        }
+        *self.codex_files.write().await = codex_by_dir;
 
         let mut removed = Vec::new();
         {
@@ -1395,10 +1406,14 @@ impl ClaudeTranscriptIngest {
             .codex_files
             .read()
             .await
-            .iter()
-            .filter(|(path, _)| path.parent() == Some(dir))
-            .map(|(path, context)| (path.clone(), context.clone()))
-            .collect::<Vec<_>>();
+            .get(dir)
+            .map(|files| {
+                files
+                    .iter()
+                    .map(|(path, context)| (path.clone(), context.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         for (path, context) in files {
             counts.files += 1;
             let Ok(metadata) = fs::metadata(&path) else {
@@ -1426,12 +1441,18 @@ impl ClaudeTranscriptIngest {
     /// Ask for an early registry pass when a CLI-mode Codex reports a thread
     /// not imported yet, so its first turns do not wait for the next tick.
     pub async fn request_codex_import(&self, codex_thread_id: &str) {
-        let tracked = self.codex_files.read().await.keys().any(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .and_then(rollout_thread_id)
-                == Some(codex_thread_id)
-        });
+        let tracked = self
+            .codex_files
+            .read()
+            .await
+            .values()
+            .flat_map(HashMap::keys)
+            .any(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(rollout_thread_id)
+                    == Some(codex_thread_id)
+            });
         if !tracked
             && self
                 .codex_nudged
@@ -1474,9 +1495,9 @@ impl ClaudeTranscriptIngest {
     /// way the thread must have started after the pane launched, so a report
     /// or rollout from an earlier pane never binds.
     ///
-    /// The session link is written before the pane binding: the binding is
-    /// what makes the rollout tracked, and a pass interrupted between the two
-    /// leaves the binding unset, so the next pass finds the thread again.
+    /// The ownership check, the session link and the pane binding commit in
+    /// one transaction, so a concurrent owner or a released pane leaves
+    /// nothing half-written.
     async fn bind_fresh_codex_cli(
         &self,
         root: &Path,
@@ -1546,17 +1567,17 @@ impl ClaudeTranscriptIngest {
         match unowned.as_slice() {
             [] => {}
             [(sid, path)] => {
-                let mutation = ClaudeSessionLink::assign_cli(
+                if let Some(mutation) = ClaudeSessionLink::assign_fresh_pane(
                     pool,
                     sid,
+                    binding.id,
                     binding.session_id,
                     workspace.id,
                     &cwd.to_string_lossy(),
-                    db::models::claude_session_link::ClaudeSessionBoundVia::CliFresh,
                 )
-                .await?;
-                self.apply_link_mutation(&mutation).await;
-                if CliPaneBinding::bind_discovered_sid(pool, binding.id, sid).await? {
+                .await?
+                {
+                    self.apply_link_mutation(&mutation).await;
                     self.quarantined_paths.lock().unwrap().remove(path);
                 }
             }
