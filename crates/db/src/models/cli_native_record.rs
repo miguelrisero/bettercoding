@@ -89,6 +89,15 @@ pub struct ReplacedGenerationImport {
     pub imported: ImportBatchResult,
 }
 
+/// Import transactions read before they write. A deferred transaction whose
+/// snapshot went stale while it read fails its first write with
+/// `SQLITE_BUSY` at once, without waiting on the busy timeout, so under
+/// concurrent API writes an import could fail on every attempt. Taking the
+/// write lock up front makes it wait its turn instead.
+async fn begin_immediate(pool: &SqlitePool) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
+    pool.begin_with("BEGIN IMMEDIATE").await
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct SessionNativeRecord {
     pub file_id: Uuid,
@@ -198,7 +207,7 @@ impl CliNativeRecord {
         records: &[NewCliNativeRecord],
         cursor: &ImportedCursor<'_>,
     ) -> Result<ImportBatchResult, sqlx::Error> {
-        let mut tx = pool.begin().await?;
+        let mut tx = begin_immediate(pool).await?;
         let result = Self::import_batch_in_transaction(
             &mut tx,
             file_id,
@@ -219,7 +228,7 @@ impl CliNativeRecord {
         cursor: &ImportedCursor<'_>,
         context: NativeImportContext,
     ) -> Result<ImportBatchResult, sqlx::Error> {
-        let mut tx = pool.begin().await?;
+        let mut tx = begin_immediate(pool).await?;
         let result =
             Self::import_batch_in_transaction(&mut tx, file_id, records, cursor, None, context)
                 .await?;
@@ -255,7 +264,7 @@ impl CliNativeRecord {
         cursor: &ImportedCursor<'_>,
         context: NativeImportContext,
     ) -> Result<ReplacedGenerationImport, sqlx::Error> {
-        let mut tx = pool.begin().await?;
+        let mut tx = begin_immediate(pool).await?;
         let next_generation = sqlx::query_scalar!(
             r#"SELECT COALESCE(MAX(generation), -1) + 1 AS "generation!: i64"
                FROM cli_native_files
