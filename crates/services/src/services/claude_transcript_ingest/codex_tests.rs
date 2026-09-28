@@ -567,3 +567,183 @@ async fn ambiguous_fresh_codex_rollouts_are_quarantined_until_the_hook_names_one
     assert_eq!(quarantined(&pane.case).await, 1);
     drop(pane.case.temp);
 }
+
+/// Measures a Codex rollout backfill and per-append cost against a copy of a
+/// real database while an API-shaped load runs. `CODEX_MEASURE_DB` is a COPY
+/// (the run writes to it), `CODEX_MEASURE_ROLLOUT` a real rollout (only
+/// read), and `CODEX_MEASURE_ROOT` a scratch sessions root the rollout is
+/// replayed into: all but its last ten lines, then one line per append.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual measurement against a copied database"]
+async fn measure_codex_on_copied_database() {
+    use std::{io::BufRead, time::Duration as StdDuration};
+
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+
+    let db_path = std::env::var("CODEX_MEASURE_DB").expect("CODEX_MEASURE_DB");
+    let source = PathBuf::from(std::env::var("CODEX_MEASURE_ROLLOUT").expect("rollout"));
+    let root = PathBuf::from(std::env::var("CODEX_MEASURE_ROOT").expect("root"));
+    let options = SqliteConnectOptions::new()
+        .filename(&db_path)
+        .create_if_missing(false)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(StdDuration::from_secs(30))
+        .synchronous(SqliteSynchronous::Normal);
+    let pool = SqlitePoolOptions::new()
+        .connect_with(options)
+        .await
+        .unwrap();
+    db::run_migrations_for_tests(&pool).await.unwrap();
+    let db = DBService { pool };
+
+    let file_name = source.file_name().unwrap().to_str().unwrap().to_string();
+    let thread = super::rollout_thread_id(&file_name).unwrap().to_string();
+    let created = super::codex_thread_created_at(&thread).unwrap();
+    let target = super::codex_day_dir(&root, created).join(&file_name);
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let lines = std::io::BufReader::new(fs::File::open(&source).unwrap())
+        .lines()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let (history, tail) = lines.split_at(lines.len() - 10);
+    fs::write(&target, history.join("\n") + "\n").unwrap();
+
+    // Bind the thread to the live workspace with the most sessions.
+    let (workspace_id, session_id): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT w.id, (SELECT s.id FROM sessions s WHERE s.workspace_id = w.id
+                        ORDER BY s.created_at DESC LIMIT 1)
+         FROM workspaces w WHERE w.archived = 0 AND w.container_ref IS NOT NULL
+           AND EXISTS (SELECT 1 FROM sessions s WHERE s.workspace_id = w.id)
+         ORDER BY (SELECT COUNT(*) FROM sessions s WHERE s.workspace_id = w.id) DESC LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    CliPaneBinding::record_launch(
+        &db.pool,
+        workspace_id,
+        session_id,
+        Some(&thread),
+        CliPaneBoundVia::CliResume,
+    )
+    .await
+    .unwrap();
+    ClaudeSessionLink::assign_cli(
+        &db.pool,
+        &thread,
+        session_id,
+        workspace_id,
+        "/measure",
+        ClaudeSessionBoundVia::CliResume,
+    )
+    .await
+    .unwrap();
+
+    let done = CancellationToken::new();
+    let load_db = db.clone();
+    let load_done = done.clone();
+    let load = tokio::spawn(async move {
+        let mut latencies = Vec::new();
+        let mut busy = 0u64;
+        while !load_done.is_cancelled() {
+            let started = std::time::Instant::now();
+            let read = sqlx::query("SELECT * FROM workspaces ORDER BY updated_at DESC")
+                .fetch_all(&load_db.pool)
+                .await
+                .map(|_| ());
+            let write = sqlx::query("UPDATE workspaces SET updated_at = updated_at WHERE id = ?")
+                .bind(workspace_id)
+                .execute(&load_db.pool)
+                .await
+                .map(|_| ());
+            latencies.push(started.elapsed());
+            for result in [read, write] {
+                if let Err(sqlx::Error::Database(error)) = result
+                    && matches!(error.code().as_deref(), Some("5") | Some("517"))
+                {
+                    busy += 1;
+                }
+            }
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+        (latencies, busy)
+    });
+
+    let empty_projects = root.join("no-claude-projects");
+    let mut service = ClaudeTranscriptIngest::new(db.clone(), empty_projects);
+    service.codex_sessions_dir = Some(root.clone());
+    let service = Arc::new(service);
+    let started = std::time::Instant::now();
+    let counts = service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+    let backfill = started.elapsed();
+    let started = std::time::Instant::now();
+    service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+    let idle_reconcile = started.elapsed();
+    done.cancel();
+    let (mut latencies, busy) = load.await.unwrap();
+    latencies.sort();
+    let percentile = |p: usize| latencies[(latencies.len() * p / 100).min(latencies.len() - 1)];
+    println!(
+        "codex backfill {backfill:?}: {} history lines, {} files, {} records stored; \
+         idle reconcile {idle_reconcile:?}; API-shaped requests {} (p50 {:?}, p95 {:?}, max {:?}); \
+         SQLITE_BUSY {busy}",
+        history.len(),
+        counts.files,
+        counts.records,
+        latencies.len(),
+        percentile(50),
+        percentile(95),
+        latencies.last().unwrap(),
+    );
+
+    let _subscription = service.subscribe_feed(session_id);
+    let started = std::time::Instant::now();
+    let (change, mut cursor) = service.feed_since(session_id, None).await.unwrap();
+    let full = started.elapsed();
+    let NativeFeedChange::Full(snapshot) = change else {
+        panic!("first update is a snapshot");
+    };
+    println!(
+        "feed: {} entries ({} cli), {} snapshot bytes, full build {full:?}",
+        snapshot.entries.len(),
+        snapshot
+            .entries
+            .iter()
+            .filter(|entry| entry.origin == NativeFeedOrigin::Cli)
+            .count(),
+        serde_json::to_vec(&snapshot).unwrap().len(),
+    );
+    let dir = target.parent().unwrap().to_path_buf();
+    let started = std::time::Instant::now();
+    service.scan_directory(&dir, false).await.unwrap();
+    println!("unchanged scan (watcher noise) {:?}", started.elapsed());
+    for line in tail {
+        append(&target, &format!("{line}\n"));
+        let started = std::time::Instant::now();
+        let scanned = service.scan_directory(&dir, false).await.unwrap();
+        let import = started.elapsed();
+        let started = std::time::Instant::now();
+        let (change, next) = service.feed_since(session_id, Some(cursor)).await.unwrap();
+        let update = started.elapsed();
+        cursor = next;
+        let (kind, bytes) = match &change {
+            NativeFeedChange::Delta { appended, .. } => {
+                ("delta", serde_json::to_vec(appended).unwrap().len())
+            }
+            NativeFeedChange::Full(snapshot) => {
+                ("FULL", serde_json::to_vec(snapshot).unwrap().len())
+            }
+        };
+        println!(
+            "  append {} B line: import {import:?} ({} stored), feed update {update:?} ({kind}, {bytes} B)",
+            line.len(),
+            scanned.records,
+        );
+    }
+}

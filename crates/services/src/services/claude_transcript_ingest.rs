@@ -353,6 +353,9 @@ pub struct ClaudeTranscriptIngest {
     /// other threads in a shared day directory cost one `stat` per file.
     codex_seen: Mutex<HashMap<PathBuf, (i64, Option<i64>)>>,
     codex_path_cache: RwLock<HashMap<String, PathBuf>>,
+    /// Threads a hook already asked to import; each asks once, so a thread
+    /// that cannot be bound does not turn every hook event into a pass.
+    codex_nudged: Mutex<HashSet<String>>,
     registry_nudge: Notify,
     writer_probe: Arc<dyn CliWriterProbe>,
     directories: RwLock<HashMap<PathBuf, DirectoryContext>>,
@@ -465,6 +468,7 @@ impl ClaudeTranscriptIngest {
             codex_files: RwLock::new(HashMap::new()),
             codex_seen: Mutex::new(HashMap::new()),
             codex_path_cache: RwLock::new(HashMap::new()),
+            codex_nudged: Mutex::new(HashSet::new()),
             registry_nudge: Notify::new(),
             writer_probe,
             directories: RwLock::new(HashMap::new()),
@@ -1124,12 +1128,26 @@ impl ClaudeTranscriptIngest {
         };
         let mut native_file = CliNativeFile::register(&self.db.pool, &registration).await?;
 
-        let mut link = ClaudeSessionLink::resolve_or_bind_executor(
-            &self.db.pool,
-            claude_session_id,
-            &context.cwd.to_string_lossy(),
-        )
-        .await?;
+        // A Codex rollout is only tracked once a CLI pane's binding linked it,
+        // and the executor never writes to a thread another session owns (a
+        // chat follow-up forks a new thread), so its link is read, not
+        // re-derived with a write on every append.
+        let mut link = if is_codex {
+            ClaudeSessionLink::find(&self.db.pool, claude_session_id)
+                .await?
+                .map(|link| ClaudeSessionLinkMutation {
+                    previous_session_id: Some(link.session_id),
+                    link,
+                    republished_outbox: 0,
+                })
+        } else {
+            ClaudeSessionLink::resolve_or_bind_executor(
+                &self.db.pool,
+                claude_session_id,
+                &context.cwd.to_string_lossy(),
+            )
+            .await?
+        };
         // Fresh Codex panes are bound during registry reconciliation; this
         // probe only recognises a Claude process.
         if link.is_none() && !is_codex {
@@ -1399,7 +1417,13 @@ impl ClaudeTranscriptIngest {
                 .and_then(rollout_thread_id)
                 == Some(codex_thread_id)
         });
-        if !tracked {
+        if !tracked
+            && self
+                .codex_nudged
+                .lock()
+                .unwrap()
+                .insert(codex_thread_id.to_string())
+        {
             self.registry_nudge.notify_one();
         }
     }
