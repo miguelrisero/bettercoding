@@ -15,7 +15,21 @@
     "setupRunningTitle": "Preparing the workspace",
     "title": "Claude CLI",
     "titleShort": "CLI",
-    "working": "Working…"
+    "working": "Working…",
+    "composer": {
+      "toggle": "Composer",
+      "toggleHint": "Write in a text box and send the whole message to the terminal",
+      "label": "Message for the terminal agent",
+      "placeholder": "Write a message. Enter sends, Shift+Enter adds a line.",
+      "send": "Send to terminal",
+      "unsubmitted": "The text is in the terminal but was not submitted. Press Enter in the terminal to submit it.",
+      "noAgent": "No agent is running in this terminal. Restart the agent, then send again.",
+      "notDelivered": "tmux did not confirm the text. Check the terminal before you send again.",
+      "empty": "Write a message to send.",
+      "controlChars": "The text contains control characters that the terminal cannot receive. Remove them, then send again.",
+      "tooLarge": "The text is {{size}} KB. The limit is {{limit}} KB.",
+      "failed": "The message was not sent: {{message}}"
+    }
   },
   "loopAutomation": {
     "label": "Keep going",

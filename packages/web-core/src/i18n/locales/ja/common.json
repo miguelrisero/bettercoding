@@ -15,7 +15,21 @@
     "setupRunningTitle": "ワークスペースを準備しています",
     "title": "Claude CLI",
     "titleShort": "CLI",
-    "working": "作業中…"
+    "working": "作業中…",
+    "composer": {
+      "toggle": "コンポーザー",
+      "toggleHint": "テキストボックスで書き、メッセージ全体をターミナルに送信します",
+      "label": "ターミナルのエージェントへのメッセージ",
+      "placeholder": "メッセージを入力。Enter で送信、Shift+Enter で改行。",
+      "send": "ターミナルに送信",
+      "unsubmitted": "テキストはターミナルにありますが、送信されていません。ターミナルで Enter を押して送信してください。",
+      "noAgent": "このターミナルでエージェントが実行されていません。エージェントを再起動してから再送信してください。",
+      "notDelivered": "tmux がテキストを確認できませんでした。再送信する前にターミナルを確認してください。",
+      "empty": "送信するメッセージを入力してください。",
+      "controlChars": "ターミナルが受信できない制御文字が含まれています。削除してから再送信してください。",
+      "tooLarge": "テキストは {{size}} KB です。上限は {{limit}} KB です。",
+      "failed": "メッセージは送信されませんでした: {{message}}"
+    }
   },
   "loopAutomation": {
     "label": "継続",

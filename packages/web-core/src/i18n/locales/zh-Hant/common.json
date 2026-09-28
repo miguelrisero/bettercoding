@@ -15,7 +15,21 @@
     "setupRunningTitle": "正在準備工作區",
     "title": "Claude CLI",
     "titleShort": "CLI",
-    "working": "工作中…"
+    "working": "工作中…",
+    "composer": {
+      "toggle": "編輯器",
+      "toggleHint": "在文字方塊中撰寫，並將完整訊息傳送到終端機",
+      "label": "傳送給終端機代理的訊息",
+      "placeholder": "輸入訊息。Enter 傳送，Shift+Enter 換行。",
+      "send": "傳送到終端機",
+      "unsubmitted": "文字已在終端機中，但未提交。請在終端機中按 Enter 提交。",
+      "noAgent": "此終端機中沒有執行中的代理。請重新啟動代理，然後重新傳送。",
+      "notDelivered": "tmux 未確認文字。重新傳送前請檢查終端機。",
+      "empty": "請輸入要傳送的訊息。",
+      "controlChars": "文字包含終端機無法接收的控制字元。請移除後重新傳送。",
+      "tooLarge": "文字大小為 {{size}} KB。上限為 {{limit}} KB。",
+      "failed": "訊息未傳送：{{message}}"
+    }
   },
   "loopAutomation": {
     "label": "繼續執行",

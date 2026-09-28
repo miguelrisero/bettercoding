@@ -44,6 +44,17 @@ const loadMobileFontScale = (): MobileFontScale => {
   return 'default';
 };
 
+const CLI_COMPOSER_KEY = 'vk-cli-composer';
+
+const loadCliComposerEnabled = (): boolean => {
+  try {
+    return localStorage.getItem(CLI_COMPOSER_KEY) === '1';
+  } catch {
+    // localStorage may be unavailable
+  }
+  return false;
+};
+
 export type KanbanViewMode = 'kanban' | 'list';
 
 export type ContextBarPosition =
@@ -372,6 +383,9 @@ type State = {
   // Mobile font scale
   mobileFontScale: MobileFontScale;
 
+  // CLI mode: write in a frontend composer and send full texts to the pane
+  cliComposerEnabled: boolean;
+
   // Last selected organization and project (persisted via scratch store)
   selectedOrgId: string | null;
   selectedProjectId: string | null;
@@ -460,6 +474,8 @@ type State = {
   // Mobile font scale actions
   setMobileFontScale: (scale: MobileFontScale) => void;
 
+  setCliComposerEnabled: (enabled: boolean) => void;
+
   // Last selected organization and project actions
   setSelectedOrgId: (orgId: string | null) => void;
   clearSelectedOrgId: () => void;
@@ -503,6 +519,8 @@ export const useUiPreferencesStore = create<State>()((set, get) => ({
 
   // Mobile font scale
   mobileFontScale: loadMobileFontScale(),
+
+  cliComposerEnabled: loadCliComposerEnabled(),
 
   // Last selected organization and project
   selectedOrgId: null,
@@ -857,6 +875,19 @@ export const useUiPreferencesStore = create<State>()((set, get) => ({
     set({ mobileFontScale: scale });
   },
 
+  setCliComposerEnabled: (enabled) => {
+    try {
+      if (enabled) {
+        localStorage.setItem(CLI_COMPOSER_KEY, '1');
+      } else {
+        localStorage.removeItem(CLI_COMPOSER_KEY);
+      }
+    } catch {
+      // localStorage may be unavailable
+    }
+    set({ cliComposerEnabled: enabled });
+  },
+
   // Last selected organization and project actions
   setSelectedOrgId: (orgId) => set({ selectedOrgId: orgId }),
   clearSelectedOrgId: () => set({ selectedOrgId: null }),
@@ -966,6 +997,13 @@ export function useMobileFontScale() {
   const scale = useUiPreferencesStore((s) => s.mobileFontScale);
   const set = useUiPreferencesStore((s) => s.setMobileFontScale);
   return [scale, set] as const;
+}
+
+// Hook for the CLI composer preference
+export function useCliComposerEnabled() {
+  const enabled = useUiPreferencesStore((s) => s.cliComposerEnabled);
+  const set = useUiPreferencesStore((s) => s.setCliComposerEnabled);
+  return [enabled, set] as const;
 }
 
 // Hook for workspace-specific panel state

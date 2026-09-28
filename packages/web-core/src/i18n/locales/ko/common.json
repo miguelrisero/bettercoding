@@ -15,7 +15,21 @@
     "setupRunningTitle": "워크스페이스를 준비하는 중",
     "title": "Claude CLI",
     "titleShort": "CLI",
-    "working": "작업 중…"
+    "working": "작업 중…",
+    "composer": {
+      "toggle": "작성기",
+      "toggleHint": "텍스트 상자에 작성하고 전체 메시지를 터미널로 보냅니다",
+      "label": "터미널 에이전트에게 보낼 메시지",
+      "placeholder": "메시지를 입력하세요. Enter로 보내고 Shift+Enter로 줄을 추가합니다.",
+      "send": "터미널로 보내기",
+      "unsubmitted": "텍스트가 터미널에 있지만 제출되지 않았습니다. 터미널에서 Enter를 눌러 제출하세요.",
+      "noAgent": "이 터미널에서 실행 중인 에이전트가 없습니다. 에이전트를 다시 시작한 후 다시 보내세요.",
+      "notDelivered": "tmux가 텍스트를 확인하지 못했습니다. 다시 보내기 전에 터미널을 확인하세요.",
+      "empty": "보낼 메시지를 입력하세요.",
+      "controlChars": "터미널이 받을 수 없는 제어 문자가 포함되어 있습니다. 제거한 후 다시 보내세요.",
+      "tooLarge": "텍스트 크기는 {{size}} KB입니다. 한도는 {{limit}} KB입니다.",
+      "failed": "메시지를 보내지 못했습니다: {{message}}"
+    }
   },
   "loopAutomation": {
     "label": "계속하기",

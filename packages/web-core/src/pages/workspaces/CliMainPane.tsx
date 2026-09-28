@@ -3,6 +3,7 @@ import {
   ChatsTeardropIcon,
   CircleIcon,
   CircleNotchIcon,
+  TextAlignLeftIcon,
   WarningCircleIcon,
   XIcon,
 } from '@phosphor-icons/react';
@@ -11,6 +12,9 @@ import { XTermInstance } from '@/shared/components/XTermInstance';
 import { LoopAutomationControl } from '@/shared/components/LoopAutomationControl';
 import { cliTabId } from '@/shared/hooks/useTerminal';
 import { useCliAgentStatus } from '@/shared/hooks/useCliAgentStatus';
+import { useCliComposerEnabled } from '@/shared/stores/useUiPreferencesStore';
+import { cn } from '@/shared/lib/utils';
+import { CliComposer } from './CliComposer';
 
 interface CliMainPaneProps {
   workspaceId: string;
@@ -88,6 +92,7 @@ export function CliMainPane({
       workspaceId,
       visible && sessionsReady && !executorRunning
     );
+  const [composerEnabled, setComposerEnabled] = useCliComposerEnabled();
 
   return (
     <div className="h-full bg-secondary flex flex-col">
@@ -133,6 +138,22 @@ export function CliMainPane({
             </span>
           )}
           <LoopAutomationControl workspaceId={workspaceId} />
+          <button
+            type="button"
+            onClick={() => setComposerEnabled(!composerEnabled)}
+            aria-pressed={composerEnabled}
+            className={cn(
+              'flex items-center gap-1 transition-colors shrink-0 p-1.5 -m-1.5 md:p-0 md:m-0',
+              composerEnabled ? 'text-normal' : 'text-low hover:text-normal'
+            )}
+            title={t('cliMode.composer.toggleHint')}
+            aria-label={t('cliMode.composer.toggle')}
+          >
+            <TextAlignLeftIcon className="size-icon-sm" weight="bold" />
+            <span className="text-xs hidden md:inline">
+              {t('cliMode.composer.toggle')}
+            </span>
+          </button>
           <button
             type="button"
             onClick={onBackToChat}
@@ -236,6 +257,14 @@ export function CliMainPane({
                   isActive={visible}
                   mode="cli"
                   sessionId={sessionId ?? undefined}
+                  footer={
+                    composerEnabled ? (
+                      <CliComposer
+                        key={workspaceId}
+                        workspaceId={workspaceId}
+                      />
+                    ) : undefined
+                  }
                 />
               </div>
             </div>

@@ -1713,10 +1713,11 @@ pub async fn cli_pane_agent_running_at(target: &CliTmuxTarget, program: &str) ->
 /// of every shipped `interactive_cli_spec`).
 pub const CLI_AGENT_PROGRAMS: &[&str] = &["claude", "codex"];
 
-/// Which of `programs` owns the pane, checked in the given order against ONE
-/// process snapshot. Order matters when several match: an agent can run
-/// another as a tool (claude shelling out to `codex exec`), so callers list
-/// the program they expect first. `None` when the pane can't be read.
+/// Which of `programs` owns the pane, from ONE process snapshot. When several
+/// run (an agent can run another as a tool: claude shelling out to
+/// `codex exec`), the one closest to the pane root wins, since that is the
+/// TUI reading the pane's input; list order breaks ties. `None` when the pane
+/// can't be read.
 pub async fn cli_pane_agent_program_at<'a>(
     target: &CliTmuxTarget,
     programs: &[&'a str],
@@ -1730,10 +1731,30 @@ fn first_program_in_pane_subtree<'a>(
     root_pid: u32,
     programs: &[&'a str],
 ) -> Option<&'a str> {
-    programs
-        .iter()
-        .copied()
-        .find(|program| pane_subtree_has_program(ps_listing, root_pid, program))
+    let (comm_by_pid, children) = parse_ps_tree(ps_listing);
+    // Breadth-first from the pane root, one depth level at a time.
+    let mut level = vec![root_pid];
+    let mut visited = HashSet::new();
+    while !level.is_empty() {
+        level.retain(|pid| visited.insert(*pid));
+        let found = programs.iter().copied().find(|program| {
+            level.iter().any(|pid| {
+                comm_by_pid
+                    .get(pid)
+                    .is_some_and(|comm| comm_matches_program(comm, program))
+            })
+        });
+        if found.is_some() {
+            return found;
+        }
+        level = level
+            .iter()
+            .filter_map(|pid| children.get(pid))
+            .flatten()
+            .copied()
+            .collect();
+    }
+    None
 }
 
 async fn pane_process_listing(target: &CliTmuxTarget) -> Option<(u32, String)> {
@@ -1817,7 +1838,8 @@ fn pane_subtree_has_program(ps_listing: &str, root_pid: u32, program: &str) -> b
     !pane_subtree_program_pids(ps_listing, root_pid, program).is_empty()
 }
 
-fn pane_subtree_program_pids(ps_listing: &str, root_pid: u32, program: &str) -> Vec<u32> {
+/// `ps -eo pid=,ppid=,comm=` snapshot as (comm by pid, children by ppid).
+fn parse_ps_tree(ps_listing: &str) -> (HashMap<u32, &str>, HashMap<u32, Vec<u32>>) {
     let mut comm_by_pid: HashMap<u32, &str> = HashMap::new();
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for line in ps_listing.lines() {
@@ -1839,6 +1861,11 @@ fn pane_subtree_program_pids(ps_listing: &str, root_pid: u32, program: &str) -> 
         comm_by_pid.insert(pid, comm.trim());
         children.entry(ppid).or_default().push(pid);
     }
+    (comm_by_pid, children)
+}
+
+fn pane_subtree_program_pids(ps_listing: &str, root_pid: u32, program: &str) -> Vec<u32> {
+    let (comm_by_pid, children) = parse_ps_tree(ps_listing);
     // Depth-first from the pane root, inclusive. `visited` guards against a
     // malformed snapshot: a real ppid graph is a forest and can't cycle, but a
     // torn read must not spin.
@@ -1983,8 +2010,9 @@ pub async fn capture_cli_pane(workspace_id: Uuid) -> Option<String> {
 /// user typed it. This is the only way to re-prompt a LIVE, detached agent: the
 /// parked `pending_cli_prompt` path only fires when a fresh tmux session is
 /// created, so an already-running pane needs keystroke injection. Every text
-/// is staged through a namespaced tmux buffer and bracketed-pasted, then Enter
-/// is sent as a separate key. Typing text as keys (`send-keys -l`) is not
+/// is staged through a namespaced tmux buffer and bracketed-pasted (for
+/// Claude Code, one short paste per line, see [`claude_paste_stream`]), then
+/// Enter is sent as a separate key. Typing text as keys (`send-keys -l`) is not
 /// used: Codex reads a fast burst of typed characters as a paste and turns
 /// the Enter that follows into a newline, leaving the text unsubmitted, and
 /// multi-line text typed as keys would submit at its first newline. A paste
@@ -2069,13 +2097,17 @@ async fn send_detached(
     let workspace_id = target.workspace_id;
     tokio::spawn(async move {
         let _guard = cli_send_lock(target.workspace_id).lock_owned().await;
-        if let Some(programs) = programs {
-            let programs: Vec<&str> = programs.iter().map(String::as_str).collect();
-            cli_pane_agent_program_at(&target, &programs)
-                .await
-                .flatten()?;
-        }
-        Some(send_cli_keys_locked(&target, &text).await)
+        let program = match programs {
+            Some(programs) => {
+                let programs: Vec<&str> = programs.iter().map(String::as_str).collect();
+                cli_pane_agent_program_at(&target, &programs)
+                    .await
+                    .flatten()?
+                    .to_owned()
+            }
+            None => String::new(),
+        };
+        Some(send_cli_keys_locked(&target, &program, &text).await)
     })
     .await
     .unwrap_or_else(|error| {
@@ -2088,7 +2120,54 @@ async fn send_detached(
 /// and the rest would reach the TUI as key input.
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
 
-async fn send_cli_keys_locked(target: &CliTmuxTarget, text: &str) -> CliSendResult {
+/// Bracketed-paste start marker.
+const BRACKETED_PASTE_START: &str = "\x1b[200~";
+
+/// Longest single paste Claude Code keeps as typed input, in UTF-16 units
+/// with each tab counted as four (Claude expands tabs in pastes). Claude Code
+/// 2.1.283 turns a paste longer than 800 units, or with more than
+/// `min(2, rows - 10)` line breaks, into a `[Pasted text #N]` placeholder and
+/// sends it wrapped in `<pasted_content>` tags, which the model reads as
+/// quoted material rather than the user's own words. Kept below 800 for
+/// margin.
+const CLAUDE_INLINE_PASTE_MAX_UNITS: usize = 512;
+
+/// Claude Code input stream for `text`: every line split into bracketed
+/// pastes short enough to stay inline, and a bare LF (Ctrl+J, Claude's
+/// "insert newline" key) between lines. No paste holds a line break, so the
+/// pane height cannot push one over the placeholder threshold, and the
+/// submitted turn is the plain text (tabs become four spaces, as in any
+/// Claude paste).
+fn claude_paste_stream(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 32 + 16);
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    for (index, line) in normalized.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let mut units = 0;
+        for ch in line.chars() {
+            let width = if ch == '\t' { 4 } else { ch.len_utf16() };
+            if units == 0 || units + width > CLAUDE_INLINE_PASTE_MAX_UNITS {
+                if units > 0 {
+                    out.push_str(BRACKETED_PASTE_END);
+                }
+                out.push_str(BRACKETED_PASTE_START);
+                units = 0;
+            }
+            out.push(ch);
+            units += width;
+        }
+        if units > 0 {
+            out.push_str(BRACKETED_PASTE_END);
+        }
+    }
+    out
+}
+
+/// `program` is the agent the ownership probe found in the pane (empty when
+/// the caller skipped the probe).
+async fn send_cli_keys_locked(target: &CliTmuxTarget, program: &str, text: &str) -> CliSendResult {
     if text.contains(BRACKETED_PASTE_END) {
         tracing::warn!(
             "CLI send to workspace {} refused: text holds the bracketed-paste end marker",
@@ -2099,7 +2178,14 @@ async fn send_cli_keys_locked(target: &CliTmuxTarget, text: &str) -> CliSendResu
     // Bare name (not `=exact`): send-keys/paste-buffer take a pane target, for
     // which the `=` session-target syntax is rejected. Unambiguous given
     // full-hex names.
-    let delivered = paste_via_tmux_buffer(target, text).await;
+    let delivered = if program == "claude" {
+        // Claude always enables bracketed paste at its prompt, so the stream
+        // carries its own markers and goes out verbatim (`-r` keeps each LF a
+        // Ctrl+J instead of tmux's default CR, which would submit the line).
+        paste_via_tmux_buffer(target, &claude_paste_stream(text), "-r").await
+    } else {
+        paste_via_tmux_buffer(target, text, "-p").await
+    };
     if !delivered {
         return CliSendResult::NotDelivered;
     }
@@ -2172,7 +2258,9 @@ async fn load_cli_tmux_buffer(target: &CliTmuxTarget, buffer: &str, text: &str) 
     .unwrap_or(false)
 }
 
-async fn paste_via_tmux_buffer(target: &CliTmuxTarget, text: &str) -> bool {
+/// `mode` is `-p` (tmux adds the bracketed-paste markers) or `-r` (payload
+/// sent verbatim, LF kept as LF).
+async fn paste_via_tmux_buffer(target: &CliTmuxTarget, text: &str, mode: &str) -> bool {
     // Per-send sequence number on top of the workspace namespace: two
     // concurrent sends to the SAME workspace (e.g. a loop wake-up racing a
     // deferred initial-prompt delivery) must not overwrite each other's buffer
@@ -2191,7 +2279,7 @@ async fn paste_via_tmux_buffer(target: &CliTmuxTarget, text: &str) -> bool {
         &target.socket,
         "paste-buffer",
         "-d",
-        "-p",
+        mode,
         "-b",
         &buffer,
         "-t",
@@ -4106,8 +4194,9 @@ mod tests {
     #[test]
     fn pane_agent_program_prefers_the_expected_agent_in_list_order() {
         // Real codex 0.157 tree: a bash wrapper execs the node launcher, which
-        // spawns the native `codex`. A claude pane running `codex exec` as a
-        // tool holds both names; the caller's order picks the pane's agent.
+        // spawns the native `codex`. A pane whose agent runs the other as a
+        // tool holds both names; the one nearer the pane root is the pane's
+        // agent whatever the caller's order (it picks the paste protocol).
         let codex_pane = "\
   100     1 sh
   200   100 node
@@ -4133,6 +4222,25 @@ mod tests {
         );
         assert_eq!(
             first_program_in_pane_subtree(claude_running_codex, 100, &["codex", "claude"]),
+            Some("claude")
+        );
+        let codex_running_claude = "\
+  100     1 sh
+  200   100 node
+  300   200 codex
+  400   300 claude
+";
+        assert_eq!(
+            first_program_in_pane_subtree(codex_running_claude, 100, CLI_AGENT_PROGRAMS),
+            Some("codex")
+        );
+        let both_at_root_depth = "\
+  100     1 sh
+  200   100 codex
+  300   100 claude
+";
+        assert_eq!(
+            first_program_in_pane_subtree(both_at_root_depth, 100, &["codex", "claude"]),
             Some("codex")
         );
         assert_eq!(
@@ -4231,6 +4339,111 @@ mod tests {
             let sender = pair[0].strip_suffix("-first").expect("first line");
             assert_eq!(pair[1], format!("{sender}-second"), "pane: {lines:?}");
         }
+    }
+
+    /// Bracketed segments of a Claude paste stream, split at the line feeds
+    /// between them.
+    fn claude_stream_lines(stream: &str) -> Vec<Vec<&str>> {
+        stream
+            .split('\n')
+            .map(|line| {
+                line.split(BRACKETED_PASTE_END)
+                    .filter(|part| !part.is_empty())
+                    .map(|part| {
+                        part.strip_prefix(BRACKETED_PASTE_START)
+                            .expect("every segment opens a paste")
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn claude_paste_stream_keeps_line_breaks_outside_every_paste() {
+        let stream = claude_paste_stream("first\n\tsecond\r\n\nfourth\rfifth");
+        assert_eq!(
+            stream,
+            "\x1b[200~first\x1b[201~\n\x1b[200~\tsecond\x1b[201~\n\n\
+             \x1b[200~fourth\x1b[201~\n\x1b[200~fifth\x1b[201~"
+        );
+        assert_eq!(
+            claude_paste_stream("one line"),
+            "\x1b[200~one line\x1b[201~"
+        );
+        assert_eq!(claude_paste_stream("\n"), "\n");
+    }
+
+    #[test]
+    fn claude_paste_stream_splits_long_lines_under_the_inline_limit() {
+        // Tabs count four units and astral characters two, as Claude
+        // measures a paste after expanding tabs.
+        let line = format!(
+            "{}{}{}",
+            "a".repeat(700),
+            "\t".repeat(100),
+            "🚀".repeat(300)
+        );
+        let stream = claude_paste_stream(&line);
+        let lines = claude_stream_lines(&stream);
+        assert_eq!(lines.len(), 1);
+        let segments = &lines[0];
+        assert!(segments.len() > 1);
+        for segment in segments {
+            let units: usize = segment
+                .chars()
+                .map(|ch| if ch == '\t' { 4 } else { ch.len_utf16() })
+                .sum();
+            assert!(units <= CLAUDE_INLINE_PASTE_MAX_UNITS, "{units}");
+            assert!(!segment.contains('\n'));
+        }
+        assert_eq!(segments.concat(), line);
+    }
+
+    #[tokio::test]
+    async fn claude_send_reaches_the_pane_verbatim() {
+        if !tmux_available() {
+            return;
+        }
+        // A raw-mode `cat` records the exact bytes the pane receives: the
+        // markers and each LF must arrive untouched (tmux's default paste
+        // separator would turn LF into CR, which submits in Claude), then
+        // the Enter.
+        let pair = scratch_tmux_pair();
+        let dir = tempfile::tempdir().expect("scratch output dir");
+        let out = dir.path().join("received");
+        let target = owned_cli_tmux_target_on(
+            CliTmuxHome::Current,
+            Uuid::new_v4(),
+            &pair.current.socket,
+            &pair.legacy.socket,
+        );
+        let command = format!(
+            "stty raw -echo; exec cat > {}",
+            shell_single_quote(&out.to_string_lossy())
+        );
+        let output = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &target.socket,
+                "new-session",
+                "-d",
+                "-s",
+                &target.session_name,
+                &command,
+            ])
+            .output()
+            .expect("start cat pane");
+        assert!(output.status.success());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let text = "line one\n\tline two\n\nlast 🚀";
+        assert_eq!(
+            send_cli_keys_locked(&target, "claude", text).await,
+            CliSendResult::Submitted
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let received = std::fs::read_to_string(&out).expect("read pane input");
+        assert_eq!(received, format!("{}\r", claude_paste_stream(text)));
     }
 
     #[test]
