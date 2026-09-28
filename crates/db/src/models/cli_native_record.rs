@@ -117,6 +117,8 @@ pub struct SessionNativeRecord {
     pub file_name: String,
     pub generation: i64,
     pub last_import_at: Option<DateTime<Utc>>,
+    /// Working directory the native session is bound under.
+    pub link_cwd: String,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -613,6 +615,16 @@ impl CliNativeRecord {
     /// commits the row, so every row at or below an observed `seq` is already
     /// visible: a caller that has consumed rows through `after_seq` can fetch
     /// only the tail.
+    ///
+    /// A Codex rollout row (`rollout-*` file) written while one of the
+    /// session's coding-agent processes ran is attributed to that process.
+    /// Codex rollouts carry no per-record link to the executor, and a rollout
+    /// a CLI pane resumed also holds the executor's earlier turns (a forked
+    /// thread replays its whole history, stamped when the fork writes it),
+    /// which chat already renders from the executor's logs. Only a process
+    /// that ran this very thread qualifies: a chat follow-up forks a new
+    /// thread, so a pane turn typed while it runs stays the pane's. A run a
+    /// reset dropped keeps its rows, so they stay out of chat with it.
     pub async fn list_for_session_after(
         pool: &SqlitePool,
         session_id: Uuid,
@@ -629,14 +641,35 @@ impl CliNativeRecord {
                       r.ts,
                       r.raw,
                       r.disposition,
-                      (
-                          SELECT enl.execution_process_id
-                          FROM execution_native_links enl
-                          JOIN execution_processes linked_ep
-                            ON linked_ep.id = enl.execution_process_id
-                          WHERE enl.native_uuid = r.uuid
-                          ORDER BY linked_ep.created_at ASC
-                          LIMIT 1
+                      COALESCE(
+                          (
+                              SELECT enl.execution_process_id
+                              FROM execution_native_links enl
+                              JOIN execution_processes linked_ep
+                                ON linked_ep.id = enl.execution_process_id
+                              WHERE enl.native_uuid = r.uuid
+                              ORDER BY linked_ep.created_at ASC
+                              LIMIT 1
+                          ),
+                          CASE WHEN f.file_name LIKE 'rollout-%' AND r.ts IS NOT NULL THEN (
+                              SELECT window_ep.id
+                              FROM execution_processes window_ep
+                              WHERE window_ep.session_id = l.session_id
+                                AND window_ep.run_reason = 'codingagent'
+                                AND EXISTS (
+                                    SELECT 1 FROM coding_agent_turns window_cat
+                                    WHERE window_cat.execution_process_id = window_ep.id
+                                      AND window_cat.agent_session_id = r.claude_session_id
+                                )
+                                AND julianday(r.ts) >= julianday(window_ep.started_at)
+                                AND (
+                                    julianday(r.ts) <= julianday(window_ep.completed_at)
+                                    OR (window_ep.completed_at IS NULL
+                                        AND window_ep.status = 'running')
+                                )
+                              ORDER BY window_ep.started_at DESC
+                              LIMIT 1
+                          ) END
                       ) AS "linked_execution_process_id?: Uuid",
                       cat.execution_process_id AS "bound_turn_execution_process_id?: Uuid",
                       r.bound_queued_message_id AS "bound_queued_message_id: Uuid",
@@ -644,7 +677,8 @@ impl CliNativeRecord {
                       f.dir_path,
                       f.file_name,
                       f.generation,
-                      f.last_import_at AS "last_import_at?: DateTime<Utc>"
+                      f.last_import_at AS "last_import_at?: DateTime<Utc>",
+                      l.cwd AS link_cwd
                FROM cli_native_records r
                JOIN cli_native_files f ON f.id = r.file_id
                JOIN claude_session_links l

@@ -4,6 +4,8 @@
 //! `read_dir`, `metadata`, or `File::open`. App-owned persistence goes only to
 //! SQLite through `db` model functions.
 
+#[cfg(test)]
+mod codex_tests;
 mod forks;
 mod projection;
 mod tail;
@@ -36,10 +38,12 @@ use db::{
         cli_pane_binding::{CliPaneBinding, CliPaneBoundVia},
         session::Session,
         workspace::{Workspace, WorkspaceError},
+        workspace_cli_activity::WorkspaceCliActivity,
     },
 };
-use executors::executors::claude::native::{
-    NativeClaudeDisposition, NativeClaudeSkipReason, adapt_native_claude_line,
+use executors::executors::{
+    claude::native::{NativeClaudeDisposition, NativeClaudeSkipReason, adapt_native_claude_line},
+    codex::rollout::{CodexRolloutDisposition, adapt_codex_rollout_line, rollout_thread_id},
 };
 pub use forks::{NativeForkBranch, NativeForkView};
 use futures::StreamExt;
@@ -80,6 +84,15 @@ const CONCURRENT_IMPORT_BATCHES: usize = 1;
 /// cap the least recently used session is evicted, preferring ones without a
 /// connected feed; a session is also dropped when its last feed disconnects.
 const PROJECTION_CACHE_CAPACITY: usize = 32;
+/// Codex day directories a CLI-first fallback reads when no hook reported the
+/// fresh pane's thread: the pane's launch day, its neighbours (the directory
+/// name is the local date) and today, newest first.
+const CODEX_FALLBACK_DAY_DIRS: usize = 4;
+/// Rollouts written this long before a pane launch still count as its own.
+const CODEX_FALLBACK_LAUNCH_SKEW: chrono::Duration = chrono::Duration::seconds(60);
+/// Bytes read from a rollout's first line (`session_meta`) when matching a
+/// fresh pane by working directory.
+const CODEX_SESSION_META_READ_LIMIT: u64 = 1024 * 1024;
 
 /// Days an unreachable transcript is kept before retention removes it. `0`
 /// disables retention and lets the store grow without bound.
@@ -331,6 +344,23 @@ impl CliWriterProbe for TestNoPaneWriterProbe {
 pub struct ClaudeTranscriptIngest {
     db: DBService,
     projects_dir: PathBuf,
+    /// `$CODEX_HOME/sessions`; `None` disables Codex rollout import.
+    codex_sessions_dir: Option<PathBuf>,
+    /// Codex rollouts to import, by day directory and path. Codex keeps every
+    /// thread of every project in shared day directories, so only these files
+    /// are read there.
+    codex_files: RwLock<HashMap<PathBuf, HashMap<PathBuf, DirectoryContext>>>,
+    /// Size and mtime at the last import of each Codex rollout, so events for
+    /// other threads in a shared day directory cost one `stat` per file.
+    /// Codex only appends to a rollout; a rewrite that keeps both is caught by
+    /// a forced rescan, not by this skip.
+    codex_seen: Mutex<HashMap<PathBuf, (i64, Option<i64>)>>,
+    codex_path_cache: RwLock<HashMap<String, PathBuf>>,
+    /// Threads a hook asked to import since the last registry pass; each asks
+    /// once per pass, so a thread that cannot be bound does not turn every
+    /// hook event into a pass.
+    codex_nudged: Mutex<HashSet<String>>,
+    registry_nudge: Notify,
     writer_probe: Arc<dyn CliWriterProbe>,
     directories: RwLock<HashMap<PathBuf, DirectoryContext>>,
     watchers: tokio::sync::Mutex<HashMap<PathBuf, JoinHandle<()>>>,
@@ -368,7 +398,10 @@ impl ClaudeTranscriptIngest {
         shutdown: CancellationToken,
     ) -> Option<Arc<Self>> {
         let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
-        let service = Arc::new(Self::new_with_probe(db, projects_dir, writer_probe));
+        let mut service = Self::new_with_probe(db, projects_dir, writer_probe);
+        service.codex_sessions_dir =
+            executors::executors::codex::codex_home().map(|home| home.join("sessions"));
+        let service = Arc::new(service);
 
         if !utils::feature_flags::cli_transcript_ingest_enabled() {
             tracing::info!(
@@ -435,6 +468,12 @@ impl ClaudeTranscriptIngest {
         Self {
             db,
             projects_dir,
+            codex_sessions_dir: None,
+            codex_files: RwLock::new(HashMap::new()),
+            codex_seen: Mutex::new(HashMap::new()),
+            codex_path_cache: RwLock::new(HashMap::new()),
+            codex_nudged: Mutex::new(HashSet::new()),
+            registry_nudge: Notify::new(),
             writer_probe,
             directories: RwLock::new(HashMap::new()),
             watchers: tokio::sync::Mutex::new(HashMap::new()),
@@ -580,12 +619,19 @@ impl ClaudeTranscriptIngest {
     ) -> Result<NativeIngestHealth, ClaudeTranscriptIngestError> {
         let degraded_paths = self.degraded_watchers.read().await.clone();
         let directories = self.directories.read().await;
+        let codex_files = self.codex_files.read().await;
         let watch_degraded = degraded_paths.iter().any(|path| {
             directories
                 .get(path)
                 .is_some_and(|context| context.workspace_id == session.workspace_id)
+                || codex_files.get(path).is_some_and(|files| {
+                    files
+                        .values()
+                        .any(|context| context.workspace_id == session.workspace_id)
+                })
         });
         drop(directories);
+        drop(codex_files);
         let quarantined_files = self.quarantined_paths.lock().unwrap().len() as u64;
         let foreign_writer_seen_at =
             ClaudeSessionLink::latest_foreign_writer_seen_for_session(&self.db.pool, session.id)
@@ -740,14 +786,14 @@ impl ClaudeTranscriptIngest {
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
-                _ = interval.tick() => {
-                    if let Err(error) = self
-                        .reconcile_registry(start_watchers, shutdown.child_token())
-                        .await
-                    {
-                        tracing::warn!(?error, "CLI transcript reconciliation failed");
-                    }
-                }
+                _ = interval.tick() => {}
+                _ = self.registry_nudge.notified() => {}
+            }
+            if let Err(error) = self
+                .reconcile_registry(start_watchers, shutdown.child_token())
+                .await
+            {
+                tracing::warn!(?error, "CLI transcript reconciliation failed");
             }
         }
     }
@@ -758,7 +804,10 @@ impl ClaudeTranscriptIngest {
         shutdown: CancellationToken,
     ) -> Result<ScanCounts, ClaudeTranscriptIngestError> {
         let mut desired = HashMap::new();
-        if self.projects_dir.is_dir() {
+        let mut codex_desired = HashMap::new();
+        let claude_store = self.projects_dir.is_dir();
+        let codex_root = self.codex_sessions_dir.clone().filter(|root| root.is_dir());
+        if claude_store || codex_root.is_some() {
             for workspace in Workspace::fetch_all(&self.db.pool).await? {
                 if workspace.archived || workspace.worktree_deleted {
                     continue;
@@ -781,6 +830,14 @@ impl ClaudeTranscriptIngest {
                     workspace_id: workspace.id,
                     cwd: cwd.clone(),
                 };
+                if let Some(root) = &codex_root {
+                    for path in self.codex_cli_rollouts(root, &workspace).await? {
+                        codex_desired.insert(path, context.clone());
+                    }
+                }
+                if !claude_store {
+                    continue;
+                }
                 let computed_dir = self.projects_dir.join(claude_project_slug(&cwd));
                 if computed_dir.is_dir() {
                     let dir = fs::canonicalize(&computed_dir).unwrap_or(computed_dir.clone());
@@ -791,6 +848,11 @@ impl ClaudeTranscriptIngest {
                     ClaudeSessionLink::known_session_ids_for_workspace(&self.db.pool, workspace.id)
                         .await?
                 {
+                    // Codex thread ids (UUIDv7) are handled above; Claude's
+                    // are v4, so a v7 id is never in the Claude store.
+                    if is_codex_thread_id(&sid) {
+                        continue;
+                    }
                     if computed_dir.join(format!("{sid}.jsonl")).is_file() {
                         continue;
                     }
@@ -801,22 +863,53 @@ impl ClaudeTranscriptIngest {
                 }
             }
         }
-        self.reconcile_directories(desired, start_watchers, shutdown)
+        self.reconcile_directories(desired, codex_desired, start_watchers, shutdown)
             .await
     }
 
     async fn reconcile_directories(
         self: &Arc<Self>,
         desired: HashMap<PathBuf, DirectoryContext>,
+        codex_desired: HashMap<PathBuf, DirectoryContext>,
         start_watchers: bool,
         shutdown: CancellationToken,
     ) -> Result<ScanCounts, ClaudeTranscriptIngestError> {
+        let scan_dirs = desired
+            .keys()
+            .cloned()
+            .chain(
+                codex_desired
+                    .keys()
+                    .filter_map(|path| path.parent().map(Path::to_path_buf)),
+            )
+            .collect::<HashSet<_>>();
         let watched_paths = if start_watchers {
-            desired.keys().cloned().collect::<HashSet<_>>()
+            scan_dirs.clone()
         } else {
             HashSet::new()
         };
         *self.directories.write().await = desired;
+        self.codex_seen
+            .lock()
+            .unwrap()
+            .retain(|path, _| codex_desired.contains_key(path));
+        self.codex_path_cache
+            .write()
+            .await
+            .retain(|_, path| codex_desired.contains_key(path));
+        // This pass served every earlier request; a thread that still cannot
+        // be bound may ask again, at most once per pass.
+        self.codex_nudged.lock().unwrap().clear();
+        let mut codex_by_dir = HashMap::<PathBuf, HashMap<PathBuf, DirectoryContext>>::new();
+        for (path, context) in codex_desired {
+            if let Some(dir) = path.parent() {
+                codex_by_dir
+                    .entry(dir.to_path_buf())
+                    .or_default()
+                    .insert(path, context);
+            }
+        }
+        *self.codex_files.write().await = codex_by_dir;
 
         let mut removed = Vec::new();
         {
@@ -853,15 +946,8 @@ impl ClaudeTranscriptIngest {
                     .await;
             }
         }
-        let directories = self
-            .directories
-            .read()
-            .await
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
         let mut counts = ScanCounts::default();
-        for dir in directories {
+        for dir in scan_dirs {
             let scanned = self.scan_directory(&dir, false).await?;
             counts.directories += 1;
             counts.files += scanned.files;
@@ -937,7 +1023,7 @@ impl ClaudeTranscriptIngest {
         dir: &Path,
         force_rescan: bool,
     ) -> Result<ScanCounts, ClaudeTranscriptIngestError> {
-        let mut counts = ScanCounts::default();
+        let mut counts = self.scan_codex_files(dir, force_rescan).await;
         let Some(context) = self.directories.read().await.get(dir).cloned() else {
             return Ok(counts);
         };
@@ -1028,9 +1114,18 @@ impl ClaudeTranscriptIngest {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default();
-        let Some(claude_session_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        let codex_thread_id = rollout_thread_id(file_name);
+        let Some(claude_session_id) =
+            codex_thread_id.or_else(|| path.file_stem().and_then(|stem| stem.to_str()))
+        else {
             return Ok(0);
         };
+        let is_codex = codex_thread_id.is_some();
+        // Cleared until this import completes: a failed import, or a scan
+        // coalesced into this one, must not leave the file looking current.
+        if is_codex {
+            self.codex_seen.lock().unwrap().remove(path);
+        }
         let dir_path = path
             .parent()
             .unwrap_or_else(|| Path::new(""))
@@ -1056,13 +1151,29 @@ impl ClaudeTranscriptIngest {
         };
         let mut native_file = CliNativeFile::register(&self.db.pool, &registration).await?;
 
-        let mut link = ClaudeSessionLink::resolve_or_bind_executor(
-            &self.db.pool,
-            claude_session_id,
-            &context.cwd.to_string_lossy(),
-        )
-        .await?;
-        if link.is_none() {
+        // A Codex rollout is only tracked once a CLI pane's binding linked it,
+        // and the executor never writes to a thread another session owns (a
+        // chat follow-up forks a new thread), so its link is read, not
+        // re-derived with a write on every append.
+        let mut link = if is_codex {
+            ClaudeSessionLink::find(&self.db.pool, claude_session_id)
+                .await?
+                .map(|link| ClaudeSessionLinkMutation {
+                    previous_session_id: Some(link.session_id),
+                    link,
+                    republished_outbox: 0,
+                })
+        } else {
+            ClaudeSessionLink::resolve_or_bind_executor(
+                &self.db.pool,
+                claude_session_id,
+                &context.cwd.to_string_lossy(),
+            )
+            .await?
+        };
+        // Fresh Codex panes are bound during registry reconciliation; this
+        // probe only recognises a Claude process.
+        if link.is_none() && !is_codex {
             link = self
                 .try_auto_bind_cli_fresh(claude_session_id, context)
                 .await?;
@@ -1079,7 +1190,10 @@ impl ClaudeTranscriptIngest {
             self.quarantined_paths.lock().unwrap().remove(path);
         }
 
-        let import_context = if link.is_some() {
+        // The writer probe only recognises a Claude process, so a live Codex
+        // pane would read as absent; Codex keeps the fail-closed default and
+        // is never flagged as a foreign writer.
+        let import_context = if link.is_some() && !is_codex {
             let report = self
                 .writer_probe
                 .probe(
@@ -1150,7 +1264,21 @@ impl ClaudeTranscriptIngest {
             }
 
             let mut records = Vec::new();
+            let codex_cwd = context.cwd.to_string_lossy();
             for complete in &tail.lines {
+                if is_codex {
+                    let (record, unknown) = codex_native_record(
+                        complete.line_seq,
+                        claude_session_id,
+                        &complete.raw,
+                        &codex_cwd,
+                    );
+                    if unknown {
+                        self.unknown_kinds.fetch_add(1, Ordering::Relaxed);
+                    }
+                    records.extend(record);
+                    continue;
+                }
                 match adapt_native_claude_line(&complete.raw, claude_session_id) {
                     Ok(line) => {
                         let disposition = match line.disposition() {
@@ -1261,7 +1389,243 @@ impl ClaudeTranscriptIngest {
                 break;
             }
         }
+        if is_codex {
+            self.codex_seen
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), (observed_size, observed_mtime_ms));
+        }
         Ok(inserted)
+    }
+
+    /// Import every tracked Codex rollout in `dir` that changed since its last
+    /// import.
+    async fn scan_codex_files(&self, dir: &Path, force_rescan: bool) -> ScanCounts {
+        let mut counts = ScanCounts::default();
+        let files = self
+            .codex_files
+            .read()
+            .await
+            .get(dir)
+            .map(|files| {
+                files
+                    .iter()
+                    .map(|(path, context)| (path.clone(), context.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (path, context) in files {
+            counts.files += 1;
+            let Ok(metadata) = fs::metadata(&path) else {
+                counts.failed_files += 1;
+                continue;
+            };
+            let stamp = (file_size(&metadata), modified_ms(&metadata));
+            if !force_rescan && self.codex_seen.lock().unwrap().get(&path) == Some(&stamp) {
+                continue;
+            }
+            match self
+                .process_native_path(&path, &context, force_rescan)
+                .await
+            {
+                Ok(records) => counts.records += records,
+                Err(error) => {
+                    counts.failed_files += 1;
+                    tracing::warn!(?error, path = %path.display(), "Codex rollout import failed");
+                }
+            }
+        }
+        counts
+    }
+
+    /// Ask for an early registry pass when a CLI-mode Codex reports a thread
+    /// not imported yet, so its first turns do not wait for the next tick.
+    pub async fn request_codex_import(&self, codex_thread_id: &str) {
+        let tracked = self
+            .codex_files
+            .read()
+            .await
+            .values()
+            .flat_map(HashMap::keys)
+            .any(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(rollout_thread_id)
+                    == Some(codex_thread_id)
+            });
+        if !tracked
+            && self
+                .codex_nudged
+                .lock()
+                .unwrap()
+                .insert(codex_thread_id.to_string())
+        {
+            self.registry_nudge.notify_one();
+        }
+    }
+
+    /// Rollouts of the Codex threads this workspace's CLI panes ran.
+    ///
+    /// Only threads a pane was bound to are imported. The executor forks a new
+    /// thread for every chat follow-up, each replaying the history before it,
+    /// and chat already renders those turns from the executor's own logs.
+    async fn codex_cli_rollouts(
+        &self,
+        root: &Path,
+        workspace: &Workspace,
+    ) -> Result<Vec<PathBuf>, ClaudeTranscriptIngestError> {
+        self.bind_fresh_codex_cli(root, workspace).await?;
+        let mut paths = Vec::new();
+        for sid in
+            CliPaneBinding::bound_session_ids_for_workspace(&self.db.pool, workspace.id).await?
+        {
+            if let Some(path) = self.locate_codex_rollout(root, &sid).await {
+                paths.push(path);
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Bind the thread a fresh CLI-mode Codex pane started.
+    ///
+    /// The thread id comes from the pane's own activity hook when Codex runs
+    /// with hooks. Otherwise the pane's working directory and launch time
+    /// select interactive rollouts no other session owns; only a single match
+    /// binds, and several are quarantined rather than guessed between. Either
+    /// way the thread must have started after the pane launched, so a report
+    /// or rollout from an earlier pane never binds.
+    ///
+    /// The ownership check, the session link and the pane binding commit in
+    /// one transaction, so a concurrent owner or a released pane leaves
+    /// nothing half-written.
+    async fn bind_fresh_codex_cli(
+        &self,
+        root: &Path,
+        workspace: &Workspace,
+    ) -> Result<(), ClaudeTranscriptIngestError> {
+        let pool = &self.db.pool;
+        let Some(binding) = CliPaneBinding::find_active_for_workspace(pool, workspace.id).await?
+        else {
+            return Ok(());
+        };
+        if binding.bound_via != CliPaneBoundVia::CliFresh || binding.claude_session_id.is_some() {
+            return Ok(());
+        }
+        let Some(session) = Session::find_by_id(pool, binding.session_id).await? else {
+            return Ok(());
+        };
+        let is_codex = session.executor.as_deref().is_some_and(|executor| {
+            matches!(
+                executor.parse(),
+                Ok(executors::executors::BaseCodingAgent::Codex)
+            )
+        });
+        // The pane runs in its own session's directory, which can differ
+        // from the workspace's latest session.
+        let Some(cwd) = workspace
+            .container_ref
+            .as_deref()
+            .and_then(|container_ref| session.effective_working_dir(Path::new(container_ref)))
+        else {
+            return Ok(());
+        };
+        if !is_codex {
+            return Ok(());
+        }
+        let launched_at = binding.created_at - CODEX_FALLBACK_LAUNCH_SKEW;
+        let hook_sid = WorkspaceCliActivity::find_by_workspace_id(pool, workspace.id)
+            .await?
+            .filter(|activity| activity.hook_at.is_some_and(|at| at >= binding.created_at))
+            .and_then(|activity| activity.hook)
+            .map(|hook| hook.agent_session_id)
+            .filter(|sid| codex_thread_created_at(sid).is_some_and(|at| at >= launched_at));
+        // The hook names the thread, but its rollout must still be an
+        // interactive session this pane started, as the fallback requires.
+        let hooked = match &hook_sid {
+            Some(sid) => self.locate_codex_rollout(root, sid).await,
+            None => None,
+        };
+        let root = root.to_path_buf();
+        let scan_cwd = cwd.clone();
+        let candidates = tokio::task::spawn_blocking(move || match (hook_sid, hooked) {
+            (Some(sid), Some(path)) if codex_rollout_started_in(&path, &scan_cwd, launched_at) => {
+                vec![(sid, path)]
+            }
+            _ => codex_rollouts_started_in(&root, &scan_cwd, launched_at),
+        })
+        .await
+        .unwrap_or_default();
+        let mut unowned = Vec::new();
+        for (sid, path) in candidates {
+            if ClaudeSessionLink::find(pool, &sid)
+                .await?
+                .is_none_or(|link| link.session_id == binding.session_id)
+            {
+                unowned.push((sid, path));
+            }
+        }
+        match unowned.as_slice() {
+            [] => {}
+            [(sid, path)] => {
+                if let Some(mutation) = CliPaneBinding::assign_discovered_session(
+                    pool,
+                    binding.id,
+                    sid,
+                    binding.session_id,
+                    workspace.id,
+                    &cwd.to_string_lossy(),
+                )
+                .await?
+                {
+                    self.apply_link_mutation(&mutation).await;
+                    self.quarantined_paths.lock().unwrap().remove(path);
+                }
+            }
+            ambiguous => {
+                tracing::info!(
+                    workspace_id = %workspace.id,
+                    candidates = ambiguous.len(),
+                    "several Codex rollouts match a fresh CLI pane; none bound"
+                );
+                self.quarantined_paths
+                    .lock()
+                    .unwrap()
+                    .extend(ambiguous.iter().map(|(_, path)| path.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// The rollout of Codex thread `sid`. Thread ids are UUIDv7, so their
+    /// creation time names the day directory; only the neighbouring days are
+    /// read (the directory name is the local date).
+    async fn locate_codex_rollout(&self, root: &Path, sid: &str) -> Option<PathBuf> {
+        if !is_codex_thread_id(sid) {
+            return None;
+        }
+        if let Some(cached) = self.codex_path_cache.read().await.get(sid).cloned()
+            && cached.is_file()
+        {
+            return Some(cached);
+        }
+        let created = codex_thread_created_at(sid)?;
+        let suffix = format!("-{sid}.jsonl");
+        let found = (-1..=1)
+            .filter_map(|days| created.checked_add_signed(chrono::Duration::days(days)))
+            .map(|day| codex_day_dir(root, day))
+            .filter_map(|dir| fs::read_dir(dir).ok())
+            .flat_map(|entries| entries.flatten())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(&suffix))
+            })?;
+        self.codex_path_cache
+            .write()
+            .await
+            .insert(sid.to_string(), found.clone());
+        Some(found)
     }
 
     async fn try_auto_bind_cli_fresh(
@@ -1585,6 +1949,117 @@ fn verify_last_line_hash(
     let mut bytes = vec![0; length];
     file.read_exact(&mut bytes)?;
     Ok(Some(hash_bytes(&bytes)))
+}
+
+/// Codex thread ids are UUIDv7; Claude session ids are v4.
+fn is_codex_thread_id(sid: &str) -> bool {
+    Uuid::parse_str(sid).is_ok_and(|id| id.get_version_num() == 7)
+}
+
+fn codex_thread_created_at(sid: &str) -> Option<DateTime<Utc>> {
+    let (seconds, nanos) = Uuid::parse_str(sid).ok()?.get_timestamp()?.to_unix();
+    DateTime::from_timestamp(seconds as i64, nanos)
+}
+
+fn codex_day_dir(root: &Path, day: DateTime<Utc>) -> PathBuf {
+    root.join(day.format("%Y/%m/%d").to_string())
+}
+
+/// Interactive (`source: "cli"`) rollouts whose `session_meta` names `cwd`
+/// and which started at or after `since`, as `(thread id, path)`.
+fn codex_rollouts_started_in(
+    root: &Path,
+    cwd: &Path,
+    since: DateTime<Utc>,
+) -> Vec<(String, PathBuf)> {
+    let first = since.date_naive() - chrono::Duration::days(1);
+    let since_ms = since.timestamp_millis();
+    let last = (Utc::now() + chrono::Duration::days(1)).date_naive();
+    std::iter::successors(Some(last), |day| day.pred_opt())
+        .take_while(|day| *day >= first)
+        .take(CODEX_FALLBACK_DAY_DIRS)
+        .filter_map(|day| fs::read_dir(root.join(day.format("%Y/%m/%d").to_string())).ok())
+        .flat_map(|entries| entries.flatten())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let sid = rollout_thread_id(path.file_name()?.to_str()?)?.to_string();
+            let modified = modified_ms(&entry.metadata().ok()?)?;
+            (modified >= since_ms && codex_rollout_started_in(&path, cwd, since))
+                .then_some((sid, path))
+        })
+        .collect()
+}
+
+/// Whether the rollout at `path` is an interactive (`source: "cli"`) session
+/// that started in `cwd` at or after `since`, per its `session_meta`.
+fn codex_rollout_started_in(path: &Path, cwd: &Path, since: DateTime<Utc>) -> bool {
+    let matches = || -> Option<bool> {
+        let mut first_line = String::new();
+        BufReader::new(File::open(path).ok()?.take(CODEX_SESSION_META_READ_LIMIT))
+            .read_line(&mut first_line)
+            .ok()?;
+        let meta: serde_json::Value = serde_json::from_str(&first_line).ok()?;
+        let payload = meta.get("payload")?;
+        let started = payload
+            .get("timestamp")
+            .and_then(|value| value.as_str())
+            .and_then(parse_native_timestamp)?;
+        Some(
+            meta.get("type")?.as_str()? == "session_meta"
+                && payload.get("source")?.as_str()? == "cli"
+                && Path::new(payload.get("cwd")?.as_str()?) == cwd
+                && started >= since,
+        )
+    };
+    matches().unwrap_or(false)
+}
+
+/// The stored form of one Codex rollout line, and whether it was unknown.
+/// Bookkeeping lines are not stored: they never render and a rollout repeats
+/// every turn several times over.
+fn codex_native_record(
+    line_seq: i64,
+    thread_id: &str,
+    raw: &str,
+    cwd: &str,
+) -> (Option<NewCliNativeRecord>, bool) {
+    let unknown = |ts: Option<String>| NewCliNativeRecord {
+        line_seq,
+        claude_session_id: thread_id.to_string(),
+        uuid: None,
+        parent_uuid: None,
+        kind: "unknown".to_string(),
+        ts,
+        raw: raw.to_string(),
+        disposition: CliNativeRecordDisposition::Unknown,
+        user_prompt: None,
+        recorded_at: None,
+    };
+    let Ok(line) = adapt_codex_rollout_line(raw, cwd) else {
+        return (Some(unknown(None)), true);
+    };
+    match line.disposition {
+        CodexRolloutDisposition::Bookkeeping => (None, false),
+        CodexRolloutDisposition::Unknown => (Some(unknown(line.timestamp)), true),
+        CodexRolloutDisposition::Renderable => (
+            Some(NewCliNativeRecord {
+                line_seq,
+                claude_session_id: thread_id.to_string(),
+                uuid: line.item_id,
+                parent_uuid: line.turn_id,
+                kind: line.kind,
+                recorded_at: line.timestamp.as_deref().and_then(parse_native_timestamp),
+                ts: line.timestamp,
+                raw: raw.to_string(),
+                disposition: CliNativeRecordDisposition::Renderable,
+                // No prompt-equality reconciliation: it would hide a pane turn
+                // that repeats a recent chat prompt, and executor turns in a
+                // rollout are attributed by their run window instead.
+                user_prompt: None,
+            }),
+            false,
+        ),
+    }
 }
 
 fn file_size(metadata: &Metadata) -> i64 {

@@ -5,7 +5,10 @@ use std::{
 
 use db::models::cli_native_record::{CliNativeRecordDisposition, SessionNativeRecord};
 use executors::{
-    executors::claude::native::{NativeClaudeNormalizer, adapt_native_claude_line},
+    executors::{
+        claude::native::{NativeClaudeNormalizer, adapt_native_claude_line},
+        codex::rollout::{adapt_codex_rollout_line, rollout_thread_id},
+    },
     logs::{NormalizedEntry, NormalizedEntryType},
 };
 use serde::{Deserialize, Serialize};
@@ -325,6 +328,10 @@ impl NativeProjection {
             }
         }
 
+        if rollout_thread_id(&row.file_name).is_some() {
+            self.fold_codex_row(row);
+            return;
+        }
         if row.disposition == CliNativeRecordDisposition::Sidechain.as_str() {
             return;
         }
@@ -387,18 +394,7 @@ impl NativeProjection {
                 continue;
             }
 
-            let linked_execution_process_id = row
-                .linked_execution_process_id
-                .or(row.bound_turn_execution_process_id);
-            let origin = if row.linked_execution_process_id.is_some() {
-                NativeFeedOrigin::Executor
-            } else if row.bound_turn_execution_process_id.is_some()
-                || row.bound_queued_message_id.is_some()
-            {
-                NativeFeedOrigin::App
-            } else {
-                NativeFeedOrigin::Cli
-            };
+            let (origin, linked_execution_process_id) = row_origin(row);
             self.entry_positions.insert(key, self.entries.len());
             self.entries.push(NativeFeedEntry {
                 normalized_entry: change.entry,
@@ -410,6 +406,33 @@ impl NativeProjection {
                 linked_execution_process_id,
                 git_branch: metadata.git_branch.clone(),
                 version: metadata.version.clone(),
+                branch: None,
+                seq: row.seq,
+            });
+        }
+    }
+
+    /// A Codex rollout row: every completed item appends its entries once, and
+    /// a rollout has no fork DAG, so it never touches forks or branches.
+    fn fold_codex_row(&mut self, row: &SessionNativeRecord) {
+        if row.disposition != CliNativeRecordDisposition::Renderable.as_str() {
+            return;
+        }
+        let Ok(line) = adapt_codex_rollout_line(&row.raw, &row.link_cwd) else {
+            return;
+        };
+        let (origin, linked_execution_process_id) = row_origin(row);
+        for normalized_entry in line.entries {
+            self.entries.push(NativeFeedEntry {
+                normalized_entry,
+                claude_session_id: row.claude_session_id.clone(),
+                uuid: line.item_id.clone(),
+                parent_uuid: line.turn_id.clone(),
+                ts: line.timestamp.clone(),
+                origin,
+                linked_execution_process_id,
+                git_branch: None,
+                version: None,
                 branch: None,
                 seq: row.seq,
             });
@@ -457,6 +480,22 @@ impl NativeProjection {
             }
         }
     }
+}
+
+/// Who wrote a native row, and the executor process it belongs to if any.
+fn row_origin(row: &SessionNativeRecord) -> (NativeFeedOrigin, Option<Uuid>) {
+    let linked = row
+        .linked_execution_process_id
+        .or(row.bound_turn_execution_process_id);
+    let origin = if row.linked_execution_process_id.is_some() {
+        NativeFeedOrigin::Executor
+    } else if row.bound_turn_execution_process_id.is_some() || row.bound_queued_message_id.is_some()
+    {
+        NativeFeedOrigin::App
+    } else {
+        NativeFeedOrigin::Cli
+    };
+    (origin, linked)
 }
 
 /// Claude Code writes a multi-line or large bracketed paste (the chat
@@ -684,6 +723,7 @@ mod tests {
                 file_name: format!("{}.jsonl", line.sid),
                 generation: 1,
                 last_import_at: None,
+                link_cwd: "/tmp/native-projection-test".to_string(),
             });
             *line_seq += 1;
         }
@@ -789,6 +829,54 @@ mod tests {
         }
         assert!(saw_replacement, "no sequence replaced an entry in place");
         assert!(saw_fork_change, "no sequence changed the fork topology");
+    }
+
+    #[test]
+    fn codex_rows_extend_exactly_like_a_full_build() {
+        const CODEX: &str = include_str!(
+            "../../../../executors/src/executors/codex/testdata/rollout-0.157.1.redacted.jsonl"
+        );
+        let file_id = Uuid::from_u128(7);
+        let rows = CODEX
+            .lines()
+            .enumerate()
+            .map(|(index, raw)| SessionNativeRecord {
+                file_id,
+                line_seq: index as i64,
+                claude_session_id: "01a0e7f5-9f42-73e0-9b4d-2dfa51b6f868".to_string(),
+                uuid: None,
+                parent_uuid: None,
+                kind: String::new(),
+                ts: None,
+                raw: raw.to_string(),
+                disposition: CliNativeRecordDisposition::Renderable.as_str().to_string(),
+                linked_execution_process_id: None,
+                bound_turn_execution_process_id: None,
+                bound_queued_message_id: None,
+                seq: index as i64 + 1,
+                dir_path: "/sessions/2026/09/28".to_string(),
+                file_name: "rollout-2026-09-28T12-20-29-01a0e7f5-9f42-73e0-9b4d-2dfa51b6f868.jsonl"
+                    .to_string(),
+                generation: 0,
+                last_import_at: None,
+                link_cwd: "/workspace/demo".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let full = NativeProjection::build(&rows, 0);
+        assert_eq!(full.entries().len(), 10);
+        assert!(full.forks().is_empty());
+        for split in 0..rows.len() {
+            let mut projection = NativeProjection::build(&rows[..split], 0);
+            let cursor = projection.cursor();
+            assert!(projection.can_extend(&rows[split..]));
+            projection.extend(&rows[split..]);
+            assert_eq!(
+                entries_json(projection.entries()),
+                entries_json(full.entries())
+            );
+            let delta = projection.delta_since(cursor).unwrap();
+            assert!(delta.replaced.is_empty() && !delta.forks_changed);
+        }
     }
 
     #[test]
