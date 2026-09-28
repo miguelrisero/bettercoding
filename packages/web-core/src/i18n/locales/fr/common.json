@@ -15,7 +15,21 @@
     "setupRunningTitle": "Préparation de l'espace de travail",
     "title": "CLI Claude",
     "titleShort": "CLI",
-    "working": "En cours…"
+    "working": "En cours…",
+    "composer": {
+      "toggle": "Éditeur",
+      "toggleHint": "Écrire dans une zone de texte et envoyer le message complet au terminal",
+      "label": "Message pour l'agent du terminal",
+      "placeholder": "Écrivez un message. Entrée envoie, Maj+Entrée ajoute une ligne.",
+      "send": "Envoyer au terminal",
+      "unsubmitted": "Le texte est dans le terminal mais n'a pas été soumis. Appuyez sur Entrée dans le terminal pour le soumettre.",
+      "noAgent": "Aucun agent ne tourne dans ce terminal. Redémarrez l'agent, puis renvoyez.",
+      "notDelivered": "Le terminal n'a pas reçu le texte. Renvoyez-le.",
+      "empty": "Écrivez un message à envoyer.",
+      "controlChars": "Le texte contient des caractères de contrôle que le terminal ne peut pas recevoir. Supprimez-les, puis renvoyez.",
+      "tooLarge": "Le texte fait {{size}} Ko. La limite est de {{limit}} Ko.",
+      "failed": "Le message n'a pas été envoyé : {{message}}"
+    }
   },
   "loopAutomation": {
     "label": "Continuer",

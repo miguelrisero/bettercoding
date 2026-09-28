@@ -4,6 +4,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type ReactNode,
 } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
@@ -51,6 +52,11 @@ interface XTermInstanceProps {
    * (handover from the chat UI). Forwarded to the terminal WS as `session_id`.
    */
   sessionId?: string;
+  /**
+   * Rendered under the terminal, above the touch key bar (the CLI composer).
+   * The terminal refits when this changes height.
+   */
+  footer?: ReactNode;
 }
 
 function isTerminalMeasurable(terminal: Terminal): boolean {
@@ -75,6 +81,7 @@ export function XTermInstance({
   onClose,
   mode = 'shell',
   sessionId,
+  footer,
 }: XTermInstanceProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const resizeRef = useRef<HTMLDivElement>(null);
@@ -452,6 +459,9 @@ export function XTermInstance({
       timer = setTimeout(fitTerminal, 75);
     });
     observer.observe(resizeRef.current);
+    // The terminal's own box also shrinks when a footer grows, while the
+    // outer pane keeps its size.
+    if (containerRef.current) observer.observe(containerRef.current);
     return () => {
       if (timer) clearTimeout(timer);
       observer.disconnect();
@@ -482,6 +492,7 @@ export function XTermInstance({
         <div ref={containerRef} className="w-full h-full" />
         <TerminalMobileControls terminal={liveTerminal} refit={fitTerminal} />
       </div>
+      {footer}
       {/* Touch-only hotkey row (renders null off-touch). Sits at the pane's
           bottom edge — the visual-viewport sizing keeps that edge above the
           on-screen keyboard, Termius-style. */}

@@ -15,7 +15,21 @@
     "setupRunningTitle": "正在准备工作区",
     "title": "Claude CLI",
     "titleShort": "CLI",
-    "working": "工作中…"
+    "working": "工作中…",
+    "composer": {
+      "toggle": "编辑器",
+      "toggleHint": "在文本框中编写，并将完整消息发送到终端",
+      "label": "发送给终端代理的消息",
+      "placeholder": "输入消息。Enter 发送，Shift+Enter 换行。",
+      "send": "发送到终端",
+      "unsubmitted": "文本已在终端中，但未提交。请在终端中按 Enter 提交。",
+      "noAgent": "此终端中没有运行的代理。请重启代理，然后重新发送。",
+      "notDelivered": "终端未收到文本。请重新发送。",
+      "empty": "请输入要发送的消息。",
+      "controlChars": "文本包含终端无法接收的控制字符。请删除后重新发送。",
+      "tooLarge": "文本大小为 {{size}} KB。上限为 {{limit}} KB。",
+      "failed": "消息未发送：{{message}}"
+    }
   },
   "loopAutomation": {
     "label": "继续运行",
