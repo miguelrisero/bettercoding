@@ -107,6 +107,7 @@ pub struct SessionNativeRecord {
     pub dir_path: String,
     pub file_name: String,
     pub generation: i64,
+    pub last_import_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -594,6 +595,20 @@ impl CliNativeRecord {
         pool: &SqlitePool,
         session_id: Uuid,
     ) -> Result<Vec<SessionNativeRecord>, sqlx::Error> {
+        Self::list_for_session_after(pool, session_id, i64::MIN).await
+    }
+
+    /// Projection rows whose outbox `seq` is above `after_seq`, in `seq` order.
+    ///
+    /// Outbox sequences are allocated inside the SQLite write transaction that
+    /// commits the row, so every row at or below an observed `seq` is already
+    /// visible: a caller that has consumed rows through `after_seq` can fetch
+    /// only the tail.
+    pub async fn list_for_session_after(
+        pool: &SqlitePool,
+        session_id: Uuid,
+        after_seq: i64,
+    ) -> Result<Vec<SessionNativeRecord>, sqlx::Error> {
         sqlx::query_as!(
             SessionNativeRecord,
             r#"SELECT r.file_id AS "file_id!: Uuid",
@@ -613,13 +628,14 @@ impl CliNativeRecord {
                           WHERE enl.native_uuid = r.uuid
                           ORDER BY linked_ep.created_at ASC
                           LIMIT 1
-                      ) AS "linked_execution_process_id: Uuid",
-                      cat.execution_process_id AS "bound_turn_execution_process_id: Uuid",
+                      ) AS "linked_execution_process_id?: Uuid",
+                      cat.execution_process_id AS "bound_turn_execution_process_id?: Uuid",
                       r.bound_queued_message_id AS "bound_queued_message_id: Uuid",
                       outbox.seq,
                       f.dir_path,
                       f.file_name,
-                      f.generation
+                      f.generation,
+                      f.last_import_at AS "last_import_at: DateTime<Utc>"
                FROM cli_native_records r
                JOIN cli_native_files f ON f.id = r.file_id
                JOIN claude_session_links l
@@ -631,6 +647,8 @@ impl CliNativeRecord {
                LEFT JOIN coding_agent_turns cat
                  ON cat.id = r.bound_coding_agent_turn_id
                WHERE l.session_id = $1
+                 AND outbox.session_id = $1
+                 AND outbox.seq > $2
                  AND f.generation = (
                      SELECT MAX(newer.generation)
                      FROM cli_native_files newer
@@ -638,7 +656,8 @@ impl CliNativeRecord {
                        AND newer.file_name = f.file_name
                  )
                ORDER BY outbox.seq ASC"#,
-            session_id
+            session_id,
+            after_seq
         )
         .fetch_all(pool)
         .await

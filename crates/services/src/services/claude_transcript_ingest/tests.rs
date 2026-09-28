@@ -43,7 +43,8 @@ use uuid::Uuid;
 
 use super::{
     ClaudeTranscriptIngest, ClaudeTranscriptIngestError, CliSessionKind, DirectoryContext,
-    NativeFeedOrigin, NativeFeedUpdate, claude_project_slug, read_session_preview,
+    NativeFeedChange, NativeFeedOrigin, NativeFeedUpdate, claude_project_slug,
+    read_session_preview,
 };
 use crate::services::cli_collab::{CliWriterProbe, ProbeReport, SidEvidence};
 
@@ -2464,5 +2465,360 @@ async fn watcher_degradation_is_scoped_to_its_workspace() {
             .unwrap()
             .health
             .watch_degraded
+    );
+}
+
+fn chained_record(sid: &str, line_seq: i64) -> NewCliNativeRecord {
+    let uuid = format!("chain-{line_seq}");
+    let parent = (line_seq > 0).then(|| format!("chain-{}", line_seq - 1));
+    let raw = serde_json::json!({
+        "type": "assistant",
+        "sessionId": sid,
+        "uuid": uuid,
+        "parentUuid": parent,
+        "timestamp": "2026-07-20T20:00:00Z",
+        "message": {
+            "role": "assistant",
+            "content": [{
+                "type": "text",
+                "text": format!("step {line_seq}: {}", "the build is still green ".repeat(8)),
+            }],
+        },
+    })
+    .to_string();
+    NewCliNativeRecord {
+        line_seq,
+        claude_session_id: sid.to_string(),
+        uuid: Some(uuid),
+        parent_uuid: parent,
+        kind: "assistant".to_string(),
+        ts: Some("2026-07-20T20:00:00Z".to_string()),
+        raw,
+        disposition: CliNativeRecordDisposition::Renderable,
+        user_prompt: None,
+        recorded_at: None,
+    }
+}
+
+async fn import_chained(db: &DBService, file_id: Uuid, sid: &str, lines: std::ops::Range<i64>) {
+    let records = lines
+        .clone()
+        .map(|line_seq| chained_record(sid, line_seq))
+        .collect::<Vec<_>>();
+    for batch in records.chunks(500) {
+        CliNativeRecord::import_batch_with_context(
+            &db.pool,
+            file_id,
+            batch,
+            &cursor(batch.last().unwrap().line_seq + 1),
+            NativeImportContext::default(),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+fn cached_rows_visited(service: &ClaudeTranscriptIngest, session_id: Uuid) -> u64 {
+    let cell = service
+        .projections
+        .lock()
+        .unwrap()
+        .sessions
+        .get(&session_id)
+        .expect("projection is cached")
+        .cell
+        .clone();
+    cell.try_lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .projection
+        .rows_visited()
+}
+
+struct AppendCost {
+    rows_visited: Vec<u64>,
+    /// Fastest of several updates: the least scheduler-noise-sensitive
+    /// estimate on a shared machine.
+    fastest: Duration,
+    payload_bytes: Vec<usize>,
+    appended_bytes: Vec<usize>,
+}
+
+async fn measure_append_cost(history: i64) -> AppendCost {
+    let db = test_db().await;
+    let temp = TempDir::new().unwrap();
+    let (workspace, session) = create_workspace_and_session(&db, temp.path()).await;
+    let sid = "61616161-6161-4161-8161-616161616161";
+    let file = register_native_file(&db, workspace.id, sid).await;
+    ClaudeSessionLink::assign_manual(&db.pool, sid, session.id, "/tmp/native-import-test")
+        .await
+        .unwrap()
+        .unwrap();
+    import_chained(&db, file.id, sid, 0..history).await;
+
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), temp.path().into()));
+    let _subscription = service.subscribe_feed(session.id);
+    let (change, mut cursor) = service.feed_since(session.id, None).await.unwrap();
+    let NativeFeedChange::Full(snapshot) = change else {
+        panic!("the first update is a snapshot");
+    };
+    assert_eq!(snapshot.entries.len(), history as usize);
+
+    let mut cost = AppendCost {
+        rows_visited: Vec::new(),
+        fastest: Duration::ZERO,
+        payload_bytes: Vec::new(),
+        appended_bytes: Vec::new(),
+    };
+    let mut timings = Vec::new();
+    for line_seq in history..history + 7 {
+        import_chained(&db, file.id, sid, line_seq..line_seq + 1).await;
+        let visited = cached_rows_visited(&service, session.id);
+        let started = std::time::Instant::now();
+        let (change, next) = service.feed_since(session.id, Some(cursor)).await.unwrap();
+        timings.push(started.elapsed());
+        cursor = next;
+        cost.rows_visited
+            .push(cached_rows_visited(&service, session.id) - visited);
+        let NativeFeedChange::Delta {
+            appended,
+            replaced,
+            forks,
+            health,
+            ..
+        } = change
+        else {
+            panic!("an append at an unchanged revision is a delta");
+        };
+        assert_eq!(appended.len(), 1);
+        assert!(replaced.is_empty() && forks.is_none());
+        let appended_bytes = serde_json::to_vec(&appended).unwrap().len();
+        cost.appended_bytes.push(appended_bytes);
+        cost.payload_bytes
+            .push(appended_bytes + serde_json::to_vec(&health).unwrap().len());
+    }
+    cost.fastest = timings.into_iter().min().unwrap();
+    cost
+}
+
+/// Per-update work in the append case must follow the appended rows, not the
+/// transcript length: one row read and adapted per appended line, a payload
+/// the size of that line, and no 10x slowdown from 1k to 10k rows of history.
+#[tokio::test]
+async fn append_update_cost_scales_with_appended_rows_not_history() {
+    let small = measure_append_cost(1_000).await;
+    let large = measure_append_cost(10_000).await;
+    println!(
+        "fastest per-update time: 1k rows {:?}, 10k rows {:?}; payload bytes {:?} / {:?}",
+        small.fastest, large.fastest, small.payload_bytes, large.payload_bytes
+    );
+
+    for cost in [&small, &large] {
+        assert!(cost.rows_visited.iter().all(|visited| *visited == 1));
+        for (payload, appended) in cost.payload_bytes.iter().zip(&cost.appended_bytes) {
+            // Health adds a small constant (one file) on top of the new entry.
+            assert!(*payload < appended + 512, "{payload} vs {appended}");
+        }
+    }
+    let small_payload = small.payload_bytes.iter().max().unwrap();
+    let large_payload = large.payload_bytes.iter().max().unwrap();
+    assert!(*large_payload <= small_payload + 16);
+    // A full rebuild is ~10x slower at 10k rows; the incremental path should
+    // stay close to constant. 4x leaves room for scheduler noise.
+    assert!(
+        large.fastest < small.fastest * 4,
+        "10k-row update {:?} vs 1k-row update {:?}",
+        large.fastest,
+        small.fastest
+    );
+}
+
+/// A link moved to another session without a revision bump (the CLI resume
+/// path does this) removes rows from the canonical set, so the cached
+/// projection must rebuild rather than keep them.
+#[tokio::test]
+async fn cached_projection_rebuilds_when_a_link_moves_away() {
+    let db = test_db().await;
+    let temp = TempDir::new().unwrap();
+    let (workspace, session) = create_workspace_and_session(&db, temp.path()).await;
+    let other_session = create_session(&db, workspace.id).await;
+    let moving = "62626262-6262-4262-8262-626262626262";
+    let staying = "63636363-6363-4363-8363-636363636363";
+    for sid in [moving, staying] {
+        let file = register_native_file(&db, workspace.id, sid).await;
+        ClaudeSessionLink::assign_manual(&db.pool, sid, session.id, "/tmp/native-import-test")
+            .await
+            .unwrap()
+            .unwrap();
+        import_chained(&db, file.id, sid, 0..3).await;
+    }
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), temp.path().into()));
+    let _subscription = service.subscribe_feed(session.id);
+    let (_, cursor) = service.feed_since(session.id, None).await.unwrap();
+
+    ClaudeSessionLink::assign_cli(
+        &db.pool,
+        moving,
+        other_session.id,
+        workspace.id,
+        "/tmp/native-import-test",
+        ClaudeSessionBoundVia::CliResume,
+    )
+    .await
+    .unwrap();
+    let (change, _) = service.feed_since(session.id, Some(cursor)).await.unwrap();
+    let NativeFeedChange::Full(snapshot) = change else {
+        panic!("rows left the projection, so the consumer needs a snapshot");
+    };
+    assert_eq!(snapshot.entries.len(), 3);
+    assert!(
+        snapshot
+            .entries
+            .iter()
+            .all(|entry| entry.claude_session_id == staying)
+    );
+}
+
+#[tokio::test]
+async fn projection_cache_is_released_with_its_last_subscriber_and_bounded() {
+    let db = test_db().await;
+    let temp = TempDir::new().unwrap();
+    let (workspace, session) = create_workspace_and_session(&db, temp.path()).await;
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), temp.path().into()));
+
+    let first = service.subscribe_feed(session.id);
+    let second = service.subscribe_feed(session.id);
+    service.feed_since(session.id, None).await.unwrap();
+    drop(first);
+    assert!(
+        service
+            .projections
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key(&session.id)
+    );
+    drop(second);
+    assert!(
+        !service
+            .projections
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key(&session.id)
+    );
+
+    let _held = service.subscribe_feed(session.id);
+    for _ in 0..super::PROJECTION_CACHE_CAPACITY + 5 {
+        let unsubscribed = create_session(&db, workspace.id).await;
+        service.feed_since(unsubscribed.id, None).await.unwrap();
+    }
+    let cache = service.projections.lock().unwrap();
+    assert_eq!(cache.sessions.len(), super::PROJECTION_CACHE_CAPACITY);
+    assert!(cache.sessions.contains_key(&session.id));
+}
+
+/// Measures a start-up backfill against a copy of a real database while an
+/// API-shaped load runs. Point `CLI_BACKFILL_DB` at a COPY (never a live data
+/// directory; the run writes to it) and `CLI_BACKFILL_PROJECTS` at a Claude
+/// projects root, which is only read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual measurement against a copied database"]
+async fn measure_backfill_on_copied_database() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+
+    let db_path = std::env::var("CLI_BACKFILL_DB").expect("CLI_BACKFILL_DB");
+    let projects_dir = std::env::var("CLI_BACKFILL_PROJECTS").expect("CLI_BACKFILL_PROJECTS");
+    let options = SqliteConnectOptions::new()
+        .filename(&db_path)
+        .create_if_missing(false)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(30))
+        .synchronous(SqliteSynchronous::Normal);
+    let pool = SqlitePoolOptions::new()
+        .connect_with(options)
+        .await
+        .unwrap();
+    db::run_migrations_for_tests(&pool).await.unwrap();
+    let db = DBService { pool };
+    let workspaces = Workspace::fetch_all(&db.pool).await.unwrap();
+    let probe_workspace = workspaces[0].id;
+
+    let done = CancellationToken::new();
+    let load_db = db.clone();
+    let load_done = done.clone();
+    let load = tokio::spawn(async move {
+        let mut latencies = Vec::new();
+        let mut busy = 0u64;
+        while !load_done.is_cancelled() {
+            let started = std::time::Instant::now();
+            let read = sqlx::query("SELECT * FROM workspaces ORDER BY updated_at DESC")
+                .fetch_all(&load_db.pool)
+                .await
+                .map(|_| ());
+            let write = sqlx::query("UPDATE workspaces SET updated_at = updated_at WHERE id = ?")
+                .bind(probe_workspace)
+                .execute(&load_db.pool)
+                .await
+                .map(|_| ());
+            latencies.push(started.elapsed());
+            for result in [read, write] {
+                if let Err(sqlx::Error::Database(error)) = result
+                    && matches!(error.code().as_deref(), Some("5") | Some("517"))
+                {
+                    busy += 1;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        (latencies, busy)
+    });
+
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), projects_dir.into()));
+    let started = std::time::Instant::now();
+    let counts = service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
+    let backfill = started.elapsed();
+    done.cancel();
+    let (mut latencies, busy) = load.await.unwrap();
+    latencies.sort();
+    let percentile = |p: usize| latencies[(latencies.len() * p / 100).min(latencies.len() - 1)];
+    println!(
+        "backfill {backfill:?}: {} directories, {} files, {} records; \
+         API-shaped requests {} (p50 {:?}, p95 {:?}, max {:?}); SQLITE_BUSY {busy}",
+        counts.directories,
+        counts.files,
+        counts.records,
+        latencies.len(),
+        percentile(50),
+        percentile(95),
+        latencies.last().unwrap(),
+    );
+
+    let (largest, rows): (Uuid, i64) = sqlx::query_as(
+        "SELECT session_id, COUNT(*) AS rows FROM cli_ingest_outbox
+         GROUP BY session_id ORDER BY rows DESC LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let _subscription = service.subscribe_feed(largest);
+    let started = std::time::Instant::now();
+    let (change, cursor) = service.feed_since(largest, None).await.unwrap();
+    let full = started.elapsed();
+    let NativeFeedChange::Full(snapshot) = change else {
+        panic!("first update is a snapshot");
+    };
+    let snapshot_bytes = serde_json::to_vec(&snapshot).unwrap().len();
+    let started = std::time::Instant::now();
+    service.feed_since(largest, Some(cursor)).await.unwrap();
+    println!(
+        "largest session: {rows} rows, {} entries, {snapshot_bytes} snapshot bytes; \
+         full build {full:?}, incremental update {:?}",
+        snapshot.entries.len(),
+        started.elapsed()
     );
 }

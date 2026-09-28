@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use db::models::cli_native_record::{CliNativeRecordDisposition, SessionNativeRecord};
 use executors::{
@@ -9,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 use uuid::Uuid;
 
-use super::forks::{NativeDagRecord, NativeForkView, compute_fork_view};
+use super::forks::{ForkFreeTracker, NativeDagRecord, NativeForkView, compute_fork_view};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "lowercase")]
@@ -76,62 +79,302 @@ pub struct NativeFeedSnapshot {
     pub health: NativeIngestHealth,
 }
 
-#[derive(Default)]
 struct FileDag {
-    file_id: Option<Uuid>,
+    file_id: Uuid,
     claude_session_id: String,
     records: Vec<NativeDagRecord>,
     leaf_hint: Option<String>,
+    /// `None` once the tracker can no longer prove this file fork-free.
+    tracker: Option<ForkFreeTracker>,
+    fork: Option<NativeForkView>,
 }
 
-pub fn build_projection(
-    rows: &[SessionNativeRecord],
-    revision: u64,
-    seq: i64,
-    health: NativeIngestHealth,
-) -> NativeFeedSnapshot {
-    let mut normalizers = HashMap::<String, NativeClaudeNormalizer>::new();
-    let mut entry_positions = HashMap::<(String, usize), usize>::new();
-    let mut entries = Vec::<NativeFeedEntry>::new();
-    let mut file_dags = Vec::<FileDag>::new();
-    let mut file_dag_positions = HashMap::<Uuid, usize>::new();
+/// Distinguishes one full build from every other, across all sessions, so a
+/// change cursor taken from a replaced projection is never applied to it.
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
-    for row in rows {
+/// What a feed consumer has already received from one [`NativeProjection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeFeedCursor {
+    epoch: u64,
+    version: u64,
+    len: usize,
+}
+
+/// The entry-level difference between a cursor and the current projection.
+#[derive(Debug)]
+pub struct NativeFeedDelta<'a> {
+    /// Entries at or above the cursor's length, starting at `appended_from`.
+    pub appended_from: usize,
+    pub appended: &'a [NativeFeedEntry],
+    /// Entries below the cursor's length that changed in place.
+    pub replaced: Vec<(usize, &'a NativeFeedEntry)>,
+    pub forks_changed: bool,
+}
+
+/// A session's native feed projection, kept so that appended records can be
+/// folded in without re-reading or re-adapting the rows already projected.
+///
+/// [`NativeProjection::build`] over rows `a ++ b` is equal to `build(a)`
+/// followed by [`NativeProjection::extend`] with `b`, provided `b` holds only
+/// rows ordered after `a` and [`NativeProjection::can_extend`] accepts it. The
+/// fold is sequential by construction (one normalizer per Claude session, in
+/// row order); fork views are recomputed only for files the append touched
+/// and only when [`ForkFreeTracker`] cannot prove they stay fork-free.
+pub struct NativeProjection {
+    revision: u64,
+    last_row_seq: i64,
+    rows_visited: u64,
+    normalizers: HashMap<String, NativeClaudeNormalizer>,
+    entry_positions: HashMap<(String, usize), usize>,
+    entries: Vec<NativeFeedEntry>,
+    file_dags: Vec<FileDag>,
+    file_dag_positions: HashMap<Uuid, usize>,
+    file_ids_by_path: HashMap<(String, String), Uuid>,
+    files: Vec<NativeFileImportHealth>,
+    file_positions: HashMap<Uuid, usize>,
+    branch_by_uuid: HashMap<String, NativeBranchMetadata>,
+    forks: Vec<NativeFeedFork>,
+    epoch: u64,
+    version: u64,
+    forks_version: u64,
+    /// `(version, index)` for every in-place change to an entry, in version
+    /// order, so a cursor's replacements are found without scanning entries.
+    changes: Vec<(u64, usize)>,
+}
+
+impl NativeProjection {
+    pub fn build(rows: &[SessionNativeRecord], revision: u64) -> Self {
+        let mut projection = Self {
+            revision,
+            last_row_seq: i64::MIN,
+            rows_visited: 0,
+            normalizers: HashMap::new(),
+            entry_positions: HashMap::new(),
+            entries: Vec::new(),
+            file_dags: Vec::new(),
+            file_dag_positions: HashMap::new(),
+            file_ids_by_path: HashMap::new(),
+            files: Vec::new(),
+            file_positions: HashMap::new(),
+            branch_by_uuid: HashMap::new(),
+            forks: Vec::new(),
+            epoch: NEXT_EPOCH.fetch_add(1, Ordering::Relaxed),
+            version: 0,
+            forks_version: 0,
+            changes: Vec::new(),
+        };
+        let mut touched = BTreeSet::new();
+        for row in rows {
+            projection.fold_row(row, 0, &mut touched);
+        }
+        for dag in &mut projection.file_dags {
+            dag.fork = compute_fork_view(&dag.records, dag.leaf_hint.as_deref());
+        }
+        projection.rebuild_branches(0);
+        projection
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Highest outbox `seq` folded in; fetch only rows above it to extend.
+    pub fn last_row_seq(&self) -> i64 {
+        self.last_row_seq
+    }
+
+    #[cfg(test)]
+    /// Rows folded in since the full build, including it.
+    pub fn rows_visited(&self) -> u64 {
+        self.rows_visited
+    }
+
+    #[cfg(test)]
+    pub fn entries(&self) -> &[NativeFeedEntry] {
+        &self.entries
+    }
+
+    pub fn forks(&self) -> &[NativeFeedFork] {
+        &self.forks
+    }
+
+    pub fn files(&self) -> &[NativeFileImportHealth] {
+        &self.files
+    }
+
+    /// Whether `rows` can be folded in without a full rebuild. A row from a
+    /// newer generation of an already projected file means the older
+    /// generation's rows have left the canonical row set, which an append
+    /// cannot express.
+    pub fn can_extend(&self, rows: &[SessionNativeRecord]) -> bool {
+        rows.iter().all(|row| {
+            row.seq > self.last_row_seq
+                && self
+                    .file_ids_by_path
+                    .get(&(row.dir_path.clone(), row.file_name.clone()))
+                    .is_none_or(|file_id| *file_id == row.file_id)
+        })
+    }
+
+    pub fn extend(&mut self, rows: &[SessionNativeRecord]) {
+        if rows.is_empty() {
+            return;
+        }
+        self.version += 1;
+        let base_len = self.entries.len();
+        let mut touched = BTreeSet::new();
+        for row in rows {
+            self.fold_row(row, base_len, &mut touched);
+        }
+
+        let mut forks_changed = false;
+        for index in touched {
+            let dag = &mut self.file_dags[index];
+            if dag.tracker.is_some() {
+                continue;
+            }
+            let fork = compute_fork_view(&dag.records, dag.leaf_hint.as_deref());
+            if fork != dag.fork {
+                dag.fork = fork;
+                forks_changed = true;
+            }
+        }
+        if forks_changed {
+            self.forks_version = self.version;
+            self.rebuild_branches(base_len);
+        } else {
+            for entry in &mut self.entries[base_len..] {
+                entry.branch = entry
+                    .uuid
+                    .as_ref()
+                    .and_then(|uuid| self.branch_by_uuid.get(uuid).cloned());
+            }
+        }
+    }
+
+    pub fn cursor(&self) -> NativeFeedCursor {
+        NativeFeedCursor {
+            epoch: self.epoch,
+            version: self.version,
+            len: self.entries.len(),
+        }
+    }
+
+    /// The difference since `cursor`, or `None` when the cursor belongs to a
+    /// different build and the consumer needs the whole projection.
+    pub fn delta_since(&self, cursor: NativeFeedCursor) -> Option<NativeFeedDelta<'_>> {
+        if cursor.epoch != self.epoch || cursor.len > self.entries.len() {
+            return None;
+        }
+        let first_change = self
+            .changes
+            .partition_point(|(version, _)| *version <= cursor.version);
+        let replaced = self.changes[first_change..]
+            .iter()
+            .map(|(_, index)| *index)
+            .filter(|index| *index < cursor.len)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|index| (index, &self.entries[index]))
+            .collect();
+        Some(NativeFeedDelta {
+            appended_from: cursor.len,
+            appended: &self.entries[cursor.len..],
+            replaced,
+            forks_changed: self.forks_version > cursor.version,
+        })
+    }
+
+    pub fn snapshot(&self, seq: i64, mut health: NativeIngestHealth) -> NativeFeedSnapshot {
+        health.files = self.files.clone();
+        NativeFeedSnapshot {
+            revision: self.revision,
+            seq,
+            entries: self.entries.clone(),
+            forks: self.forks.clone(),
+            health,
+        }
+    }
+
+    fn fold_row(
+        &mut self,
+        row: &SessionNativeRecord,
+        base_len: usize,
+        touched: &mut BTreeSet<usize>,
+    ) {
+        self.rows_visited += 1;
+        self.last_row_seq = self.last_row_seq.max(row.seq);
+        self.file_ids_by_path
+            .insert((row.dir_path.clone(), row.file_name.clone()), row.file_id);
+        let health = NativeFileImportHealth {
+            claude_session_id: row.claude_session_id.clone(),
+            file_name: row.file_name.clone(),
+            generation: row.generation,
+            last_import_at: row.last_import_at.map(|time| time.to_rfc3339()),
+        };
+        match self.file_positions.get(&row.file_id) {
+            Some(position) => self.files[*position] = health,
+            None => {
+                self.file_positions.insert(row.file_id, self.files.len());
+                self.files.push(health);
+            }
+        }
+
         if row.disposition == CliNativeRecordDisposition::Sidechain.as_str() {
-            continue;
+            return;
         }
         let Ok(line) = adapt_native_claude_line(&row.raw, &row.claude_session_id) else {
-            continue;
+            return;
         };
         let metadata = line.metadata();
-        let dag_index = *file_dag_positions.entry(row.file_id).or_insert_with(|| {
-            let index = file_dags.len();
-            file_dags.push(FileDag {
-                file_id: Some(row.file_id),
-                claude_session_id: row.claude_session_id.clone(),
-                ..FileDag::default()
+        let dag_index = *self
+            .file_dag_positions
+            .entry(row.file_id)
+            .or_insert_with(|| {
+                self.file_dags.push(FileDag {
+                    file_id: row.file_id,
+                    claude_session_id: row.claude_session_id.clone(),
+                    records: Vec::new(),
+                    leaf_hint: None,
+                    tracker: Some(ForkFreeTracker::default()),
+                    fork: None,
+                });
+                self.file_dags.len() - 1
             });
-            index
-        });
-        let dag = &mut file_dags[dag_index];
+        let dag = &mut self.file_dags[dag_index];
         if let Some(uuid) = &metadata.uuid {
-            dag.records.push(NativeDagRecord {
+            let record = NativeDagRecord {
                 uuid: uuid.clone(),
                 parent_uuid: metadata.parent_uuid.clone(),
                 kind: metadata.kind.clone(),
-            });
+            };
+            if dag
+                .tracker
+                .as_mut()
+                .is_some_and(|tracker| !tracker.push(&record))
+            {
+                dag.tracker = None;
+            }
+            dag.records.push(record);
+            touched.insert(dag_index);
         }
         if let Some(leaf_hint) = &metadata.leaf_uuid {
             dag.leaf_hint = Some(leaf_hint.clone());
+            touched.insert(dag_index);
         }
 
-        let normalizer = normalizers
+        let normalizer = self
+            .normalizers
             .entry(row.claude_session_id.clone())
             .or_default();
         for change in normalizer.normalize(&line, &row.dir_path) {
             let key = (row.claude_session_id.clone(), change.index);
-            if let Some(position) = entry_positions.get(&key).copied() {
-                entries[position].normalized_entry = change.entry;
+            if let Some(position) = self.entry_positions.get(&key).copied() {
+                self.entries[position].normalized_entry = change.entry;
+                if position < base_len {
+                    self.changes.push((self.version, position));
+                }
                 continue;
             }
 
@@ -147,8 +390,8 @@ pub fn build_projection(
             } else {
                 NativeFeedOrigin::Cli
             };
-            let position = entries.len();
-            entries.push(NativeFeedEntry {
+            self.entry_positions.insert(key, self.entries.len());
+            self.entries.push(NativeFeedEntry {
                 normalized_entry: change.entry,
                 claude_session_id: row.claude_session_id.clone(),
                 uuid: metadata.uuid.clone(),
@@ -161,46 +404,366 @@ pub fn build_projection(
                 branch: None,
                 seq: row.seq,
             });
-            entry_positions.insert(key, position);
         }
     }
 
-    let mut forks = Vec::new();
-    let mut branch_by_uuid = HashMap::<String, NativeBranchMetadata>::new();
-    for dag in file_dags {
-        let Some(fork) = compute_fork_view(&dag.records, dag.leaf_hint.as_deref()) else {
-            continue;
-        };
-        for (branch_index, branch) in fork.branches.iter().enumerate() {
-            for uuid in &branch.node_uuids {
-                branch_by_uuid.insert(
-                    uuid.clone(),
-                    NativeBranchMetadata {
-                        fork_parent_uuid: fork.fork_parent_uuid.clone(),
-                        branch_index,
-                        branch_label: format!("Branch {}", branch_index + 1),
-                        is_default: fork.default_branch == Some(branch_index),
-                    },
-                );
+    /// Recompute the fork list and every entry's branch from the per-file fork
+    /// views, logging entries below `base_len` whose branch changed.
+    fn rebuild_branches(&mut self, base_len: usize) {
+        self.forks.clear();
+        self.branch_by_uuid.clear();
+        for dag in &self.file_dags {
+            let Some(fork) = &dag.fork else {
+                continue;
+            };
+            for (branch_index, branch) in fork.branches.iter().enumerate() {
+                for uuid in &branch.node_uuids {
+                    self.branch_by_uuid.insert(
+                        uuid.clone(),
+                        NativeBranchMetadata {
+                            fork_parent_uuid: fork.fork_parent_uuid.clone(),
+                            branch_index,
+                            branch_label: format!("Branch {}", branch_index + 1),
+                            is_default: fork.default_branch == Some(branch_index),
+                        },
+                    );
+                }
+            }
+            self.forks.push(NativeFeedFork {
+                claude_session_id: dag.claude_session_id.clone(),
+                file_id: dag.file_id,
+                fork: fork.clone(),
+            });
+        }
+        for (position, entry) in self.entries.iter_mut().enumerate() {
+            let branch = entry
+                .uuid
+                .as_ref()
+                .and_then(|uuid| self.branch_by_uuid.get(uuid).cloned());
+            if entry.branch != branch {
+                entry.branch = branch;
+                if position < base_len {
+                    self.changes.push((self.version, position));
+                }
             }
         }
-        forks.push(NativeFeedFork {
-            claude_session_id: dag.claude_session_id,
-            file_id: dag.file_id.expect("file dag always has an id"),
-            fork,
-        });
     }
-    for entry in &mut entries {
-        if let Some(uuid) = &entry.uuid {
-            entry.branch = branch_by_uuid.get(uuid).cloned();
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    const FIXTURE: &str = include_str!(
+        "../../../../../docs/superpowers/specs/evidence/2026-07-20-cli-ui-seam/evidence-transcript.redacted.jsonl"
+    );
+    const FIXTURE_SID: &str = "06a7eacd-664b-4d9c-83f3-d4774a6216a8";
+    const TOOL_SID: &str = "7b7b7b7b-7b7b-4b7b-8b7b-7b7b7b7b7b7b";
+    const LATE_SID: &str = "5c5c5c5c-5c5c-4c5c-8c5c-5c5c5c5c5c5c";
+
+    /// Deterministic xorshift; the sequences must be reproducible.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
         }
     }
 
-    NativeFeedSnapshot {
-        revision,
-        seq,
-        entries,
-        forks,
-        health,
+    struct Line {
+        sid: &'static str,
+        file_id: Uuid,
+        raw: String,
+        disposition: CliNativeRecordDisposition,
+    }
+
+    fn record(sid: &str, uuid: &str, parent: Option<&str>, kind: &str, content: Value) -> String {
+        json!({
+            "type": kind,
+            "sessionId": sid,
+            "uuid": uuid,
+            "parentUuid": parent,
+            "timestamp": "2026-07-20T20:00:00Z",
+            "message": { "role": kind, "content": content },
+        })
+        .to_string()
+    }
+
+    /// A linear tool-calling conversation (each tool result replaces its
+    /// tool-use entry), then a fork from an earlier assistant turn that keeps
+    /// growing on both branches, plus a sidechain and an unparseable line.
+    fn tool_session(file_id: Uuid) -> Vec<Line> {
+        let mut raws = Vec::new();
+        let mut parent: Option<String> = None;
+        let mut fork_point = String::new();
+        for turn in 0..12 {
+            let user = format!("tool-user-{turn}");
+            raws.push(record(
+                TOOL_SID,
+                &user,
+                parent.as_deref(),
+                "user",
+                json!(format!("run step {turn}")),
+            ));
+            let call = format!("tool-call-{turn}");
+            raws.push(record(
+                TOOL_SID,
+                &call,
+                Some(&user),
+                "assistant",
+                json!([{ "type": "tool_use", "id": format!("toolu_{turn}"), "name": "Bash",
+                         "input": { "command": format!("echo {turn}") } }]),
+            ));
+            let result = format!("tool-result-{turn}");
+            raws.push(record(
+                TOOL_SID,
+                &result,
+                Some(&call),
+                "user",
+                json!([{ "type": "tool_result", "tool_use_id": format!("toolu_{turn}"),
+                         "content": format!("{turn}\n") }]),
+            ));
+            let answer = format!("tool-answer-{turn}");
+            raws.push(record(
+                TOOL_SID,
+                &answer,
+                Some(&result),
+                "assistant",
+                json!([{ "type": "text", "text": format!("step {turn} done") }]),
+            ));
+            if turn == 4 {
+                fork_point = answer.clone();
+            }
+            parent = Some(answer);
+        }
+        raws.push(
+            json!({
+                "type": "user", "sessionId": TOOL_SID, "uuid": "side-1",
+                "parentUuid": parent, "isSidechain": true,
+                "message": { "role": "user", "content": "subagent" },
+            })
+            .to_string(),
+        );
+        raws.push("{not json".to_string());
+        // Rewind to turn 4 and continue on the new branch.
+        let mut branch_parent = fork_point;
+        for step in 0..6 {
+            let uuid = format!("branch-{step}");
+            let kind = if step % 2 == 0 { "user" } else { "assistant" };
+            let content = if kind == "user" {
+                json!(format!("branch prompt {step}"))
+            } else {
+                json!([{ "type": "text", "text": format!("branch answer {step}") }])
+            };
+            raws.push(record(TOOL_SID, &uuid, Some(&branch_parent), kind, content));
+            branch_parent = uuid;
+        }
+        raws.push(
+            json!({ "type": "summary", "sessionId": TOOL_SID, "leafUuid": "branch-5" }).to_string(),
+        );
+        raws.into_iter()
+            .map(|raw| Line {
+                sid: TOOL_SID,
+                file_id,
+                disposition: if raw.contains("\"isSidechain\":true") {
+                    CliNativeRecordDisposition::Sidechain
+                } else {
+                    CliNativeRecordDisposition::Renderable
+                },
+                raw,
+            })
+            .collect()
+    }
+
+    /// A child written before its parent; the tracker cannot prove this.
+    fn late_parent_session(file_id: Uuid) -> Vec<Line> {
+        [
+            record(
+                LATE_SID,
+                "late-2",
+                Some("late-1"),
+                "assistant",
+                json!([{ "type": "text", "text": "child first" }]),
+            ),
+            record(LATE_SID, "late-1", None, "user", json!("parent second")),
+            record(LATE_SID, "late-3", Some("late-2"), "user", json!("after")),
+        ]
+        .into_iter()
+        .map(|raw| Line {
+            sid: LATE_SID,
+            file_id,
+            raw,
+            disposition: CliNativeRecordDisposition::Renderable,
+        })
+        .collect()
+    }
+
+    fn interleave(rng: &mut Rng, mut sources: Vec<Vec<Line>>) -> Vec<SessionNativeRecord> {
+        for source in &mut sources {
+            source.reverse();
+        }
+        let mut rows = Vec::new();
+        let mut line_seqs = HashMap::<Uuid, i64>::new();
+        while sources.iter().any(|source| !source.is_empty()) {
+            let live = sources
+                .iter()
+                .enumerate()
+                .filter(|(_, source)| !source.is_empty())
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let line = sources[live[rng.below(live.len())]].pop().unwrap();
+            let line_seq = line_seqs.entry(line.file_id).or_default();
+            rows.push(SessionNativeRecord {
+                file_id: line.file_id,
+                line_seq: *line_seq,
+                claude_session_id: line.sid.to_string(),
+                uuid: None,
+                parent_uuid: None,
+                kind: String::new(),
+                ts: None,
+                raw: line.raw,
+                disposition: line.disposition.as_str().to_string(),
+                linked_execution_process_id: None,
+                bound_turn_execution_process_id: None,
+                bound_queued_message_id: None,
+                seq: rows.len() as i64 + 1,
+                dir_path: "/tmp/native-projection-test".to_string(),
+                file_name: format!("{}.jsonl", line.sid),
+                generation: 1,
+                last_import_at: None,
+            });
+            *line_seq += 1;
+        }
+        rows
+    }
+
+    fn session_rows(seed: u64) -> Vec<SessionNativeRecord> {
+        let mut rng = Rng(seed);
+        let fixture = FIXTURE
+            .lines()
+            .map(|raw| Line {
+                sid: FIXTURE_SID,
+                file_id: Uuid::from_u128(1),
+                raw: raw.to_string(),
+                disposition: CliNativeRecordDisposition::Renderable,
+            })
+            .collect();
+        interleave(
+            &mut rng,
+            vec![
+                fixture,
+                tool_session(Uuid::from_u128(2)),
+                late_parent_session(Uuid::from_u128(3)),
+            ],
+        )
+    }
+
+    fn entries_json(entries: &[NativeFeedEntry]) -> Vec<Value> {
+        entries
+            .iter()
+            .map(|entry| serde_json::to_value(entry).unwrap())
+            .collect()
+    }
+
+    /// Applies deltas the way the feed socket does: replace in place, then
+    /// append at the exact index.
+    struct Client {
+        entries: Vec<Value>,
+        forks: Vec<NativeFeedFork>,
+        cursor: NativeFeedCursor,
+    }
+
+    impl Client {
+        fn catch_up(&mut self, projection: &NativeProjection) {
+            let delta = projection
+                .delta_since(self.cursor)
+                .expect("a cursor from the same build yields a delta");
+            for (index, entry) in delta.replaced {
+                self.entries[index] = serde_json::to_value(entry).unwrap();
+            }
+            assert_eq!(delta.appended_from, self.entries.len());
+            self.entries.extend(entries_json(delta.appended));
+            if delta.forks_changed {
+                self.forks = projection.forks().to_vec();
+            }
+            self.cursor = projection.cursor();
+        }
+    }
+
+    #[test]
+    fn incremental_extend_matches_full_rebuild_for_every_append_sequence() {
+        let mut saw_replacement = false;
+        let mut saw_fork_change = false;
+        for seed in 1..=24u64 {
+            let rows = session_rows(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut rng = Rng(seed + 7);
+            let mut consumed = rng.below(rows.len() / 4);
+            let mut projection = NativeProjection::build(&rows[..consumed], 3);
+            let mut client = Client {
+                entries: entries_json(projection.entries()),
+                forks: projection.forks().to_vec(),
+                cursor: projection.cursor(),
+            };
+            while consumed < rows.len() {
+                let batch = (1 + rng.below(6)).min(rows.len() - consumed);
+                let visited = projection.rows_visited();
+                let forks_before = projection.forks().to_vec();
+                let changes_before = projection.changes.len();
+                assert!(projection.can_extend(&rows[consumed..consumed + batch]));
+                projection.extend(&rows[consumed..consumed + batch]);
+                consumed += batch;
+                assert_eq!(projection.rows_visited(), visited + batch as u64);
+                saw_replacement |= projection.changes.len() > changes_before;
+                saw_fork_change |= projection.forks() != forks_before;
+
+                let full = NativeProjection::build(&rows[..consumed], 3);
+                assert_eq!(
+                    entries_json(projection.entries()),
+                    entries_json(full.entries()),
+                    "seed {seed}: entries diverged after {consumed} rows"
+                );
+                assert_eq!(projection.forks(), full.forks(), "seed {seed}");
+                assert_eq!(projection.files(), full.files(), "seed {seed}");
+                assert_eq!(projection.last_row_seq(), full.last_row_seq());
+
+                // A consumer that skips some updates still converges.
+                if rng.below(3) != 0 || consumed == rows.len() {
+                    client.catch_up(&projection);
+                    assert_eq!(client.entries, entries_json(full.entries()), "seed {seed}");
+                    assert_eq!(client.forks, full.forks(), "seed {seed}");
+                }
+            }
+        }
+        assert!(saw_replacement, "no sequence replaced an entry in place");
+        assert!(saw_fork_change, "no sequence changed the fork topology");
+    }
+
+    #[test]
+    fn a_cursor_from_another_build_needs_a_full_snapshot() {
+        let rows = session_rows(42);
+        let first = NativeProjection::build(&rows[..10], 0);
+        let second = NativeProjection::build(&rows[..10], 0);
+        assert!(second.delta_since(first.cursor()).is_none());
+        assert!(first.delta_since(first.cursor()).is_some());
+    }
+
+    #[test]
+    fn a_newer_file_generation_cannot_be_appended() {
+        let rows = session_rows(9);
+        let projection = NativeProjection::build(&rows[..20], 0);
+        let mut replacement = rows[20].clone();
+        replacement.file_id = Uuid::from_u128(99);
+        replacement.file_name = rows[0].file_name.clone();
+        assert!(!projection.can_extend(&[replacement]));
+        assert!(projection.can_extend(&rows[20..21]));
     }
 }

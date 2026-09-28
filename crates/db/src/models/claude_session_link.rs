@@ -282,6 +282,22 @@ impl ClaudeSessionLink {
         })
     }
 
+    /// Claude session ids currently linked to one app session.
+    pub async fn claude_session_ids_for_session(
+        pool: &SqlitePool,
+        session_id: Uuid,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar!(
+            r#"SELECT claude_session_id AS "claude_session_id!"
+               FROM claude_session_links
+               WHERE session_id = $1
+               ORDER BY claude_session_id"#,
+            session_id
+        )
+        .fetch_all(pool)
+        .await
+    }
+
     pub async fn known_session_ids_for_workspace(
         pool: &SqlitePool,
         workspace_id: Uuid,

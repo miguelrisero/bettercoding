@@ -44,13 +44,13 @@ use executors::executors::claude::native::{
 pub use forks::{NativeForkBranch, NativeForkView};
 use futures::StreamExt;
 pub use projection::{
-    NativeBranchMetadata, NativeFeedEntry, NativeFeedFork, NativeFeedOrigin, NativeFeedSnapshot,
-    NativeFileImportHealth, NativeIngestHealth,
+    NativeBranchMetadata, NativeFeedCursor, NativeFeedEntry, NativeFeedFork, NativeFeedOrigin,
+    NativeFeedSnapshot, NativeFileImportHealth, NativeIngestHealth,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
-    sync::{Notify, RwLock, broadcast},
+    sync::{Notify, RwLock, Semaphore, broadcast},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -58,7 +58,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 use self::{
-    projection::build_projection,
+    projection::NativeProjection,
     tail::{
         ObservedFileState, StoredTailState, hash_bytes, read_complete_line_batch, rescan_reason,
     },
@@ -71,6 +71,14 @@ use crate::services::{
 const REGISTRY_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const OUTBOX_SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const IMPORT_BATCH_LINE_LIMIT: usize = 256;
+/// Import batches committed at once across every watched directory. SQLite
+/// has one writer, so more permits only queue on its lock and starve API
+/// writes; one keeps a start-up backfill from monopolising it while live
+/// appends still interleave batch by batch (the semaphore is FIFO).
+const CONCURRENT_IMPORT_BATCHES: usize = 1;
+/// Sessions whose projection is kept for incremental feed updates. A session
+/// with a connected feed is evicted only after its last subscriber leaves.
+const PROJECTION_CACHE_CAPACITY: usize = 32;
 
 /// Days an unreachable transcript is kept before retention removes it. `0`
 /// disables retention and lets the store grow without bound.
@@ -192,6 +200,96 @@ struct DirectoryContext {
     cwd: PathBuf,
 }
 
+/// A session's cached projection plus the links it was built under.
+struct SessionProjection {
+    projection: NativeProjection,
+    linked_sids: Vec<String>,
+}
+
+type ProjectionCell = Arc<tokio::sync::Mutex<Option<SessionProjection>>>;
+
+struct CachedProjection {
+    cell: ProjectionCell,
+    subscribers: usize,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct ProjectionCache {
+    sessions: HashMap<Uuid, CachedProjection>,
+    clock: u64,
+}
+
+impl ProjectionCache {
+    fn cell(&mut self, session_id: Uuid) -> ProjectionCell {
+        self.clock += 1;
+        let clock = self.clock;
+        let cached = self
+            .sessions
+            .entry(session_id)
+            .or_insert_with(|| CachedProjection {
+                cell: Arc::default(),
+                subscribers: 0,
+                last_used: clock,
+            });
+        cached.last_used = clock;
+        let cell = cached.cell.clone();
+        if self.sessions.len() > PROJECTION_CACHE_CAPACITY
+            && let Some(evict) = self
+                .sessions
+                .iter()
+                .filter(|(id, cached)| **id != session_id && cached.subscribers == 0)
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(id, _)| *id)
+        {
+            self.sessions.remove(&evict);
+        }
+        cell
+    }
+}
+
+/// One feed consumer's claim on a session's cached projection. The cache
+/// drops the projection when the last claim is released.
+pub struct NativeFeedSubscription {
+    ingest: Arc<ClaudeTranscriptIngest>,
+    session_id: Uuid,
+}
+
+impl Drop for NativeFeedSubscription {
+    fn drop(&mut self) {
+        let mut cache = self.ingest.projections.lock().unwrap();
+        if let Some(cached) = cache.sessions.get_mut(&self.session_id) {
+            cached.subscribers = cached.subscribers.saturating_sub(1);
+            if cached.subscribers == 0 {
+                cache.sessions.remove(&self.session_id);
+            }
+        }
+    }
+}
+
+/// A feed update for one consumer: the whole projection, or only what changed
+/// since the consumer's cursor.
+#[derive(Debug)]
+pub enum NativeFeedChange {
+    Full(NativeFeedSnapshot),
+    Delta {
+        revision: u64,
+        seq: i64,
+        appended_from: usize,
+        appended: Vec<NativeFeedEntry>,
+        replaced: Vec<(usize, NativeFeedEntry)>,
+        forks: Option<Vec<NativeFeedFork>>,
+        health: NativeIngestHealth,
+    },
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ScanCounts {
+    directories: u64,
+    files: u64,
+    records: u64,
+}
+
 #[derive(Debug, Default)]
 struct ImportPathState {
     pending: bool,
@@ -237,6 +335,8 @@ pub struct ClaudeTranscriptIngest {
     revisions: RwLock<HashMap<Uuid, u64>>,
     feed_updates: broadcast::Sender<NativeFeedUpdate>,
     publisher_notify: Notify,
+    projections: Mutex<ProjectionCache>,
+    import_permits: Semaphore,
     #[cfg(test)]
     snapshot_watermark_barrier: tokio::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
@@ -246,8 +346,8 @@ pub struct ClaudeTranscriptIngest {
 impl ClaudeTranscriptIngest {
     /// Check the feature gate exactly once at startup.
     ///
-    /// The CLI↔UI handover ships dark, so this returns `None` — no watcher, no
-    /// publisher, no registry reconcile — unless `ENABLE_CLI_HANDOVER` is set.
+    /// The ingest is on by default. `DISABLE_CLI_TRANSCRIPT_INGEST` makes this
+    /// return `None` — no watcher, no publisher, no registry reconcile.
     ///
     /// Retention is the deliberate exception and is spawned either way. It is
     /// the pruner for `cli_native_record`/`cli_native_file`; gating it behind
@@ -262,9 +362,9 @@ impl ClaudeTranscriptIngest {
         let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
         let service = Arc::new(Self::new_with_probe(db, projects_dir, writer_probe));
 
-        if !utils::feature_flags::cli_handover_enabled() {
+        if !utils::feature_flags::cli_transcript_ingest_enabled() {
             tracing::info!(
-                flag = utils::feature_flags::CLI_HANDOVER_ENV,
+                flag = utils::feature_flags::CLI_TRANSCRIPT_INGEST_DISABLE_ENV,
                 "CLI transcript ingest is disabled; running retention only"
             );
             tokio::spawn(service.run_retention(shutdown.child_token()));
@@ -339,6 +439,8 @@ impl ClaudeTranscriptIngest {
             revisions: RwLock::new(HashMap::new()),
             feed_updates,
             publisher_notify: Notify::new(),
+            projections: Mutex::new(ProjectionCache::default()),
+            import_permits: Semaphore::new(CONCURRENT_IMPORT_BATCHES),
             #[cfg(test)]
             snapshot_watermark_barrier: tokio::sync::Mutex::new(None),
             #[cfg(test)]
@@ -355,13 +457,46 @@ impl ClaudeTranscriptIngest {
         self.feed_updates.subscribe()
     }
 
+    /// Keep `session_id`'s projection cached while the returned claim lives.
+    pub fn subscribe_feed(self: &Arc<Self>, session_id: Uuid) -> NativeFeedSubscription {
+        let mut cache = self.projections.lock().unwrap();
+        cache.cell(session_id);
+        if let Some(cached) = cache.sessions.get_mut(&session_id) {
+            cached.subscribers += 1;
+        }
+        NativeFeedSubscription {
+            ingest: self.clone(),
+            session_id,
+        }
+    }
+
     pub async fn snapshot(
         &self,
         session_id: Uuid,
     ) -> Result<NativeFeedSnapshot, ClaudeTranscriptIngestError> {
+        match self.feed_since(session_id, None).await?.0 {
+            NativeFeedChange::Full(snapshot) => Ok(snapshot),
+            NativeFeedChange::Delta { .. } => unreachable!("no cursor always yields a snapshot"),
+        }
+    }
+
+    /// Bring the session's cached projection up to date and describe it
+    /// relative to `since`.
+    ///
+    /// With an unchanged revision and link set, only rows above the cached
+    /// `seq` are read and adapted. Anything an append cannot express — a new
+    /// revision, a removed link, a replaced file generation — rebuilds the
+    /// projection, which also invalidates every earlier cursor.
+    pub async fn feed_since(
+        &self,
+        session_id: Uuid,
+        since: Option<NativeFeedCursor>,
+    ) -> Result<(NativeFeedChange, NativeFeedCursor), ClaudeTranscriptIngestError> {
         let session = Session::find_by_id(&self.db.pool, session_id)
             .await?
             .ok_or(ClaudeTranscriptIngestError::SessionNotFound(session_id))?;
+        let cell = self.projections.lock().unwrap().cell(session_id);
+        let mut cached = cell.lock().await;
 
         // Capture both live-stream watermarks before reading projection rows.
         // With subscribe-before-snapshot, a later import/reset is queued for
@@ -371,23 +506,71 @@ impl ClaudeTranscriptIngest {
         let seq = CliIngestOutbox::latest_seq(&self.db.pool, session_id).await?;
         #[cfg(test)]
         self.wait_at_snapshot_watermark().await;
-        let rows = CliNativeRecord::list_for_session(&self.db.pool, session_id).await?;
+        let linked_sids =
+            ClaudeSessionLink::claude_session_ids_for_session(&self.db.pool, session_id).await?;
 
-        let mut seen_files = HashSet::new();
-        let mut files = Vec::new();
-        for row in &rows {
-            if !seen_files.insert(row.file_id) {
-                continue;
-            }
-            if let Some(file) = CliNativeFile::find_by_id(&self.db.pool, row.file_id).await? {
-                files.push(NativeFileImportHealth {
-                    claude_session_id: file.claude_session_id,
-                    file_name: file.file_name,
-                    generation: file.generation,
-                    last_import_at: file.last_import_at.map(|time| time.to_rfc3339()),
-                });
+        let mut extended = false;
+        if let Some(current) = cached.as_mut()
+            && current.projection.revision() == revision
+            && current
+                .linked_sids
+                .iter()
+                .all(|sid| linked_sids.binary_search(sid).is_ok())
+        {
+            let rows = CliNativeRecord::list_for_session_after(
+                &self.db.pool,
+                session_id,
+                current.projection.last_row_seq(),
+            )
+            .await?;
+            if current.projection.can_extend(&rows) {
+                current.projection.extend(&rows);
+                current.linked_sids = linked_sids.clone();
+                extended = true;
             }
         }
+        if !extended {
+            let rows = CliNativeRecord::list_for_session(&self.db.pool, session_id).await?;
+            *cached = Some(SessionProjection {
+                projection: NativeProjection::build(&rows, revision),
+                linked_sids,
+            });
+        }
+        let projection = &cached
+            .as_ref()
+            .expect("projection was just built")
+            .projection;
+        let mut health = self.ingest_health(&session).await?;
+        let cursor = projection.cursor();
+        let delta = since.and_then(|since| projection.delta_since(since));
+        let change = match delta {
+            None => NativeFeedChange::Full(projection.snapshot(seq, health)),
+            Some(delta) => {
+                health.files = projection.files().to_vec();
+                NativeFeedChange::Delta {
+                    revision: projection.revision(),
+                    seq,
+                    appended_from: delta.appended_from,
+                    appended: delta.appended.to_vec(),
+                    replaced: delta
+                        .replaced
+                        .into_iter()
+                        .map(|(index, entry)| (index, entry.clone()))
+                        .collect(),
+                    forks: delta.forks_changed.then(|| projection.forks().to_vec()),
+                    health,
+                }
+            }
+        };
+        Ok((change, cursor))
+    }
+
+    /// Ingest health for `session`, without the per-file list the projection
+    /// supplies.
+    async fn ingest_health(
+        &self,
+        session: &Session,
+    ) -> Result<NativeIngestHealth, ClaudeTranscriptIngestError> {
         let degraded_paths = self.degraded_watchers.read().await.clone();
         let directories = self.directories.read().await;
         let watch_degraded = degraded_paths.iter().any(|path| {
@@ -398,18 +581,17 @@ impl ClaudeTranscriptIngest {
         drop(directories);
         let quarantined_files = self.quarantined_paths.lock().unwrap().len() as u64;
         let foreign_writer_seen_at =
-            ClaudeSessionLink::latest_foreign_writer_seen_for_session(&self.db.pool, session_id)
+            ClaudeSessionLink::latest_foreign_writer_seen_for_session(&self.db.pool, session.id)
                 .await?
                 .map(|time| time.to_rfc3339());
-        let health = NativeIngestHealth {
+        Ok(NativeIngestHealth {
             unknown_kinds: self.unknown_kinds.load(Ordering::Relaxed),
             rescans: self.rescans.load(Ordering::Relaxed),
             quarantined_files,
             watch_degraded,
             foreign_writer_seen_at,
-            files,
-        };
-        Ok(build_projection(&rows, revision, seq, health))
+            files: Vec::new(),
+        })
     }
 
     #[cfg(test)]
@@ -531,11 +713,19 @@ impl ClaudeTranscriptIngest {
     }
 
     async fn run_registry(self: Arc<Self>, shutdown: CancellationToken, start_watchers: bool) {
-        if let Err(error) = self
+        let started = std::time::Instant::now();
+        match self
             .reconcile_registry(start_watchers, shutdown.child_token())
             .await
         {
-            tracing::warn!(?error, "initial CLI transcript reconciliation failed");
+            Ok(counts) => tracing::info!(
+                directories = counts.directories,
+                files = counts.files,
+                records = counts.records,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "initial CLI transcript backfill finished"
+            ),
+            Err(error) => tracing::warn!(?error, "initial CLI transcript reconciliation failed"),
         }
         let mut interval = tokio::time::interval(REGISTRY_RECONCILE_INTERVAL);
         interval.tick().await;
@@ -558,7 +748,7 @@ impl ClaudeTranscriptIngest {
         self: &Arc<Self>,
         start_watchers: bool,
         shutdown: CancellationToken,
-    ) -> Result<(), ClaudeTranscriptIngestError> {
+    ) -> Result<ScanCounts, ClaudeTranscriptIngestError> {
         let mut desired = HashMap::new();
         if self.projects_dir.is_dir() {
             for workspace in Workspace::fetch_all(&self.db.pool).await? {
@@ -612,7 +802,7 @@ impl ClaudeTranscriptIngest {
         desired: HashMap<PathBuf, DirectoryContext>,
         start_watchers: bool,
         shutdown: CancellationToken,
-    ) -> Result<(), ClaudeTranscriptIngestError> {
+    ) -> Result<ScanCounts, ClaudeTranscriptIngestError> {
         let watched_paths = if start_watchers {
             desired.keys().cloned().collect::<HashSet<_>>()
         } else {
@@ -662,10 +852,14 @@ impl ClaudeTranscriptIngest {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
+        let mut counts = ScanCounts::default();
         for dir in directories {
-            self.scan_directory(&dir, false).await?;
+            let scanned = self.scan_directory(&dir, false).await?;
+            counts.directories += 1;
+            counts.files += scanned.files;
+            counts.records += scanned.records;
         }
-        Ok(())
+        Ok(counts)
     }
 
     async fn ensure_watcher(self: &Arc<Self>, dir: PathBuf, shutdown: CancellationToken) {
@@ -733,9 +927,10 @@ impl ClaudeTranscriptIngest {
         &self,
         dir: &Path,
         force_rescan: bool,
-    ) -> Result<(), ClaudeTranscriptIngestError> {
+    ) -> Result<ScanCounts, ClaudeTranscriptIngestError> {
+        let mut counts = ScanCounts::default();
         let Some(context) = self.directories.read().await.get(dir).cloned() else {
-            return Ok(());
+            return Ok(counts);
         };
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
@@ -747,38 +942,47 @@ impl ClaudeTranscriptIngest {
             {
                 continue;
             }
-            if let Err(error) = self
+            counts.files += 1;
+            match self
                 .process_native_path(&path, &context, force_rescan)
                 .await
             {
-                tracing::warn!(?error, path = %path.display(), "native transcript import failed");
+                Ok(records) => counts.records += records,
+                Err(error) => {
+                    tracing::warn!(?error, path = %path.display(), "native transcript import failed")
+                }
             }
         }
-        Ok(())
+        Ok(counts)
     }
 
+    /// Import new lines of one transcript; returns the records inserted.
     async fn process_native_path(
         &self,
         path: &Path,
         context: &DirectoryContext,
         force_rescan: bool,
-    ) -> Result<(), ClaudeTranscriptIngestError> {
+    ) -> Result<u64, ClaudeTranscriptIngestError> {
         let path = path.to_path_buf();
         {
             let mut importing = self.importing_paths.lock().await;
             if let Some(state) = importing.get_mut(&path) {
                 state.pending = true;
                 state.force_rescan |= force_rescan;
-                return Ok(());
+                return Ok(0);
             }
             importing.insert(path.clone(), ImportPathState::default());
         }
 
         let mut next_force_rescan = force_rescan;
+        let mut inserted = 0;
         loop {
             let result = self
                 .process_native_path_inner(&path, context, next_force_rescan)
                 .await;
+            if let Ok(records) = &result {
+                inserted += records;
+            }
             #[cfg(test)]
             if let Some(barrier) = self.path_import_barrier.lock().await.take() {
                 barrier.wait().await;
@@ -800,7 +1004,7 @@ impl ClaudeTranscriptIngest {
                 continue;
             }
             importing.remove(&path);
-            return result;
+            return result.map(|_| inserted);
         }
     }
 
@@ -809,13 +1013,13 @@ impl ClaudeTranscriptIngest {
         path: &Path,
         context: &DirectoryContext,
         force_rescan: bool,
-    ) -> Result<(), ClaudeTranscriptIngestError> {
+    ) -> Result<u64, ClaudeTranscriptIngestError> {
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default();
         let Some(claude_session_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            return Ok(());
+            return Ok(0);
         };
         let dir_path = path
             .parent()
@@ -825,7 +1029,7 @@ impl ClaudeTranscriptIngest {
         let mut file = File::open(path)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() {
-            return Ok(());
+            return Ok(0);
         }
         let (dev, inode) = file_identity(&metadata);
         let observed_size = file_size(&metadata);
@@ -922,6 +1126,7 @@ impl ClaudeTranscriptIngest {
             file.seek(SeekFrom::Start(native_file.cursor_offset as u64))?;
         }
         let mut reader = BufReader::new(file);
+        let mut inserted = 0;
 
         loop {
             let tail = read_complete_line_batch(
@@ -997,6 +1202,11 @@ impl ClaudeTranscriptIngest {
                 observed_size,
                 observed_mtime_ms,
             };
+            let permit = self
+                .import_permits
+                .acquire()
+                .await
+                .expect("the import semaphore is never closed");
             let imported = if activate_replacement {
                 let replacement =
                     CliNativeRecord::replace_generation_and_import_batch_with_context(
@@ -1027,6 +1237,8 @@ impl ClaudeTranscriptIngest {
                 )
                 .await?
             };
+            drop(permit);
+            inserted += imported.inserted_records;
             if imported.appended_outbox > 0 {
                 self.publisher_notify.notify_one();
             }
@@ -1039,7 +1251,7 @@ impl ClaudeTranscriptIngest {
                 break;
             }
         }
-        Ok(())
+        Ok(inserted)
     }
 
     async fn try_auto_bind_cli_fresh(
@@ -1168,6 +1380,20 @@ impl ClaudeTranscriptIngest {
                     Ok(event) => event,
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "native-link invalidation listener lagged");
+                        // A missed link can change any cached projection's
+                        // origins, and cached projections only re-read rows on
+                        // a new revision.
+                        let cached = self
+                            .projections
+                            .lock()
+                            .unwrap()
+                            .sessions
+                            .keys()
+                            .copied()
+                            .collect::<Vec<_>>();
+                        for session_id in cached {
+                            self.invalidate_revision(session_id).await;
+                        }
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,

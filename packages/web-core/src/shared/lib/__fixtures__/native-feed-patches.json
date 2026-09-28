@@ -1,0 +1,659 @@
+[
+  {
+    "name": "snapshot",
+    "message": {
+      "JsonPatch": [
+        {
+          "op": "replace",
+          "path": "/revision",
+          "value": 1
+        },
+        {
+          "op": "replace",
+          "path": "/seq",
+          "value": 2
+        },
+        {
+          "op": "replace",
+          "path": "/entries",
+          "value": [
+            {
+              "normalized_entry": {
+                "timestamp": null,
+                "entry_type": {
+                  "type": "assistant_message"
+                },
+                "content": "tool: running",
+                "metadata": null
+              },
+              "claude_session_id": "fixture-sid",
+              "uuid": "uuid-1",
+              "parent_uuid": null,
+              "ts": null,
+              "origin": "cli",
+              "linked_execution_process_id": null,
+              "git_branch": null,
+              "version": null,
+              "branch": null,
+              "seq": 1
+            },
+            {
+              "normalized_entry": {
+                "timestamp": null,
+                "entry_type": {
+                  "type": "assistant_message"
+                },
+                "content": "thinking",
+                "metadata": null
+              },
+              "claude_session_id": "fixture-sid",
+              "uuid": "uuid-2",
+              "parent_uuid": null,
+              "ts": null,
+              "origin": "cli",
+              "linked_execution_process_id": null,
+              "git_branch": null,
+              "version": null,
+              "branch": null,
+              "seq": 2
+            }
+          ]
+        },
+        {
+          "op": "replace",
+          "path": "/forks",
+          "value": []
+        },
+        {
+          "op": "replace",
+          "path": "/health",
+          "value": {
+            "unknown_kinds": 0,
+            "rescans": 0,
+            "quarantined_files": 0,
+            "watch_degraded": false,
+            "foreign_writer_seen_at": null,
+            "files": [
+              {
+                "claude_session_id": "fixture-sid",
+                "file_name": "fixture-sid.jsonl",
+                "generation": 1,
+                "last_import_at": null
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "expected": {
+      "revision": 1,
+      "seq": 2,
+      "entries": [
+        {
+          "normalized_entry": {
+            "timestamp": null,
+            "entry_type": {
+              "type": "assistant_message"
+            },
+            "content": "tool: running",
+            "metadata": null
+          },
+          "claude_session_id": "fixture-sid",
+          "uuid": "uuid-1",
+          "parent_uuid": null,
+          "ts": null,
+          "origin": "cli",
+          "linked_execution_process_id": null,
+          "git_branch": null,
+          "version": null,
+          "branch": null,
+          "seq": 1
+        },
+        {
+          "normalized_entry": {
+            "timestamp": null,
+            "entry_type": {
+              "type": "assistant_message"
+            },
+            "content": "thinking",
+            "metadata": null
+          },
+          "claude_session_id": "fixture-sid",
+          "uuid": "uuid-2",
+          "parent_uuid": null,
+          "ts": null,
+          "origin": "cli",
+          "linked_execution_process_id": null,
+          "git_branch": null,
+          "version": null,
+          "branch": null,
+          "seq": 2
+        }
+      ],
+      "forks": [],
+      "health": {
+        "unknown_kinds": 0,
+        "rescans": 0,
+        "quarantined_files": 0,
+        "watch_degraded": false,
+        "foreign_writer_seen_at": null,
+        "files": [
+          {
+            "claude_session_id": "fixture-sid",
+            "file_name": "fixture-sid.jsonl",
+            "generation": 1,
+            "last_import_at": null
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "append with mid replace",
+    "message": {
+      "JsonPatch": [
+        {
+          "op": "replace",
+          "path": "/revision",
+          "value": 1
+        },
+        {
+          "op": "replace",
+          "path": "/seq",
+          "value": 3
+        },
+        {
+          "op": "replace",
+          "path": "/entries/0",
+          "value": {
+            "normalized_entry": {
+              "timestamp": null,
+              "entry_type": {
+                "type": "assistant_message"
+              },
+              "content": "tool: done",
+              "metadata": null
+            },
+            "claude_session_id": "fixture-sid",
+            "uuid": "uuid-1",
+            "parent_uuid": null,
+            "ts": null,
+            "origin": "cli",
+            "linked_execution_process_id": null,
+            "git_branch": null,
+            "version": null,
+            "branch": null,
+            "seq": 1
+          }
+        },
+        {
+          "op": "add",
+          "path": "/entries/2",
+          "value": {
+            "normalized_entry": {
+              "timestamp": null,
+              "entry_type": {
+                "type": "assistant_message"
+              },
+              "content": "answer",
+              "metadata": null
+            },
+            "claude_session_id": "fixture-sid",
+            "uuid": "uuid-3",
+            "parent_uuid": null,
+            "ts": null,
+            "origin": "cli",
+            "linked_execution_process_id": null,
+            "git_branch": null,
+            "version": null,
+            "branch": null,
+            "seq": 3
+          }
+        },
+        {
+          "op": "replace",
+          "path": "/health",
+          "value": {
+            "unknown_kinds": 0,
+            "rescans": 0,
+            "quarantined_files": 0,
+            "watch_degraded": false,
+            "foreign_writer_seen_at": null,
+            "files": [
+              {
+                "claude_session_id": "fixture-sid",
+                "file_name": "fixture-sid.jsonl",
+                "generation": 1,
+                "last_import_at": null
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "expected": {
+      "revision": 1,
+      "seq": 3,
+      "entries": [
+        {
+          "normalized_entry": {
+            "timestamp": null,
+            "entry_type": {
+              "type": "assistant_message"
+            },
+            "content": "tool: done",
+            "metadata": null
+          },
+          "claude_session_id": "fixture-sid",
+          "uuid": "uuid-1",
+          "parent_uuid": null,
+          "ts": null,
+          "origin": "cli",
+          "linked_execution_process_id": null,
+          "git_branch": null,
+          "version": null,
+          "branch": null,
+          "seq": 1
+        },
+        {
+          "normalized_entry": {
+            "timestamp": null,
+            "entry_type": {
+              "type": "assistant_message"
+            },
+            "content": "thinking",
+            "metadata": null
+          },
+          "claude_session_id": "fixture-sid",
+          "uuid": "uuid-2",
+          "parent_uuid": null,
+          "ts": null,
+          "origin": "cli",
+          "linked_execution_process_id": null,
+          "git_branch": null,
+          "version": null,
+          "branch": null,
+          "seq": 2
+        },
+        {
+          "normalized_entry": {
+            "timestamp": null,
+            "entry_type": {
+              "type": "assistant_message"
+            },
+            "content": "answer",
+            "metadata": null
+          },
+          "claude_session_id": "fixture-sid",
+          "uuid": "uuid-3",
+          "parent_uuid": null,
+          "ts": null,
+          "origin": "cli",
+          "linked_execution_process_id": null,
+          "git_branch": null,
+          "version": null,
+          "branch": null,
+          "seq": 3
+        }
+      ],
+      "forks": [],
+      "health": {
+        "unknown_kinds": 0,
+        "rescans": 0,
+        "quarantined_files": 0,
+        "watch_degraded": false,
+        "foreign_writer_seen_at": null,
+        "files": [
+          {
+            "claude_session_id": "fixture-sid",
+            "file_name": "fixture-sid.jsonl",
+            "generation": 1,
+            "last_import_at": null
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "append with fork change",
+    "message": {
+      "JsonPatch": [
+        {
+          "op": "replace",
+          "path": "/revision",
+          "value": 1
+        },
+        {
+          "op": "replace",
+          "path": "/seq",
+          "value": 5
+        },
+        {
+          "op": "add",
+          "path": "/entries/3",
+          "value": {
+            "normalized_entry": {
+              "timestamp": null,
+              "entry_type": {
+                "type": "assistant_message"
+              },
+              "content": "rewound prompt",
+              "metadata": null
+            },
+            "claude_session_id": "fixture-sid",
+            "uuid": "uuid-4",
+            "parent_uuid": null,
+            "ts": null,
+            "origin": "cli",
+            "linked_execution_process_id": null,
+            "git_branch": null,
+            "version": null,
+            "branch": null,
+            "seq": 4
+          }
+        },
+        {
+          "op": "add",
+          "path": "/entries/4",
+          "value": {
+            "normalized_entry": {
+              "timestamp": null,
+              "entry_type": {
+                "type": "assistant_message"
+              },
+              "content": "rewound answer",
+              "metadata": null
+            },
+            "claude_session_id": "fixture-sid",
+            "uuid": "uuid-5",
+            "parent_uuid": null,
+            "ts": null,
+            "origin": "cli",
+            "linked_execution_process_id": null,
+            "git_branch": null,
+            "version": null,
+            "branch": null,
+            "seq": 5
+          }
+        },
+        {
+          "op": "replace",
+          "path": "/forks",
+          "value": [
+            {
+              "claude_session_id": "fixture-sid",
+              "file_id": "00000000-0000-0000-0000-000000000000",
+              "fork": {
+                "fork_parent_uuid": "uuid-1",
+                "prefix_uuids": ["uuid-1"],
+                "branches": [],
+                "default_branch": null
+              }
+            }
+          ]
+        },
+        {
+          "op": "replace",
+          "path": "/health",
+          "value": {
+            "unknown_kinds": 0,
+            "rescans": 0,
+            "quarantined_files": 0,
+            "watch_degraded": false,
+            "foreign_writer_seen_at": null,
+            "files": [
+              {
+                "claude_session_id": "fixture-sid",
+                "file_name": "fixture-sid.jsonl",
+                "generation": 1,
+                "last_import_at": null
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "expected": {
+      "revision": 1,
+      "seq": 5,
+      "entries": [
+        {
+          "normalized_entry": {
+            "timestamp": null,
+            "entry_type": {
+              "type": "assistant_message"
+            },
+            "content": "tool: done",
+            "metadata": null
+          },
+          "claude_session_id": "fixture-sid",
+          "uuid": "uuid-1",
+          "parent_uuid": null,
+          "ts": null,
+          "origin": "cli",
+          "linked_execution_process_id": null,
+          "git_branch": null,
+          "version": null,
+          "branch": null,
+          "seq": 1
+        },
+        {
+          "normalized_entry": {
+            "timestamp": null,
+            "entry_type": {
+              "type": "assistant_message"
+            },
+            "content": "thinking",
+            "metadata": null
+          },
+          "claude_session_id": "fixture-sid",
+          "uuid": "uuid-2",
+          "parent_uuid": null,
+          "ts": null,
+          "origin": "cli",
+          "linked_execution_process_id": null,
+          "git_branch": null,
+          "version": null,
+          "branch": null,
+          "seq": 2
+        },
+        {
+          "normalized_entry": {
+            "timestamp": null,
+            "entry_type": {
+              "type": "assistant_message"
+            },
+            "content": "answer",
+            "metadata": null
+          },
+          "claude_session_id": "fixture-sid",
+          "uuid": "uuid-3",
+          "parent_uuid": null,
+          "ts": null,
+          "origin": "cli",
+          "linked_execution_process_id": null,
+          "git_branch": null,
+          "version": null,
+          "branch": null,
+          "seq": 3
+        },
+        {
+          "normalized_entry": {
+            "timestamp": null,
+            "entry_type": {
+              "type": "assistant_message"
+            },
+            "content": "rewound prompt",
+            "metadata": null
+          },
+          "claude_session_id": "fixture-sid",
+          "uuid": "uuid-4",
+          "parent_uuid": null,
+          "ts": null,
+          "origin": "cli",
+          "linked_execution_process_id": null,
+          "git_branch": null,
+          "version": null,
+          "branch": null,
+          "seq": 4
+        },
+        {
+          "normalized_entry": {
+            "timestamp": null,
+            "entry_type": {
+              "type": "assistant_message"
+            },
+            "content": "rewound answer",
+            "metadata": null
+          },
+          "claude_session_id": "fixture-sid",
+          "uuid": "uuid-5",
+          "parent_uuid": null,
+          "ts": null,
+          "origin": "cli",
+          "linked_execution_process_id": null,
+          "git_branch": null,
+          "version": null,
+          "branch": null,
+          "seq": 5
+        }
+      ],
+      "forks": [
+        {
+          "claude_session_id": "fixture-sid",
+          "file_id": "00000000-0000-0000-0000-000000000000",
+          "fork": {
+            "fork_parent_uuid": "uuid-1",
+            "prefix_uuids": ["uuid-1"],
+            "branches": [],
+            "default_branch": null
+          }
+        }
+      ],
+      "health": {
+        "unknown_kinds": 0,
+        "rescans": 0,
+        "quarantined_files": 0,
+        "watch_degraded": false,
+        "foreign_writer_seen_at": null,
+        "files": [
+          {
+            "claude_session_id": "fixture-sid",
+            "file_name": "fixture-sid.jsonl",
+            "generation": 1,
+            "last_import_at": null
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "revision reset",
+    "message": {
+      "JsonPatch": [
+        {
+          "op": "replace",
+          "path": "/revision",
+          "value": 2
+        },
+        {
+          "op": "replace",
+          "path": "/seq",
+          "value": 5
+        },
+        {
+          "op": "replace",
+          "path": "/entries",
+          "value": [
+            {
+              "normalized_entry": {
+                "timestamp": null,
+                "entry_type": {
+                  "type": "assistant_message"
+                },
+                "content": "rebuilt",
+                "metadata": null
+              },
+              "claude_session_id": "fixture-sid",
+              "uuid": "uuid-5",
+              "parent_uuid": null,
+              "ts": null,
+              "origin": "cli",
+              "linked_execution_process_id": null,
+              "git_branch": null,
+              "version": null,
+              "branch": null,
+              "seq": 5
+            }
+          ]
+        },
+        {
+          "op": "replace",
+          "path": "/forks",
+          "value": []
+        },
+        {
+          "op": "replace",
+          "path": "/health",
+          "value": {
+            "unknown_kinds": 0,
+            "rescans": 0,
+            "quarantined_files": 0,
+            "watch_degraded": false,
+            "foreign_writer_seen_at": null,
+            "files": [
+              {
+                "claude_session_id": "fixture-sid",
+                "file_name": "fixture-sid.jsonl",
+                "generation": 1,
+                "last_import_at": null
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "expected": {
+      "revision": 2,
+      "seq": 5,
+      "entries": [
+        {
+          "normalized_entry": {
+            "timestamp": null,
+            "entry_type": {
+              "type": "assistant_message"
+            },
+            "content": "rebuilt",
+            "metadata": null
+          },
+          "claude_session_id": "fixture-sid",
+          "uuid": "uuid-5",
+          "parent_uuid": null,
+          "ts": null,
+          "origin": "cli",
+          "linked_execution_process_id": null,
+          "git_branch": null,
+          "version": null,
+          "branch": null,
+          "seq": 5
+        }
+      ],
+      "forks": [],
+      "health": {
+        "unknown_kinds": 0,
+        "rescans": 0,
+        "quarantined_files": 0,
+        "watch_degraded": false,
+        "foreign_writer_seen_at": null,
+        "files": [
+          {
+            "claude_session_id": "fixture-sid",
+            "file_name": "fixture-sid.jsonl",
+            "generation": 1,
+            "last_import_at": null
+          }
+        ]
+      }
+    }
+  }
+]

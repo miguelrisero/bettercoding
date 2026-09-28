@@ -21,13 +21,17 @@ pub struct CliIngestSessionMaximum {
 impl CliIngestOutbox {
     pub async fn latest_seq(pool: &SqlitePool, session_id: Uuid) -> Result<i64, sqlx::Error> {
         sqlx::query_scalar!(
-            r#"SELECT COALESCE(MAX(seq), 0) AS "seq!: i64"
-               FROM (
-                   SELECT seq FROM cli_ingest_outbox WHERE session_id = $1
-                   UNION ALL
-                   SELECT published_seq AS seq
-                   FROM cli_ingest_publisher_watermarks WHERE session_id = $1
-               )"#,
+            r#"SELECT MAX(
+                   COALESCE(
+                       (SELECT MAX(seq) FROM cli_ingest_outbox WHERE session_id = $1),
+                       0
+                   ),
+                   COALESCE(
+                       (SELECT published_seq FROM cli_ingest_publisher_watermarks
+                        WHERE session_id = $1),
+                       0
+                   )
+               ) AS "seq!: i64""#,
             session_id
         )
         .fetch_one(pool)
@@ -39,13 +43,17 @@ impl CliIngestOutbox {
         session_id: Uuid,
     ) -> Result<i64, sqlx::Error> {
         sqlx::query_scalar!(
-            r#"SELECT COALESCE(MAX(seq), 0) + 1 AS "seq!: i64"
-               FROM (
-                   SELECT seq FROM cli_ingest_outbox WHERE session_id = $1
-                   UNION ALL
-                   SELECT published_seq AS seq
-                   FROM cli_ingest_publisher_watermarks WHERE session_id = $1
-               )"#,
+            r#"SELECT MAX(
+                   COALESCE(
+                       (SELECT MAX(seq) FROM cli_ingest_outbox WHERE session_id = $1),
+                       0
+                   ),
+                   COALESCE(
+                       (SELECT published_seq FROM cli_ingest_publisher_watermarks
+                        WHERE session_id = $1),
+                       0
+                   )
+               ) + 1 AS "seq!: i64""#,
             session_id
         )
         .fetch_one(&mut **tx)

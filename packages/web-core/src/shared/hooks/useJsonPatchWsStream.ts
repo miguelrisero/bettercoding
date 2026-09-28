@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef } from 'react';
 import { produce } from 'immer';
 import type { Operation } from 'rfc6902';
-import { applyUpsertPatch } from '@/shared/lib/jsonPatch';
+import { applyPatchStrict, applyUpsertPatch } from '@/shared/lib/jsonPatch';
 import { openLocalApiWebSocket } from '@/shared/lib/localApiTransport';
 
 type WsJsonPatchMsg = { JsonPatch: Operation[] };
@@ -18,6 +18,12 @@ interface UseJsonPatchStreamOptions<T> {
    * Filter/deduplicate patches before applying them
    */
   deduplicatePatches?: (patches: Operation[]) => Operation[];
+  /**
+   * Apply patches strictly and, when one fails to apply, drop the socket and
+   * reconnect so the server sends a fresh snapshot. For streams whose patches
+   * depend on the client holding the exact previous state.
+   */
+  resyncOnPatchFailure?: boolean;
 }
 
 interface UseJsonPatchStreamResult<T> {
@@ -50,6 +56,7 @@ export const useJsonPatchWsStream = <T extends object>(
 
   const injectInitialEntry = options?.injectInitialEntry;
   const deduplicatePatches = options?.deduplicatePatches;
+  const resyncOnPatchFailure = options?.resyncOnPatchFailure ?? false;
 
   function scheduleReconnect() {
     if (retryTimerRef.current) return; // already scheduled
@@ -135,9 +142,27 @@ export const useJsonPatchWsStream = <T extends object>(
                 if (!filtered.length || !current) return;
 
                 // Use Immer for structural sharing - only modified parts get new references
-                const next = produce(current, (draft) => {
-                  applyUpsertPatch(draft, filtered);
-                });
+                let next: T;
+                try {
+                  next = produce(current, (draft) => {
+                    if (resyncOnPatchFailure) {
+                      applyPatchStrict(draft, filtered);
+                    } else {
+                      applyUpsertPatch(draft, filtered);
+                    }
+                  });
+                } catch (err) {
+                  if (!resyncOnPatchFailure) throw err;
+                  // The local copy drifted from the server: reconnect now
+                  // for a fresh snapshot.
+                  console.warn('Stream patch did not apply; resyncing', err);
+                  ws.onclose = null;
+                  ws.close();
+                  wsRef.current = null;
+                  setIsConnected(false);
+                  setRetryNonce((n) => n + 1);
+                  return;
+                }
 
                 dataRef.current = next;
                 setData(next);
@@ -235,6 +260,7 @@ export const useJsonPatchWsStream = <T extends object>(
     initialData,
     injectInitialEntry,
     deduplicatePatches,
+    resyncOnPatchFailure,
     retryNonce,
   ]);
 
