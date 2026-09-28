@@ -45,7 +45,9 @@ import {
   RIGHT_MAIN_PANEL_MODES,
 } from '@/shared/stores/useUiPreferencesStore';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
+import { cliTabId, useTerminal } from '@/shared/hooks/useTerminal';
 import { blurActiveTerminalTextarea } from '@/shared/lib/blurActiveTerminalTextarea';
+import { retainedCliWorkspace } from '@/shared/lib/cliPaneRetention';
 
 const WORKSPACES_GUIDE_ID = 'workspaces-guide';
 
@@ -198,6 +200,72 @@ export function WorkspacesLayout() {
     setLeftMainPanelVisible,
   ]);
 
+  // ── CLI pane retention ─────────────────────────────────────────────
+  // Once shown, the selected workspace's CLI pane stays mounted under
+  // `hidden` while chat is shown, so the chat/CLI toggle reuses the live
+  // socket and xterm buffer instead of reattaching tmux. The socket belongs
+  // to the selected workspace: it closes when the selection changes or the
+  // layout unmounts, never on a mode toggle.
+  const { closeTab } = useTerminal();
+  const cliWorkspaceId = isCreateMode ? null : (selectedWorkspace?.id ?? null);
+  const cliShown = mainPaneMode === 'cli' && cliWorkspaceId !== null;
+  const [cliRetainedFor, setCliRetainedFor] = useState<string | null>(null);
+  const nextCliRetainedFor = retainedCliWorkspace(
+    cliRetainedFor,
+    cliWorkspaceId,
+    cliShown
+  );
+  if (nextCliRetainedFor !== cliRetainedFor) {
+    setCliRetainedFor(nextCliRetainedFor);
+  }
+
+  useEffect(() => {
+    if (!nextCliRetainedFor) return;
+    return () => closeTab(nextCliRetainedFor, cliTabId(nextCliRetainedFor));
+  }, [nextCliRetainedFor, closeTab]);
+
+  const cliPaneRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    // A hidden xterm textarea can keep focus (iOS does not blur on
+    // display:none), which leaves the on-screen keyboard open over chat.
+    // Layout-phase for the same reason as the mobile-tab blur above.
+    if (cliShown) return;
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && cliPaneRef.current?.contains(active)) {
+      active.blur();
+    }
+  }, [cliShown]);
+
+  const selectedWorkspaceActivity = nextCliRetainedFor
+    ? activeWorkspaces.find((w) => w.id === nextCliRetainedFor)
+    : undefined;
+  const cliPane = nextCliRetainedFor ? (
+    <div ref={cliPaneRef} className={cn('h-full', !cliShown && 'hidden')}>
+      <CliMainPane
+        workspaceId={nextCliRetainedFor}
+        visible={cliShown}
+        onBackToChat={() => setMainPaneMode('chat')}
+        // Mid-switch, selectedSession can briefly still be the previous
+        // workspace's; never hand a foreign session to the terminal resume.
+        sessionId={
+          selectedSession?.workspace_id === nextCliRetainedFor
+            ? selectedSessionId
+            : undefined
+        }
+        sessionsReady={!isSessionsLoading}
+        // Hold the terminal back while the chat executor runs (e.g. a
+        // just-created workspace's initial prompt) — it would otherwise bake
+        // a conversation-less tmux session and split work between chat and
+        // CLI. Streams live via the workspaces WebSocket.
+        executorRunning={selectedWorkspaceActivity?.isExecutorRunning ?? false}
+        codingAgentRunning={
+          selectedWorkspaceActivity?.isCodingAgentRunning ?? false
+        }
+        cliRunning={cliSessionActive}
+      />
+    </div>
+  ) : null;
+
   const [rightMainPanelSize, setRightMainPanelSize] = usePaneSize(
     PERSIST_KEYS.rightMainPanel,
     50
@@ -267,45 +335,29 @@ export function WorkspacesLayout() {
                 <CreateChatBoxContainer
                   onWorkspaceCreated={handleWorkspaceCreated}
                 />
-              ) : mainPaneMode === 'cli' && selectedWorkspace?.id ? (
-                // Same CLI pane as desktop — phones get the terminal too,
-                // with the navbar's terminal button (and the pane's "Back to
-                // chat") to switch. All handover gates mirror the desktop
-                // call site.
-                <CliMainPane
-                  workspaceId={selectedWorkspace.id}
-                  onBackToChat={() => setMainPaneMode('chat')}
-                  sessionId={
-                    selectedSession?.workspace_id === selectedWorkspace.id
-                      ? selectedSessionId
-                      : undefined
-                  }
-                  sessionsReady={!isSessionsLoading}
-                  executorRunning={
-                    activeWorkspaces.find((w) => w.id === selectedWorkspace.id)
-                      ?.isExecutorRunning ?? false
-                  }
-                  codingAgentRunning={
-                    activeWorkspaces.find((w) => w.id === selectedWorkspace.id)
-                      ?.isCodingAgentRunning ?? false
-                  }
-                  cliRunning={cliSessionActive}
-                />
               ) : (
-                <WorkspacesMainContainer
-                  ref={mainContainerRef}
-                  selectedWorkspace={selectedWorkspace ?? null}
-                  selectedSession={selectedSession}
-                  selectedSessionId={selectedSessionId}
-                  sessions={sessions}
-                  repos={repos}
-                  onSelectSession={selectSession}
-                  isLoading={isLoading}
-                  isSessionsLoading={isSessionsLoading}
-                  isNewSessionMode={isNewSessionMode}
-                  onStartNewSession={startNewSession}
-                  cliSessionActive={cliSessionActive}
-                />
+                <>
+                  {/* Same CLI pane as desktop — phones get the terminal
+                      too, with the navbar's terminal button (and the pane's
+                      "Back to chat") to switch. */}
+                  {cliPane}
+                  {!cliShown && (
+                    <WorkspacesMainContainer
+                      ref={mainContainerRef}
+                      selectedWorkspace={selectedWorkspace ?? null}
+                      selectedSession={selectedSession}
+                      selectedSessionId={selectedSessionId}
+                      sessions={sessions}
+                      repos={repos}
+                      onSelectSession={selectSession}
+                      isLoading={isLoading}
+                      isSessionsLoading={isSessionsLoading}
+                      isNewSessionMode={isNewSessionMode}
+                      onStartNewSession={startNewSession}
+                      cliSessionActive={cliSessionActive}
+                    />
+                  )}
+                </>
               )}
             </div>
 
@@ -419,51 +471,26 @@ export function WorkspacesLayout() {
                   <CreateChatBoxContainer
                     onWorkspaceCreated={handleWorkspaceCreated}
                   />
-                ) : mainPaneMode === 'cli' && selectedWorkspace?.id ? (
-                  <CliMainPane
-                    workspaceId={selectedWorkspace.id}
-                    onBackToChat={() => setMainPaneMode('chat')}
-                    // Mid-switch, selectedSession can briefly still be the
-                    // previous workspace's; never hand a foreign session to
-                    // the terminal resume.
-                    sessionId={
-                      selectedSession?.workspace_id === selectedWorkspace.id
-                        ? selectedSessionId
-                        : undefined
-                    }
-                    sessionsReady={!isSessionsLoading}
-                    // Hold the terminal back while the chat executor runs
-                    // (e.g. a just-created workspace's initial prompt) — it
-                    // would otherwise bake a conversation-less tmux session
-                    // and split work between chat and CLI. Streams live via
-                    // the workspaces WebSocket.
-                    executorRunning={
-                      activeWorkspaces.find(
-                        (w) => w.id === selectedWorkspace.id
-                      )?.isExecutorRunning ?? false
-                    }
-                    codingAgentRunning={
-                      activeWorkspaces.find(
-                        (w) => w.id === selectedWorkspace.id
-                      )?.isCodingAgentRunning ?? false
-                    }
-                    cliRunning={cliSessionActive}
-                  />
                 ) : (
-                  <WorkspacesMainContainer
-                    ref={mainContainerRef}
-                    selectedWorkspace={selectedWorkspace ?? null}
-                    selectedSession={selectedSession}
-                    selectedSessionId={selectedSessionId}
-                    sessions={sessions}
-                    repos={repos}
-                    onSelectSession={selectSession}
-                    isLoading={isLoading}
-                    isSessionsLoading={isSessionsLoading}
-                    isNewSessionMode={isNewSessionMode}
-                    onStartNewSession={startNewSession}
-                    cliSessionActive={cliSessionActive}
-                  />
+                  <>
+                    {cliPane}
+                    {!cliShown && (
+                      <WorkspacesMainContainer
+                        ref={mainContainerRef}
+                        selectedWorkspace={selectedWorkspace ?? null}
+                        selectedSession={selectedSession}
+                        selectedSessionId={selectedSessionId}
+                        sessions={sessions}
+                        repos={repos}
+                        onSelectSession={selectSession}
+                        isLoading={isLoading}
+                        isSessionsLoading={isSessionsLoading}
+                        isNewSessionMode={isNewSessionMode}
+                        onStartNewSession={startNewSession}
+                        cliSessionActive={cliSessionActive}
+                      />
+                    )}
+                  </>
                 )}
               </Panel>
             )}
