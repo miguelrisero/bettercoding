@@ -21,6 +21,7 @@ import WYSIWYGEditor from '@/shared/components/WYSIWYGEditor';
 
 import { useHotkeysContext } from 'react-hotkeys-hook';
 import { TabNavContext } from '@/shared/hooks/TabNavigationContext';
+import { usePaneVisible } from '@/shared/hooks/PaneVisibilityContext';
 import {
   useKeyApproveRequest,
   useKeyDenyApproval,
@@ -189,8 +190,10 @@ const PendingApprovalEntry = ({
   const { enableScope, disableScope, activeScopes } = useHotkeysContext();
   const tabNav = useContext(TabNavContext);
   const isLogsTabActive = tabNav ? tabNav.activeTab === 'logs' : true;
+  const paneVisible = usePaneVisible();
   const dialogScopeActive = activeScopes.includes(Scope.DIALOG);
-  const shouldControlScopes = isLogsTabActive && !dialogScopeActive;
+  const shouldControlScopes =
+    isLogsTabActive && paneVisible && !dialogScopeActive;
   const approvalsScopeEnabledRef = useRef(false);
   const dialogScopeActiveRef = useRef(dialogScopeActive);
 

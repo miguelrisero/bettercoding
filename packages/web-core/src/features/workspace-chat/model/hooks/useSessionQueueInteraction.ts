@@ -1,6 +1,7 @@
 import { useCallback } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ApiError, queueApi } from '@/shared/lib/api';
+import { usePaneVisible } from '@/shared/hooks/PaneVisibilityContext';
 import type { ExecutorConfig, QueueStatus } from 'shared/types';
 
 interface UseSessionQueueInteractionOptions {
@@ -63,12 +64,17 @@ export function useSessionQueueInteraction({
 }: UseSessionQueueInteractionOptions): UseSessionQueueInteractionResult {
   const queryClient = useQueryClient();
   const queryKey = sessionQueueKeys.status(sessionId);
+  const paneVisible = usePaneVisible();
 
   const { data: queueStatus = { status: 'empty' as const }, refetch } =
     useQuery<QueueStatus>({
       queryKey,
       queryFn: () => queueApi.getStatus(sessionId!),
       enabled: Boolean(sessionId),
+      // Stops polling inside a hidden pane. Always stale, so showing the pane
+      // again (re-subscribing) fetches the current status once.
+      subscribed: paneVisible,
+      staleTime: 0,
       refetchInterval: (query) => {
         const status = query.state.data;
         return status && status.status !== 'empty' ? 1_000 : 5_000;

@@ -7,6 +7,7 @@ import type {
 import { handleApiResponse } from '@/shared/lib/api';
 import { makeLocalApiRequest } from '@/shared/lib/localApiTransport';
 import { useHostId } from '@/shared/providers/HostIdProvider';
+import { usePaneVisible } from '@/shared/hooks/PaneVisibilityContext';
 
 const unassignedCliSessionKeys = {
   byWorkspace: (workspaceId: string | undefined, hostId: string | null) =>
@@ -43,10 +44,12 @@ export function useUnassignedCliSessions(
   const hostId = useHostId();
   const queryClient = useQueryClient();
   const queryKey = unassignedCliSessionKeys.byWorkspace(workspaceId, hostId);
+  const paneVisible = usePaneVisible();
   const query = useQuery({
     queryKey,
     queryFn: () => fetchUnassignedCliSessions(workspaceId!),
     enabled: Boolean(workspaceId && sessionId),
+    subscribed: paneVisible,
     refetchInterval: 15_000,
     refetchOnWindowFocus: true,
     retry: false,
