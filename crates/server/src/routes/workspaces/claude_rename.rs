@@ -28,8 +28,8 @@ use db::models::{
     claude_session_link::ClaudeSessionLink, coding_agent_turn::CodingAgentTurn, session::Session,
 };
 use local_deployment::pty::{
-    cli_pane_agent_running_at, latest_cli_client_activity, locate_cli_tmux_target, now_unix_secs,
-    send_cli_keys_to,
+    CliSendResult, cli_pane_agent_running_at, latest_cli_client_activity, locate_cli_tmux_target,
+    now_unix_secs, send_cli_keys_to_live_agent,
 };
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -55,9 +55,9 @@ pub fn custom_title_sidecar_path(transcript_path: &Path) -> Option<PathBuf> {
 /// Whether `/rename` keystrokes may be injected: the name must survive being
 /// typed into a single TUI input line as literal text, and the newest tmux
 /// `client_activity` on the socket must be older than the margin. Rejects:
-/// control bytes (send-keys -l types them raw into the pane's pty, where a
-/// raw-mode TUI reads Esc/Ctrl-C/... as real keystrokes — a name containing
-/// one would drive the TUI, not type into it); newlines (submit mid-name);
+/// control bytes (the paste delivers them raw into the pane's pty, where an
+/// Esc can end the bracketed paste and the rest reads as real keystrokes — a
+/// name containing one would drive the TUI, not type into it); newlines;
 /// empty names. No readable client activity means idleness could not be
 /// established — fail closed, skip.
 pub fn should_inject_rename_keys(
@@ -142,7 +142,10 @@ async fn propagate_rename(pool: &SqlitePool, workspace_id: Uuid, name: &str) -> 
         && should_inject_rename_keys(name, Some(latest_activity), now_unix_secs())
     {
         let command = format!("/rename {name}");
-        if !send_cli_keys_to(&target, &command).await {
+        if !send_cli_keys_to_live_agent(&target, &["claude"], &command)
+            .await
+            .is_some_and(CliSendResult::delivered)
+        {
             tracing::debug!(
                 %workspace_id,
                 "Claude /rename keystrokes not delivered; files carry the rename"
@@ -297,8 +300,8 @@ mod tests {
 
     #[test]
     fn inject_rejects_control_bytes() {
-        // send-keys -l types raw bytes; a raw-mode TUI reads control bytes as
-        // keystrokes (Esc opens menus, Ctrl-C interrupts), not as text.
+        // The paste carries raw bytes; an Esc can end the bracketed paste and
+        // the rest reads as keystrokes (Esc opens menus, Ctrl-C interrupts).
         let idle = 1_000_000 - RENAME_IDLE_MARGIN_SECS;
         for name in [
             "a\u{1b}b", // Esc
@@ -331,8 +334,8 @@ mod tests {
 
     #[test]
     fn inject_allows_tricky_single_line_names() {
-        // Leading `-`, quotes, and spaces are safe: send_cli_keys passes the
-        // text after a `--` terminator via `send-keys -l`.
+        // Leading `-`, quotes, and spaces are safe: send_cli_keys stages the
+        // text through a tmux buffer on stdin, never through argv.
         let idle = 1_000_000 - RENAME_IDLE_MARGIN_SECS;
         assert!(should_inject_rename_keys("--force", Some(idle), 1_000_000));
         assert!(should_inject_rename_keys(

@@ -114,6 +114,8 @@ import {
   BulkDeleteArchivedWorkspacesRequest,
   BulkDeleteArchivedWorkspacesResponse,
   SetCliManualRequest,
+  SendCliTextRequest,
+  SendCliTextResponse,
 } from 'shared/types';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
 import { createWorkspaceWithSession } from '@/shared/types/attempt';
@@ -1183,6 +1185,23 @@ export const cliAgentApi = {
       { method: 'POST' }
     );
     return handleApiResponse<CliRestartResponse>(response);
+  },
+
+  /**
+   * Type text into the workspace's live CLI agent (Claude Code or Codex) and
+   * submit it. Rejects with a 409 when no agent owns the pane and a 400 for
+   * empty or over-256-KiB text. `submitted: false` means the text is in the
+   * agent's input box but Enter failed.
+   */
+  sendText: async (
+    workspaceId: string,
+    data: SendCliTextRequest
+  ): Promise<SendCliTextResponse> => {
+    const response = await makeRequest(
+      `/api/workspaces/${workspaceId}/cli/send`,
+      { method: 'POST', body: JSON.stringify(data) }
+    );
+    return handleApiResponse<SendCliTextResponse>(response);
   },
 };
 

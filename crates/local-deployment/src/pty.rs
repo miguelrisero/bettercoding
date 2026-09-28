@@ -1701,16 +1701,39 @@ pub fn cli_tmux_available() -> bool {
 /// launch. Matching the EXACT program name (not "any non-shell") still keeps a
 /// user's vim/npm inside the missing-binary fallback shell from satisfying the
 /// paste gate.
-pub async fn cli_pane_agent_running(workspace_id: Uuid, program: &str) -> Option<bool> {
-    let target = locate_cli_tmux_target(workspace_id).await?;
-    cli_pane_agent_running_at(&target, program).await
-}
-
-/// Check agent ownership at one already-located target without re-running the
-/// dual-home locator. The tmux pane probe is bounded like the locator probes.
+///
+/// Takes an already-located target so a multi-step caller never re-runs the
+/// dual-home locator; the tmux pane probe is bounded like the locator probes.
 pub async fn cli_pane_agent_running_at(target: &CliTmuxTarget, program: &str) -> Option<bool> {
     let (pane_pid, listing) = pane_process_listing(target).await?;
     Some(pane_subtree_has_program(&listing, pane_pid, program))
+}
+
+/// Binary names of the agents CLI mode can launch (`CliLaunchSpec::program`
+/// of every shipped `interactive_cli_spec`).
+pub const CLI_AGENT_PROGRAMS: &[&str] = &["claude", "codex"];
+
+/// Which of `programs` owns the pane, checked in the given order against ONE
+/// process snapshot. Order matters when several match: an agent can run
+/// another as a tool (claude shelling out to `codex exec`), so callers list
+/// the program they expect first. `None` when the pane can't be read.
+pub async fn cli_pane_agent_program_at<'a>(
+    target: &CliTmuxTarget,
+    programs: &[&'a str],
+) -> Option<Option<&'a str>> {
+    let (pane_pid, listing) = pane_process_listing(target).await?;
+    Some(first_program_in_pane_subtree(&listing, pane_pid, programs))
+}
+
+fn first_program_in_pane_subtree<'a>(
+    ps_listing: &str,
+    root_pid: u32,
+    programs: &[&'a str],
+) -> Option<&'a str> {
+    programs
+        .iter()
+        .copied()
+        .find(|program| pane_subtree_has_program(ps_listing, root_pid, program))
 }
 
 async fn pane_process_listing(target: &CliTmuxTarget) -> Option<(u32, String)> {
@@ -1956,70 +1979,135 @@ pub async fn capture_cli_pane(workspace_id: Uuid) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Texts at/above this size go through tmux buffers (load-buffer + paste-buffer)
-/// instead of `send-keys -l`, which — like every tmux client command — is
-/// rejected once its argv exceeds ~16KB. The small-text `send-keys` path is the
-/// already-live-verified one, so keep it for the common case.
-const SEND_KEYS_PASTE_THRESHOLD: usize = 4096;
-
-/// Whether `text` must ride the buffer/bracketed-paste transport instead of
-/// plain `send-keys -l`: oversized texts hit tmux's ~16KB client-command
-/// ceiling, and MULTI-LINE texts sent as literal keystrokes would submit at
-/// the first newline (each `\n` acts as Enter to the TUI) — mangling the
-/// message while still reporting success. Single-line small texts keep the
-/// live-verified `send-keys -l` path.
-fn needs_paste_transport(text: &str) -> bool {
-    text.len() >= SEND_KEYS_PASTE_THRESHOLD || text.contains('\n')
-}
-
 /// Type `text` into a workspace's CLI tmux pane and submit it (Enter), as if the
 /// user typed it. This is the only way to re-prompt a LIVE, detached agent: the
 /// parked `pending_cli_prompt` path only fires when a fresh tmux session is
-/// created, so an already-running pane needs keystroke injection. Small
-/// single-line texts go via `send-keys -l` (literal, so never interpreted as
-/// tmux key names); larger or multi-line texts are staged through a namespaced
-/// tmux buffer and bracketed-pasted ([`needs_paste_transport`]). Enter is a
-/// separate call so it submits rather than being typed verbatim. Best-effort.
+/// created, so an already-running pane needs keystroke injection. Every text
+/// is staged through a namespaced tmux buffer and bracketed-pasted, then Enter
+/// is sent as a separate key. Typing text as keys (`send-keys -l`) is not
+/// used: Codex reads a fast burst of typed characters as a paste and turns
+/// the Enter that follows into a newline, leaving the text unsubmitted, and
+/// multi-line text typed as keys would submit at its first newline. A paste
+/// has no argv size limit either. Sends only when a CLI agent owns the pane,
+/// so text never reaches the fallback shell. Best-effort.
 pub async fn send_cli_keys(workspace_id: Uuid, text: &str) -> bool {
     let Some(target) = locate_cli_tmux_target(workspace_id).await else {
         return false;
     };
-    send_cli_keys_to(&target, text).await
+    send_cli_keys_to_live_agent(&target, CLI_AGENT_PROGRAMS, text)
+        .await
+        .is_some_and(CliSendResult::delivered)
+}
+
+/// How far a CLI send got. Text that reached the pane but whose Enter failed
+/// is distinct from a failed delivery: it sits in the TUI's input box, so a
+/// caller must not re-deliver it (that doubles the prompt), and it is not a
+/// submitted turn either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliSendResult {
+    NotDelivered,
+    DeliveredUnsubmitted,
+    Submitted,
+}
+
+impl CliSendResult {
+    /// The text reached the pane (submitted or not).
+    pub fn delivered(self) -> bool {
+        self != Self::NotDelivered
+    }
+}
+
+/// Per-workspace send lock. A send is several tmux commands (paste, then
+/// Enter); without this, two concurrent senders (collab router, loop
+/// supervisor, rename, deferred prompt, composer) could interleave as
+/// paste A, paste B, Enter, Enter and submit one merged prompt. Entries no
+/// sender holds are pruned on each lookup, so the map stays as small as the
+/// set of in-flight sends.
+fn cli_send_lock(workspace_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    locks.entry(workspace_id).or_default().clone()
 }
 
 /// Send and submit text to one already-located target without allowing a
 /// second locator pass to switch homes midway through the transaction.
-pub async fn send_cli_keys_to(target: &CliTmuxTarget, text: &str) -> bool {
+pub async fn send_cli_keys_to(target: &CliTmuxTarget, text: &str) -> CliSendResult {
+    send_detached(target, None, text)
+        .await
+        .unwrap_or(CliSendResult::NotDelivered)
+}
+
+/// Like [`send_cli_keys_to`], but only when one of `programs` owns the pane,
+/// probed under the send lock so a send queued behind another cannot act on a
+/// stale check. `None` means no listed agent is live (or the pane is
+/// unreadable) and nothing was sent.
+pub async fn send_cli_keys_to_live_agent(
+    target: &CliTmuxTarget,
+    programs: &[&str],
+    text: &str,
+) -> Option<CliSendResult> {
+    send_detached(target, Some(programs), text).await
+}
+
+/// Run lock, optional ownership probe, paste and Enter as one spawned task. A
+/// caller whose future is dropped (an HTTP client disconnecting) then cannot
+/// release the lock between paste and Enter, which would let the next sender
+/// join its text to this one, or skip the staged buffer's cleanup.
+async fn send_detached(
+    target: &CliTmuxTarget,
+    programs: Option<&[&str]>,
+    text: &str,
+) -> Option<CliSendResult> {
+    let target = target.clone();
+    let programs: Option<Vec<String>> =
+        programs.map(|programs| programs.iter().map(|p| p.to_string()).collect());
+    let text = text.to_owned();
+    let workspace_id = target.workspace_id;
+    tokio::spawn(async move {
+        let _guard = cli_send_lock(target.workspace_id).lock_owned().await;
+        if let Some(programs) = programs {
+            let programs: Vec<&str> = programs.iter().map(String::as_str).collect();
+            cli_pane_agent_program_at(&target, &programs)
+                .await
+                .flatten()?;
+        }
+        Some(send_cli_keys_locked(&target, &text).await)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(%workspace_id, %error, "CLI send task failed");
+        Some(CliSendResult::NotDelivered)
+    })
+}
+
+/// Bracketed-paste end marker. Text holding it would close the paste early
+/// and the rest would reach the TUI as key input.
+const BRACKETED_PASTE_END: &str = "\x1b[201~";
+
+async fn send_cli_keys_locked(target: &CliTmuxTarget, text: &str) -> CliSendResult {
+    if text.contains(BRACKETED_PASTE_END) {
+        tracing::warn!(
+            "CLI send to workspace {} refused: text holds the bracketed-paste end marker",
+            target.workspace_id
+        );
+        return CliSendResult::NotDelivered;
+    }
     // Bare name (not `=exact`): send-keys/paste-buffer take a pane target, for
     // which the `=` session-target syntax is rejected. Unambiguous given
     // full-hex names.
-    let delivered = if needs_paste_transport(text) {
-        paste_via_tmux_buffer(target, text).await
-    } else {
-        // `--` ends option parsing so text starting with `-` (e.g. a prompt
-        // like "-rf ...") is treated as a literal key rather than an unknown
-        // send-keys flag (verified: `send-keys -l "-x"` fails "unknown flag").
-        run_cli_tmux(&[
-            "-L",
-            &target.socket,
-            "send-keys",
-            "-t",
-            &target.session_name,
-            "-l",
-            "--",
-            text,
-        ])
-        .await
-        .is_ok()
-    };
+    let delivered = paste_via_tmux_buffer(target, text).await;
     if !delivered {
-        return false;
+        return CliSendResult::NotDelivered;
     }
 
     // The text is already IN the pane; failing the whole send over a flaky
     // Enter would make the caller re-deliver the text on top of the residue
-    // (a doubled prompt). Retry the Enter once, then accept: delivered (the
-    // user can press Enter themselves), submission best-effort.
+    // (a doubled prompt). Retry the Enter once, then report it delivered but
+    // unsubmitted (the user can press Enter themselves).
     for _ in 0..2 {
         if run_cli_tmux(&[
             "-L",
@@ -2032,7 +2120,7 @@ pub async fn send_cli_keys_to(target: &CliTmuxTarget, text: &str) -> bool {
         .await
         .is_ok()
         {
-            return true;
+            return CliSendResult::Submitted;
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
@@ -2041,7 +2129,7 @@ pub async fn send_cli_keys_to(target: &CliTmuxTarget, text: &str) -> bool {
          left unsubmitted in the pane",
         target.workspace_id
     );
-    true
+    CliSendResult::DeliveredUnsubmitted
 }
 
 /// Stage `text` into a per-workspace tmux buffer via `load-buffer -` (text on
@@ -4016,14 +4104,133 @@ mod tests {
     }
 
     #[test]
-    fn multiline_or_oversized_text_takes_the_paste_transport() {
-        // `send-keys -l` types newlines as Enter keystrokes — a multi-line
-        // text would submit at its first line — so anything with a newline
-        // rides the bracketed-paste buffer path regardless of size.
-        assert!(!needs_paste_transport("single line"));
-        assert!(needs_paste_transport("two\nlines"));
-        assert!(needs_paste_transport(&"x".repeat(4096)));
-        assert!(!needs_paste_transport(&"x".repeat(4095)));
+    fn pane_agent_program_prefers_the_expected_agent_in_list_order() {
+        // Real codex 0.157 tree: a bash wrapper execs the node launcher, which
+        // spawns the native `codex`. A claude pane running `codex exec` as a
+        // tool holds both names; the caller's order picks the pane's agent.
+        let codex_pane = "\
+  100     1 sh
+  200   100 node
+  300   200 codex
+";
+        let claude_running_codex = "\
+  100     1 sh
+  200   100 claude
+  300   200 node
+  400   300 codex
+";
+        let shell_only = "\
+  100     1 sh
+  200   100 vim
+";
+        assert_eq!(
+            first_program_in_pane_subtree(codex_pane, 100, &["claude", "codex"]),
+            Some("codex")
+        );
+        assert_eq!(
+            first_program_in_pane_subtree(claude_running_codex, 100, &["claude", "codex"]),
+            Some("claude")
+        );
+        assert_eq!(
+            first_program_in_pane_subtree(claude_running_codex, 100, &["codex", "claude"]),
+            Some("codex")
+        );
+        assert_eq!(
+            first_program_in_pane_subtree(shell_only, 100, CLI_AGENT_PROGRAMS),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn send_refuses_text_holding_the_paste_end_marker() {
+        // Refused before any tmux call, so the socket need not exist.
+        let target = owned_cli_tmux_target_on(
+            CliTmuxHome::Current,
+            Uuid::new_v4(),
+            "bc-never-started",
+            "bc-never-started-legacy",
+        );
+        assert_eq!(
+            send_cli_keys_to(&target, "a\x1b[201~rm -rf x").await,
+            CliSendResult::NotDelivered
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_sends_to_one_pane_never_interleave() {
+        if !tmux_available() {
+            return;
+        }
+        // `cat` with echo off prints each submitted line exactly once. Each
+        // send is a two-line paste then Enter; an interleaving shows up as a
+        // line joining two senders' texts (fails without the send lock).
+        let pair = scratch_tmux_pair();
+        let workspace_id = Uuid::new_v4();
+        let target = owned_cli_tmux_target_on(
+            CliTmuxHome::Current,
+            workspace_id,
+            &pair.current.socket,
+            &pair.legacy.socket,
+        );
+        let output = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &target.socket,
+                "new-session",
+                "-d",
+                "-x",
+                "200",
+                "-y",
+                "50",
+                "-s",
+                &target.session_name,
+                "stty -echo; exec cat",
+            ])
+            .output()
+            .expect("start cat pane");
+        assert!(output.status.success());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let sends: Vec<_> = (0..8)
+            .map(|i| {
+                let target = target.clone();
+                tokio::spawn(async move {
+                    let text = format!("s{i}-first\ns{i}-second");
+                    send_cli_keys_to(&target, &text).await
+                })
+            })
+            .collect();
+        // Callers that go away mid-send (a dropped HTTP request) must still
+        // leave a whole paste + Enter, never half of one for the next sender.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        for send in sends.iter().skip(1).step_by(2) {
+            send.abort();
+        }
+        for send in sends.into_iter().step_by(2) {
+            assert_eq!(send.await.unwrap(), CliSendResult::Submitted);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        let captured = run_cli_tmux(&[
+            "-L",
+            &target.socket,
+            "capture-pane",
+            "-p",
+            "-t",
+            &target.session_name,
+        ])
+        .await
+        .expect("capture pane");
+        let lines: Vec<String> = String::from_utf8_lossy(&captured.stdout)
+            .lines()
+            .map(str::to_string)
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 16, "pane: {lines:?}");
+        for pair in lines.chunks(2) {
+            let sender = pair[0].strip_suffix("-first").expect("first line");
+            assert_eq!(pair[1], format!("{sender}-second"), "pane: {lines:?}");
+        }
     }
 
     #[test]
