@@ -1003,6 +1003,7 @@ mod tests {
                 raw: "{}".to_string(),
                 disposition: CliNativeRecordDisposition::Renderable,
                 user_prompt: Some(prompt.to_string()),
+                paste_ack_prompt: None,
                 recorded_at: Some(recorded_at),
             }],
             &ImportedCursor {

@@ -55,6 +55,11 @@ pub struct NewCliNativeRecord {
     pub disposition: CliNativeRecordDisposition,
     /// Plain user text used only for durable app-turn reconciliation.
     pub user_prompt: Option<String>,
+    /// Plain user text that may acknowledge a CLI paste of the same prompt
+    /// when `user_prompt` is withheld. Codex sets only this: its turns are
+    /// matched to executor runs by run window, never by prompt, but a
+    /// collaboration paste still needs its acknowledgement.
+    pub paste_ack_prompt: Option<String>,
     pub recorded_at: Option<DateTime<Utc>>,
 }
 
@@ -81,6 +86,10 @@ pub struct ImportBatchResult {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NativeImportContext {
     pub app_pane_absent: bool,
+    /// When set, only a turn recorded at or after this instant can mark a
+    /// foreign writer. A Codex thread is imported in full when a pane first
+    /// links it, and its earlier turns say nothing about who writes now.
+    pub foreign_since: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -433,7 +442,13 @@ impl CliNativeRecord {
 
             let bound_queued_message_id =
                 if record.kind == "user" && !linked_to_execution && bound_turn_id.is_none() {
-                    match (record.user_prompt.as_deref(), session_id) {
+                    // Claude Code and Codex both submit a paste with its
+                    // surrounding whitespace trimmed.
+                    let prompt = record
+                        .user_prompt
+                        .as_deref()
+                        .or(record.paste_ack_prompt.as_deref());
+                    match (prompt, session_id) {
                         (Some(prompt), Some(session_id)) => {
                             let reference_time = record.recorded_at.unwrap_or(imported_at);
                             let earliest_paste = reference_time
@@ -453,7 +468,7 @@ impl CliNativeRecord {
                                          AND failure_reason = $6
                                      )
                                  )
-                                 AND prompt = $2
+                                 AND (prompt = $2 OR trim(prompt, char(9, 10, 13, 32)) = $2)
                                  AND (claude_session_id IS NULL OR claude_session_id = $3)
                                  AND pasted_at IS NOT NULL
                                  AND julianday(pasted_at) >= julianday($4)
@@ -528,6 +543,9 @@ impl CliNativeRecord {
                 .await?;
             } else if context.app_pane_absent
                 && record.kind == "user"
+                && context.foreign_since.is_none_or(|since| {
+                    record.recorded_at.is_some_and(|recorded| recorded >= since)
+                })
                 && !linked_to_execution
                 && bound_turn_id.is_none()
                 && let Some(session_id) = session_id

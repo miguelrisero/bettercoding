@@ -1359,3 +1359,160 @@ async fn measure_codex_on_copied_database() {
         );
     }
 }
+
+struct CodexPaneProbe {
+    agent_running: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::services::cli_collab::CliWriterProbe for CodexPaneProbe {
+    async fn probe(
+        &self,
+        _workspace_id: Uuid,
+        _effective_dir: &Path,
+        _expected_sid: Option<&str>,
+        _binding: Option<&CliPaneBinding>,
+        _check_cwd_uniqueness: bool,
+    ) -> crate::services::cli_collab::ProbeReport {
+        crate::services::cli_collab::ProbeReport {
+            pane_session_exists: true,
+            agent_running: Some(self.agent_running),
+            agent_program: self.agent_running.then(|| "codex".to_string()),
+            sid_evidence: crate::services::cli_collab::SidEvidence::NoResumeArg,
+            probe_failed: false,
+            only_active_claude_in_cwd: None,
+        }
+    }
+}
+
+/// A user turn in a linked Codex thread while no app pane agent runs and no
+/// executor runs came from a writer outside the app. `history` writes the
+/// turn before the pane links the thread, as a resumed thread's backfill.
+async fn codex_foreign_writer_flagged(pane_agent_running: bool, history: bool) -> bool {
+    let mut case = codex_case().await;
+    let mut service = ClaudeTranscriptIngest::new_with_probe(
+        case.db.clone(),
+        case.temp.path().join("projects"),
+        Arc::new(CodexPaneProbe {
+            agent_running: pane_agent_running,
+        }),
+    );
+    service.codex_sessions_dir = Some(case.root.clone());
+    case.service = Arc::new(service);
+    let created = fixture_created_at();
+    let thread = thread_id_at(created, 7);
+    if !history {
+        bind_resumed(&case, &thread).await;
+    }
+    let typed_at = if history { created } else { Utc::now() };
+    write_rollout(
+        &rollout_path(&case.root, &thread, created),
+        &[
+            session_meta(&thread, &case.cwd, created, "cli"),
+            user_turn(
+                &thread,
+                "foreign-turn",
+                typed_at,
+                "typed in another terminal",
+            ),
+        ]
+        .concat(),
+    );
+    if history {
+        bind_resumed(&case, &thread).await;
+    }
+
+    reconcile(&case).await;
+
+    assert_eq!(
+        texts(&entries(&case).await),
+        [
+            "typed in another terminal",
+            "answer to typed in another terminal"
+        ]
+    );
+    ClaudeSessionLink::find(&case.db.pool, &thread)
+        .await
+        .unwrap()
+        .unwrap()
+        .foreign_writer_seen_at
+        .is_some()
+}
+
+#[tokio::test]
+async fn a_codex_turn_written_outside_the_app_pane_marks_a_foreign_writer() {
+    assert!(codex_foreign_writer_flagged(false, false).await);
+    assert!(!codex_foreign_writer_flagged(true, false).await);
+    // A resumed thread's earlier turns never mark one, pane or not.
+    assert!(!codex_foreign_writer_flagged(false, true).await);
+}
+
+/// State of a collaboration paste of `pasted` after the pane records `typed`.
+async fn codex_paste_state(
+    pasted: &str,
+    typed: &str,
+) -> db::models::session_queued_message::QueuedMessageState {
+    use db::models::session_queued_message::{
+        QueuedMessageSource, SessionQueuedMessage, StoreQueuedMessageResult,
+    };
+    let case = codex_case().await;
+    let now = Utc::now();
+    let thread = thread_id_at(now, 3);
+    bind_resumed(&case, &thread).await;
+    let prompt = pasted;
+    let StoreQueuedMessageResult::Stored(row) = SessionQueuedMessage::store(
+        &case.db.pool,
+        case.session.id,
+        prompt,
+        None,
+        QueuedMessageSource::Ui,
+        false,
+    )
+    .await
+    .unwrap() else {
+        unreachable!("the session has no queued message");
+    };
+    SessionQueuedMessage::claim_for_paste(&case.db.pool, row.id, Some(&thread), "paster")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        SessionQueuedMessage::mark_pasted(&case.db.pool, row.id, "paster")
+            .await
+            .unwrap()
+    );
+    write_rollout(
+        &rollout_path(&case.root, &thread, now),
+        &[
+            session_meta(&thread, &case.cwd, now, "cli"),
+            user_turn(&thread, "routed-turn", now, typed),
+        ]
+        .concat(),
+    );
+
+    reconcile(&case).await;
+
+    SessionQueuedMessage::find_by_id(&case.db.pool, row.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .state
+}
+
+#[tokio::test]
+async fn a_codex_turn_acknowledges_the_collaboration_paste_of_its_prompt() {
+    use db::models::session_queued_message::QueuedMessageState::{Imported, Pasted};
+    assert_eq!(
+        codex_paste_state("routed from chat", "routed from chat").await,
+        Imported
+    );
+    // The TUI submits the paste trimmed.
+    assert_eq!(
+        codex_paste_state("\n routed from chat \t\n", "routed from chat").await,
+        Imported
+    );
+    assert_eq!(
+        codex_paste_state("routed from chat", "something else").await,
+        Pasted
+    );
+}

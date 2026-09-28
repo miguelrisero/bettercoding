@@ -300,6 +300,7 @@ fn import_record(
             .to_string(),
         disposition: CliNativeRecordDisposition::Renderable,
         user_prompt: Some(prompt.to_string()),
+        paste_ack_prompt: None,
         recorded_at: Some(at),
     }
 }
@@ -324,6 +325,7 @@ fn writer_report(
     ProbeReport {
         pane_session_exists,
         agent_running,
+        agent_program: (agent_running == Some(true)).then(|| "claude".to_string()),
         sid_evidence,
         probe_failed: false,
         only_active_claude_in_cwd,
@@ -524,6 +526,14 @@ async fn cli_fresh_file_quarantines_for_released_dead_or_nonexclusive_panes() {
         (
             false,
             writer_report(true, Some(true), SidEvidence::NoResumeArg, Some(false)),
+        ),
+        // A fresh Codex pane never claims a Claude transcript.
+        (
+            false,
+            ProbeReport {
+                agent_program: Some("codex".to_string()),
+                ..healthy_report()
+            },
         ),
     ];
 
@@ -2496,6 +2506,7 @@ fn chained_record(sid: &str, line_seq: i64) -> NewCliNativeRecord {
         raw,
         disposition: CliNativeRecordDisposition::Renderable,
         user_prompt: None,
+        paste_ack_prompt: None,
         recorded_at: None,
     }
 }

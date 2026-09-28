@@ -337,6 +337,7 @@ impl CliWriterProbe for TestNoPaneWriterProbe {
         crate::services::cli_collab::ProbeReport {
             pane_session_exists: false,
             agent_running: Some(false),
+            agent_program: None,
             sid_evidence: SidEvidence::Unknown,
             probe_failed: false,
             only_active_claude_in_cwd: Some(false),
@@ -1212,8 +1213,8 @@ impl ClaudeTranscriptIngest {
             )
             .await?
         };
-        // Fresh Codex panes are bound during registry reconciliation; this
-        // probe only recognises a Claude process.
+        // Fresh Codex panes are bound during registry reconciliation;
+        // cli-fresh auto-binding claims Claude transcripts for Claude panes.
         if link.is_none() && !is_codex {
             link = self
                 .try_auto_bind_cli_fresh(claude_session_id, context)
@@ -1231,10 +1232,11 @@ impl ClaudeTranscriptIngest {
             self.quarantined_paths.lock().unwrap().remove(path);
         }
 
-        // The writer probe only recognises a Claude process, so a live Codex
-        // pane would read as absent; Codex keeps the fail-closed default and
-        // is never flagged as a foreign writer.
-        let import_context = if link.is_some() && !is_codex {
+        // The writer probe recognises the pane's Claude or Codex process, so a
+        // user turn written while no app pane agent runs marks a foreign
+        // writer for either agent. A Codex thread's history arrives in bulk
+        // when a pane first links it, so only turns after the link count.
+        let import_context = if let Some(mutation) = &link {
             let report = self
                 .writer_probe
                 .probe(
@@ -1248,6 +1250,7 @@ impl ClaudeTranscriptIngest {
             NativeImportContext {
                 app_pane_absent: !(report.probe_failed
                     || report.pane_session_exists && report.agent_running == Some(true)),
+                foreign_since: is_codex.then_some(mutation.link.created_at),
             }
         } else {
             NativeImportContext::default()
@@ -1350,6 +1353,7 @@ impl ClaudeTranscriptIngest {
                             raw: complete.raw.clone(),
                             disposition,
                             user_prompt: line.plain_user_text(),
+                            paste_ack_prompt: None,
                             recorded_at: envelope
                                 .timestamp
                                 .as_deref()
@@ -1368,6 +1372,7 @@ impl ClaudeTranscriptIngest {
                             raw: complete.raw.clone(),
                             disposition: CliNativeRecordDisposition::Unknown,
                             user_prompt: None,
+                            paste_ack_prompt: None,
                             recorded_at: None,
                         });
                     }
@@ -1774,6 +1779,7 @@ impl ClaudeTranscriptIngest {
         if report.probe_failed
             || !report.pane_session_exists
             || report.agent_running != Some(true)
+            || report.agent_program.as_deref() != Some("claude")
             || report.sid_evidence != SidEvidence::NoResumeArg
             || report.only_active_claude_in_cwd != Some(true)
         {
@@ -2170,6 +2176,7 @@ fn codex_native_record(
         raw: raw.to_string(),
         disposition: CliNativeRecordDisposition::Unknown,
         user_prompt: None,
+        paste_ack_prompt: None,
         recorded_at: None,
     };
     let Ok(line) = adapt_codex_rollout_line(raw, cwd, legacy_history) else {
@@ -2178,24 +2185,38 @@ fn codex_native_record(
     match line.disposition {
         CodexRolloutDisposition::Bookkeeping => (None, false),
         CodexRolloutDisposition::Unknown => (Some(unknown(line.timestamp)), true),
-        CodexRolloutDisposition::Renderable => (
-            Some(NewCliNativeRecord {
-                line_seq,
-                claude_session_id: thread_id.to_string(),
-                uuid: line.item_id,
-                parent_uuid: line.turn_id,
-                kind: line.kind,
-                recorded_at: line.timestamp.as_deref().and_then(parse_native_timestamp),
-                ts: line.timestamp,
-                raw: raw.to_string(),
-                disposition: CliNativeRecordDisposition::Renderable,
-                // No prompt-equality reconciliation: it would hide a pane turn
-                // that repeats a recent chat prompt, and executor turns in a
-                // rollout are attributed by their run window instead.
-                user_prompt: None,
-            }),
-            false,
-        ),
+        CodexRolloutDisposition::Renderable => {
+            let paste_ack_prompt = line
+                .entries
+                .iter()
+                .find(|entry| {
+                    matches!(
+                        entry.entry_type,
+                        executors::logs::NormalizedEntryType::UserMessage
+                    )
+                })
+                .map(|entry| entry.content.clone());
+            (
+                Some(NewCliNativeRecord {
+                    line_seq,
+                    claude_session_id: thread_id.to_string(),
+                    uuid: line.item_id,
+                    parent_uuid: line.turn_id,
+                    kind: line.kind,
+                    recorded_at: line.timestamp.as_deref().and_then(parse_native_timestamp),
+                    ts: line.timestamp,
+                    raw: raw.to_string(),
+                    disposition: CliNativeRecordDisposition::Renderable,
+                    // No prompt-equality reconciliation: it would hide a pane turn
+                    // that repeats a recent chat prompt, and executor turns in a
+                    // rollout are attributed by their run window instead. The
+                    // text still acknowledges a collaboration paste of it.
+                    user_prompt: None,
+                    paste_ack_prompt,
+                }),
+                false,
+            )
+        }
     }
 }
 

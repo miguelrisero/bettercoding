@@ -1726,6 +1726,30 @@ pub async fn cli_pane_agent_program_at<'a>(
     Some(first_program_in_pane_subtree(&listing, pane_pid, programs))
 }
 
+/// The pane's agent, if it is one of `programs`. Ownership is decided among
+/// every shipped agent, so an agent that merely runs as a descendant of
+/// another (claude shelling out to `codex exec`) never counts as the owner.
+/// `programs` keeps its tie-break priority.
+async fn pane_owner_among<'a>(target: &CliTmuxTarget, programs: &[&'a str]) -> Option<&'a str> {
+    let (pane_pid, listing) = pane_process_listing(target).await?;
+    owner_among(&listing, pane_pid, programs)
+}
+
+fn owner_among<'a>(ps_listing: &str, root_pid: u32, programs: &[&'a str]) -> Option<&'a str> {
+    let order: Vec<&str> = programs
+        .iter()
+        .copied()
+        .chain(
+            CLI_AGENT_PROGRAMS
+                .iter()
+                .copied()
+                .filter(|agent| !programs.contains(agent)),
+        )
+        .collect();
+    let owner = first_program_in_pane_subtree(ps_listing, root_pid, &order)?;
+    programs.iter().copied().find(|program| *program == owner)
+}
+
 fn first_program_in_pane_subtree<'a>(
     ps_listing: &str,
     root_pid: u32,
@@ -1800,17 +1824,33 @@ async fn pane_process_listing(target: &CliTmuxTarget) -> Option<(u32, String)> {
 pub struct CliPaneAgentProcess {
     pub pid: u32,
     pub cmdline: String,
+    /// Exact argument vector (`/proc/<pid>/cmdline` on Linux). `None` where
+    /// it cannot be read: `cmdline` joins arguments with spaces, so it cannot
+    /// tell a prompt from the arguments around it.
+    pub argv: Option<Vec<String>>,
 }
 
-/// Fresh command lines for every matching agent process in the pane subtree.
-/// `None` means tmux, the pane PID, the process snapshot, or a command line was
-/// unreadable and callers must fail closed.
-pub async fn cli_pane_agent_processes(
+/// The agent that owns the pane (of `programs`, chosen as in
+/// [`cli_pane_agent_program_at`]) and every process of that agent in the pane
+/// subtree, all from one process snapshot. `(None, [])` means no listed agent
+/// runs. `None` means tmux, the pane PID, the process snapshot, or a command
+/// line was unreadable and callers must fail closed.
+pub async fn cli_pane_agent_processes<'a>(
     workspace_id: Uuid,
-    program: &str,
-) -> Option<Vec<CliPaneAgentProcess>> {
+    programs: &[&'a str],
+) -> Option<(Option<&'a str>, Vec<CliPaneAgentProcess>)> {
     let target = locate_cli_tmux_target(workspace_id).await?;
-    let (pane_pid, listing) = pane_process_listing(&target).await?;
+    cli_pane_agent_processes_at(&target, programs).await
+}
+
+async fn cli_pane_agent_processes_at<'a>(
+    target: &CliTmuxTarget,
+    programs: &[&'a str],
+) -> Option<(Option<&'a str>, Vec<CliPaneAgentProcess>)> {
+    let (pane_pid, listing) = pane_process_listing(target).await?;
+    let Some(program) = first_program_in_pane_subtree(&listing, pane_pid, programs) else {
+        return Some((None, Vec::new()));
+    };
     let mut processes = Vec::new();
     for pid in pane_subtree_program_pids(&listing, pane_pid, program) {
         let output = tokio::process::Command::new("ps")
@@ -1822,12 +1862,27 @@ pub async fn cli_pane_agent_processes(
         if !output.status.success() {
             return None;
         }
-        processes.push(CliPaneAgentProcess {
-            pid,
-            cmdline: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        });
+        let cmdline = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let argv = process_argv(pid);
+        processes.push(CliPaneAgentProcess { pid, cmdline, argv });
     }
-    Some(processes)
+    Some((Some(program), processes))
+}
+
+#[cfg(target_os = "linux")]
+fn process_argv(pid: u32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let raw = raw.strip_suffix(&[0]).unwrap_or(&raw);
+    (!raw.is_empty()).then(|| {
+        raw.split(|byte| *byte == 0)
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect()
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_argv(_pid: u32) -> Option<Vec<String>> {
+    None
 }
 
 /// Whether `program` runs anywhere in the process subtree rooted at `root_pid`
@@ -2100,10 +2155,7 @@ async fn send_detached(
         let program = match programs {
             Some(programs) => {
                 let programs: Vec<&str> = programs.iter().map(String::as_str).collect();
-                cli_pane_agent_program_at(&target, &programs)
-                    .await
-                    .flatten()?
-                    .to_owned()
+                pane_owner_among(&target, &programs).await?.to_owned()
             }
             None => String::new(),
         };
@@ -4065,6 +4117,26 @@ mod tests {
     }
 
     #[test]
+    fn cli_bootstrap_session_args_ride_the_handoff_and_prompt_launches() {
+        // The collaboration handoff (busy pane resumed by the server) and a
+        // CLI-first prompt launch are fresh Codex launches too.
+        let mut spec = codex_spec(&["-s", "danger-full-access"]);
+        spec.session_args = vec!["-c".to_string(), "hooks.Stop=[]".to_string()];
+        let handoff = cli_bootstrap(
+            &spec,
+            None,
+            None,
+            false,
+            Some(Path::new("/tmp/vk/resume-ready")),
+        );
+        assert!(handoff.contains("exec 'codex' '-c' 'hooks.Stop=[]' resume \"$bc_sid\""));
+        let prompted = cli_bootstrap(&spec, None, Some(Path::new("/tmp/vk/p.txt")), false, None);
+        assert!(
+            prompted.contains("'codex' '-c' 'hooks.Stop=[]' '-s' 'danger-full-access' \"$bc_p\"")
+        );
+    }
+
+    #[test]
     fn cli_bootstrap_reads_prompt_from_file_length_is_constant() {
         // The prompt is delivered via a temp file, so the generated command is
         // O(1) in prompt size — the whole point of the fix (tmux rejects
@@ -4249,6 +4321,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_send_reaches_only_the_agent_that_owns_the_pane() {
+        let claude_running_codex = "\
+  100     1 sh
+  200   100 claude
+  300   200 node
+  400   300 codex
+";
+        // A codex lease must not deliver into the Claude TUI that runs it.
+        assert_eq!(owner_among(claude_running_codex, 100, &["codex"]), None);
+        assert_eq!(
+            owner_among(claude_running_codex, 100, &["claude"]),
+            Some("claude")
+        );
+        let both_at_root_depth = "\
+  100     1 sh
+  200   100 codex
+  300   100 claude
+";
+        // The caller's order still breaks a tie.
+        assert_eq!(
+            owner_among(both_at_root_depth, 100, &["codex", "claude"]),
+            Some("codex")
+        );
+        assert_eq!(
+            owner_among(both_at_root_depth, 100, &["claude"]),
+            Some("claude")
+        );
+    }
+
     #[tokio::test]
     async fn send_refuses_text_holding_the_paste_end_marker() {
         // Refused before any tmux call, so the socket need not exist.
@@ -4339,6 +4441,75 @@ mod tests {
             let sender = pair[0].strip_suffix("-first").expect("first line");
             assert_eq!(pair[1], format!("{sender}-second"), "pane: {lines:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn pane_agent_processes_name_the_owning_agent_and_its_exact_argv() {
+        if !tmux_available() {
+            return;
+        }
+        // A symlink runs /bin/sh with comm `codex`/`claude`, so each pane holds
+        // a live process that the probe must attribute to that agent. The
+        // trailing `:` keeps sh from exec-ing `sleep` in its place.
+        let bin = tempfile::tempdir().unwrap();
+        for name in ["codex", "claude"] {
+            std::os::unix::fs::symlink("/bin/sh", bin.path().join(name)).unwrap();
+        }
+        let thread = "019e6f10-4f27-7d02-9a4b-4f3c2d1e0a55";
+        let pair = scratch_tmux_pair();
+        let start = |program: &str, args: &str| {
+            let target = owned_cli_tmux_target_on(
+                CliTmuxHome::Current,
+                Uuid::new_v4(),
+                &pair.current.socket,
+                &pair.legacy.socket,
+            );
+            let command = format!(
+                "{} -c 'sleep 30; :' {args}",
+                bin.path().join(program).display()
+            );
+            let output = std::process::Command::new("tmux")
+                .args([
+                    "-L",
+                    &target.socket,
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &target.session_name,
+                    &command,
+                ])
+                .output()
+                .expect("start agent pane");
+            assert!(output.status.success());
+            target
+        };
+        let codex = start("codex", &format!("resume {thread}"));
+        let claude = start("claude", &format!("--resume {thread}"));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let (program, processes) = cli_pane_agent_processes_at(&codex, CLI_AGENT_PROGRAMS)
+            .await
+            .expect("readable pane");
+        assert_eq!(program, Some("codex"));
+        assert_eq!(processes.len(), 1);
+        assert_eq!(
+            processes[0].argv.as_ref().unwrap()[1..],
+            ["-c", "sleep 30; :", "resume", thread]
+        );
+        let (program, _) = cli_pane_agent_processes_at(&claude, CLI_AGENT_PROGRAMS)
+            .await
+            .expect("readable pane");
+        assert_eq!(program, Some("claude"));
+
+        // A lease derived for one agent never delivers into the other's pane.
+        assert_eq!(
+            send_cli_keys_to_live_agent(&codex, &["claude"], "hello").await,
+            None
+        );
+        assert_eq!(
+            send_cli_keys_to_live_agent(&claude, &["codex"], "hello").await,
+            None
+        );
     }
 
     /// Bracketed segments of a Claude paste stream, split at the line feeds

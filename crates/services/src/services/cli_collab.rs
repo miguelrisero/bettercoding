@@ -55,12 +55,17 @@ pub enum SidEvidence {
 pub struct ProbeReport {
     pub pane_session_exists: bool,
     pub agent_running: Option<bool>,
+    /// The CLI agent that owns the pane (`claude` or `codex`) when
+    /// `agent_running` is `Some(true)`. `sid_evidence` is read from this
+    /// agent's command line, and a paste may only go to this agent.
+    pub agent_program: Option<String>,
     pub sid_evidence: SidEvidence,
     /// True when any authoritative tmux/process/DB component of the probe was
     /// unreadable. Lease derivation treats this as busy.
     pub probe_failed: bool,
-    /// Used by cli-fresh discovery: `Some(true)` means exactly one live Claude
-    /// process has `effective_dir` as its cwd.
+    /// Used by cli-fresh discovery: `Some(true)` means exactly one live
+    /// process of the pane's agent has `effective_dir` as its cwd, and it is
+    /// the pane's process.
     pub only_active_claude_in_cwd: Option<bool>,
 }
 
@@ -69,6 +74,7 @@ impl ProbeReport {
         Self {
             pane_session_exists: false,
             agent_running: None,
+            agent_program: None,
             sid_evidence: SidEvidence::Unknown,
             probe_failed: true,
             only_active_claude_in_cwd: None,
@@ -90,7 +96,11 @@ pub trait CliWriterProbe: Send + Sync {
 
 #[async_trait]
 pub trait CliPasteTransport: Send + Sync {
-    async fn paste_and_submit(&self, workspace_id: Uuid, text: &str) -> bool;
+    /// Paste `text` and submit it, only if `program` still owns the pane when
+    /// the send lock is held. `program` is the agent the lease was derived
+    /// for, so the lease probe and the delivery can never disagree about
+    /// which agent receives the text.
+    async fn paste_and_submit(&self, workspace_id: Uuid, program: &str, text: &str) -> bool;
     async fn pane_alive(&self, workspace_id: Uuid) -> AnyhowResult<bool>;
     async fn agent_running(&self, workspace_id: Uuid) -> Option<bool>;
     async fn signal_resume_ready(&self, workspace_id: Uuid, sid: &str) -> AnyhowResult<()>;
@@ -137,7 +147,12 @@ pub struct RetryDispatchContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriterLease {
     Executor,
-    Cli { claude_session_id: Option<String> },
+    /// `claude_session_id` is the agent's own session id (a Codex thread id
+    /// for Codex); `program` is the pane agent the paste must reach.
+    Cli {
+        claude_session_id: Option<String>,
+        program: String,
+    },
     CliAmbiguous,
     Free,
     Busy,
@@ -338,6 +353,9 @@ impl CliCollabService {
                 }
             }
         }
+        let Some(program) = report.agent_program else {
+            return WriterLease::Busy;
+        };
 
         let Some(binding) = binding.filter(|binding| binding.session_id == session.id) else {
             return WriterLease::CliAmbiguous;
@@ -346,11 +364,13 @@ impl CliCollabService {
             (Some(expected), SidEvidence::ConfirmedResume(observed)) if expected == observed => {
                 WriterLease::Cli {
                     claude_session_id: Some(expected.to_string()),
+                    program,
                 }
             }
             (None, SidEvidence::NoResumeArg) if binding.claude_session_id.is_none() => {
                 WriterLease::Cli {
                     claude_session_id: None,
+                    program,
                 }
             }
             _ => WriterLease::CliAmbiguous,
@@ -455,7 +475,10 @@ impl CliCollabService {
                 )
                 .await?
             }
-            WriterLease::Cli { claude_session_id } if !self.routing_disabled => {
+            WriterLease::Cli {
+                claude_session_id,
+                program,
+            } if !self.routing_disabled => {
                 let row = match existing {
                     Some(row) => row,
                     None => {
@@ -463,7 +486,7 @@ impl CliCollabService {
                             .await?
                     }
                 };
-                self.paste_slot(session, row, claude_session_id.as_deref())
+                self.paste_slot(session, row, claude_session_id.as_deref(), &program)
                     .await?
             }
             WriterLease::Cli { .. } => {
@@ -659,6 +682,7 @@ impl CliCollabService {
         session: &Session,
         row: SessionQueuedMessage,
         claude_session_id: Option<&str>,
+        program: &str,
     ) -> Result<DispatchOutcome, CliCollabError> {
         let Some(claimed) = SessionQueuedMessage::claim_for_paste(
             &self.db.pool,
@@ -674,7 +698,7 @@ impl CliCollabService {
         };
         if self
             .transport
-            .paste_and_submit(session.workspace_id, &claimed.prompt)
+            .paste_and_submit(session.workspace_id, program, &claimed.prompt)
             .await
         {
             if !SessionQueuedMessage::mark_pasted(
@@ -1118,12 +1142,15 @@ impl CliCollabService {
         match self.derive_lease_locked(&session).await {
             WriterLease::Executor | WriterLease::CliAmbiguous | WriterLease::Busy => Ok(false),
             WriterLease::Cli { .. } if dispatch_context.is_some() => Ok(false),
-            WriterLease::Cli { claude_session_id } => {
+            WriterLease::Cli {
+                claude_session_id,
+                program,
+            } => {
                 if self.original_paste_binding_is_active(&row).await? {
                     return Ok(false);
                 }
                 let routed = self
-                    .paste_slot(&session, row, claude_session_id.as_deref())
+                    .paste_slot(&session, row, claude_session_id.as_deref(), &program)
                     .await?;
                 Ok(matches!(routed, DispatchOutcome::RoutedToCli { .. }))
             }
@@ -1512,7 +1539,7 @@ mod tests {
 
     #[async_trait]
     impl CliPasteTransport for FakeTransport {
-        async fn paste_and_submit(&self, _workspace_id: Uuid, _text: &str) -> bool {
+        async fn paste_and_submit(&self, _workspace_id: Uuid, _program: &str, _text: &str) -> bool {
             true
         }
 
@@ -1532,6 +1559,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct TransportState {
         pasted_prompts: Vec<String>,
+        programs: Vec<String>,
         observed_states: Vec<QueuedMessageState>,
     }
 
@@ -1544,7 +1572,7 @@ mod tests {
 
     #[async_trait]
     impl CliPasteTransport for RecordingTransport {
-        async fn paste_and_submit(&self, _workspace_id: Uuid, text: &str) -> bool {
+        async fn paste_and_submit(&self, _workspace_id: Uuid, program: &str, text: &str) -> bool {
             let state = SessionQueuedMessage::find_active(&self.db.pool, self.session_id)
                 .await
                 .unwrap()
@@ -1552,6 +1580,7 @@ mod tests {
                 .expect("paste transport must observe an active delivery row");
             let mut observations = self.state.lock().unwrap();
             observations.pasted_prompts.push(text.to_string());
+            observations.programs.push(program.to_string());
             observations.observed_states.push(state);
             self.paste_succeeds
         }
@@ -1577,7 +1606,7 @@ mod tests {
 
     #[async_trait]
     impl CliPasteTransport for SlowPasteTransport {
-        async fn paste_and_submit(&self, _workspace_id: Uuid, _text: &str) -> bool {
+        async fn paste_and_submit(&self, _workspace_id: Uuid, _program: &str, _text: &str) -> bool {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
                 self.started.notify_one();
@@ -1611,7 +1640,7 @@ mod tests {
 
     #[async_trait]
     impl CliPasteTransport for ResumeRecordingTransport {
-        async fn paste_and_submit(&self, _workspace_id: Uuid, _text: &str) -> bool {
+        async fn paste_and_submit(&self, _workspace_id: Uuid, _program: &str, _text: &str) -> bool {
             true
         }
 
@@ -1837,6 +1866,7 @@ mod tests {
         ProbeReport {
             pane_session_exists,
             agent_running,
+            agent_program: (agent_running == Some(true)).then(|| "claude".to_string()),
             sid_evidence,
             probe_failed: false,
             only_active_claude_in_cwd: None,
@@ -1952,7 +1982,8 @@ mod tests {
         assert_eq!(
             service.derive_lease(&session).await,
             WriterLease::Cli {
-                claude_session_id: Some("11111111-1111-4111-8111-111111111111".to_string())
+                claude_session_id: Some("11111111-1111-4111-8111-111111111111".to_string()),
+                program: "claude".to_string(),
             }
         );
 
@@ -2106,7 +2137,8 @@ mod tests {
         assert_eq!(
             service.derive_lease(&session).await,
             WriterLease::Cli {
-                claude_session_id: Some(sid.to_string())
+                claude_session_id: Some(sid.to_string()),
+                program: "claude".to_string(),
             }
         );
         *probe.0.lock().unwrap() = report(true, Some(false), SidEvidence::Unknown);
@@ -2415,6 +2447,94 @@ mod tests {
         let observations = transport_state.lock().unwrap();
         assert_eq!(observations.pasted_prompts, ["route to CLI"]);
         assert_eq!(observations.observed_states, [QueuedMessageState::Pasting]);
+    }
+
+    fn codex_report(agent_running: Option<bool>, sid_evidence: SidEvidence) -> ProbeReport {
+        ProbeReport {
+            agent_program: (agent_running == Some(true)).then(|| "codex".to_string()),
+            ..report(true, agent_running, sid_evidence)
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_gate_routes_a_resumed_codex_thread_to_codex_only() {
+        let (db, workspace, session) = fixture().await;
+        let thread = "019e6f10-4f27-7d02-9a4b-4f3c2d1e0a55";
+        bind_confirmed_cli(&db, &workspace, &session, thread).await;
+        let transport_state = Arc::new(StdMutex::new(TransportState::default()));
+        let transport = Arc::new(RecordingTransport {
+            db: db.clone(),
+            session_id: session.id,
+            state: transport_state.clone(),
+            paste_succeeds: true,
+        });
+        let (service, _) = service_with_components(
+            db.clone(),
+            codex_report(Some(true), SidEvidence::ConfirmedResume(thread.to_string())),
+            transport,
+            Arc::new(NeverDispatcher),
+        );
+
+        let outcome = service
+            .dispatch_gate(
+                &session,
+                "route to Codex".to_string(),
+                executor_config(),
+                QueuedMessageSource::Ui,
+                false,
+            )
+            .await
+            .unwrap();
+        let DispatchOutcome::RoutedToCli { delivery } = outcome else {
+            panic!("a resumed Codex thread must receive the prompt");
+        };
+        let message = delivery.message().unwrap();
+        assert_eq!(message.state, QueuedMessageState::Pasted);
+        assert_eq!(message.claude_session_id.as_deref(), Some(thread));
+        let observations = transport_state.lock().unwrap();
+        assert_eq!(observations.pasted_prompts, ["route to Codex"]);
+        assert_eq!(observations.programs, ["codex"]);
+    }
+
+    #[tokio::test]
+    async fn a_live_codex_pane_is_never_a_free_writer() {
+        let (db, workspace, session) = fixture().await;
+        let thread = "019e6f10-4f27-7d02-9a4b-4f3c2d1e0a55";
+        let other = "019e6f10-4f27-7d02-9a4b-4f3c2d1e0a66";
+        bind_confirmed_cli(&db, &workspace, &session, thread).await;
+        let (service, probe) = service(
+            db.clone(),
+            codex_report(Some(true), SidEvidence::ConfirmedResume(other.to_string())),
+        );
+        assert_eq!(
+            service.derive_lease(&session).await,
+            WriterLease::CliAmbiguous
+        );
+        *probe.0.lock().unwrap() = codex_report(Some(true), SidEvidence::NoResumeArg);
+        assert_eq!(
+            service.derive_lease(&session).await,
+            WriterLease::CliAmbiguous
+        );
+        *probe.0.lock().unwrap() = codex_report(Some(true), SidEvidence::Ambiguous);
+        assert_eq!(
+            service.derive_lease(&session).await,
+            WriterLease::CliAmbiguous
+        );
+        // A running agent the probe cannot name fails closed.
+        *probe.0.lock().unwrap() = ProbeReport {
+            agent_program: None,
+            ..codex_report(Some(true), SidEvidence::ConfirmedResume(thread.to_string()))
+        };
+        assert_eq!(service.derive_lease(&session).await, WriterLease::Busy);
+        *probe.0.lock().unwrap() =
+            codex_report(Some(true), SidEvidence::ConfirmedResume(thread.to_string()));
+        assert_eq!(
+            service.derive_lease(&session).await,
+            WriterLease::Cli {
+                claude_session_id: Some(thread.to_string()),
+                program: "codex".to_string(),
+            }
+        );
     }
 
     #[tokio::test]

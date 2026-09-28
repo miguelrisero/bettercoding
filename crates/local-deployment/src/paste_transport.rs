@@ -2,21 +2,26 @@ use async_trait::async_trait;
 use services::services::cli_collab::CliPasteTransport;
 use uuid::Uuid;
 
-use crate::{pty, writer_probe::COLLAB_AGENT_PROGRAM};
+use crate::pty;
 
 #[derive(Debug, Clone, Default)]
 pub struct LocalCliPasteTransport;
 
 #[async_trait]
 impl CliPasteTransport for LocalCliPasteTransport {
-    async fn paste_and_submit(&self, workspace_id: Uuid, text: &str) -> bool {
+    async fn paste_and_submit(&self, workspace_id: Uuid, program: &str, text: &str) -> bool {
         // Close the lease-to-paste TOCTOU window with a fresh pane-subtree
         // check under the send lock, immediately before the irreversible
-        // keystroke injection.
+        // keystroke injection. Only the agent the lease was derived for may
+        // receive the text, and the send path picks that agent's delivery
+        // (Claude's chunked paste stream, Codex's single bracketed paste).
+        if !pty::CLI_AGENT_PROGRAMS.contains(&program) {
+            return false;
+        }
         let Some(target) = pty::locate_cli_tmux_target(workspace_id).await else {
             return false;
         };
-        pty::send_cli_keys_to_live_agent(&target, &[COLLAB_AGENT_PROGRAM], text)
+        pty::send_cli_keys_to_live_agent(&target, &[program], text)
             .await
             .is_some_and(pty::CliSendResult::delivered)
     }
@@ -27,7 +32,7 @@ impl CliPasteTransport for LocalCliPasteTransport {
 
     async fn agent_running(&self, workspace_id: Uuid) -> Option<bool> {
         let target = pty::locate_cli_tmux_target(workspace_id).await?;
-        pty::cli_pane_agent_program_at(&target, &[COLLAB_AGENT_PROGRAM])
+        pty::cli_pane_agent_program_at(&target, pty::CLI_AGENT_PROGRAMS)
             .await
             .map(|program| program.is_some())
     }
