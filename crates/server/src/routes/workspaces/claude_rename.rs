@@ -1,4 +1,5 @@
-//! Propagate a workspace rename into the running Claude Code session.
+//! Propagate a workspace rename into the running Claude Code session, or,
+//! for a Codex workspace, its Codex thread (see `codex_rename`).
 //!
 //! Claude Code persists a conversation title in two places it reads back:
 //! a `custom-title.json` sidecar next to the transcript, and a
@@ -25,7 +26,8 @@
 use std::path::{Path, PathBuf};
 
 use db::models::{
-    claude_session_link::ClaudeSessionLink, coding_agent_turn::CodingAgentTurn, session::Session,
+    cli_pane_binding::{CliPaneBinding, is_codex_thread_id},
+    session::Session,
 };
 use local_deployment::pty::{
     CliSendResult, cli_pane_agent_running_at, latest_cli_client_activity, locate_cli_tmux_target,
@@ -33,6 +35,8 @@ use local_deployment::pty::{
 };
 use sqlx::SqlitePool;
 use uuid::Uuid;
+
+use super::codex_rename::propagate_codex_rename;
 
 /// How long the newest tmux client activity on the workspace's CLI socket must
 /// be old before `/rename` keystrokes may be injected. The gate is
@@ -83,7 +87,7 @@ pub fn spawn_rename_propagation(pool: SqlitePool, workspace_id: Uuid, name: Stri
             tracing::warn!(
                 %workspace_id,
                 error,
-                "Claude session rename propagation failed (rename itself succeeded)"
+                "CLI session rename propagation failed (rename itself succeeded)"
             );
         }
     });
@@ -97,22 +101,17 @@ async fn propagate_rename(pool: &SqlitePool, workspace_id: Uuid, name: &str) -> 
         return Ok(()); // no session: nothing running to rename
     };
 
-    // Same precedence as the attach path (cli_agent.rs): executor-reported
-    // turns first, the CLI binding second. Both resolve to a claude
-    // session id; neither is guaranteed to exist.
-    let claude_session_id = match CodingAgentTurn::find_latest_session_info(pool, session.id)
+    // The session a CLI launch would resume (terminal.rs, cli_agent.rs);
+    // none is guaranteed to exist.
+    let claude_session_id = CliPaneBinding::resume_session_id(pool, session.id)
         .await
-        .map_err(|e| e.to_string())?
-    {
-        Some(info) => Some(info.session_id),
-        None => ClaudeSessionLink::find_latest_for_session(pool, session.id)
-            .await
-            .map_err(|e| e.to_string())?
-            .map(|link| link.claude_session_id),
-    };
+        .map_err(|e| e.to_string())?;
     let Some(claude_session_id) = claude_session_id else {
         return Ok(()); // no claude conversation bound: nothing to rename
     };
+    if is_codex_thread_id(&claude_session_id) {
+        return propagate_codex_rename(workspace_id, &claude_session_id, name).await;
+    }
 
     // The sid comes from agent-reported data, so it is untrusted for path
     // construction: require a plain UUID (claude's own session ids are UUIDs)

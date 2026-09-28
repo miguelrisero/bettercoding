@@ -44,6 +44,12 @@ const FIXTURE: &str = include_str!(
     "../../../../executors/src/executors/codex/testdata/rollout-0.157.1.redacted.jsonl"
 );
 const FIXTURE_THREAD: &str = "01a0e7f5-9f42-73e0-9b4d-2dfa51b6f868";
+/// A thread the executor's app server started and the TUI resumed, in the
+/// legacy history format; see the adapter tests in the executors crate.
+const LEGACY_FIXTURE: &str = include_str!(
+    "../../../../executors/src/executors/codex/testdata/rollout-0.124.0-legacy.redacted.jsonl"
+);
+const LEGACY_FIXTURE_THREAD: &str = "01a0e90f-8d3b-7e41-89ab-75a0b7eac22b";
 const FIXTURE_ENTRIES: usize = 10;
 
 struct Case {
@@ -794,6 +800,7 @@ async fn fresh_pane_assignment_writes_nothing_for_a_taken_thread_or_released_pan
     let assigned = CliPaneBinding::assign_discovered_session(
         pool,
         pane.binding.id,
+        None,
         &taken,
         pane.case.session.id,
         pane.case.workspace.id,
@@ -821,6 +828,7 @@ async fn fresh_pane_assignment_writes_nothing_for_a_taken_thread_or_released_pan
     let assigned = CliPaneBinding::assign_discovered_session(
         pool,
         pane.binding.id,
+        None,
         &free,
         pane.case.session.id,
         pane.case.workspace.id,
@@ -834,6 +842,341 @@ async fn fresh_pane_assignment_writes_nothing_for_a_taken_thread_or_released_pan
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_legacy_history_thread_resumed_in_the_pane_renders_its_cli_turns() {
+    let case = codex_case().await;
+    let created: DateTime<Utc> = "2026-09-28T17:28:25.669Z".parse().unwrap();
+    write_rollout(
+        &rollout_path(&case.root, LEGACY_FIXTURE_THREAD, created),
+        &LEGACY_FIXTURE.replace("/workspace/demo", &case.cwd.to_string_lossy()),
+    );
+    bind_resumed(&case, LEGACY_FIXTURE_THREAD).await;
+    // The chat turn the executor ran before the pane resumed its thread.
+    let chat = executor_run(
+        &case,
+        LEGACY_FIXTURE_THREAD,
+        "2026-09-28 17:28:22.000+00:00",
+        Some("2026-09-28 17:28:33.000+00:00"),
+    )
+    .await;
+
+    reconcile(&case).await;
+
+    let entries = entries(&case).await;
+    let (executor, cli): (Vec<_>, Vec<_>) = entries
+        .iter()
+        .cloned()
+        .partition(|entry| entry.linked_execution_process_id == Some(chat));
+    assert_eq!(
+        texts(&executor),
+        ["Remember the codeword PAPAYA. Reply with just OK."]
+    );
+    assert_eq!(
+        texts(&cli)[..3],
+        [
+            "Also remember the second codeword MANGO. Reply with just OK2.",
+            "OK2",
+            "Use apply_patch to create notes.txt containing the line hello, then run ls and tell me the file count.",
+        ]
+    );
+    assert!(
+        cli.iter()
+            .all(|entry| entry.origin == NativeFeedOrigin::Cli)
+    );
+    let snapshot = case.service.snapshot(case.session.id).await.unwrap();
+    assert_eq!(snapshot.health.unknown_kinds, 0);
+}
+
+#[tokio::test]
+async fn a_paginated_rollout_renders_a_turn_once_when_it_repeats_it_as_legacy_events() {
+    let case = codex_case().await;
+    let at = Utc::now() - chrono::Duration::minutes(1);
+    let thread = thread_id_at(at, 30);
+    let meta = session_meta(&thread, &case.cwd, at, "cli").replace(
+        r#""source":"cli""#,
+        r#""source":"cli","history_mode":"paginated""#,
+    );
+    assert!(meta.contains("paginated"));
+    let legacy = |kind: &str, text: &str| {
+        format!(
+            "{}\n",
+            json!({ "timestamp": stamp(at), "type": "event_msg",
+                    "payload": { "type": kind, "message": text } })
+        )
+    };
+    write_rollout(
+        &rollout_path(&case.root, &thread, at),
+        &[
+            meta,
+            user_turn(&thread, "turn-30", at, "prompt 30"),
+            legacy("user_message", "prompt 30"),
+            legacy("agent_message", "answer to prompt 30"),
+        ]
+        .concat(),
+    );
+    bind_resumed(&case, &thread).await;
+
+    reconcile(&case).await;
+
+    assert_eq!(
+        texts(&entries(&case).await),
+        ["prompt 30", "answer to prompt 30"]
+    );
+}
+
+/// A pane launched to resume `first`, which then switches to `second` inside
+/// the TUI (`/new`), reported by its hook.
+struct SwitchedPane {
+    case: Case,
+    binding: CliPaneBinding,
+    first: String,
+    first_path: PathBuf,
+    second: String,
+}
+
+fn cli_rollout(case: &Case, n: u16, at: DateTime<Utc>, cwd: &Path) -> (String, PathBuf) {
+    let thread = thread_id_at(at, n);
+    let path = rollout_path(&case.root, &thread, at);
+    write_rollout(
+        &path,
+        &[
+            session_meta(&thread, cwd, at, "cli"),
+            user_turn(&thread, &format!("turn-{n}"), at, &format!("prompt {n}")),
+        ]
+        .concat(),
+    );
+    (thread, path)
+}
+
+async fn switched_pane(second_cwd: Option<&Path>) -> SwitchedPane {
+    let case = codex_case().await;
+    let started = Utc::now() - chrono::Duration::minutes(5);
+    let (first, first_path) = cli_rollout(&case, 20, started, &case.cwd);
+    bind_resumed(&case, &first).await;
+    reconcile(&case).await;
+    let binding = CliPaneBinding::find_active_for_workspace(&case.db.pool, case.workspace.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let cwd = second_cwd.map_or_else(|| case.cwd.clone(), Path::to_path_buf);
+    let (second, _) = cli_rollout(&case, 21, Utc::now(), &cwd);
+    report_hook(&case, &second).await;
+    SwitchedPane {
+        case,
+        binding,
+        first,
+        first_path,
+        second,
+    }
+}
+
+#[tokio::test]
+async fn a_thread_switch_inside_the_pane_binds_the_new_thread_and_keeps_the_old() {
+    let pane = switched_pane(None).await;
+    let pool = &pane.case.db.pool;
+
+    reconcile(&pane.case).await;
+
+    let binding = CliPaneBinding::find_by_id(pool, pane.binding.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        binding.claude_session_id.as_deref(),
+        Some(pane.second.as_str())
+    );
+    assert!(binding.released_at.is_none(), "the pane keeps its binding");
+    assert_eq!(
+        ClaudeSessionLink::find(pool, &pane.second)
+            .await
+            .unwrap()
+            .map(|link| link.session_id),
+        Some(pane.case.session.id)
+    );
+    assert_eq!(
+        texts(&entries(&pane.case).await),
+        [
+            "prompt 20",
+            "answer to prompt 20",
+            "prompt 21",
+            "answer to prompt 21"
+        ]
+    );
+    // A relaunch resumes the thread the pane ran last.
+    assert_eq!(
+        CliPaneBinding::latest_codex_pane_thread(pool, pane.case.session.id)
+            .await
+            .unwrap(),
+        Some(pane.second.clone())
+    );
+
+    // The thread the pane left (and may `/resume` again) stays imported.
+    append(
+        &pane.first_path,
+        &user_turn(&pane.first, "turn-22", Utc::now(), "prompt 22"),
+    );
+    reconcile(&pane.case).await;
+    assert_eq!(
+        texts(&entries(&pane.case).await),
+        [
+            "prompt 20",
+            "answer to prompt 20",
+            "prompt 21",
+            "answer to prompt 21",
+            "prompt 22",
+            "answer to prompt 22"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_switch_reported_before_the_pane_launched_never_binds() {
+    let case = codex_case().await;
+    let (first, _) = cli_rollout(
+        &case,
+        24,
+        Utc::now() - chrono::Duration::minutes(5),
+        &case.cwd,
+    );
+    bind_resumed(&case, &first).await;
+    reconcile(&case).await;
+    let binding = CliPaneBinding::find_active_for_workspace(&case.db.pool, case.workspace.id)
+        .await
+        .unwrap()
+        .unwrap();
+    // A previous pane's last report, fired before this pane launched but
+    // received after it.
+    let (earlier, _) = cli_rollout(&case, 25, Utc::now(), &case.cwd);
+    WorkspaceCliActivity::upsert_hook(
+        &case.db.pool,
+        case.workspace.id,
+        &CliHookState {
+            agent_session_id: earlier.clone(),
+            transcript_path: None,
+            phase: CliPhase::Working,
+            tasks: None,
+            crons: None,
+            seq: binding.created_at.timestamp_nanos_opt().unwrap() - 1_000_000_000,
+        },
+        false,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    reconcile(&case).await;
+
+    let binding = CliPaneBinding::find_by_id(&case.db.pool, binding.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.claude_session_id.as_deref(), Some(first.as_str()));
+    assert!(
+        ClaudeSessionLink::find(&case.db.pool, &earlier)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_thread_switch_to_another_directory_never_binds() {
+    let other = TempDir::new().unwrap();
+    let pane = switched_pane(Some(other.path())).await;
+
+    reconcile(&pane.case).await;
+
+    let binding = CliPaneBinding::find_by_id(&pane.case.db.pool, pane.binding.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        binding.claude_session_id.as_deref(),
+        Some(pane.first.as_str())
+    );
+    assert!(
+        ClaudeSessionLink::find(&pane.case.db.pool, &pane.second)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        texts(&entries(&pane.case).await),
+        ["prompt 20", "answer to prompt 20"]
+    );
+}
+
+#[tokio::test]
+async fn a_thread_switch_never_takes_another_sessions_thread() {
+    let pane = switched_pane(None).await;
+    let pool = &pane.case.db.pool;
+    let other = Session::create(
+        pool,
+        &CreateSession {
+            executor: Some("CODEX".to_string()),
+            name: None,
+        },
+        Uuid::new_v4(),
+        pane.case.workspace.id,
+    )
+    .await
+    .unwrap();
+    // The other session's executor ran the thread the pane resumed.
+    let run = executor_run(
+        &pane.case,
+        &pane.second,
+        "2026-09-28 12:00:00.000+00:00",
+        None,
+    )
+    .await;
+    sqlx::query("UPDATE execution_processes SET session_id = ? WHERE id = ?")
+        .bind(other.id)
+        .bind(run)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    reconcile(&pane.case).await;
+
+    let binding = CliPaneBinding::find_by_id(pool, pane.binding.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        binding.claude_session_id.as_deref(),
+        Some(pane.first.as_str())
+    );
+    assert!(
+        ClaudeSessionLink::find(pool, &pane.second)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn an_executor_run_after_the_pane_takes_the_resume_back() {
+    let pane = switched_pane(None).await;
+    let pool = &pane.case.db.pool;
+    reconcile(&pane.case).await;
+
+    // A chat follow-up after the switch forks from the executor's thread.
+    executor_run(
+        &pane.case,
+        &thread_id_at(Utc::now(), 23),
+        &Utc::now().to_rfc3339(),
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        CliPaneBinding::latest_codex_pane_thread(pool, pane.case.session.id)
+            .await
+            .unwrap(),
+        None
     );
 }
 
