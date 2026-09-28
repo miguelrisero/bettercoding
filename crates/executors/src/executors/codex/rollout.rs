@@ -2,13 +2,17 @@
 //! (`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<local time>-<thread id>.jsonl`).
 //!
 //! A rollout carries the same turn several times: model-facing
-//! `response_item`s, legacy `event_msg`s, and the typed `item_completed`
-//! thread items the Codex TUI renders. Only `item_completed` is rendered, so a
-//! turn is shown exactly once and injected context (AGENTS.md, environment,
-//! developer instructions) never appears as a user message. Parsing is
-//! tolerant `serde_json::Value` access: rollouts from newer Codex versions
-//! than the pinned protocol crates still adapt, and anything unrecognised is
-//! reported as [`CodexRolloutDisposition::Unknown`] instead of failing.
+//! `response_item`s, legacy `event_msg`s, and, in a paginated-history rollout,
+//! the typed `item_completed` thread items the Codex TUI renders. A paginated
+//! rollout renders only `item_completed`; a legacy-history rollout (a thread an
+//! older Codex or the app server started, which the TUI keeps appending to in
+//! the same format) has none, and renders its message and tool events
+//! instead. Either way a turn is shown exactly once and injected context
+//! (AGENTS.md, environment, developer instructions) never appears as a user
+//! message. Parsing is tolerant `serde_json::Value` access: rollouts from
+//! newer Codex versions than the pinned protocol crates still adapt, and
+//! anything unrecognised is reported as [`CodexRolloutDisposition::Unknown`]
+//! instead of failing.
 
 use serde_json::Value;
 use workspace_utils::{diff::normalize_unified_diff, path::make_path_relative};
@@ -103,9 +107,29 @@ const BOOKKEEPING_ITEMS: &[&str] = &["SubAgentActivity", "CollabAgentToolCall"];
 /// transcript cell for.
 const BOOKKEEPING_EXTENSIONS: &[&str] = &["clock.sleep", "image_gen.generation"];
 
+/// Whether a rollout whose first line is `session_meta_line` records turns
+/// as legacy events rather than `item_completed` thread items. Only a
+/// `history_mode` of `paginated` has thread items; Codex versions before the
+/// field existed wrote legacy history.
+pub fn rollout_has_legacy_history(session_meta_line: &str) -> Option<bool> {
+    let record: Value = serde_json::from_str(session_meta_line).ok()?;
+    if record.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let mode = record
+        .get("payload")
+        .and_then(|payload| payload.get("history_mode"))
+        .and_then(Value::as_str);
+    Some(mode != Some("paginated"))
+}
+
+/// Adapt one rollout line. `legacy_history` renders the message and tool
+/// events of a legacy-history rollout; a paginated rollout repeats some of
+/// them next to its thread items, so they stay bookkeeping there.
 pub fn adapt_codex_rollout_line(
     raw: &str,
     worktree_path: &str,
+    legacy_history: bool,
 ) -> Result<CodexRolloutLine, serde_json::Error> {
     let record: Value = serde_json::from_str(raw)?;
     let record_type = record.get("type").and_then(Value::as_str).unwrap_or("");
@@ -115,6 +139,11 @@ pub fn adapt_codex_rollout_line(
         let event_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
         if event_type == "item_completed" {
             return Ok(adapt_item(&record, payload, worktree_path));
+        }
+        if legacy_history
+            && let Some(line) = adapt_legacy_event(&record, payload, event_type, worktree_path)
+        {
+            return Ok(line);
         }
         // Lifecycle and legacy message events duplicate or annotate the
         // completed items.
@@ -209,54 +238,26 @@ fn adapt_item(record: &Value, payload: &Value, worktree_path: &str) -> CodexRoll
             };
             ("tool", vec![entry(entry_type, command)])
         }
-        "McpToolCall" => {
-            let server = str_at(item, "server").unwrap_or_default();
-            let tool = str_at(item, "tool").unwrap_or_default();
-            let tool_name = format!("mcp:{server}:{tool}");
-            let entry_type = NormalizedEntryType::ToolUse {
-                tool_name: tool_name.clone(),
-                action_type: ActionType::Tool {
-                    tool_name,
-                    arguments: item.get("arguments").cloned(),
-                    result: mcp_result(item),
-                },
-                status: item_status(item),
-            };
-            ("tool", vec![entry(entry_type, tool)])
-        }
-        "FileChange" => {
-            let status = item_status(item);
-            let entries = item
-                .get("changes")
-                .and_then(Value::as_object)
-                .map(|changes| {
-                    changes
-                        .iter()
-                        .map(|(path, change)| {
-                            let relative = make_path_relative(path, worktree_path);
-                            let entry_type = NormalizedEntryType::ToolUse {
-                                tool_name: "edit".to_string(),
-                                action_type: ActionType::FileEdit {
-                                    path: relative.clone(),
-                                    changes: file_changes(&relative, change, worktree_path),
-                                },
-                                status: status.clone(),
-                            };
-                            entry(entry_type, relative)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            ("tool", entries)
-        }
+        "McpToolCall" => (
+            "tool",
+            vec![mcp_entry(
+                item,
+                item.get("result"),
+                item_status(item),
+                timestamp.clone(),
+            )],
+        ),
+        "FileChange" => (
+            "tool",
+            file_change_entries(
+                item.get("changes"),
+                item_status(item),
+                worktree_path,
+                &timestamp,
+            ),
+        ),
         "Extension" if item.get("kind").and_then(Value::as_str) == Some("web.search") => {
-            let query = str_at(item, "query").unwrap_or_else(|| "Web search".to_string());
-            let entry_type = NormalizedEntryType::ToolUse {
-                tool_name: "web_search".to_string(),
-                action_type: ActionType::WebFetch { url: query.clone() },
-                status: ToolStatus::Success,
-            };
-            ("tool", vec![entry(entry_type, query)])
+            ("tool", vec![web_search_entry(item, timestamp.clone())])
         }
         "ImageView" => {
             let path = str_at(item, "path").unwrap_or_default();
@@ -311,6 +312,160 @@ fn adapt_item(record: &Value, payload: &Value, worktree_path: &str) -> CodexRoll
     }
 }
 
+/// A legacy-history `event_msg` that renders, or `None` for any other event.
+fn adapt_legacy_event(
+    record: &Value,
+    payload: &Value,
+    event_type: &str,
+    worktree_path: &str,
+) -> Option<CodexRolloutLine> {
+    let timestamp = str_at(record, "timestamp");
+    let entry = |entry_type, content: String| NormalizedEntry {
+        timestamp: timestamp.clone(),
+        entry_type,
+        content,
+        metadata: None,
+    };
+    let message = || str_at(payload, "message").filter(|text| !text.trim().is_empty());
+    let succeeded = || match payload.get("success").and_then(Value::as_bool) {
+        Some(false) => ToolStatus::Failed,
+        _ => ToolStatus::Success,
+    };
+    let (kind, entries) = match event_type {
+        "user_message" => (
+            "user",
+            message()
+                .map(|text| entry(NormalizedEntryType::UserMessage, text))
+                .into_iter()
+                .collect(),
+        ),
+        "agent_message" => (
+            "assistant",
+            message()
+                .map(|text| entry(NormalizedEntryType::AssistantMessage, text))
+                .into_iter()
+                .collect(),
+        ),
+        "patch_apply_end" => (
+            "tool",
+            file_change_entries(
+                payload.get("changes"),
+                succeeded(),
+                worktree_path,
+                &timestamp,
+            ),
+        ),
+        "mcp_tool_call_end" => {
+            let invocation = payload.get("invocation").unwrap_or(&Value::Null);
+            let result = payload.get("result");
+            let status = match result {
+                Some(result) if result.get("Err").is_some() => ToolStatus::Failed,
+                _ => ToolStatus::Success,
+            };
+            let result = result.map(|result| result.get("Ok").unwrap_or(result));
+            (
+                "tool",
+                vec![mcp_entry(invocation, result, status, timestamp.clone())],
+            )
+        }
+        "web_search_end" => ("tool", vec![web_search_entry(payload, timestamp.clone())]),
+        "context_compacted" => (
+            "system",
+            vec![entry(
+                NormalizedEntryType::SystemMessage,
+                "Context compacted".to_string(),
+            )],
+        ),
+        _ => return None,
+    };
+    let disposition = if entries.is_empty() {
+        CodexRolloutDisposition::Bookkeeping
+    } else {
+        CodexRolloutDisposition::Renderable
+    };
+    Some(CodexRolloutLine {
+        disposition,
+        kind: kind.to_string(),
+        item_id: str_at(payload, "call_id"),
+        turn_id: str_at(payload, "turn_id"),
+        timestamp,
+        entries,
+    })
+}
+
+/// An MCP call from its `server`, `tool` and `arguments`, with `result`.
+fn mcp_entry(
+    call: &Value,
+    result: Option<&Value>,
+    status: ToolStatus,
+    timestamp: Option<String>,
+) -> NormalizedEntry {
+    let server = str_at(call, "server").unwrap_or_default();
+    let tool = str_at(call, "tool").unwrap_or_default();
+    let tool_name = format!("mcp:{server}:{tool}");
+    NormalizedEntry {
+        timestamp,
+        entry_type: NormalizedEntryType::ToolUse {
+            tool_name: tool_name.clone(),
+            action_type: ActionType::Tool {
+                tool_name,
+                arguments: call.get("arguments").cloned(),
+                result: result.map(mcp_result),
+            },
+            status,
+        },
+        content: tool,
+        metadata: None,
+    }
+}
+
+/// One edit entry per changed path in a `{path: change}` map.
+fn file_change_entries(
+    changes: Option<&Value>,
+    status: ToolStatus,
+    worktree_path: &str,
+    timestamp: &Option<String>,
+) -> Vec<NormalizedEntry> {
+    let Some(changes) = changes.and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    changes
+        .iter()
+        .map(|(path, change)| {
+            let relative = make_path_relative(path, worktree_path);
+            NormalizedEntry {
+                timestamp: timestamp.clone(),
+                entry_type: NormalizedEntryType::ToolUse {
+                    tool_name: "edit".to_string(),
+                    action_type: ActionType::FileEdit {
+                        path: relative.clone(),
+                        changes: file_changes(&relative, change, worktree_path),
+                    },
+                    status: status.clone(),
+                },
+                content: relative,
+                metadata: None,
+            }
+        })
+        .collect()
+}
+
+fn web_search_entry(search: &Value, timestamp: Option<String>) -> NormalizedEntry {
+    let query = str_at(search, "query")
+        .filter(|query| !query.is_empty())
+        .unwrap_or_else(|| "Web search".to_string());
+    NormalizedEntry {
+        timestamp,
+        entry_type: NormalizedEntryType::ToolUse {
+            tool_name: "web_search".to_string(),
+            action_type: ActionType::WebFetch { url: query.clone() },
+            status: ToolStatus::Success,
+        },
+        content: query,
+        metadata: None,
+    }
+}
+
 fn str_at(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_string)
 }
@@ -352,8 +507,7 @@ fn item_status(item: &Value) -> ToolStatus {
     }
 }
 
-fn mcp_result(item: &Value) -> Option<ToolResult> {
-    let result = item.get("result")?;
+fn mcp_result(result: &Value) -> ToolResult {
     let content = result.get("content").and_then(Value::as_array);
     let texts = content.and_then(|blocks| {
         blocks
@@ -365,7 +519,7 @@ fn mcp_result(item: &Value) -> Option<ToolResult> {
             })
             .collect::<Option<Vec<_>>>()
     });
-    Some(match texts {
+    match texts {
         Some(texts) => ToolResult::markdown(texts.join("\n")),
         None => ToolResult {
             r#type: crate::logs::ToolResultValueType::Json,
@@ -374,7 +528,7 @@ fn mcp_result(item: &Value) -> Option<ToolResult> {
                 .cloned()
                 .unwrap_or_else(|| result.clone()),
         },
-    })
+    }
 }
 
 fn file_changes(relative: &str, change: &Value, worktree_path: &str) -> Vec<FileChange> {
@@ -412,7 +566,7 @@ mod tests {
     fn adapt_all() -> Vec<CodexRolloutLine> {
         FIXTURE
             .lines()
-            .map(|line| adapt_codex_rollout_line(line, "/workspace/demo").unwrap())
+            .map(|line| adapt_codex_rollout_line(line, "/workspace/demo", false).unwrap())
             .collect()
     }
 
@@ -478,13 +632,15 @@ mod tests {
             .collect();
         assert_eq!(unknown.len(), 2);
         assert!(unknown.iter().all(|line| line.entries.is_empty()));
-        assert!(adapt_codex_rollout_line("{not json", "/").is_err());
+        assert!(adapt_codex_rollout_line("{not json", "/", false).is_err());
         for line in [
             r#"{"type":"event_msg","payload":{"type":"hologram_delta"}}"#,
             r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"Extension","kind":"holo.call","id":"x"}}}"#,
         ] {
             assert_eq!(
-                adapt_codex_rollout_line(line, "/").unwrap().disposition,
+                adapt_codex_rollout_line(line, "/", false)
+                    .unwrap()
+                    .disposition,
                 CodexRolloutDisposition::Unknown
             );
         }
@@ -493,10 +649,103 @@ mod tests {
             r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"Extension","kind":"clock.sleep","id":"x"}}}"#,
         ] {
             assert_eq!(
-                adapt_codex_rollout_line(line, "/").unwrap().disposition,
+                adapt_codex_rollout_line(line, "/", false)
+                    .unwrap()
+                    .disposition,
                 CodexRolloutDisposition::Bookkeeping
             );
         }
+    }
+
+    /// A thread the app server (0.124.0) started, resumed and continued by
+    /// the Codex TUI (0.158.0), which keeps its legacy history format. The
+    /// last turn splices in the remaining legacy event shapes seen in local
+    /// 0.144 to 0.154 rollouts, with synthetic values.
+    const LEGACY_FIXTURE: &str = include_str!("testdata/rollout-0.124.0-legacy.redacted.jsonl");
+
+    fn rendered(fixture: &str, legacy_history: bool) -> Vec<String> {
+        fixture
+            .lines()
+            .map(|line| adapt_codex_rollout_line(line, "/workspace/demo", legacy_history).unwrap())
+            .flat_map(|line| line.entries)
+            .map(|entry| match &entry.entry_type {
+                NormalizedEntryType::UserMessage => format!("user: {}", entry.content),
+                NormalizedEntryType::AssistantMessage => format!("assistant: {}", entry.content),
+                NormalizedEntryType::ToolUse {
+                    tool_name, status, ..
+                } => format!("tool {tool_name} {status:?}: {}", entry.content),
+                NormalizedEntryType::SystemMessage => format!("system: {}", entry.content),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_history_mode_comes_from_session_meta() {
+        let first = |fixture: &str| fixture.lines().next().unwrap().to_string();
+        assert_eq!(
+            rollout_has_legacy_history(&first(LEGACY_FIXTURE)),
+            Some(true)
+        );
+        assert_eq!(rollout_has_legacy_history(&first(FIXTURE)), Some(false));
+        assert_eq!(
+            rollout_has_legacy_history(r#"{"type":"event_msg","payload":{}}"#),
+            None
+        );
+        assert_eq!(rollout_has_legacy_history("{not json"), None);
+    }
+
+    #[test]
+    fn a_legacy_history_rollout_renders_its_message_and_tool_events() {
+        assert_eq!(
+            rendered(LEGACY_FIXTURE, true),
+            [
+                "user: Remember the codeword PAPAYA. Reply with just OK.",
+                "user: Also remember the second codeword MANGO. Reply with just OK2.",
+                "assistant: OK2",
+                "user: Use apply_patch to create notes.txt containing the line hello, then run ls and tell me the file count.",
+                "assistant: I’ll create `notes.txt`, then list the directory and count its files.",
+                "tool edit Success: notes.txt",
+                "assistant: Created `notes.txt` containing `hello`. `ls` shows 4 entries, so the file count is 4.",
+                "user: Search the docs, then compact.",
+                "tool mcp:docs:search Success: search",
+                "tool mcp:docs:fetch Failed: fetch",
+                "tool web_search Success: markdown greeting",
+                "system: Context compacted",
+            ]
+        );
+        let lines: Vec<_> = LEGACY_FIXTURE
+            .lines()
+            .map(|line| adapt_codex_rollout_line(line, "/workspace/demo", true).unwrap())
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.disposition != CodexRolloutDisposition::Unknown)
+        );
+        let edit = lines
+            .iter()
+            .flat_map(|line| &line.entries)
+            .find_map(|entry| match &entry.entry_type {
+                NormalizedEntryType::ToolUse {
+                    action_type: ActionType::FileEdit { changes, .. },
+                    ..
+                } => Some(changes.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(
+            edit.as_slice(),
+            [FileChange::Write { content }] if content == "hello\n"
+        ));
+    }
+
+    #[test]
+    fn a_paginated_rollout_never_renders_its_legacy_events() {
+        // A paginated rollout can repeat turns as legacy events next to its
+        // thread items; those stay bookkeeping.
+        assert!(rendered(LEGACY_FIXTURE, false).is_empty());
+        assert_eq!(rendered(FIXTURE, true), rendered(FIXTURE, false));
     }
 
     #[test]

@@ -21,8 +21,8 @@ use axum::{
     routing::{get, post},
 };
 use db::models::{
-    claude_session_link::ClaudeSessionLink, coding_agent_turn::CodingAgentTurn,
-    execution_process::ExecutionProcess, session::Session, workspace::Workspace,
+    cli_pane_binding::CliPaneBinding, execution_process::ExecutionProcess, session::Session,
+    workspace::Workspace,
 };
 use deployment::Deployment;
 use local_deployment::{
@@ -143,12 +143,7 @@ async fn cli_context(
                     tracing::warn!(?error, session_id = %s.id, "restart writer guard failed closed");
                     true
                 });
-            let sid = CodingAgentTurn::find_latest_session_info(pool, s.id)
-                .await?
-                .map(|info| info.session_id)
-                .or(ClaudeSessionLink::find_latest_for_session(pool, s.id)
-                    .await?
-                    .map(|link| link.claude_session_id));
+            let sid = CliPaneBinding::resume_session_id(pool, s.id).await?;
             (active, sid)
         }
         None => (false, None),

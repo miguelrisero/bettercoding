@@ -7,7 +7,13 @@ use uuid::Uuid;
 use super::{
     claude_session_link::{ClaudeSessionLink, ClaudeSessionLinkMutation},
     cli_ingest_outbox::CliIngestOutbox,
+    coding_agent_turn::CodingAgentTurn,
 };
+
+/// Codex thread ids are UUIDv7; Claude session ids are v4.
+pub fn is_codex_thread_id(sid: &str) -> bool {
+    Uuid::parse_str(sid).is_ok_and(|id| id.get_version_num() == 7)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, TS)]
 #[sqlx(type_name = "TEXT", rename_all = "kebab-case")]
@@ -119,28 +125,84 @@ impl CliPaneBinding {
     }
 
     /// Every native session id a CLI pane in `workspace_id` was ever bound
-    /// to, released bindings included.
+    /// to, released bindings included, and every session a pane of the
+    /// workspace ran before it switched to another inside the TUI.
     pub async fn bound_session_ids_for_workspace(
         pool: &SqlitePool,
         workspace_id: Uuid,
     ) -> Result<Vec<String>, sqlx::Error> {
         sqlx::query_scalar(
-            "SELECT DISTINCT claude_session_id FROM cli_pane_bindings \
-             WHERE workspace_id = ? AND claude_session_id IS NOT NULL",
+            "SELECT claude_session_id FROM cli_pane_bindings \
+             WHERE workspace_id = ?1 AND claude_session_id IS NOT NULL \
+             UNION \
+             SELECT claude_session_id FROM claude_session_links \
+             WHERE workspace_id = ?1 AND bound_via IN ('cli-resume', 'cli-fresh')",
         )
         .bind(workspace_id)
         .fetch_all(pool)
         .await
     }
 
-    /// Link a fresh pane's discovered native session to the pane's app
-    /// session and record it on the pane, in one transaction, publishing the
-    /// session's already imported records. Nothing is written, and `None` is
-    /// returned, when another session owns `claude_session_id` or the binding
-    /// is no longer an active, still-unbound `cli-fresh` one.
+    /// The Codex thread the latest CLI pane of `session_id` ran, unless a
+    /// coding-agent run of the session started after that pane launched.
+    ///
+    /// A pane that switches threads inside the Codex TUI (`/new`, `/resume`,
+    /// `/fork`) records the thread it runs now, so this names the
+    /// conversation the user last saw in the pane, which can be newer than
+    /// the executor's latest thread. Only Codex thread ids (UUIDv7) are
+    /// returned; a Claude pane keeps the executor-first resume order.
+    pub async fn latest_codex_pane_thread(
+        pool: &SqlitePool,
+        session_id: Uuid,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let sid: Option<String> = sqlx::query_scalar(
+            "SELECT b.claude_session_id FROM cli_pane_bindings b \
+             WHERE b.session_id = ?1 AND b.claude_session_id IS NOT NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM execution_processes ep \
+                   WHERE ep.session_id = ?1 AND ep.run_reason = 'codingagent' \
+                     AND ep.dropped = FALSE \
+                     AND julianday(ep.created_at) > julianday(b.created_at)) \
+             ORDER BY b.created_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(sid.filter(|sid| is_codex_thread_id(sid)))
+    }
+
+    /// The native session a CLI launch of `session_id` resumes: the Codex
+    /// thread its pane ran last, then the executor's latest turn, then the
+    /// session's latest CLI link.
+    pub async fn resume_session_id(
+        pool: &SqlitePool,
+        session_id: Uuid,
+    ) -> Result<Option<String>, sqlx::Error> {
+        if let Some(thread) = Self::latest_codex_pane_thread(pool, session_id).await? {
+            return Ok(Some(thread));
+        }
+        if let Some(info) = CodingAgentTurn::find_latest_session_info(pool, session_id).await? {
+            return Ok(Some(info.session_id));
+        }
+        Ok(ClaudeSessionLink::find_latest_for_session(pool, session_id)
+            .await?
+            .map(|link| link.claude_session_id))
+    }
+
+    /// Link the native session a pane runs to the pane's app session and
+    /// record it on the pane, in one transaction, publishing the session's
+    /// already imported records.
+    ///
+    /// `current` is the session the pane is recorded to run: `None` for a
+    /// fresh `cli-fresh` pane that has not been bound yet, or the session it
+    /// ran before switching inside the TUI. Nothing is written, and `None` is
+    /// returned, when another session owns `claude_session_id` (by link or by
+    /// a coding-agent run), or the binding is no longer active and still
+    /// recorded as running `current`.
     pub async fn assign_discovered_session(
         pool: &SqlitePool,
         binding_id: Uuid,
+        current: Option<&str>,
         claude_session_id: &str,
         session_id: Uuid,
         workspace_id: Uuid,
@@ -156,13 +218,28 @@ impl CliPaneBinding {
         if previous_session_id.is_some_and(|owner| owner != session_id) {
             return Ok(None);
         }
+        let run_by_another_session: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM coding_agent_turns cat \
+                 JOIN execution_processes ep ON ep.id = cat.execution_process_id \
+                 WHERE cat.agent_session_id = ? AND ep.session_id != ? \
+                   AND ep.dropped = FALSE)",
+        )
+        .bind(claude_session_id)
+        .bind(session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if run_by_another_session {
+            return Ok(None);
+        }
         let bound = sqlx::query(
-            "UPDATE cli_pane_bindings SET claude_session_id = ? \
-             WHERE id = ? AND released_at IS NULL \
-               AND bound_via = 'cli-fresh' AND claude_session_id IS NULL",
+            "UPDATE cli_pane_bindings SET claude_session_id = ?1 \
+             WHERE id = ?2 AND released_at IS NULL \
+               AND claude_session_id IS ?3 \
+               AND (?3 IS NOT NULL OR bound_via = 'cli-fresh')",
         )
         .bind(claude_session_id)
         .bind(binding_id)
+        .bind(current)
         .execute(&mut *tx)
         .await?
         .rows_affected();
