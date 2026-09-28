@@ -1033,6 +1033,56 @@ async fn a_thread_switch_inside_the_pane_binds_the_new_thread_and_keeps_the_old(
 }
 
 #[tokio::test]
+async fn a_switch_reported_before_the_pane_launched_never_binds() {
+    let case = codex_case().await;
+    let (first, _) = cli_rollout(
+        &case,
+        24,
+        Utc::now() - chrono::Duration::minutes(5),
+        &case.cwd,
+    );
+    bind_resumed(&case, &first).await;
+    reconcile(&case).await;
+    let binding = CliPaneBinding::find_active_for_workspace(&case.db.pool, case.workspace.id)
+        .await
+        .unwrap()
+        .unwrap();
+    // A previous pane's last report, fired before this pane launched but
+    // received after it.
+    let (earlier, _) = cli_rollout(&case, 25, Utc::now(), &case.cwd);
+    WorkspaceCliActivity::upsert_hook(
+        &case.db.pool,
+        case.workspace.id,
+        &CliHookState {
+            agent_session_id: earlier.clone(),
+            transcript_path: None,
+            phase: CliPhase::Working,
+            tasks: None,
+            crons: None,
+            seq: binding.created_at.timestamp_nanos_opt().unwrap() - 1_000_000_000,
+        },
+        false,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    reconcile(&case).await;
+
+    let binding = CliPaneBinding::find_by_id(&case.db.pool, binding.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.claude_session_id.as_deref(), Some(first.as_str()));
+    assert!(
+        ClaudeSessionLink::find(&case.db.pool, &earlier)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn a_thread_switch_to_another_directory_never_binds() {
     let other = TempDir::new().unwrap();
     let pane = switched_pane(Some(other.path())).await;

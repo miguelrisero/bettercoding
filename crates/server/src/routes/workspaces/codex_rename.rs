@@ -1,30 +1,21 @@
 //! Propagate a workspace rename into the workspace's Codex thread.
 //!
-//! Codex names a thread through its own interfaces: the TUI's
-//! `/rename <name>` command, and the app server's `thread/name/set` request.
-//! Both record the name in Codex's thread index, where `codex resume` and the
-//! TUI status line read it, and a thread forked later inherits it. Nothing
-//! here writes Codex's files directly.
-//!
-//! A live, input-idle Codex pane gets the `/rename` keystrokes, so its status
-//! line updates at once; the gate is the one the Claude path uses. Otherwise
-//! a short-lived `codex app-server` names the thread. Everything is
-//! best-effort and runs off the request path.
+//! A short-lived `codex app-server` sends `thread/name/set` for the selected
+//! thread. Codex records the name in its thread index, where `codex resume`
+//! and a later TUI session read it, and a thread forked later inherits it.
+//! Nothing here writes Codex's files directly, and nothing is typed into a
+//! live pane: its input can hold a draft that an injected command would
+//! submit. A running TUI shows the new name after its next resume.
+//! Everything is best-effort and runs off the request path.
 
 use std::{process::Stdio, time::Duration};
 
-use local_deployment::pty::{
-    CliSendResult, cli_pane_agent_running_at, latest_cli_client_activity, locate_cli_tmux_target,
-    now_unix_secs, send_cli_keys_to_live_agent,
-};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
 };
 use uuid::Uuid;
-
-use super::claude_rename::should_inject_rename_keys;
 
 /// Bound on one `codex app-server` naming run, start-up included.
 const APP_SERVER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -44,33 +35,9 @@ pub async fn propagate_codex_rename(
     if name.is_empty() {
         return Ok(());
     }
-    if rename_in_live_pane(workspace_id, name).await {
-        tracing::debug!(%workspace_id, "Codex thread renamed through the live pane");
-        return Ok(());
-    }
     set_thread_name(thread_id, name).await?;
-    tracing::debug!(%workspace_id, thread_id, "Codex thread renamed through the app server");
+    tracing::debug!(%workspace_id, thread_id, "Codex thread renamed");
     Ok(())
-}
-
-/// Type `/rename <name>` into a pane that demonstrably runs Codex and whose
-/// clients have been input-idle. `true` when the keystrokes were delivered.
-async fn rename_in_live_pane(workspace_id: Uuid, name: &str) -> bool {
-    let Some(target) = locate_cli_tmux_target(workspace_id).await else {
-        return false;
-    };
-    if cli_pane_agent_running_at(&target, "codex").await != Some(true) {
-        return false;
-    }
-    let Some(latest_activity) = latest_cli_client_activity(&target).await else {
-        return false;
-    };
-    if !should_inject_rename_keys(name, Some(latest_activity), now_unix_secs()) {
-        return false;
-    }
-    send_cli_keys_to_live_agent(&target, &["codex"], &format!("/rename {name}"))
-        .await
-        .is_some_and(CliSendResult::delivered)
 }
 
 /// Name `thread_id` through a short-lived `codex app-server`.
@@ -117,11 +84,10 @@ async fn set_thread_name(thread_id: &str, name: &str) -> Result<(), String> {
         }
         Err("codex app-server exited before answering thread/name/set".to_string())
     };
-    let outcome = tokio::time::timeout(APP_SERVER_TIMEOUT, exchange)
-        .await
-        .map_err(|_| "codex app-server timed out".to_string())?;
+    let outcome = tokio::time::timeout(APP_SERVER_TIMEOUT, exchange).await;
+    // Killed and reaped on every path, a timeout included.
     let _ = child.kill().await;
-    outcome
+    outcome.map_err(|_| "codex app-server timed out".to_string())?
 }
 
 /// The outcome of `thread/name/set` when `line` is its response.

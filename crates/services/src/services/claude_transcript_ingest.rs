@@ -1597,20 +1597,30 @@ impl ClaudeTranscriptIngest {
         else {
             return Ok(());
         };
-        let hook_sid = WorkspaceCliActivity::find_by_workspace_id(pool, workspace.id)
+        let hook = WorkspaceCliActivity::find_by_workspace_id(pool, workspace.id)
             .await?
             .filter(|activity| activity.hook_at.is_some_and(|at| at >= binding.created_at))
             .and_then(|activity| activity.hook)
-            .map(|hook| hook.agent_session_id)
-            .filter(|sid| is_codex_thread_id(sid));
+            .filter(|hook| is_codex_thread_id(&hook.agent_session_id));
         let candidates = match binding.claude_session_id.as_deref() {
             None if binding.bound_via == CliPaneBoundVia::CliFresh => {
+                let hook_sid = hook.map(|hook| hook.agent_session_id);
                 self.fresh_codex_candidates(root, &binding, &cwd, hook_sid)
                     .await
             }
             None => return Ok(()),
             Some(current) => {
-                let Some(sid) = hook_sid.filter(|sid| sid != current) else {
+                // The switch report must have fired after this pane launched,
+                // not merely arrived after it: a previous pane's last report
+                // can still be in flight when its replacement launches. `seq`
+                // is the hook's own fire time in nanoseconds (the receipt
+                // time when the hook's `date` has no `%N`).
+                let launched_ns = binding.created_at.timestamp_nanos_opt().unwrap_or(i64::MAX);
+                let Some(sid) = hook
+                    .filter(|hook| hook.seq >= launched_ns)
+                    .map(|hook| hook.agent_session_id)
+                    .filter(|sid| sid != current)
+                else {
                     return Ok(());
                 };
                 let Some(path) = self.locate_codex_rollout(root, &sid).await else {
