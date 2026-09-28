@@ -332,13 +332,17 @@ export type UserSystemInfo = { version: string, config: Config, machine_id: stri
  */
 capabilities: { [key in string]?: Array<BaseAgentCapability> }, shared_api_base: string | null, preview_proxy_port: number | null, 
 /**
- * Whether the CLI↔UI handover (native transcript feed + collaboration
- * routing) is active on this server. The feature ships dark, so the web
- * app must consult this before opening the per-session native-feed
- * WebSocket — a disabled server accepts the connection only to answer with
- * an empty snapshot and hang up.
+ * Whether CLI collaboration routing is active on this server (opt-in via
+ * `ENABLE_CLI_HANDOVER`).
  */
-cli_handover_enabled: boolean, executors: { [key in BaseCodingAgent]?: ExecutorProfile }, };
+cli_handover_enabled: boolean, 
+/**
+ * Whether the native transcript ingest runs, so chat mode can show turns
+ * made in the CLI. The web app consults this before opening the
+ * per-session native-feed WebSocket — a disabled server accepts the
+ * connection only to answer with an empty snapshot and hang up.
+ */
+cli_transcript_ingest_enabled: boolean, executors: { [key in BaseCodingAgent]?: ExecutorProfile }, };
 
 export type Environment = { os_type: string, os_version: string, os_architecture: string, bitness: string, };
 

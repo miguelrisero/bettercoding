@@ -100,12 +100,14 @@ pub struct UserSystemInfo {
     pub capabilities: HashMap<String, Vec<BaseAgentCapability>>,
     pub shared_api_base: Option<String>,
     pub preview_proxy_port: Option<u16>,
-    /// Whether the CLI↔UI handover (native transcript feed + collaboration
-    /// routing) is active on this server. The feature ships dark, so the web
-    /// app must consult this before opening the per-session native-feed
-    /// WebSocket — a disabled server accepts the connection only to answer with
-    /// an empty snapshot and hang up.
+    /// Whether CLI collaboration routing is active on this server (opt-in via
+    /// `ENABLE_CLI_HANDOVER`).
     pub cli_handover_enabled: bool,
+    /// Whether the native transcript ingest runs, so chat mode can show turns
+    /// made in the CLI. The web app consults this before opening the
+    /// per-session native-feed WebSocket — a disabled server accepts the
+    /// connection only to answer with an empty snapshot and hang up.
+    pub cli_transcript_ingest_enabled: bool,
 }
 
 // TODO: update frontend, BE schema has changed, this replaces GET /config and /config/constants
@@ -180,6 +182,7 @@ async fn get_user_system_info(
         shared_api_base: deployment.remote_info().get_api_base(),
         preview_proxy_port: deployment.client_info().get_preview_proxy_port(),
         cli_handover_enabled: utils::feature_flags::cli_handover_enabled(),
+        cli_transcript_ingest_enabled: deployment.claude_transcript_ingest().is_some(),
     };
 
     ResponseJson(ApiResponse::success(user_system_info))

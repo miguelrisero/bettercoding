@@ -89,6 +89,15 @@ pub struct ReplacedGenerationImport {
     pub imported: ImportBatchResult,
 }
 
+/// Import transactions read before they write. A deferred transaction whose
+/// snapshot went stale while it read fails its first write with
+/// `SQLITE_BUSY` at once, without waiting on the busy timeout, so under
+/// concurrent API writes an import could fail on every attempt. Taking the
+/// write lock up front makes it wait its turn instead.
+async fn begin_immediate(pool: &SqlitePool) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
+    pool.begin_with("BEGIN IMMEDIATE").await
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct SessionNativeRecord {
     pub file_id: Uuid,
@@ -107,6 +116,7 @@ pub struct SessionNativeRecord {
     pub dir_path: String,
     pub file_name: String,
     pub generation: i64,
+    pub last_import_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -197,7 +207,7 @@ impl CliNativeRecord {
         records: &[NewCliNativeRecord],
         cursor: &ImportedCursor<'_>,
     ) -> Result<ImportBatchResult, sqlx::Error> {
-        let mut tx = pool.begin().await?;
+        let mut tx = begin_immediate(pool).await?;
         let result = Self::import_batch_in_transaction(
             &mut tx,
             file_id,
@@ -218,7 +228,7 @@ impl CliNativeRecord {
         cursor: &ImportedCursor<'_>,
         context: NativeImportContext,
     ) -> Result<ImportBatchResult, sqlx::Error> {
-        let mut tx = pool.begin().await?;
+        let mut tx = begin_immediate(pool).await?;
         let result =
             Self::import_batch_in_transaction(&mut tx, file_id, records, cursor, None, context)
                 .await?;
@@ -254,7 +264,7 @@ impl CliNativeRecord {
         cursor: &ImportedCursor<'_>,
         context: NativeImportContext,
     ) -> Result<ReplacedGenerationImport, sqlx::Error> {
-        let mut tx = pool.begin().await?;
+        let mut tx = begin_immediate(pool).await?;
         let next_generation = sqlx::query_scalar!(
             r#"SELECT COALESCE(MAX(generation), -1) + 1 AS "generation!: i64"
                FROM cli_native_files
@@ -594,6 +604,20 @@ impl CliNativeRecord {
         pool: &SqlitePool,
         session_id: Uuid,
     ) -> Result<Vec<SessionNativeRecord>, sqlx::Error> {
+        Self::list_for_session_after(pool, session_id, i64::MIN).await
+    }
+
+    /// Projection rows whose outbox `seq` is above `after_seq`, in `seq` order.
+    ///
+    /// Outbox sequences are allocated inside the SQLite write transaction that
+    /// commits the row, so every row at or below an observed `seq` is already
+    /// visible: a caller that has consumed rows through `after_seq` can fetch
+    /// only the tail.
+    pub async fn list_for_session_after(
+        pool: &SqlitePool,
+        session_id: Uuid,
+        after_seq: i64,
+    ) -> Result<Vec<SessionNativeRecord>, sqlx::Error> {
         sqlx::query_as!(
             SessionNativeRecord,
             r#"SELECT r.file_id AS "file_id!: Uuid",
@@ -613,13 +637,14 @@ impl CliNativeRecord {
                           WHERE enl.native_uuid = r.uuid
                           ORDER BY linked_ep.created_at ASC
                           LIMIT 1
-                      ) AS "linked_execution_process_id: Uuid",
-                      cat.execution_process_id AS "bound_turn_execution_process_id: Uuid",
+                      ) AS "linked_execution_process_id?: Uuid",
+                      cat.execution_process_id AS "bound_turn_execution_process_id?: Uuid",
                       r.bound_queued_message_id AS "bound_queued_message_id: Uuid",
                       outbox.seq,
                       f.dir_path,
                       f.file_name,
-                      f.generation
+                      f.generation,
+                      f.last_import_at AS "last_import_at?: DateTime<Utc>"
                FROM cli_native_records r
                JOIN cli_native_files f ON f.id = r.file_id
                JOIN claude_session_links l
@@ -631,6 +656,8 @@ impl CliNativeRecord {
                LEFT JOIN coding_agent_turns cat
                  ON cat.id = r.bound_coding_agent_turn_id
                WHERE l.session_id = $1
+                 AND outbox.session_id = $1
+                 AND outbox.seq > $2
                  AND f.generation = (
                      SELECT MAX(newer.generation)
                      FROM cli_native_files newer
@@ -638,7 +665,8 @@ impl CliNativeRecord {
                        AND newer.file_name = f.file_name
                  )
                ORDER BY outbox.seq ASC"#,
-            session_id
+            session_id,
+            after_seq
         )
         .fetch_all(pool)
         .await

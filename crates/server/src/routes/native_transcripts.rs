@@ -9,7 +9,8 @@ use axum::{
 use deployment::Deployment;
 use serde::Deserialize;
 use services::services::claude_transcript_ingest::{
-    ClaudeTranscriptIngest, NativeFeedSnapshot, NativeFeedUpdate, UnassignedCliSession,
+    ClaudeTranscriptIngest, NativeFeedChange, NativeFeedSnapshot, NativeFeedUpdate,
+    NativeIngestHealth, UnassignedCliSession,
 };
 use ts_rs::TS;
 use utils::{log_msg::LogMsg, response::ApiResponse};
@@ -75,13 +76,119 @@ async fn stream_native_feed_ws(
     })
 }
 
-async fn send_snapshot(
+/// Send `change` and return the health the client now holds.
+async fn send_change(
     socket: &mut MaybeSignedWebSocket,
-    snapshot: &NativeFeedSnapshot,
-) -> anyhow::Result<()> {
+    change: &NativeFeedChange,
+    sent_health: &NativeIngestHealth,
+) -> anyhow::Result<NativeIngestHealth> {
     socket
-        .send(snapshot_message(snapshot)?.to_ws_message_unchecked())
+        .send(change_message(change, sent_health)?.to_ws_message_unchecked())
         .await?;
+    Ok(match change {
+        NativeFeedChange::Full(snapshot) => snapshot.health.clone(),
+        NativeFeedChange::Delta { health, .. } => health.clone(),
+    })
+}
+
+/// A full change replaces every top-level field. A delta adds appended
+/// entries at their exact index and replaces changed ones in place, so a
+/// client whose copy has drifted fails to apply it instead of silently
+/// diverging. Revision and seq are always replaced; forks only when they
+/// changed; health only in the fields and file entries that differ from
+/// `sent_health`, the health the client already holds.
+fn change_message(
+    change: &NativeFeedChange,
+    sent_health: &NativeIngestHealth,
+) -> anyhow::Result<LogMsg> {
+    let (revision, seq, appended_from, appended, replaced, forks, health) = match change {
+        NativeFeedChange::Full(snapshot) => return snapshot_message(snapshot),
+        NativeFeedChange::Delta {
+            revision,
+            seq,
+            appended_from,
+            appended,
+            replaced,
+            forks,
+            health,
+        } => (
+            revision,
+            seq,
+            appended_from,
+            appended,
+            replaced,
+            forks,
+            health,
+        ),
+    };
+    let mut ops = vec![
+        serde_json::json!({ "op": "replace", "path": "/revision", "value": revision }),
+        serde_json::json!({ "op": "replace", "path": "/seq", "value": seq }),
+    ];
+    for (index, entry) in replaced {
+        ops.push(serde_json::json!({
+            "op": "replace",
+            "path": format!("/entries/{index}"),
+            "value": entry,
+        }));
+    }
+    for (offset, entry) in appended.iter().enumerate() {
+        ops.push(serde_json::json!({
+            "op": "add",
+            "path": format!("/entries/{}", appended_from + offset),
+            "value": entry,
+        }));
+    }
+    if let Some(forks) = forks {
+        ops.push(serde_json::json!({ "op": "replace", "path": "/forks", "value": forks }));
+    }
+    health_ops(sent_health, health, &mut ops)?;
+    Ok(LogMsg::JsonPatch(serde_json::from_value(
+        serde_json::Value::Array(ops),
+    )?))
+}
+
+/// Patch operations turning `sent` into `next`. The file list only grows or
+/// changes in place within one projection, so it is patched per entry; a
+/// shorter list is replaced whole.
+fn health_ops(
+    sent: &NativeIngestHealth,
+    next: &NativeIngestHealth,
+    ops: &mut Vec<serde_json::Value>,
+) -> anyhow::Result<()> {
+    let serde_json::Value::Object(sent) = serde_json::to_value(sent)? else {
+        unreachable!("health serializes to an object")
+    };
+    let serde_json::Value::Object(next) = serde_json::to_value(next)? else {
+        unreachable!("health serializes to an object")
+    };
+    for (field, value) in &next {
+        if sent.get(field) == Some(value) {
+            continue;
+        }
+        match (field.as_str(), sent.get(field), value) {
+            ("files", Some(serde_json::Value::Array(old)), serde_json::Value::Array(new))
+                if new.len() >= old.len() =>
+            {
+                for (index, file) in new.iter().enumerate() {
+                    if old.get(index) == Some(file) {
+                        continue;
+                    }
+                    let op = if index < old.len() { "replace" } else { "add" };
+                    ops.push(serde_json::json!({
+                        "op": op,
+                        "path": format!("/health/files/{index}"),
+                        "value": file,
+                    }));
+                }
+            }
+            _ => ops.push(serde_json::json!({
+                "op": "replace",
+                "path": format!("/health/{field}"),
+                "value": value,
+            })),
+        }
+    }
     Ok(())
 }
 
@@ -187,22 +294,24 @@ async fn handle_native_feed_ws(
     ingest: Arc<ClaudeTranscriptIngest>,
     session_id: Uuid,
 ) -> anyhow::Result<()> {
+    // Keep the session's projection cached for incremental updates while
+    // this socket lives.
+    let _subscription = ingest.subscribe_feed(session_id);
     // Subscribe before taking the snapshot. Updates already represented by the
     // snapshot are skipped by seq; anything newer is queued in this receiver.
     let mut updates = ingest.subscribe();
-    let mut snapshot = ingest
-        .snapshot(session_id)
+    let (change, mut cursor) = ingest
+        .feed_since(session_id, None)
         .await
         .map_err(anyhow::Error::from)?;
-    let mut last_seq = snapshot.seq;
-    let mut revision = snapshot.revision;
-    send_snapshot(&mut socket, &snapshot).await?;
+    let (mut last_seq, mut revision) = change_watermarks(&change);
+    let mut sent_health = send_change(&mut socket, &change, &NativeIngestHealth::default()).await?;
     socket.send(LogMsg::Ready.to_ws_message_unchecked()).await?;
 
     loop {
         tokio::select! {
             update = updates.recv() => {
-                match update {
+                let full = match update {
                     Ok(update) => {
                         let (latest, lagged) =
                             drain_latest_update(update, &mut updates, session_id);
@@ -225,29 +334,22 @@ async fn handle_native_feed_ws(
                                 "resnapshotting native transcript feed"
                             );
                         }
-                        // A native record can replace an earlier tool-use entry
-                        // or change fork membership. Rebuilding the canonical
-                        // projection and replacing one snapshot keeps that
-                        // update atomic at the WebSocket-message boundary.
-                        snapshot = ingest
-                            .snapshot(session_id)
-                            .await
-                            .map_err(anyhow::Error::from)?;
-                        last_seq = snapshot.seq;
-                        revision = snapshot.revision;
-                        send_snapshot(&mut socket, &snapshot).await?;
+                        lagged || reason.is_some_and(|reason| reason.revision_changed)
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        snapshot = ingest
-                            .snapshot(session_id)
-                            .await
-                            .map_err(anyhow::Error::from)?;
-                        last_seq = snapshot.seq;
-                        revision = snapshot.revision;
-                        send_snapshot(&mut socket, &snapshot).await?;
-                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
+                };
+                // A native record can replace an earlier tool-use entry or
+                // change fork membership. The projection reports those as
+                // in-place replacements, and one message carries the whole
+                // update, so it stays atomic at the WebSocket boundary.
+                let (change, next_cursor) = ingest
+                    .feed_since(session_id, (!full).then_some(cursor))
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                cursor = next_cursor;
+                (last_seq, revision) = change_watermarks(&change);
+                sent_health = send_change(&mut socket, &change, &sent_health).await?;
             }
             inbound = socket.recv() => {
                 match inbound {
@@ -259,6 +361,13 @@ async fn handle_native_feed_ws(
     }
     let _ = socket.close().await;
     Ok(())
+}
+
+fn change_watermarks(change: &NativeFeedChange) -> (i64, u64) {
+    match change {
+        NativeFeedChange::Full(snapshot) => (snapshot.seq, snapshot.revision),
+        NativeFeedChange::Delta { seq, revision, .. } => (*seq, *revision),
+    }
 }
 
 async fn get_unassigned(
@@ -298,6 +407,11 @@ pub fn router() -> Router<DeploymentImpl> {
 
 #[cfg(test)]
 mod tests {
+    use executors::logs::{NormalizedEntry, NormalizedEntryType};
+    use services::services::claude_transcript_ingest::{
+        NativeFeedEntry, NativeFeedFork, NativeFeedOrigin, NativeFileImportHealth, NativeForkView,
+    };
+
     use super::*;
 
     #[test]
@@ -328,6 +442,167 @@ mod tests {
                     }
                 }
             ])
+        );
+    }
+
+    fn feed_entry(seq: i64, content: &str) -> NativeFeedEntry {
+        NativeFeedEntry {
+            normalized_entry: NormalizedEntry {
+                timestamp: None,
+                entry_type: NormalizedEntryType::AssistantMessage,
+                content: content.to_string(),
+                metadata: None,
+            },
+            claude_session_id: "fixture-sid".to_string(),
+            uuid: Some(format!("uuid-{seq}")),
+            parent_uuid: None,
+            ts: None,
+            origin: NativeFeedOrigin::Cli,
+            linked_execution_process_id: None,
+            git_branch: None,
+            version: None,
+            branch: None,
+            seq,
+        }
+    }
+
+    fn feed_document(snapshot: &NativeFeedSnapshot) -> serde_json::Value {
+        serde_json::to_value(snapshot).unwrap()
+    }
+
+    /// Server-shaped messages and the document each must produce, shared with
+    /// the web client's applicator test (`jsonPatch.test.ts`).
+    #[test]
+    fn feed_patches_match_the_web_client_fixture() {
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/web-core/src/shared/lib/__fixtures__/native-feed-patches.json");
+        let health = |files| NativeIngestHealth {
+            files,
+            ..Default::default()
+        };
+        let file = NativeFileImportHealth {
+            claude_session_id: "fixture-sid".to_string(),
+            file_name: "fixture-sid.jsonl".to_string(),
+            generation: 1,
+            last_import_at: None,
+        };
+        let fork = NativeFeedFork {
+            claude_session_id: "fixture-sid".to_string(),
+            file_id: Uuid::nil(),
+            fork: NativeForkView {
+                fork_parent_uuid: "uuid-1".to_string(),
+                prefix_uuids: vec!["uuid-1".to_string()],
+                branches: Vec::new(),
+                default_branch: None,
+            },
+        };
+
+        let mut state = NativeFeedSnapshot {
+            revision: 1,
+            seq: 2,
+            entries: vec![feed_entry(1, "tool: running"), feed_entry(2, "thinking")],
+            forks: Vec::new(),
+            health: health(vec![file.clone()]),
+        };
+        let mut steps = vec![(
+            "snapshot",
+            NativeFeedChange::Full(state.clone()),
+            feed_document(&state),
+        )];
+
+        // A tool result replaces an entry mid-list while a new one appends,
+        // and the imported file's timestamp moves.
+        state.seq = 3;
+        state.entries[0] = feed_entry(1, "tool: done");
+        state.health.files[0].last_import_at = Some("2026-09-28T10:00:00+00:00".to_string());
+        state.entries.push(feed_entry(3, "answer"));
+        steps.push((
+            "append with mid replace",
+            NativeFeedChange::Delta {
+                revision: 1,
+                seq: 3,
+                appended_from: 2,
+                appended: vec![state.entries[2].clone()],
+                replaced: vec![(0, state.entries[0].clone())],
+                forks: None,
+                health: state.health.clone(),
+            },
+            feed_document(&state),
+        ));
+
+        // A second transcript file joins and the ingest counted a rescan.
+        state.seq = 5;
+        state.entries.push(feed_entry(4, "rewound prompt"));
+        state.entries.push(feed_entry(5, "rewound answer"));
+        state.forks = vec![fork];
+        state.health.rescans = 1;
+        state.health.files.push(NativeFileImportHealth {
+            claude_session_id: "fixture-sid-2".to_string(),
+            file_name: "fixture-sid-2.jsonl".to_string(),
+            generation: 1,
+            last_import_at: None,
+        });
+        steps.push((
+            "append with fork change",
+            NativeFeedChange::Delta {
+                revision: 1,
+                seq: 5,
+                appended_from: 3,
+                appended: state.entries[3..].to_vec(),
+                replaced: Vec::new(),
+                forks: Some(state.forks.clone()),
+                health: state.health.clone(),
+            },
+            feed_document(&state),
+        ));
+
+        let state = NativeFeedSnapshot {
+            revision: 2,
+            seq: 5,
+            entries: vec![feed_entry(5, "rebuilt")],
+            forks: Vec::new(),
+            health: health(vec![file]),
+        };
+        steps.push((
+            "revision reset",
+            NativeFeedChange::Full(state.clone()),
+            feed_document(&state),
+        ));
+
+        let fixture = serde_json::Value::Array(
+            steps
+                .into_iter()
+                .scan(
+                    NativeIngestHealth::default(),
+                    |sent_health, (name, change, expected)| {
+                        let message = change_message(&change, sent_health)
+                            .unwrap()
+                            .to_ws_message_unchecked();
+                        *sent_health = match &change {
+                            NativeFeedChange::Full(snapshot) => snapshot.health.clone(),
+                            NativeFeedChange::Delta { health, .. } => health.clone(),
+                        };
+                        let Message::Text(text) = message else {
+                            panic!("feed messages are text frames");
+                        };
+                        Some(serde_json::json!({
+                            "name": name,
+                            "message": serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                            "expected": expected,
+                        }))
+                    },
+                )
+                .collect(),
+        );
+        if std::env::var_os("UPDATE_NATIVE_FEED_FIXTURE").is_some() {
+            let rendered = serde_json::to_string_pretty(&fixture).unwrap();
+            std::fs::write(&fixture_path, format!("{rendered}\n")).unwrap();
+        }
+        let committed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&fixture_path).unwrap()).unwrap();
+        assert_eq!(
+            committed, fixture,
+            "regenerate with UPDATE_NATIVE_FEED_FIXTURE=1"
         );
     }
 

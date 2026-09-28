@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef } from 'react';
 import { produce } from 'immer';
 import type { Operation } from 'rfc6902';
-import { applyUpsertPatch } from '@/shared/lib/jsonPatch';
+import { applyPatchStrict, applyUpsertPatch } from '@/shared/lib/jsonPatch';
 import { openLocalApiWebSocket } from '@/shared/lib/localApiTransport';
 
 type WsJsonPatchMsg = { JsonPatch: Operation[] };
@@ -18,6 +18,12 @@ interface UseJsonPatchStreamOptions<T> {
    * Filter/deduplicate patches before applying them
    */
   deduplicatePatches?: (patches: Operation[]) => Operation[];
+  /**
+   * Apply patches strictly and, when one fails to apply, drop the socket and
+   * reconnect so the server sends a fresh snapshot. For streams whose patches
+   * depend on the client holding the exact previous state.
+   */
+  resyncOnPatchFailure?: boolean;
 }
 
 interface UseJsonPatchStreamResult<T> {
@@ -45,11 +51,14 @@ export const useJsonPatchWsStream = <T extends object>(
   const dataRef = useRef<T | undefined>(undefined);
   const retryTimerRef = useRef<number | null>(null);
   const retryAttemptsRef = useRef<number>(0);
+  // Resyncs since a live update last applied cleanly.
+  const resyncFailuresRef = useRef<number>(0);
   const [retryNonce, setRetryNonce] = useState(0);
   const finishedRef = useRef<boolean>(false);
 
   const injectInitialEntry = options?.injectInitialEntry;
   const deduplicatePatches = options?.deduplicatePatches;
+  const resyncOnPatchFailure = options?.resyncOnPatchFailure ?? false;
 
   function scheduleReconnect() {
     if (retryTimerRef.current) return; // already scheduled
@@ -74,6 +83,7 @@ export const useJsonPatchWsStream = <T extends object>(
         retryTimerRef.current = null;
       }
       retryAttemptsRef.current = 0;
+      resyncFailuresRef.current = 0;
       finishedRef.current = false;
       setData(undefined);
       setIsConnected(false);
@@ -120,6 +130,9 @@ export const useJsonPatchWsStream = <T extends object>(
             }
           };
 
+          // Set once the initial snapshot is in; only a live update applying
+          // cleanly after that proves a resync worked.
+          let liveUpdatesApply = false;
           ws.onmessage = (event) => {
             try {
               const msg: WsMsg = JSON.parse(event.data);
@@ -135,9 +148,39 @@ export const useJsonPatchWsStream = <T extends object>(
                 if (!filtered.length || !current) return;
 
                 // Use Immer for structural sharing - only modified parts get new references
-                const next = produce(current, (draft) => {
-                  applyUpsertPatch(draft, filtered);
-                });
+                let next: T;
+                try {
+                  next = produce(current, (draft) => {
+                    if (resyncOnPatchFailure) {
+                      applyPatchStrict(draft, filtered);
+                    } else {
+                      applyUpsertPatch(draft, filtered);
+                    }
+                  });
+                } catch (err) {
+                  if (!resyncOnPatchFailure) throw err;
+                  // The local copy drifted from the server: reconnect for a
+                  // fresh snapshot. The first resync is immediate; repeated
+                  // ones back off so a persistent mismatch cannot loop.
+                  console.warn('Stream patch did not apply; resyncing', err);
+                  ws.onclose = null;
+                  ws.close();
+                  wsRef.current = null;
+                  setIsConnected(false);
+                  const failures = resyncFailuresRef.current++;
+                  const delay =
+                    failures === 0 ? 0 : Math.min(8000, 1000 * 2 ** failures);
+                  if (!retryTimerRef.current) {
+                    retryTimerRef.current = window.setTimeout(() => {
+                      retryTimerRef.current = null;
+                      setRetryNonce((n) => n + 1);
+                    }, delay);
+                  }
+                  return;
+                }
+                if (liveUpdatesApply) {
+                  resyncFailuresRef.current = 0;
+                }
 
                 dataRef.current = next;
                 setData(next);
@@ -145,6 +188,7 @@ export const useJsonPatchWsStream = <T extends object>(
 
               // Handle Ready messages (initial data has been sent)
               if ('Ready' in msg) {
+                liveUpdatesApply = true;
                 initializedForEndpointRef.current = endpoint;
                 setIsInitialized(true);
                 setError(null);
@@ -235,6 +279,7 @@ export const useJsonPatchWsStream = <T extends object>(
     initialData,
     injectInitialEntry,
     deduplicatePatches,
+    resyncOnPatchFailure,
     retryNonce,
   ]);
 

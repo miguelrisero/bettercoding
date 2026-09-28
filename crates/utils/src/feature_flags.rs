@@ -5,32 +5,99 @@
 //! call site is off a cold path (service startup, a config request), so the
 //! lookup cost is irrelevant.
 
-/// Opt-in switch for the CLI↔UI handover (the "seamless" transcript ingest and
-/// collaboration routing landed in #39/#41).
+use crate::env::{evaluate_disable_flag, evaluate_enable_flag};
+
+/// Opt-in switch for CLI collaboration routing (landed in #41).
 pub const CLI_HANDOVER_ENV: &str = "ENABLE_CLI_HANDOVER";
 
-/// Pre-existing opt-out switch, retained as a force-off override.
+/// Opt-out switch for the native transcript ingest and its chat feed. It also
+/// forces collaboration routing off, because routing observes the ingest.
 pub const CLI_TRANSCRIPT_INGEST_DISABLE_ENV: &str = "DISABLE_CLI_TRANSCRIPT_INGEST";
 
-/// Pre-existing opt-out switch for the collaboration dispatch gate.
+/// Opt-out switch for collaboration routing only.
 pub const CLI_COLLAB_ROUTING_DISABLE_ENV: &str = "DISABLE_CLI_COLLAB_ROUTING";
 
-/// Whether the CLI↔UI handover is active.
+/// Whether the native Claude transcript ingest (the CLI→chat feed) runs.
 ///
-/// The feature ships **dark**: it stays off unless `ENABLE_CLI_HANDOVER` is
-/// explicitly truthy. It re-snapshots a session's entire transcript on every
-/// appended line — an O(n²) cost in transcript length, paid per connected tab —
-/// which is why it is not on by default.
+/// On by default. Only `DISABLE_CLI_TRANSCRIPT_INGEST` turns it off; the
+/// collaboration routing flags never affect it.
+pub fn cli_transcript_ingest_enabled() -> bool {
+    ingest_gate(&|name| std::env::var(name).ok())
+}
+
+/// Whether CLI collaboration routing (auto-dispatch between the CLI pane and
+/// the executor) is active.
 ///
-/// Either legacy `DISABLE_*` variable still forces it off, so an existing
-/// deployment that had already switched the feature off keeps that behaviour
-/// even if someone later sets the opt-in flag. Force-off wins on purpose: the
-/// safe direction for a gate on a known-expensive feature is off.
+/// Ships **dark**: off unless `ENABLE_CLI_HANDOVER` is truthy. Either
+/// `DISABLE_*` variable forces it off, and force-off wins over the opt-in.
 pub fn cli_handover_enabled() -> bool {
-    if crate::env::disable_flag_set(CLI_TRANSCRIPT_INGEST_DISABLE_ENV)
-        || crate::env::disable_flag_set(CLI_COLLAB_ROUTING_DISABLE_ENV)
-    {
-        return false;
+    collab_routing_gate(&|name| std::env::var(name).ok())
+}
+
+type Lookup<'a> = dyn Fn(&str) -> Option<String> + 'a;
+
+fn ingest_gate(lookup: &Lookup) -> bool {
+    !evaluate_disable_flag(
+        CLI_TRANSCRIPT_INGEST_DISABLE_ENV,
+        lookup(CLI_TRANSCRIPT_INGEST_DISABLE_ENV),
+    )
+}
+
+fn collab_routing_gate(lookup: &Lookup) -> bool {
+    ingest_gate(lookup)
+        && !evaluate_disable_flag(
+            CLI_COLLAB_ROUTING_DISABLE_ENV,
+            lookup(CLI_COLLAB_ROUTING_DISABLE_ENV),
+        )
+        && evaluate_enable_flag(CLI_HANDOVER_ENV, lookup(CLI_HANDOVER_ENV))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gates(vars: &[(&str, &str)]) -> (bool, bool) {
+        let lookup = |name: &str| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        };
+        (ingest_gate(&lookup), collab_routing_gate(&lookup))
     }
-    crate::env::enable_flag_set(CLI_HANDOVER_ENV)
+
+    #[test]
+    fn ingest_is_on_and_routing_is_dark_by_default() {
+        assert_eq!(gates(&[]), (true, false));
+    }
+
+    #[test]
+    fn routing_flags_never_change_the_ingest_gate() {
+        assert_eq!(gates(&[(CLI_HANDOVER_ENV, "1")]), (true, true));
+        assert_eq!(
+            gates(&[(CLI_COLLAB_ROUTING_DISABLE_ENV, "1")]),
+            (true, false)
+        );
+        assert_eq!(
+            gates(&[
+                (CLI_HANDOVER_ENV, "1"),
+                (CLI_COLLAB_ROUTING_DISABLE_ENV, "1")
+            ]),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn ingest_opt_out_turns_off_both_gates() {
+        assert_eq!(
+            gates(&[(CLI_TRANSCRIPT_INGEST_DISABLE_ENV, "1")]),
+            (false, false)
+        );
+        assert_eq!(
+            gates(&[
+                (CLI_TRANSCRIPT_INGEST_DISABLE_ENV, "1"),
+                (CLI_HANDOVER_ENV, "1")
+            ]),
+            (false, false)
+        );
+    }
 }

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT MAX(\n                   COALESCE(\n                       (SELECT MAX(seq) FROM cli_ingest_outbox WHERE session_id = $1),\n                       0\n                   ),\n                   COALESCE(\n                       (SELECT published_seq FROM cli_ingest_publisher_watermarks\n                        WHERE session_id = $1),\n                       0\n                   )\n               ) AS \"seq!: i64\"",
+  "describe": {
+    "columns": [
+      {
+        "name": "seq!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "43ec5a13e5bb07723bf553926d21d4597748416aaca268f427a41b23acb70560"
+}

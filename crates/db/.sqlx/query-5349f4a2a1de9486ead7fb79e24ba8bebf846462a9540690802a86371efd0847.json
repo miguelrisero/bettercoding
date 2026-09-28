@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT claude_session_id AS \"claude_session_id!\"\n               FROM claude_session_links\n               WHERE session_id = $1\n               ORDER BY claude_session_id",
+  "describe": {
+    "columns": [
+      {
+        "name": "claude_session_id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "5349f4a2a1de9486ead7fb79e24ba8bebf846462a9540690802a86371efd0847"
+}

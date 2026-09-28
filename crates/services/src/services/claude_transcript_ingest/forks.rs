@@ -29,6 +29,61 @@ fn is_conversational_kind(kind: &str) -> bool {
     matches!(kind, "user" | "assistant")
 }
 
+/// Proves, one appended record at a time, that a DAG which
+/// [`compute_fork_view`] reports as fork-free is still fork-free.
+///
+/// It mirrors that function's bookkeeping incrementally: the parent map, the
+/// "contains conversation" marks, and a count of marked children per node.
+/// [`ForkFreeTracker::push`] returns `false` as soon as it cannot prove the
+/// result stays `None` — a fork appeared, or a record arrived after a child
+/// that already named it as a parent (which rewires ancestry the marks were
+/// computed from). The caller then falls back to `compute_fork_view`.
+#[derive(Debug, Default)]
+pub struct ForkFreeTracker {
+    parents: HashMap<String, Option<String>>,
+    referenced: HashSet<String>,
+    marked: HashSet<String>,
+    marked_children: HashMap<String, usize>,
+}
+
+impl ForkFreeTracker {
+    pub fn push(&mut self, record: &NativeDagRecord) -> bool {
+        if self.parents.contains_key(&record.uuid) {
+            // `compute_fork_view` ignores a repeated uuid.
+            return true;
+        }
+        if self.referenced.contains(&record.uuid) {
+            return false;
+        }
+        self.parents
+            .insert(record.uuid.clone(), record.parent_uuid.clone());
+        if let Some(parent) = &record.parent_uuid {
+            self.referenced.insert(parent.clone());
+        }
+        if !is_conversational_kind(&record.kind) {
+            return true;
+        }
+        let mut cursor = Some(record.uuid.clone());
+        while let Some(current) = cursor {
+            if !self.marked.insert(current.clone()) {
+                break;
+            }
+            let parent = self.parents.get(&current).cloned().flatten();
+            if let Some(parent) = &parent {
+                let count = self.marked_children.entry(parent.clone()).or_default();
+                *count += 1;
+                // Only a node present in the DAG can anchor a fork; an unknown
+                // parent that later appears is rejected by `referenced` above.
+                if *count > 1 && self.parents.contains_key(parent) {
+                    return false;
+                }
+            }
+            cursor = parent;
+        }
+        true
+    }
+}
+
 /// Compute the first observed conversational fork in record order. Raw
 /// bookkeeping nodes preserve the topology, but only child subtrees containing
 /// user or assistant records can form branches. The common prefix includes the
@@ -105,12 +160,21 @@ pub fn compute_fork_view(
 
     let mut branch_data = Vec::new();
     for raw_root_uuid in &branch_roots {
-        let mut stack = vec![(raw_root_uuid.clone(), Vec::<String>::new())];
-        while let Some((uuid, mut raw_path)) = stack.pop() {
-            if raw_path.contains(&uuid) {
+        // Depth-first with one shared path: each stack item records the depth
+        // of its parent's path, so popping it truncates back to that path.
+        // Cloning the path per child made a linear branch quadratic.
+        let mut stack = vec![(raw_root_uuid.clone(), 0usize)];
+        let mut raw_path = Vec::<String>::new();
+        let mut on_path = HashSet::<String>::new();
+        while let Some((uuid, depth)) = stack.pop() {
+            for left in raw_path.drain(depth..) {
+                on_path.remove(&left);
+            }
+            if on_path.contains(&uuid) {
                 continue;
             }
             raw_path.push(uuid.clone());
+            on_path.insert(uuid.clone());
 
             let conversational_children = children
                 .get(&uuid)
@@ -156,7 +220,7 @@ pub fn compute_fork_view(
             }
 
             for child in conversational_children.into_iter().rev() {
-                stack.push((child, raw_path.clone()));
+                stack.push((child, raw_path.len()));
             }
         }
     }

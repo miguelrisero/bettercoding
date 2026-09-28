@@ -1,4 +1,4 @@
-import { useCallback, useMemo } from 'react';
+import { useCallback } from 'react';
 import type {
   NativeFeedEntry,
   NativeFeedFork,
@@ -8,6 +8,9 @@ import type {
 import { useHostId } from '@/shared/providers/HostIdProvider';
 import { useJsonPatchWsStream } from '@/shared/hooks/useJsonPatchWsStream';
 import { useUserSystem } from '@/shared/hooks/useUserSystem';
+
+const STREAM_OPTIONS = { resyncOnPatchFailure: true };
+const EMPTY_ENTRIES: NativeFeedEntry[] = [];
 
 export interface UseSessionNativeFeedResult {
   snapshot: NativeFeedSnapshot | undefined;
@@ -36,53 +39,41 @@ function createEmptyNativeFeedSnapshot(): NativeFeedSnapshot {
   };
 }
 
-function compareNativeEntries(
-  left: NativeFeedEntry,
-  right: NativeFeedEntry
-): number {
-  if (left.seq < right.seq) return -1;
-  if (left.seq > right.seq) return 1;
-  return 0;
-}
-
 /**
  * Session-scoped canonical Claude transcript feed.
  *
- * The server publishes every update as a revisioned top-level snapshot
- * replacement. Sorting a copy keeps the transport snapshot immutable while
- * preserving source order for entries produced from the same native record.
+ * The server sends one full snapshot, then per update only the appended and
+ * in-place replaced entries at their exact indexes. Entries arrive in `seq`
+ * order. If a patch ever fails to apply, the stream reconnects for a fresh
+ * snapshot instead of rendering a drifted copy.
  *
- * Gated on the server's `cli_handover_enabled` flag. The feature ships dark
- * because the server rebuilds and re-serializes a session's ENTIRE transcript
- * on every appended line, and this hook then re-runs an Immer produce plus a
- * full sort copy over the result — an O(n²) cost in transcript length, paid
- * once per connected tab. While the flag is off no socket is opened at all: the
- * hook reports a stable empty snapshot and the conversation renders
- * executor-only.
+ * Gated on the server's `cli_transcript_ingest_enabled` flag: while the ingest
+ * is off no socket is opened, the hook reports a stable empty snapshot, and the
+ * conversation renders executor-only.
  */
 export function useSessionNativeFeed(
   sessionId: string | undefined
 ): UseSessionNativeFeedResult {
   const hostId = useHostId();
-  const { cliHandoverEnabled } = useUserSystem();
-  const enabled = Boolean(sessionId) && cliHandoverEnabled;
+  const { cliTranscriptIngestEnabled } = useUserSystem();
+  const enabled = Boolean(sessionId) && cliTranscriptIngestEnabled;
   const endpoint =
-    sessionId && cliHandoverEnabled
+    sessionId && cliTranscriptIngestEnabled
       ? `${hostId ? `/api/host/${hostId}` : '/api'}/sessions/${sessionId}/native-feed/ws`
       : undefined;
   const initialData = useCallback(createEmptyNativeFeedSnapshot, []);
 
   const { data, isConnected, isInitialized, error } =
-    useJsonPatchWsStream<NativeFeedSnapshot>(endpoint, enabled, initialData);
-
-  const entries = useMemo(
-    () => [...(data?.entries ?? [])].sort(compareNativeEntries),
-    [data?.entries]
-  );
+    useJsonPatchWsStream<NativeFeedSnapshot>(
+      endpoint,
+      enabled,
+      initialData,
+      STREAM_OPTIONS
+    );
 
   return {
     snapshot: data,
-    entries,
+    entries: data?.entries ?? EMPTY_ENTRIES,
     forks: data?.forks ?? [],
     revision: data?.revision,
     isLoading: Boolean(sessionId) && !isInitialized && !error,
