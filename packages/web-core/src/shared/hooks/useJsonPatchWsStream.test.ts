@@ -42,6 +42,9 @@ const react = vi.hoisted(() => {
       effects.forEach((effect) => effect.cleanup?.());
       slots.length = 0;
       effects.length = 0;
+      queued = [];
+      rendering = false;
+      dirty = false;
       component = null;
     },
     useRef<T>(initial: T) {
@@ -49,9 +52,12 @@ const react = vi.hoisted(() => {
       if (!(index in slots)) slots[index] = { current: initial };
       return slots[index] as { current: T };
     },
-    useState<T>(initial: T) {
+    useState<T>(initial: T | (() => T)) {
       const index = cursor++;
-      if (!(index in slots)) slots[index] = initial;
+      if (!(index in slots)) {
+        slots[index] =
+          typeof initial === 'function' ? (initial as () => T)() : initial;
+      }
       const set = (value: T | ((previous: T) => T)) => {
         const previous = slots[index] as T;
         const next =
@@ -85,7 +91,10 @@ class FakeSocket {
   onmessage: ((event: { data: string }) => void) | null = null;
   onerror: (() => void) | null = null;
   onclose: ((event: { code: number; wasClean: boolean }) => void) | null = null;
-  close = vi.fn();
+  // Like a browser socket, closing fires `onclose` on a later task.
+  close = vi.fn(() => {
+    setTimeout(() => this.onclose?.({ code: 1005, wasClean: true }), 0);
+  });
 
   receive(message: unknown) {
     this.onmessage?.({ data: JSON.stringify(message) });
@@ -177,10 +186,19 @@ describe('useJsonPatchWsStream resync on a failed patch', () => {
     expect(sockets).toHaveLength(2);
     expect(stream().data).toBeUndefined();
 
-    connectWith(['a', 'b']);
+    const second = connectWith(['a', 'b']);
     expect(stream().data).toEqual({ entries: ['a', 'b'] });
     expect(stream().isConnected).toBe(true);
     expect(stream().isInitialized).toBe(true);
+
+    // The dropped socket's close does not schedule a second reconnect that
+    // would replace the new socket.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(sockets).toHaveLength(2);
+    expect(second.close).not.toHaveBeenCalled();
+
+    react.unmount();
+    expect(second.close).toHaveBeenCalledTimes(1);
   });
 
   it('backs off repeated resyncs until a live update applies', async () => {

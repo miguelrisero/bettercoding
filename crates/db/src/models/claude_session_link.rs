@@ -393,6 +393,10 @@ mod tests {
         });
         // Let the upsert start while the writer holds the lock.
         tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !upsert.is_finished(),
+            "the upsert is blocked on the writer's lock"
+        );
         writer.commit().await.unwrap();
 
         let mutation = upsert
