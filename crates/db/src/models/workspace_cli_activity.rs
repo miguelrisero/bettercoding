@@ -194,6 +194,12 @@ pub const CODEX_HOOK_EVENTS: &[&str] = &[
     "SessionEnd",
 ];
 
+/// Events only Codex fires (codex-cli 0.158: `Interrupt`, when the user
+/// interrupts a turn). They are registered for Codex alongside
+/// [`CODEX_HOOK_EVENTS`] and never for Claude Code, whose `--settings` list
+/// is [`HOOK_EVENTS`].
+pub const CODEX_ONLY_HOOK_EVENTS: &[&str] = &["Interrupt"];
+
 fn payload_str<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     payload.get(key).and_then(|v| v.as_str())
 }
@@ -227,7 +233,7 @@ pub fn reduce_hook(
     seq: i64,
 ) -> Option<CliHookState> {
     let event = payload_str(payload, "hook_event_name")?;
-    if !HOOK_EVENTS.contains(&event) {
+    if !HOOK_EVENTS.contains(&event) && !CODEX_ONLY_HOOK_EVENTS.contains(&event) {
         return None;
     }
     let session_id = payload_str(payload, "session_id").filter(|s| !s.is_empty())?;
@@ -271,7 +277,8 @@ pub fn reduce_hook(
     }
 
     // Only the parent's own turn-end events carry authoritative registries.
-    if event == "Stop" || event == "SubagentStop" {
+    // An interrupt ends the turn too, so earlier counts must not survive it.
+    if event == "Stop" || event == "SubagentStop" || event == "Interrupt" {
         let len = |key: &str| {
             payload
                 .get(key)
@@ -306,7 +313,7 @@ pub fn reduce_hook(
             },
             _ => return None,
         },
-        "Stop" => CliPhase::Stopped,
+        "Stop" | "Interrupt" => CliPhase::Stopped,
         "PreCompact" => CliPhase::Compacting,
         "StopFailure" => match payload_str(payload, "error") {
             Some("rate_limit") => CliPhase::RateLimit,
@@ -908,6 +915,27 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(state.phase, CliPhase::Question);
+    }
+
+    #[test]
+    fn a_codex_interrupt_ends_the_turn_and_is_never_registered_for_claude() {
+        for event in CODEX_ONLY_HOOK_EVENTS {
+            assert!(!HOOK_EVENTS.contains(event), "{event}");
+        }
+        let mut stop = event("Stop");
+        stop["background_tasks"] = json!([{"id": "t1"}]);
+        let state = run(&[
+            event("SessionStart"),
+            stop,
+            event("UserPromptSubmit"),
+            event("Interrupt"),
+        ])
+        .unwrap();
+        assert_eq!(state.phase, CliPhase::Stopped);
+        assert_eq!(
+            state.tasks, None,
+            "an interrupt drops the last turn's counts"
+        );
     }
 
     #[test]

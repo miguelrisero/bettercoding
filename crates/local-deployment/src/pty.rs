@@ -4096,6 +4096,26 @@ mod tests {
     }
 
     #[test]
+    fn cli_bootstrap_session_args_ride_the_handoff_and_prompt_launches() {
+        // The collaboration handoff (busy pane resumed by the server) and a
+        // CLI-first prompt launch are fresh Codex launches too.
+        let mut spec = codex_spec(&["-s", "danger-full-access"]);
+        spec.session_args = vec!["-c".to_string(), "hooks.Stop=[]".to_string()];
+        let handoff = cli_bootstrap(
+            &spec,
+            None,
+            None,
+            false,
+            Some(Path::new("/tmp/vk/resume-ready")),
+        );
+        assert!(handoff.contains("exec 'codex' '-c' 'hooks.Stop=[]' resume \"$bc_sid\""));
+        let prompted = cli_bootstrap(&spec, None, Some(Path::new("/tmp/vk/p.txt")), false, None);
+        assert!(
+            prompted.contains("'codex' '-c' 'hooks.Stop=[]' '-s' 'danger-full-access' \"$bc_p\"")
+        );
+    }
+
+    #[test]
     fn cli_bootstrap_reads_prompt_from_file_length_is_constant() {
         // The prompt is delivered via a temp file, so the generated command is
         // O(1) in prompt size — the whole point of the fix (tmux rejects

@@ -18,7 +18,7 @@ use db::models::{
     execution_process::ExecutionProcess,
     session::Session,
     workspace::Workspace,
-    workspace_cli_activity::{CODEX_HOOK_EVENTS, HOOK_EVENTS},
+    workspace_cli_activity::{CODEX_HOOK_EVENTS, CODEX_ONLY_HOOK_EVENTS, HOOK_EVENTS},
     workspace_repo::WorkspaceRepo,
     workspace_spawn_reservation::{SpawnReservationHolder, WorkspaceSpawnReservation},
 };
@@ -260,7 +260,7 @@ fn codex_hook_args_for(port: u16, workspace_id: Uuid) -> Vec<String> {
     let command = serde_json::to_string(&hook_report_command(port, workspace_id))
         .expect("a string always serializes");
     let mut args = vec!["--dangerously-bypass-hook-trust".to_string()];
-    for event in CODEX_HOOK_EVENTS {
+    for event in CODEX_HOOK_EVENTS.iter().chain(CODEX_ONLY_HOOK_EVENTS) {
         args.push("-c".to_string());
         args.push(format!(
             "hooks.{event}=[{{hooks=[{{type=\"command\",command={command},timeout=3}}]}}]"
@@ -1494,11 +1494,16 @@ mod tripwire_tests {
         let args = codex_hook_args_for(4111, id);
         assert_eq!(args[0], "--dangerously-bypass-hook-trust");
         let overrides: Vec<&String> = args[1..].iter().skip(1).step_by(2).collect();
-        assert_eq!(overrides.len(), super::CODEX_HOOK_EVENTS.len());
+        let registered: Vec<&str> = super::CODEX_HOOK_EVENTS
+            .iter()
+            .chain(super::CODEX_ONLY_HOOK_EVENTS)
+            .copied()
+            .collect();
+        assert_eq!(overrides.len(), registered.len());
         for value in overrides {
             let doc: toml::Table = value.parse().unwrap_or_else(|e| panic!("{value}: {e}"));
             let (event, groups) = doc["hooks"].as_table().unwrap().iter().next().unwrap();
-            assert!(super::CODEX_HOOK_EVENTS.contains(&event.as_str()));
+            assert!(registered.contains(&event.as_str()));
             let hook = &groups[0]["hooks"][0];
             assert_eq!(hook["type"].as_str(), Some("command"));
             assert_eq!(
