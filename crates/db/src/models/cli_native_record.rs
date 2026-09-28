@@ -86,6 +86,10 @@ pub struct ImportBatchResult {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NativeImportContext {
     pub app_pane_absent: bool,
+    /// When set, only a turn recorded at or after this instant can mark a
+    /// foreign writer. A Codex thread is imported in full when a pane first
+    /// links it, and its earlier turns say nothing about who writes now.
+    pub foreign_since: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -539,6 +543,9 @@ impl CliNativeRecord {
                 .await?;
             } else if context.app_pane_absent
                 && record.kind == "user"
+                && context.foreign_since.is_none_or(|since| {
+                    record.recorded_at.is_some_and(|recorded| recorded >= since)
+                })
                 && !linked_to_execution
                 && bound_turn_id.is_none()
                 && let Some(session_id) = session_id

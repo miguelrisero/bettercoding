@@ -1223,8 +1223,9 @@ impl ClaudeTranscriptIngest {
 
         // The writer probe recognises the pane's Claude or Codex process, so a
         // user turn written while no app pane agent runs marks a foreign
-        // writer for either agent.
-        let import_context = if link.is_some() {
+        // writer for either agent. A Codex thread's history arrives in bulk
+        // when a pane first links it, so only turns after the link count.
+        let import_context = if let Some(mutation) = &link {
             let report = self
                 .writer_probe
                 .probe(
@@ -1238,6 +1239,7 @@ impl ClaudeTranscriptIngest {
             NativeImportContext {
                 app_pane_absent: !(report.probe_failed
                     || report.pane_session_exists && report.agent_running == Some(true)),
+                foreign_since: is_codex.then_some(mutation.link.created_at),
             }
         } else {
             NativeImportContext::default()

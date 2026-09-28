@@ -1043,8 +1043,9 @@ impl crate::services::cli_collab::CliWriterProbe for CodexPaneProbe {
 }
 
 /// A user turn in a linked Codex thread while no app pane agent runs and no
-/// executor runs came from a writer outside the app.
-async fn codex_foreign_writer_flagged(pane_agent_running: bool) -> bool {
+/// executor runs came from a writer outside the app. `history` writes the
+/// turn before the pane links the thread, as a resumed thread's backfill.
+async fn codex_foreign_writer_flagged(pane_agent_running: bool, history: bool) -> bool {
     let mut case = codex_case().await;
     let mut service = ClaudeTranscriptIngest::new_with_probe(
         case.db.clone(),
@@ -1057,6 +1058,10 @@ async fn codex_foreign_writer_flagged(pane_agent_running: bool) -> bool {
     case.service = Arc::new(service);
     let created = fixture_created_at();
     let thread = thread_id_at(created, 7);
+    if !history {
+        bind_resumed(&case, &thread).await;
+    }
+    let typed_at = if history { created } else { Utc::now() };
     write_rollout(
         &rollout_path(&case.root, &thread, created),
         &[
@@ -1064,13 +1069,15 @@ async fn codex_foreign_writer_flagged(pane_agent_running: bool) -> bool {
             user_turn(
                 &thread,
                 "foreign-turn",
-                created,
+                typed_at,
                 "typed in another terminal",
             ),
         ]
         .concat(),
     );
-    bind_resumed(&case, &thread).await;
+    if history {
+        bind_resumed(&case, &thread).await;
+    }
 
     reconcile(&case).await;
 
@@ -1091,8 +1098,10 @@ async fn codex_foreign_writer_flagged(pane_agent_running: bool) -> bool {
 
 #[tokio::test]
 async fn a_codex_turn_written_outside_the_app_pane_marks_a_foreign_writer() {
-    assert!(codex_foreign_writer_flagged(false).await);
-    assert!(!codex_foreign_writer_flagged(true).await);
+    assert!(codex_foreign_writer_flagged(false, false).await);
+    assert!(!codex_foreign_writer_flagged(true, false).await);
+    // A resumed thread's earlier turns never mark one, pane or not.
+    assert!(!codex_foreign_writer_flagged(false, true).await);
 }
 
 /// State of a collaboration paste of `pasted` after the pane records `typed`.
