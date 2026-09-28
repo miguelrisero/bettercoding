@@ -81,7 +81,12 @@ pub async fn report_cli_activity(
     }
 
     // A CLI-mode Codex names its rollout; import a thread the feed does not
-    // track yet without waiting for the next registry pass.
+    // track yet, or rebind a pane that switched threads inside the TUI,
+    // without waiting for the next registry pass.
+    let switched = previous
+        .as_ref()
+        .and_then(|row| row.hook.as_ref())
+        .is_some_and(|hook| hook.agent_session_id != next.agent_session_id);
     let reports_rollout = next
         .transcript_path
         .as_deref()
@@ -89,7 +94,9 @@ pub async fn report_cli_activity(
         .and_then(rollout_thread_id)
         .is_some();
     if reports_rollout && let Some(ingest) = deployment.claude_transcript_ingest() {
-        ingest.request_codex_import(&next.agent_session_id).await;
+        ingest
+            .request_codex_import(&next.agent_session_id, switched)
+            .await;
     }
 
     StatusCode::NO_CONTENT

@@ -794,6 +794,7 @@ async fn fresh_pane_assignment_writes_nothing_for_a_taken_thread_or_released_pan
     let assigned = CliPaneBinding::assign_discovered_session(
         pool,
         pane.binding.id,
+        None,
         &taken,
         pane.case.session.id,
         pane.case.workspace.id,
@@ -821,6 +822,7 @@ async fn fresh_pane_assignment_writes_nothing_for_a_taken_thread_or_released_pan
     let assigned = CliPaneBinding::assign_discovered_session(
         pool,
         pane.binding.id,
+        None,
         &free,
         pane.case.session.id,
         pane.case.workspace.id,
@@ -834,6 +836,192 @@ async fn fresh_pane_assignment_writes_nothing_for_a_taken_thread_or_released_pan
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+/// A pane launched to resume `first`, which then switches to `second` inside
+/// the TUI (`/new`), reported by its hook.
+struct SwitchedPane {
+    case: Case,
+    binding: CliPaneBinding,
+    first: String,
+    first_path: PathBuf,
+    second: String,
+}
+
+fn cli_rollout(case: &Case, n: u16, at: DateTime<Utc>, cwd: &Path) -> (String, PathBuf) {
+    let thread = thread_id_at(at, n);
+    let path = rollout_path(&case.root, &thread, at);
+    write_rollout(
+        &path,
+        &[
+            session_meta(&thread, cwd, at, "cli"),
+            user_turn(&thread, &format!("turn-{n}"), at, &format!("prompt {n}")),
+        ]
+        .concat(),
+    );
+    (thread, path)
+}
+
+async fn switched_pane(second_cwd: Option<&Path>) -> SwitchedPane {
+    let case = codex_case().await;
+    let started = Utc::now() - chrono::Duration::minutes(5);
+    let (first, first_path) = cli_rollout(&case, 20, started, &case.cwd);
+    bind_resumed(&case, &first).await;
+    reconcile(&case).await;
+    let binding = CliPaneBinding::find_active_for_workspace(&case.db.pool, case.workspace.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let cwd = second_cwd.map_or_else(|| case.cwd.clone(), Path::to_path_buf);
+    let (second, _) = cli_rollout(&case, 21, Utc::now(), &cwd);
+    report_hook(&case, &second).await;
+    SwitchedPane {
+        case,
+        binding,
+        first,
+        first_path,
+        second,
+    }
+}
+
+#[tokio::test]
+async fn a_thread_switch_inside_the_pane_binds_the_new_thread_and_keeps_the_old() {
+    let pane = switched_pane(None).await;
+    let pool = &pane.case.db.pool;
+
+    reconcile(&pane.case).await;
+
+    let binding = CliPaneBinding::find_by_id(pool, pane.binding.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        binding.claude_session_id.as_deref(),
+        Some(pane.second.as_str())
+    );
+    assert!(binding.released_at.is_none(), "the pane keeps its binding");
+    assert_eq!(
+        ClaudeSessionLink::find(pool, &pane.second)
+            .await
+            .unwrap()
+            .map(|link| link.session_id),
+        Some(pane.case.session.id)
+    );
+    assert_eq!(
+        texts(&entries(&pane.case).await),
+        ["prompt 20", "answer to prompt 20", "prompt 21", "answer to prompt 21"]
+    );
+    // A relaunch resumes the thread the pane ran last.
+    assert_eq!(
+        CliPaneBinding::latest_codex_pane_thread(pool, pane.case.session.id)
+            .await
+            .unwrap(),
+        Some(pane.second.clone())
+    );
+
+    // The thread the pane left (and may `/resume` again) stays imported.
+    append(
+        &pane.first_path,
+        &user_turn(&pane.first, "turn-22", Utc::now(), "prompt 22"),
+    );
+    reconcile(&pane.case).await;
+    assert_eq!(
+        texts(&entries(&pane.case).await),
+        [
+            "prompt 20",
+            "answer to prompt 20",
+            "prompt 21",
+            "answer to prompt 21",
+            "prompt 22",
+            "answer to prompt 22"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_thread_switch_to_another_directory_never_binds() {
+    let other = TempDir::new().unwrap();
+    let pane = switched_pane(Some(other.path())).await;
+
+    reconcile(&pane.case).await;
+
+    let binding = CliPaneBinding::find_by_id(&pane.case.db.pool, pane.binding.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.claude_session_id.as_deref(), Some(pane.first.as_str()));
+    assert!(
+        ClaudeSessionLink::find(&pane.case.db.pool, &pane.second)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        texts(&entries(&pane.case).await),
+        ["prompt 20", "answer to prompt 20"]
+    );
+}
+
+#[tokio::test]
+async fn a_thread_switch_never_takes_another_sessions_thread() {
+    let pane = switched_pane(None).await;
+    let pool = &pane.case.db.pool;
+    let other = Session::create(
+        pool,
+        &CreateSession {
+            executor: Some("CODEX".to_string()),
+            name: None,
+        },
+        Uuid::new_v4(),
+        pane.case.workspace.id,
+    )
+    .await
+    .unwrap();
+    // The other session's executor ran the thread the pane resumed.
+    let run = executor_run(&pane.case, &pane.second, "2026-09-28 12:00:00.000+00:00", None).await;
+    sqlx::query("UPDATE execution_processes SET session_id = ? WHERE id = ?")
+        .bind(other.id)
+        .bind(run)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    reconcile(&pane.case).await;
+
+    let binding = CliPaneBinding::find_by_id(pool, pane.binding.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.claude_session_id.as_deref(), Some(pane.first.as_str()));
+    assert!(
+        ClaudeSessionLink::find(pool, &pane.second)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn an_executor_run_after_the_pane_takes_the_resume_back() {
+    let pane = switched_pane(None).await;
+    let pool = &pane.case.db.pool;
+    reconcile(&pane.case).await;
+
+    // A chat follow-up after the switch forks from the executor's thread.
+    executor_run(
+        &pane.case,
+        &thread_id_at(Utc::now(), 23),
+        &Utc::now().to_rfc3339(),
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        CliPaneBinding::latest_codex_pane_thread(pool, pane.case.session.id)
+            .await
+            .unwrap(),
+        None
     );
 }
 

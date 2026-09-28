@@ -416,12 +416,17 @@ async fn terminal_ws(
                                 true
                             }
                         };
-                    let sid = CodingAgentTurn::find_latest_session_info(pool, s.id)
-                        .await?
-                        .map(|info| info.session_id)
-                        .or(ClaudeSessionLink::find_latest_for_session(pool, s.id)
+                    // A Codex pane may have switched threads inside the TUI
+                    // since the executor last ran; resume the one it ran last.
+                    let sid = match CliPaneBinding::latest_codex_pane_thread(pool, s.id).await? {
+                        Some(thread) => Some(thread),
+                        None => CodingAgentTurn::find_latest_session_info(pool, s.id)
                             .await?
-                            .map(|link| link.claude_session_id));
+                            .map(|info| info.session_id)
+                            .or(ClaudeSessionLink::find_latest_for_session(pool, s.id)
+                                .await?
+                                .map(|link| link.claude_session_id)),
+                    };
                     (executor_active, sid)
                 }
                 None => (false, None),
