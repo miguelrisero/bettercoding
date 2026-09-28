@@ -791,10 +791,10 @@ async fn fresh_pane_assignment_writes_nothing_for_a_taken_thread_or_released_pan
     .unwrap();
 
     // Another session took the thread after the candidate was chosen.
-    let assigned = ClaudeSessionLink::assign_fresh_pane(
+    let assigned = CliPaneBinding::assign_discovered_session(
         pool,
-        &taken,
         pane.binding.id,
+        &taken,
         pane.case.session.id,
         pane.case.workspace.id,
         &cwd,
@@ -818,10 +818,10 @@ async fn fresh_pane_assignment_writes_nothing_for_a_taken_thread_or_released_pan
         .await
         .unwrap();
     let free = thread_id_at(pane.launched, 13);
-    let assigned = ClaudeSessionLink::assign_fresh_pane(
+    let assigned = CliPaneBinding::assign_discovered_session(
         pool,
-        &free,
         pane.binding.id,
+        &free,
         pane.case.session.id,
         pane.case.workspace.id,
         &cwd,

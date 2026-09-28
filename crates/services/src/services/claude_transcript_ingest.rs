@@ -1567,10 +1567,10 @@ impl ClaudeTranscriptIngest {
         match unowned.as_slice() {
             [] => {}
             [(sid, path)] => {
-                if let Some(mutation) = ClaudeSessionLink::assign_fresh_pane(
+                if let Some(mutation) = CliPaneBinding::assign_discovered_session(
                     pool,
-                    sid,
                     binding.id,
+                    sid,
                     binding.session_id,
                     workspace.id,
                     &cwd.to_string_lossy(),

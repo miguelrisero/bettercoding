@@ -212,98 +212,13 @@ impl ClaudeSessionLink {
         bound_via: ClaudeSessionBoundVia,
     ) -> Result<ClaudeSessionLinkMutation, sqlx::Error> {
         let mut tx = pool.begin().await?;
-        let (previous_session_id, republished_outbox) = Self::upsert_in(
-            &mut tx,
-            claude_session_id,
-            session_id,
-            workspace_id,
-            cwd,
-            bound_via,
-        )
-        .await?;
-        tx.commit().await?;
-        let link = Self::find(pool, claude_session_id)
-            .await?
-            .expect("upserted Claude session link exists");
-        Ok(ClaudeSessionLinkMutation {
-            link,
-            previous_session_id,
-            republished_outbox,
-        })
-    }
-
-    /// Link a fresh CLI pane's discovered session and record it on the pane,
-    /// in one transaction. Nothing is written, and `None` is returned, when
-    /// another session already owns `claude_session_id` or the pane binding
-    /// is no longer an active, still-unbound `cli-fresh` one.
-    pub async fn assign_fresh_pane(
-        pool: &SqlitePool,
-        claude_session_id: &str,
-        binding_id: Uuid,
-        session_id: Uuid,
-        workspace_id: Uuid,
-        cwd: &str,
-    ) -> Result<Option<ClaudeSessionLinkMutation>, sqlx::Error> {
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        let owner: Option<Uuid> = sqlx::query_scalar(
-            "SELECT session_id FROM claude_session_links WHERE claude_session_id = ?",
-        )
-        .bind(claude_session_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if owner.is_some_and(|owner| owner != session_id) {
-            return Ok(None);
-        }
-        let bound = sqlx::query(
-            "UPDATE cli_pane_bindings SET claude_session_id = ? \
-             WHERE id = ? AND released_at IS NULL \
-               AND bound_via = 'cli-fresh' AND claude_session_id IS NULL",
-        )
-        .bind(claude_session_id)
-        .bind(binding_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if bound == 0 {
-            return Ok(None);
-        }
-        let (previous_session_id, republished_outbox) = Self::upsert_in(
-            &mut tx,
-            claude_session_id,
-            session_id,
-            workspace_id,
-            cwd,
-            ClaudeSessionBoundVia::CliFresh,
-        )
-        .await?;
-        tx.commit().await?;
-        let link = Self::find(pool, claude_session_id)
-            .await?
-            .expect("assigned Claude session link exists");
-        Ok(Some(ClaudeSessionLinkMutation {
-            link,
-            previous_session_id,
-            republished_outbox,
-        }))
-    }
-
-    /// Upsert the link and publish its unpublished records to `session_id`,
-    /// inside `tx`. Returns the previous owner and the records published.
-    async fn upsert_in(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        claude_session_id: &str,
-        session_id: Uuid,
-        workspace_id: Uuid,
-        cwd: &str,
-        bound_via: ClaudeSessionBoundVia,
-    ) -> Result<(Option<Uuid>, u64), sqlx::Error> {
         let previous_session_id = sqlx::query_scalar!(
             r#"SELECT session_id AS "session_id!: Uuid"
                FROM claude_session_links
                WHERE claude_session_id = $1"#,
             claude_session_id
         )
-        .fetch_optional(&mut **tx)
+        .fetch_optional(&mut *tx)
         .await?;
 
         sqlx::query!(
@@ -321,14 +236,14 @@ impl ClaudeSessionLink {
             cwd,
             bound_via
         )
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
 
         // Raw records can predate a binding or survive a session cascade.
         // Publish every missing record to the new owner in this same
         // transaction. INSERT OR IGNORE is intentional here: assigning or
         // resolving the same sid repeatedly is an idempotent replay.
-        let next_seq = CliIngestOutbox::next_seq_in_transaction(tx, session_id).await?;
+        let next_seq = CliIngestOutbox::next_seq_in_transaction(&mut tx, session_id).await?;
         let republished_outbox = sqlx::query!(
             r#"INSERT OR IGNORE INTO cli_ingest_outbox
                    (session_id, seq, file_id, line_seq)
@@ -352,11 +267,19 @@ impl ClaudeSessionLink {
             next_seq,
             claude_session_id
         )
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
 
-        Ok((previous_session_id, republished_outbox))
+        tx.commit().await?;
+        let link = Self::find(pool, claude_session_id)
+            .await?
+            .expect("upserted Claude session link exists");
+        Ok(ClaudeSessionLinkMutation {
+            link,
+            previous_session_id,
+            republished_outbox,
+        })
     }
 
     /// Claude session ids currently linked to one app session.

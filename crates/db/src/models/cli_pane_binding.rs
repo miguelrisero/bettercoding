@@ -4,6 +4,11 @@ use sqlx::{FromRow, SqlitePool, Type};
 use ts_rs::TS;
 use uuid::Uuid;
 
+use super::{
+    claude_session_link::{ClaudeSessionLink, ClaudeSessionLinkMutation},
+    cli_ingest_outbox::CliIngestOutbox,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, TS)]
 #[sqlx(type_name = "TEXT", rename_all = "kebab-case")]
 #[serde(rename_all = "kebab-case")]
@@ -126,6 +131,94 @@ impl CliPaneBinding {
         .bind(workspace_id)
         .fetch_all(pool)
         .await
+    }
+
+    /// Link a fresh pane's discovered native session to the pane's app
+    /// session and record it on the pane, in one transaction, publishing the
+    /// session's already imported records. Nothing is written, and `None` is
+    /// returned, when another session owns `claude_session_id` or the binding
+    /// is no longer an active, still-unbound `cli-fresh` one.
+    pub async fn assign_discovered_session(
+        pool: &SqlitePool,
+        binding_id: Uuid,
+        claude_session_id: &str,
+        session_id: Uuid,
+        workspace_id: Uuid,
+        cwd: &str,
+    ) -> Result<Option<ClaudeSessionLinkMutation>, sqlx::Error> {
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let previous_session_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT session_id FROM claude_session_links WHERE claude_session_id = ?",
+        )
+        .bind(claude_session_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if previous_session_id.is_some_and(|owner| owner != session_id) {
+            return Ok(None);
+        }
+        let bound = sqlx::query(
+            "UPDATE cli_pane_bindings SET claude_session_id = ? \
+             WHERE id = ? AND released_at IS NULL \
+               AND bound_via = 'cli-fresh' AND claude_session_id IS NULL",
+        )
+        .bind(claude_session_id)
+        .bind(binding_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if bound == 0 {
+            return Ok(None);
+        }
+        sqlx::query(
+            "INSERT INTO claude_session_links \
+                 (claude_session_id, session_id, workspace_id, cwd, bound_via) \
+             VALUES (?, ?, ?, ?, 'cli-fresh') \
+             ON CONFLICT(claude_session_id) DO UPDATE SET \
+                 session_id = excluded.session_id, \
+                 workspace_id = excluded.workspace_id, \
+                 cwd = excluded.cwd, \
+                 bound_via = excluded.bound_via",
+        )
+        .bind(claude_session_id)
+        .bind(session_id)
+        .bind(workspace_id)
+        .bind(cwd)
+        .execute(&mut *tx)
+        .await?;
+        // Records imported before the link (none for a thread only just
+        // bound, unless an earlier pass stopped here) join the feed now, the
+        // same publication `ClaudeSessionLink::assign_cli` performs.
+        let next_seq = CliIngestOutbox::next_seq_in_transaction(&mut tx, session_id).await?;
+        let republished_outbox = sqlx::query(
+            "INSERT OR IGNORE INTO cli_ingest_outbox (session_id, seq, file_id, line_seq) \
+             SELECT ?1, ?2 + ROW_NUMBER() OVER ( \
+                        ORDER BY f.created_at, f.generation, r.line_seq) - 1, \
+                    r.file_id, r.line_seq \
+             FROM cli_native_records r \
+             JOIN cli_native_files f ON f.id = r.file_id \
+             WHERE r.claude_session_id = ?3 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM cli_ingest_outbox published \
+                   WHERE published.session_id = ?1 \
+                     AND published.file_id = r.file_id \
+                     AND published.line_seq = r.line_seq) \
+             ORDER BY f.created_at, f.generation, r.line_seq",
+        )
+        .bind(session_id)
+        .bind(next_seq)
+        .bind(claude_session_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        let link = ClaudeSessionLink::find(pool, claude_session_id)
+            .await?
+            .expect("assigned session link exists");
+        Ok(Some(ClaudeSessionLinkMutation {
+            link,
+            previous_session_id,
+            republished_outbox,
+        }))
     }
 
     pub async fn bind_discovered_sid(
