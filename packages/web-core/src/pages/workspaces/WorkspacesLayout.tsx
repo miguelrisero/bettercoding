@@ -47,7 +47,7 @@ import {
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
 import { cliTabId, useTerminal } from '@/shared/hooks/useTerminal';
 import { blurActiveTerminalTextarea } from '@/shared/lib/blurActiveTerminalTextarea';
-import { retainedCliWorkspace } from '@/shared/lib/cliPaneRetention';
+import { retainedPaneWorkspace } from '@/shared/lib/paneRetention';
 
 const WORKSPACES_GUIDE_ID = 'workspaces-guide';
 
@@ -213,7 +213,7 @@ export function WorkspacesLayout() {
   // Derived during render (React's "adjust state on prop change" pattern)
   // so the pane mounts in the same commit as the toggle; the effect below
   // owns the closeTab side effect.
-  const nextCliRetainedFor = retainedCliWorkspace(
+  const nextCliRetainedFor = retainedPaneWorkspace(
     cliRetainedFor,
     cliWorkspaceId,
     cliShown
@@ -228,16 +228,51 @@ export function WorkspacesLayout() {
   }, [nextCliRetainedFor, closeTab]);
 
   const cliPaneRef = useRef<HTMLDivElement>(null);
+  const chatPaneRef = useRef<HTMLDivElement>(null);
+  const pausedChatAnimationsRef = useRef<Animation[]>([]);
   useLayoutEffect(() => {
-    // A hidden xterm textarea can keep focus (iOS does not blur on
-    // display:none), which leaves the on-screen keyboard open over chat.
-    // Layout-phase for the same reason as the mobile-tab blur above.
-    if (cliShown) return;
+    // `inert` keeps the hidden chat out of focus, pointer and accessibility
+    // trees, so its composer or approval buttons never take input meant for
+    // the CLI. Running animations (e.g. running dots) would keep scheduling
+    // frames; pause them while CLI is shown and resume on return.
+    if (chatPaneRef.current) chatPaneRef.current.inert = cliShown;
+    if (cliShown) {
+      pausedChatAnimationsRef.current = (
+        chatPaneRef.current?.getAnimations({ subtree: true }) ?? []
+      ).filter((animation) => animation.playState === 'running');
+      pausedChatAnimationsRef.current.forEach((animation) => animation.pause());
+    } else {
+      pausedChatAnimationsRef.current.forEach((animation) => {
+        if (animation.playState === 'paused') animation.play();
+      });
+      pausedChatAnimationsRef.current = [];
+    }
+  }, [cliShown]);
+  useLayoutEffect(() => {
+    // A hidden xterm textarea or chat editor can keep focus (iOS does not
+    // blur a hidden element), which leaves the on-screen keyboard open over
+    // the shown pane. Layout-phase for the same reason as the mobile-tab blur
+    // above.
+    const hiddenPane = cliShown ? chatPaneRef.current : cliPaneRef.current;
     const active = document.activeElement;
-    if (active instanceof HTMLElement && cliPaneRef.current?.contains(active)) {
+    if (active instanceof HTMLElement && hiddenPane?.contains(active)) {
       active.blur();
     }
   }, [cliShown]);
+
+  // The chat pane is retained the same way, so returning from CLI reuses its
+  // loaded history and scroll position instead of re-streaming every
+  // execution process log. It mounts only once chat has been shown for the
+  // workspace, so opening a workspace in CLI mode loads no chat history.
+  const [chatRetainedFor, setChatRetainedFor] = useState<string | null>(null);
+  const nextChatRetainedFor = retainedPaneWorkspace(
+    chatRetainedFor,
+    cliWorkspaceId,
+    !cliShown
+  );
+  if (nextChatRetainedFor !== chatRetainedFor) {
+    setChatRetainedFor(nextChatRetainedFor);
+  }
 
   const cliPane = nextCliRetainedFor ? (
     <div ref={cliPaneRef} className={cn('h-full', !cliShown && 'hidden')}>
@@ -274,21 +309,35 @@ export function WorkspacesLayout() {
   ) : (
     <>
       {cliPane}
-      {!cliShown && (
-        <WorkspacesMainContainer
-          ref={mainContainerRef}
-          selectedWorkspace={selectedWorkspace ?? null}
-          selectedSession={selectedSession}
-          selectedSessionId={selectedSessionId}
-          sessions={sessions}
-          repos={repos}
-          onSelectSession={selectSession}
-          isLoading={isLoading}
-          isSessionsLoading={isSessionsLoading}
-          isNewSessionMode={isNewSessionMode}
-          onStartNewSession={startNewSession}
-          cliSessionActive={cliSessionActive}
-        />
+      {(!cliShown || nextChatRetainedFor !== null) && (
+        // Hidden chat keeps its box below the CLI pane (clipped by the
+        // panel). `content-visibility: hidden` skips its style, layout and
+        // paint but keeps its layout state, so the list returns with the same
+        // rows and scroll offset instead of re-measuring from zero.
+        // `invisible` hides it where content-visibility is unsupported.
+        <div
+          ref={chatPaneRef}
+          className={cn(
+            'h-full',
+            cliShown && 'invisible [content-visibility:hidden]'
+          )}
+        >
+          <WorkspacesMainContainer
+            ref={mainContainerRef}
+            selectedWorkspace={selectedWorkspace ?? null}
+            selectedSession={selectedSession}
+            selectedSessionId={selectedSessionId}
+            sessions={sessions}
+            repos={repos}
+            onSelectSession={selectSession}
+            isLoading={isLoading}
+            isSessionsLoading={isSessionsLoading}
+            isNewSessionMode={isNewSessionMode}
+            onStartNewSession={startNewSession}
+            cliSessionActive={cliSessionActive}
+            visible={!cliShown}
+          />
+        </div>
       )}
     </>
   );

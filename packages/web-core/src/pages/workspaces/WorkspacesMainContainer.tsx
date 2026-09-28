@@ -28,6 +28,7 @@ import { ApprovalFeedbackProvider } from '@/features/workspace-chat/model/contex
 import { forwardWheelToScroller } from '@/features/workspace-chat/ui/forwardWheelToScroller';
 import { SubagentStrip } from '@/features/workspace-chat/ui/subagent-strip/SubagentStrip';
 import { useDiffStats } from '@/shared/stores/useWorkspaceDiffStore';
+import { PaneVisibilityContext } from '@/shared/hooks/PaneVisibilityContext';
 
 /**
  * Isolated component that reads diffStats from WorkspaceContext.
@@ -108,6 +109,8 @@ interface WorkspacesMainContainerProps {
   isNewSessionMode: boolean;
   onStartNewSession: () => void;
   cliSessionActive?: boolean;
+  /** False while the pane stays mounted under the shown CLI pane. */
+  visible?: boolean;
 }
 
 export const WorkspacesMainContainer = forwardRef<
@@ -126,6 +129,7 @@ export const WorkspacesMainContainer = forwardRef<
     isNewSessionMode,
     onStartNewSession,
     cliSessionActive = false,
+    visible = true,
   },
   ref
 ) {
@@ -270,24 +274,28 @@ export const WorkspacesMainContainer = forwardRef<
   );
 
   return (
-    <ApprovalFeedbackProvider>
-      <EntriesProvider key={entriesProviderKey}>
-        <MessageEditProvider>
-          <WorkspacesMain
-            workspaceWithSession={
-              workspaceWithSession ? { id: workspaceWithSession.id } : undefined
-            }
-            isLoading={isLoading}
-            containerRef={containerRef}
-            conversationContent={conversationContent}
-            chatBoxContent={chatBoxContent}
-            contextBarContent={contextBarContent}
-            isAtBottom={isAtBottom}
-            onAtBottomChange={handleAtBottomChange}
-            onScrollToBottom={handleScrollToBottom}
-          />
-        </MessageEditProvider>
-      </EntriesProvider>
-    </ApprovalFeedbackProvider>
+    <PaneVisibilityContext.Provider value={visible}>
+      <ApprovalFeedbackProvider>
+        <EntriesProvider key={entriesProviderKey}>
+          <MessageEditProvider>
+            <WorkspacesMain
+              workspaceWithSession={
+                workspaceWithSession
+                  ? { id: workspaceWithSession.id }
+                  : undefined
+              }
+              isLoading={isLoading}
+              containerRef={containerRef}
+              conversationContent={conversationContent}
+              chatBoxContent={chatBoxContent}
+              contextBarContent={contextBarContent}
+              isAtBottom={isAtBottom}
+              onAtBottomChange={handleAtBottomChange}
+              onScrollToBottom={handleScrollToBottom}
+            />
+          </MessageEditProvider>
+        </EntriesProvider>
+      </ApprovalFeedbackProvider>
+    </PaneVisibilityContext.Provider>
   );
 });

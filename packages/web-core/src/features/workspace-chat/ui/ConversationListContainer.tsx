@@ -48,6 +48,7 @@ import {
 } from '@/shared/hooks/useConversationHistory/types';
 import { useConversationHistory } from '../model/hooks/useConversationHistory';
 import { useUnassignedCliSessions } from '../model/hooks/useUnassignedCliSessions';
+import { usePaneVisible } from '@/shared/hooks/PaneVisibilityContext';
 import { useSetTokenUsageInfo } from '../model/contexts/EntriesContext';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
 import type { NativeFeedOrigin, RepoWithTargetBranch } from 'shared/types';
@@ -348,6 +349,12 @@ export const ConversationList = forwardRef<
   // rAF naturally limits updates to the display refresh rate (~60fps) while
   // ensuring every frame reflects the latest data.
   const rafIdRef = useRef<number | null>(null);
+  // Inside a hidden pane, timeline updates are held (latest wins) and applied
+  // once the pane is shown again, so a hidden list does no derive or render
+  // work.
+  const visible = usePaneVisible();
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
   const planRevealSpacerRef = useRef<HTMLDivElement | null>(null);
   const pendingInteractionAnchorRef = useRef<{
     element: HTMLElement;
@@ -498,8 +505,12 @@ export const ConversationList = forwardRef<
 
   const flushPendingUpdate = () => {
     rafIdRef.current = null;
+    // A frame scheduled just before the pane was hidden keeps its update
+    // pending; the show effect below applies it.
+    if (!visibleRef.current) return;
     const pending = pendingUpdateRef.current;
     if (!pending) return;
+    pendingUpdateRef.current = null;
 
     const derivedEntries = deriveConversationEntries({
       source: pending.source,
@@ -541,13 +552,22 @@ export const ConversationList = forwardRef<
       source,
       addType,
       loading: newLoading,
-      isInitialLoad: addType === 'initial',
+      // A held initial load must still land as one when it is applied.
+      isInitialLoad:
+        addType === 'initial' ||
+        (pendingUpdateRef.current?.isInitialLoad ?? false),
     };
 
-    if (rafIdRef.current === null) {
+    if (visibleRef.current && rafIdRef.current === null) {
       rafIdRef.current = requestAnimationFrame(flushPendingUpdate);
     }
   };
+
+  useEffect(() => {
+    if (visible && pendingUpdateRef.current && rafIdRef.current === null) {
+      rafIdRef.current = requestAnimationFrame(flushPendingUpdate);
+    }
+  });
 
   const { isFirstTurn, isLoadingHistory, foreignWriterSeenAt } =
     useConversationHistory({
