@@ -76,8 +76,6 @@ const CODEX_VALUE_OPTIONS: &[&str] = &[
     "--ask-for-approval",
     "-p",
     "--profile",
-    "-i",
-    "--image",
     "-C",
     "--cd",
     "--enable",
@@ -89,14 +87,17 @@ const CODEX_VALUE_OPTIONS: &[&str] = &[
 ];
 
 /// The positional arguments of a Codex command line, and whether `--last`
-/// appears. `argv[0]` is the binary.
-fn codex_positionals(argv: &[String]) -> (Vec<&str>, bool) {
+/// appears. `argv[0]` is the binary. `None` when `-i/--image` appears: it
+/// takes one or more values, so where its values end is unknown.
+fn codex_positionals(argv: &[String]) -> Option<(Vec<&str>, bool)> {
     let mut positionals = Vec::new();
     let mut last = false;
     let mut args = argv.iter().skip(1).map(String::as_str);
     while let Some(arg) = args.next() {
         if arg == "--" {
             positionals.extend(args.by_ref());
+        } else if arg == "-i" || arg == "--image" || arg.starts_with("--image=") {
+            return None;
         } else if arg == "--last" {
             last = true;
         } else if CODEX_VALUE_OPTIONS.contains(&arg) {
@@ -105,7 +106,7 @@ fn codex_positionals(argv: &[String]) -> (Vec<&str>, bool) {
             positionals.push(arg);
         }
     }
-    (positionals, last)
+    Some((positionals, last))
 }
 
 /// Resume evidence from Codex argument vectors. `codex resume <uuid>` names
@@ -121,7 +122,10 @@ fn codex_resume_evidence(argvs: &[Option<Vec<String>>]) -> SidEvidence {
             ambiguous = true;
             continue;
         };
-        let (positionals, last) = codex_positionals(argv);
+        let Some((positionals, last)) = codex_positionals(argv) else {
+            ambiguous = true;
+            continue;
+        };
         if positionals.first() != Some(&"resume") {
             continue;
         }
@@ -494,6 +498,16 @@ mod tests {
                 "{args:?}"
             );
         }
+    }
+
+    #[test]
+    fn codex_image_values_make_the_command_line_ambiguous() {
+        // `-i <FILE>...` takes any number of values, so `resume <uuid>`
+        // after it may be image paths.
+        assert_eq!(
+            codex_resume_evidence(&[argv(&["codex", "-i", "a.png", "resume", THREAD])]),
+            SidEvidence::Ambiguous
+        );
     }
 
     #[test]
