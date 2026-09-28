@@ -210,6 +210,9 @@ export function WorkspacesLayout() {
   const cliWorkspaceId = isCreateMode ? null : (selectedWorkspace?.id ?? null);
   const cliShown = mainPaneMode === 'cli' && cliWorkspaceId !== null;
   const [cliRetainedFor, setCliRetainedFor] = useState<string | null>(null);
+  // Derived during render (React's "adjust state on prop change" pattern)
+  // so the pane mounts in the same commit as the toggle; the effect below
+  // owns the closeTab side effect.
   const nextCliRetainedFor = retainedCliWorkspace(
     cliRetainedFor,
     cliWorkspaceId,
@@ -236,9 +239,6 @@ export function WorkspacesLayout() {
     }
   }, [cliShown]);
 
-  const selectedWorkspaceActivity = nextCliRetainedFor
-    ? activeWorkspaces.find((w) => w.id === nextCliRetainedFor)
-    : undefined;
   const cliPane = nextCliRetainedFor ? (
     <div ref={cliPaneRef} className={cn('h-full', !cliShown && 'hidden')}>
       <CliMainPane
@@ -257,14 +257,41 @@ export function WorkspacesLayout() {
         // just-created workspace's initial prompt) — it would otherwise bake
         // a conversation-less tmux session and split work between chat and
         // CLI. Streams live via the workspaces WebSocket.
-        executorRunning={selectedWorkspaceActivity?.isExecutorRunning ?? false}
+        executorRunning={selectedWorkspaceStatus?.isExecutorRunning ?? false}
         codingAgentRunning={
-          selectedWorkspaceActivity?.isCodingAgentRunning ?? false
+          selectedWorkspaceStatus?.isCodingAgentRunning ?? false
         }
         cliRunning={cliSessionActive}
       />
     </div>
   ) : null;
+
+  // Chat/CLI slot shared by the mobile chat tab and the desktop left-main
+  // panel. The CLI pane keeps one tree position, so a mode toggle never
+  // remounts it; phones switch with the navbar's terminal button.
+  const mainPaneContent = isCreateMode ? (
+    <CreateChatBoxContainer onWorkspaceCreated={handleWorkspaceCreated} />
+  ) : (
+    <>
+      {cliPane}
+      {!cliShown && (
+        <WorkspacesMainContainer
+          ref={mainContainerRef}
+          selectedWorkspace={selectedWorkspace ?? null}
+          selectedSession={selectedSession}
+          selectedSessionId={selectedSessionId}
+          sessions={sessions}
+          repos={repos}
+          onSelectSession={selectSession}
+          isLoading={isLoading}
+          isSessionsLoading={isSessionsLoading}
+          isNewSessionMode={isNewSessionMode}
+          onStartNewSession={startNewSession}
+          cliSessionActive={cliSessionActive}
+        />
+      )}
+    </>
+  );
 
   const [rightMainPanelSize, setRightMainPanelSize] = usePaneSize(
     PERSIST_KEYS.rightMainPanel,
@@ -331,34 +358,7 @@ export function WorkspacesLayout() {
                 mobileTab !== 'chat' && 'hidden'
               )}
             >
-              {isCreateMode ? (
-                <CreateChatBoxContainer
-                  onWorkspaceCreated={handleWorkspaceCreated}
-                />
-              ) : (
-                <>
-                  {/* Same CLI pane as desktop — phones get the terminal
-                      too, with the navbar's terminal button (and the pane's
-                      "Back to chat") to switch. */}
-                  {cliPane}
-                  {!cliShown && (
-                    <WorkspacesMainContainer
-                      ref={mainContainerRef}
-                      selectedWorkspace={selectedWorkspace ?? null}
-                      selectedSession={selectedSession}
-                      selectedSessionId={selectedSessionId}
-                      sessions={sessions}
-                      repos={repos}
-                      onSelectSession={selectSession}
-                      isLoading={isLoading}
-                      isSessionsLoading={isSessionsLoading}
-                      isNewSessionMode={isNewSessionMode}
-                      onStartNewSession={startNewSession}
-                      cliSessionActive={cliSessionActive}
-                    />
-                  )}
-                </>
-              )}
+              {mainPaneContent}
             </div>
 
             {/* Changes tab */}
@@ -467,31 +467,7 @@ export function WorkspacesLayout() {
                 minSize="20%"
                 className="min-w-0 h-full overflow-hidden"
               >
-                {isCreateMode ? (
-                  <CreateChatBoxContainer
-                    onWorkspaceCreated={handleWorkspaceCreated}
-                  />
-                ) : (
-                  <>
-                    {cliPane}
-                    {!cliShown && (
-                      <WorkspacesMainContainer
-                        ref={mainContainerRef}
-                        selectedWorkspace={selectedWorkspace ?? null}
-                        selectedSession={selectedSession}
-                        selectedSessionId={selectedSessionId}
-                        sessions={sessions}
-                        repos={repos}
-                        onSelectSession={selectSession}
-                        isLoading={isLoading}
-                        isSessionsLoading={isSessionsLoading}
-                        isNewSessionMode={isNewSessionMode}
-                        onStartNewSession={startNewSession}
-                        cliSessionActive={cliSessionActive}
-                      />
-                    )}
-                  </>
-                )}
+                {mainPaneContent}
               </Panel>
             )}
 

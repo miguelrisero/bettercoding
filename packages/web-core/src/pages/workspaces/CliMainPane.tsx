@@ -51,10 +51,11 @@ interface CliMainPaneProps {
    */
   cliRunning?: boolean;
   /**
-   * False while chat is shown for this workspace. The layout keeps the pane
+   * False while this workspace is in chat mode. The layout keeps the pane
    * mounted under `hidden` so toggling back is instant (same socket, same
-   * xterm buffer). While hidden the terminal is unmeasurable, so it reports
-   * hidden presence (tmux ignores its size), and the status probe pauses.
+   * xterm buffer), and the status probe pauses. This flag tracks the
+   * chat/CLI mode only: tmux presence follows the pane's measured box, so
+   * any hidden pane (chat mode or another mobile tab) reports hidden.
    */
   visible?: boolean;
 }
