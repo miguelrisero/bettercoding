@@ -15,6 +15,7 @@ use db::{
         claude_session_link::{ClaudeSessionBoundVia, ClaudeSessionLink},
         cli_native_record::CliNativeRecord,
         cli_pane_binding::{CliPaneBinding, CliPaneBoundVia},
+        coding_agent_turn::{CodingAgentTurn, CreateCodingAgentTurn},
         execution_process::{CreateExecutionProcess, ExecutionProcess, ExecutionProcessRunReason},
         session::{CreateSession, Session},
         workspace::{CreateWorkspace, Workspace},
@@ -379,7 +380,53 @@ async fn turns_written_while_the_executor_ran_are_attributed_to_it() {
     let created = fixture_created_at();
     write_rollout(&rollout_path(&case.root, FIXTURE_THREAD, created), FIXTURE);
     bind_resumed(&case, FIXTURE_THREAD).await;
-    // The executor ran the first turn (12:20:49.3 – 12:20:52.4).
+    // The executor ran the first turn on this thread (12:20:49.3 – 12:20:52.4).
+    let on_thread = executor_run(
+        &case,
+        FIXTURE_THREAD,
+        "2026-09-28 12:20:49.000+00:00",
+        Some("2026-09-28 12:20:53.000+00:00"),
+    )
+    .await;
+    // A chat follow-up forked another thread and is still running while the
+    // pane's second turn (12:21:14) is written.
+    let forked = executor_run(
+        &case,
+        &thread_id_at(created, 77),
+        "2026-09-28 12:21:00.000+00:00",
+        None,
+    )
+    .await;
+
+    reconcile(&case).await;
+
+    let entries = entries(&case).await;
+    let (executor, cli): (Vec<_>, Vec<_>) = entries
+        .iter()
+        .partition(|entry| entry.linked_execution_process_id == Some(on_thread));
+    assert_eq!(
+        texts(&executor.into_iter().cloned().collect::<Vec<_>>()),
+        ["Reply with OK only.", "OK"]
+    );
+    assert_eq!(cli.len(), FIXTURE_ENTRIES - 2);
+    assert!(cli.iter().all(|entry| entry.origin == NativeFeedOrigin::Cli
+        && entry.linked_execution_process_id.is_none()));
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.linked_execution_process_id != Some(forked)),
+        "a run on another thread never claims the pane's turns"
+    );
+}
+
+/// A coding-agent run of this session on Codex `thread`, between the given
+/// SQLite timestamps (`None`: still running).
+async fn executor_run(
+    case: &Case,
+    thread: &str,
+    started_at: &str,
+    completed_at: Option<&str>,
+) -> Uuid {
     let process_id = Uuid::new_v4();
     ExecutionProcess::create(
         &case.db.pool,
@@ -387,7 +434,7 @@ async fn turns_written_while_the_executor_ran_are_attributed_to_it() {
             session_id: case.session.id,
             executor_action: ExecutorAction::new(
                 ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
-                    prompt: "Reply with OK only.".to_string(),
+                    prompt: "chat prompt".to_string(),
                     executor_config: ExecutorConfig::new(BaseCodingAgent::Codex),
                     working_dir: None,
                 }),
@@ -400,29 +447,52 @@ async fn turns_written_while_the_executor_ran_are_attributed_to_it() {
     )
     .await
     .unwrap();
-    sqlx::query(
-        "UPDATE execution_processes SET status = 'completed', \
-         started_at = '2026-09-28 12:20:49.000+00:00', \
-         completed_at = '2026-09-28 12:20:53.000+00:00' WHERE id = ?",
+    CodingAgentTurn::create(
+        &case.db.pool,
+        &CreateCodingAgentTurn {
+            execution_process_id: process_id,
+            prompt: Some("chat prompt".to_string()),
+        },
+        Uuid::new_v4(),
     )
+    .await
+    .unwrap();
+    CodingAgentTurn::update_agent_session_id(&case.db.pool, process_id, thread)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE execution_processes SET status = ?, started_at = ?, completed_at = ? \
+         WHERE id = ?",
+    )
+    .bind(if completed_at.is_some() {
+        "completed"
+    } else {
+        "running"
+    })
+    .bind(started_at)
+    .bind(completed_at)
     .bind(process_id)
     .execute(&case.db.pool)
     .await
     .unwrap();
+    process_id
+}
 
-    reconcile(&case).await;
+#[tokio::test]
+async fn a_hook_naming_a_non_interactive_rollout_never_binds() {
+    let pane = fresh_codex_pane().await;
+    let exec = started_rollout(&pane, 11, chrono::Duration::seconds(2), "exec");
+    report_hook(&pane.case, &exec).await;
 
-    let entries = entries(&case).await;
-    let (executor, cli): (Vec<_>, Vec<_>) = entries
-        .iter()
-        .partition(|entry| entry.linked_execution_process_id == Some(process_id));
-    assert_eq!(
-        texts(&executor.into_iter().cloned().collect::<Vec<_>>()),
-        ["Reply with OK only.", "OK"]
+    reconcile(&pane.case).await;
+
+    assert!(
+        ClaudeSessionLink::find(&pane.case.db.pool, &exec)
+            .await
+            .unwrap()
+            .is_none()
     );
-    assert_eq!(cli.len(), FIXTURE_ENTRIES - 2);
-    assert!(cli.iter().all(|entry| entry.origin == NativeFeedOrigin::Cli
-        && entry.linked_execution_process_id.is_none()));
+    assert!(entries(&pane.case).await.is_empty());
 }
 
 struct FreshPane {
@@ -566,6 +636,116 @@ async fn ambiguous_fresh_codex_rollouts_are_quarantined_until_the_hook_names_one
     );
     assert_eq!(quarantined(&pane.case).await, 1);
     drop(pane.case.temp);
+}
+
+async fn report_hook(case: &Case, thread: &str) {
+    WorkspaceCliActivity::upsert_hook(
+        &case.db.pool,
+        case.workspace.id,
+        &CliHookState {
+            agent_session_id: thread.to_string(),
+            transcript_path: None,
+            phase: CliPhase::Working,
+            tasks: None,
+            crons: None,
+            seq: Utc::now().timestamp_nanos_opt().unwrap(),
+        },
+        false,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_hook_naming_a_thread_older_than_the_pane_never_binds() {
+    let pane = fresh_codex_pane().await;
+    // An earlier pane's thread, reported after this pane launched.
+    let earlier = started_rollout(&pane, 6, chrono::Duration::minutes(-10), "cli");
+    report_hook(&pane.case, &earlier).await;
+    let own = started_rollout(&pane, 7, chrono::Duration::seconds(2), "cli");
+
+    reconcile(&pane.case).await;
+
+    assert!(
+        ClaudeSessionLink::find(&pane.case.db.pool, &earlier)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        ClaudeSessionLink::find(&pane.case.db.pool, &own)
+            .await
+            .unwrap()
+            .map(|link| link.session_id),
+        Some(pane.case.session.id)
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_pane_is_matched_in_its_own_sessions_directory() {
+    let pane = fresh_codex_pane().await;
+    // A newer session in the workspace runs in a subdirectory; the pane's
+    // own (older) session runs at the worktree root.
+    fs::create_dir_all(pane.case.cwd.join("sub")).unwrap();
+    let newer = Session::create(
+        &pane.case.db.pool,
+        &CreateSession {
+            executor: Some("CODEX".to_string()),
+            name: None,
+        },
+        Uuid::new_v4(),
+        pane.case.workspace.id,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE sessions SET agent_working_dir = 'sub', \
+         created_at = datetime('now', '+1 minute') WHERE id = ?",
+    )
+    .bind(newer.id)
+    .execute(&pane.case.db.pool)
+    .await
+    .unwrap();
+    let own = started_rollout(&pane, 8, chrono::Duration::seconds(2), "cli");
+
+    reconcile(&pane.case).await;
+
+    let link = ClaudeSessionLink::find(&pane.case.db.pool, &own)
+        .await
+        .unwrap()
+        .expect("the pane's thread is found in the pane's directory");
+    assert_eq!(link.session_id, pane.case.session.id);
+    assert_eq!(link.cwd, pane.case.cwd.to_string_lossy());
+}
+
+#[tokio::test]
+async fn a_pass_interrupted_after_linking_binds_on_the_next_pass() {
+    let pane = fresh_codex_pane().await;
+    let own = started_rollout(&pane, 10, chrono::Duration::seconds(2), "cli");
+    // The state a pass leaves when it stops between the link and the binding.
+    ClaudeSessionLink::assign_cli(
+        &pane.case.db.pool,
+        &own,
+        pane.case.session.id,
+        pane.case.workspace.id,
+        &pane.case.cwd.to_string_lossy(),
+        ClaudeSessionBoundVia::CliFresh,
+    )
+    .await
+    .unwrap();
+
+    reconcile(&pane.case).await;
+
+    let binding = CliPaneBinding::find_by_id(&pane.case.db.pool, pane.binding.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.claude_session_id.as_deref(), Some(own.as_str()));
+    assert_eq!(
+        texts(&entries(&pane.case).await),
+        ["prompt 10", "answer to prompt 10"]
+    );
 }
 
 /// Measures a Codex rollout backfill and per-append cost against a copy of a

@@ -83,8 +83,28 @@ const BOOKKEEPING_RECORDS: &[&str] = &[
     "inter_agent_communication_metadata",
 ];
 
+/// `event_msg` types every current rollout carries besides `item_completed`.
+const BOOKKEEPING_EVENTS: &[&str] = &[
+    "token_count",
+    "task_started",
+    "task_complete",
+    "turn_aborted",
+    "agent_message",
+    "user_message",
+    "thread_settings_applied",
+    "thread_goal_updated",
+    "patch_apply_end",
+    "context_compacted",
+    "web_search_end",
+    "mcp_tool_call_end",
+];
+
 /// Thread items that are known but have no chat rendering.
 const BOOKKEEPING_ITEMS: &[&str] = &["SubAgentActivity", "CollabAgentToolCall"];
+
+/// `Extension` kinds besides web search: tool plumbing the TUI shows no
+/// transcript cell for.
+const BOOKKEEPING_EXTENSIONS: &[&str] = &["clock.sleep", "image_gen.generation"];
 
 pub fn adapt_codex_rollout_line(
     raw: &str,
@@ -95,16 +115,23 @@ pub fn adapt_codex_rollout_line(
     let payload = record.get("payload").unwrap_or(&Value::Null);
 
     if record_type == "event_msg" {
-        if payload.get("type").and_then(Value::as_str) != Some("item_completed") {
-            // Streaming deltas, lifecycle and legacy message events all
-            // duplicate or annotate the completed items below.
-            return Ok(CodexRolloutLine::new(
-                CodexRolloutDisposition::Bookkeeping,
-                record_type,
-                &record,
-            ));
+        let event_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+        if event_type == "item_completed" {
+            return Ok(adapt_item(&record, payload, worktree_path));
         }
-        return Ok(adapt_item(&record, payload, worktree_path));
+        // Lifecycle and legacy message events duplicate or annotate the
+        // completed items.
+        let disposition = if BOOKKEEPING_EVENTS.contains(&event_type) {
+            CodexRolloutDisposition::Bookkeeping
+        } else {
+            CodexRolloutDisposition::Unknown
+        };
+        let kind = if disposition == CodexRolloutDisposition::Unknown {
+            "unknown"
+        } else {
+            record_type
+        };
+        return Ok(CodexRolloutLine::new(disposition, kind, &record));
     }
     let disposition = if BOOKKEEPING_RECORDS.contains(&record_type) {
         CodexRolloutDisposition::Bookkeeping
@@ -256,9 +283,14 @@ fn adapt_item(record: &Value, payload: &Value, worktree_path: &str) -> CodexRoll
             )],
             None,
         ),
-        // `Extension` kinds other than web search (`clock.sleep`, …) are
-        // tool plumbing the TUI shows no transcript cell for.
-        "Extension" => ("bookkeeping", Vec::new(), None),
+        "Extension"
+            if item
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| BOOKKEEPING_EXTENSIONS.contains(&kind)) =>
+        {
+            ("bookkeeping", Vec::new(), None)
+        }
         known if BOOKKEEPING_ITEMS.contains(&known) => ("bookkeeping", Vec::new(), None),
         _ => {
             let mut line =
@@ -455,6 +487,24 @@ mod tests {
         assert_eq!(unknown.len(), 2);
         assert!(unknown.iter().all(|line| line.entries.is_empty()));
         assert!(adapt_codex_rollout_line("{not json", "/").is_err());
+        for line in [
+            r#"{"type":"event_msg","payload":{"type":"hologram_delta"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"Extension","kind":"holo.call","id":"x"}}}"#,
+        ] {
+            assert_eq!(
+                adapt_codex_rollout_line(line, "/").unwrap().disposition,
+                CodexRolloutDisposition::Unknown
+            );
+        }
+        for line in [
+            r#"{"type":"event_msg","payload":{"type":"token_count"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"Extension","kind":"clock.sleep","id":"x"}}}"#,
+        ] {
+            assert_eq!(
+                adapt_codex_rollout_line(line, "/").unwrap().disposition,
+                CodexRolloutDisposition::Bookkeeping
+            );
+        }
     }
 
     #[test]
