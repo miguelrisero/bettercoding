@@ -1110,6 +1110,11 @@ impl ClaudeTranscriptIngest {
             return Ok(0);
         };
         let is_codex = codex_thread_id.is_some();
+        // Cleared until this import completes: a failed import, or a scan
+        // coalesced into this one, must not leave the file looking current.
+        if is_codex {
+            self.codex_seen.lock().unwrap().remove(path);
+        }
         let dir_path = path
             .parent()
             .unwrap_or_else(|| Path::new(""))
@@ -1373,6 +1378,12 @@ impl ClaudeTranscriptIngest {
                 break;
             }
         }
+        if is_codex {
+            self.codex_seen
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), (observed_size, observed_mtime_ms));
+        }
         Ok(inserted)
     }
 
@@ -1402,10 +1413,7 @@ impl ClaudeTranscriptIngest {
                 .process_native_path(&path, &context, force_rescan)
                 .await
             {
-                Ok(records) => {
-                    counts.records += records;
-                    self.codex_seen.lock().unwrap().insert(path, stamp);
-                }
+                Ok(records) => counts.records += records,
                 Err(error) => {
                     counts.failed_files += 1;
                     tracing::warn!(?error, path = %path.display(), "Codex rollout import failed");
