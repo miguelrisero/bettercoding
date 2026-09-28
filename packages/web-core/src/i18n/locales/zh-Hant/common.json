@@ -24,7 +24,7 @@
       "send": "傳送到終端機",
       "unsubmitted": "文字已在終端機中，但未提交。請在終端機中按 Enter 提交。",
       "noAgent": "此終端機中沒有執行中的代理。請重新啟動代理，然後重新傳送。",
-      "notDelivered": "終端機未收到文字。請重新傳送。",
+      "notDelivered": "tmux 未確認文字。重新傳送前請檢查終端機。",
       "empty": "請輸入要傳送的訊息。",
       "controlChars": "文字包含終端機無法接收的控制字元。請移除後重新傳送。",
       "tooLarge": "文字大小為 {{size}} KB。上限為 {{limit}} KB。",

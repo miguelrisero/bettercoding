@@ -24,7 +24,7 @@
       "send": "Send to terminal",
       "unsubmitted": "The text is in the terminal but was not submitted. Press Enter in the terminal to submit it.",
       "noAgent": "No agent is running in this terminal. Restart the agent, then send again.",
-      "notDelivered": "The terminal did not receive the text. Send again.",
+      "notDelivered": "tmux did not confirm the text. Check the terminal before you send again.",
       "empty": "Write a message to send.",
       "controlChars": "The text contains control characters that the terminal cannot receive. Remove them, then send again.",
       "tooLarge": "The text is {{size}} KB. The limit is {{limit}} KB.",

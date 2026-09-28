@@ -24,7 +24,7 @@
       "send": "Envoyer au terminal",
       "unsubmitted": "Le texte est dans le terminal mais n'a pas été soumis. Appuyez sur Entrée dans le terminal pour le soumettre.",
       "noAgent": "Aucun agent ne tourne dans ce terminal. Redémarrez l'agent, puis renvoyez.",
-      "notDelivered": "Le terminal n'a pas reçu le texte. Renvoyez-le.",
+      "notDelivered": "tmux n'a pas confirmé le texte. Vérifiez le terminal avant de renvoyer.",
       "empty": "Écrivez un message à envoyer.",
       "controlChars": "Le texte contient des caractères de contrôle que le terminal ne peut pas recevoir. Supprimez-les, puis renvoyez.",
       "tooLarge": "Le texte fait {{size}} Ko. La limite est de {{limit}} Ko.",

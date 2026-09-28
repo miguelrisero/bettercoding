@@ -14,15 +14,23 @@ interface CliComposerProps {
   workspaceId: string;
 }
 
+// Unsent drafts per workspace, kept for the page's lifetime so hiding the
+// composer or switching workspaces never discards typed text.
+const drafts = new Map<string, string>();
+
 /**
  * Opt-in text box under the CLI terminal: the text is written locally (no
  * per-keystroke round trip through tmux) and sent whole to the pane's agent
- * on Enter. Mount it keyed by workspace so a draft never follows the user
- * into another workspace's terminal.
+ * on Enter. Mount it keyed by workspace so each workspace keeps its own draft.
  */
 export function CliComposer({ workspaceId }: CliComposerProps) {
   const { t } = useTranslation('common');
-  const [text, setText] = useState('');
+  const [text, setTextState] = useState(() => drafts.get(workspaceId) ?? '');
+  const setText = (value: string) => {
+    if (value) drafts.set(workspaceId, value);
+    else drafts.delete(workspaceId);
+    setTextState(value);
+  };
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState<ComposerNotice | null>(null);
 
@@ -113,6 +121,7 @@ export function CliComposer({ workspaceId }: CliComposerProps) {
             // Keep focus (and the soft keyboard) on the text box.
             onPointerDown={(e) => e.preventDefault()}
             disabled={!canSend}
+            aria-busy={sending}
             aria-label={t('cliMode.composer.send')}
             title={t('cliMode.composer.send')}
             className="flex items-center justify-center size-8 shrink-0 rounded-md text-low hover:text-normal hover:bg-primary transition-colors disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-low"
