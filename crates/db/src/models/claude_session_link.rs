@@ -391,8 +391,16 @@ mod tests {
                 .await
             }
         });
-        // Let the upsert start while the writer holds the lock.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Wait until the upsert holds the pool's second connection, so it
+        // runs while the writer holds the lock.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !upsert.is_finished() && (pool.size() < 2 || pool.num_idle() > 0) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the upsert takes a connection");
+        tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             !upsert.is_finished(),
             "the upsert is blocked on the writer's lock"
