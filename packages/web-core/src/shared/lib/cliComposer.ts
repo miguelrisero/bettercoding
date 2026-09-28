@@ -103,3 +103,58 @@ export async function sendComposerText(
     };
   }
 }
+
+export interface ComposerState {
+  text: string;
+  sending: boolean;
+  notice: ComposerNotice | null;
+}
+
+const IDLE: ComposerState = { text: '', sending: false, notice: null };
+
+/**
+ * Composer state per workspace, outside React: a composer unmounted mid-send
+ * (hidden, or the workspace switched away and back) remounts onto the same
+ * draft, in-flight flag and outcome instead of fresh state, so it can neither
+ * send a draft twice nor lose a newer one.
+ */
+export function createComposerStore() {
+  const states = new Map<string, ComposerState>();
+  const listeners = new Set<() => void>();
+
+  const get = (workspaceId: string) => states.get(workspaceId) ?? IDLE;
+  const update = (workspaceId: string, patch: Partial<ComposerState>) => {
+    const next = { ...get(workspaceId), ...patch };
+    if (!next.text && !next.sending && !next.notice) states.delete(workspaceId);
+    else states.set(workspaceId, next);
+    listeners.forEach((listener) => listener());
+  };
+
+  return {
+    get,
+    subscribe(listener: () => void) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    /** Edit the draft; an edit dismisses the last send's notice. */
+    setText(workspaceId: string, text: string) {
+      update(workspaceId, { text, notice: null });
+    },
+    async submit(
+      workspaceId: string,
+      send: (text: string) => Promise<SendCliTextResponse>
+    ) {
+      const { text, sending } = get(workspaceId);
+      if (sending || text.trim() === '') return;
+      update(workspaceId, { sending: true, notice: null });
+      const result = await sendComposerText(text, send);
+      update(workspaceId, {
+        sending: false,
+        notice: result.notice,
+        ...(result.clear ? { text: '' } : {}),
+      });
+    },
+  };
+}

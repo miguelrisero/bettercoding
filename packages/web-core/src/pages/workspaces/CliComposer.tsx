@@ -1,12 +1,12 @@
-import { useState } from 'react';
+import { useSyncExternalStore } from 'react';
 import { useTranslation } from 'react-i18next';
 import { CircleNotchIcon, PaperPlaneRightIcon } from '@phosphor-icons/react';
 
 import { cliAgentApi } from '@/shared/lib/api';
 import {
   CLI_SEND_MAX_BYTES,
+  createComposerStore,
   isComposerSendKey,
-  sendComposerText,
   type ComposerNotice,
 } from '@/shared/lib/cliComposer';
 
@@ -14,45 +14,26 @@ interface CliComposerProps {
   workspaceId: string;
 }
 
-// Unsent drafts per workspace, kept for the page's lifetime so hiding the
-// composer or switching workspaces never discards typed text.
-const drafts = new Map<string, string>();
-// Workspaces with a send in flight. Module-level because a composer remounted
-// mid-send (workspace switched away and back) starts with fresh state.
-const sendsInFlight = new Set<string>();
+// Drafts, in-flight sends and outcomes per workspace, kept for the page's
+// lifetime so hiding the composer or switching workspaces keeps them.
+const composerStore = createComposerStore();
 
 /**
  * Opt-in text box under the CLI terminal: the text is written locally (no
  * per-keystroke round trip through tmux) and sent whole to the pane's agent
- * on Enter. Mount it keyed by workspace so each workspace keeps its own draft.
+ * on Enter.
  */
 export function CliComposer({ workspaceId }: CliComposerProps) {
   const { t } = useTranslation('common');
-  const [text, setTextState] = useState(() => drafts.get(workspaceId) ?? '');
-  const setText = (value: string) => {
-    if (value) drafts.set(workspaceId, value);
-    else drafts.delete(workspaceId);
-    setTextState(value);
-  };
-  const [sending, setSending] = useState(false);
-  const [notice, setNotice] = useState<ComposerNotice | null>(null);
-
+  const { text, sending, notice } = useSyncExternalStore(
+    composerStore.subscribe,
+    () => composerStore.get(workspaceId)
+  );
   const canSend = !sending && text.trim() !== '';
-
-  const submit = async () => {
-    if (!canSend || sendsInFlight.has(workspaceId)) return;
-    const sent = text;
-    sendsInFlight.add(workspaceId);
-    setSending(true);
-    const result = await sendComposerText(sent, (value) =>
+  const submit = () =>
+    composerStore.submit(workspaceId, (value) =>
       cliAgentApi.sendText(workspaceId, { text: value })
-    ).finally(() => sendsInFlight.delete(workspaceId));
-    setSending(false);
-    // A composer remounted during the send may hold newer text; only the
-    // text this send delivered is cleared.
-    if (result.clear && (drafts.get(workspaceId) ?? '') === sent) setText('');
-    setNotice(result.notice);
-  };
+    );
 
   const noticeText = (n: ComposerNotice) => {
     switch (n.kind) {
@@ -96,10 +77,7 @@ export function CliComposer({ workspaceId }: CliComposerProps) {
         <div className="flex items-end gap-2 rounded-md border border-border bg-secondary px-2 py-1">
           <textarea
             value={text}
-            onChange={(e) => {
-              setText(e.target.value);
-              if (notice) setNotice(null);
-            }}
+            onChange={(e) => composerStore.setText(workspaceId, e.target.value)}
             onKeyDown={(e) => {
               if (
                 isComposerSendKey({

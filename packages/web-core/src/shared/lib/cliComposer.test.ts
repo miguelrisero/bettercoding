@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   CLI_SEND_MAX_BYTES,
+  createComposerStore,
   isComposerSendKey,
   prepareCliText,
   sendComposerText,
@@ -119,5 +120,47 @@ describe('sendComposerText', () => {
       notice: { kind: 'empty' },
     });
     expect(send).not.toHaveBeenCalled();
+  });
+});
+
+describe('createComposerStore', () => {
+  it('shares one in-flight send across remounts and clears only after it lands', async () => {
+    const store = createComposerStore();
+    let resolve!: (r: { submitted: boolean }) => void;
+    const send = vi.fn(
+      () => new Promise<{ submitted: boolean }>((r) => (resolve = r))
+    );
+    store.setText('ws', 'hello');
+    const first = store.submit('ws', send);
+    // A remounted composer reads the same state and cannot send again.
+    expect(store.get('ws')).toMatchObject({ text: 'hello', sending: true });
+    await store.submit('ws', send);
+    expect(send).toHaveBeenCalledTimes(1);
+    resolve({ submitted: true });
+    await first;
+    expect(store.get('ws')).toEqual({ text: '', sending: false, notice: null });
+  });
+
+  it('keeps the draft and the outcome when the send fails', async () => {
+    const store = createComposerStore();
+    store.setText('ws', 'hello');
+    await store.submit('ws', () => Promise.reject(httpError(409)));
+    expect(store.get('ws')).toEqual({
+      text: 'hello',
+      sending: false,
+      notice: { kind: 'noAgent' },
+    });
+    store.setText('ws', 'hello again');
+    expect(store.get('ws').notice).toBeNull();
+  });
+
+  it('keeps drafts per workspace', () => {
+    const store = createComposerStore();
+    store.setText('a', 'one');
+    store.setText('b', 'two');
+    expect(store.get('a').text).toBe('one');
+    expect(store.get('b').text).toBe('two');
+    store.setText('a', '');
+    expect(store.get('a')).toEqual({ text: '', sending: false, notice: null });
   });
 });
