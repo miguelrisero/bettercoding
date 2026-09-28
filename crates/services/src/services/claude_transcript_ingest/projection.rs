@@ -418,7 +418,9 @@ impl NativeProjection {
         if row.disposition != CliNativeRecordDisposition::Renderable.as_str() {
             return;
         }
-        let Ok(line) = adapt_codex_rollout_line(&row.raw, &row.link_cwd) else {
+        // Only rendering rows are stored, and a paginated rollout's legacy
+        // events never render, so every stored event is rendered here.
+        let Ok(line) = adapt_codex_rollout_line(&row.raw, &row.link_cwd, true) else {
             return;
         };
         let (origin, linked_execution_process_id) = row_origin(row);

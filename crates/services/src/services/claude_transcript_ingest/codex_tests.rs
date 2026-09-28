@@ -44,6 +44,12 @@ const FIXTURE: &str = include_str!(
     "../../../../executors/src/executors/codex/testdata/rollout-0.157.1.redacted.jsonl"
 );
 const FIXTURE_THREAD: &str = "01a0e7f5-9f42-73e0-9b4d-2dfa51b6f868";
+/// A thread the executor's app server started and the TUI resumed, in the
+/// legacy history format; see the adapter tests in the executors crate.
+const LEGACY_FIXTURE: &str = include_str!(
+    "../../../../executors/src/executors/codex/testdata/rollout-0.124.0-legacy.redacted.jsonl"
+);
+const LEGACY_FIXTURE_THREAD: &str = "01a0e90f-8d3b-7e41-89ab-75a0b7eac22b";
 const FIXTURE_ENTRIES: usize = 10;
 
 struct Case {
@@ -839,6 +845,88 @@ async fn fresh_pane_assignment_writes_nothing_for_a_taken_thread_or_released_pan
     );
 }
 
+#[tokio::test]
+async fn a_legacy_history_thread_resumed_in_the_pane_renders_its_cli_turns() {
+    let case = codex_case().await;
+    let created: DateTime<Utc> = "2026-09-28T17:28:25.669Z".parse().unwrap();
+    write_rollout(
+        &rollout_path(&case.root, LEGACY_FIXTURE_THREAD, created),
+        &LEGACY_FIXTURE.replace("/workspace/demo", &case.cwd.to_string_lossy()),
+    );
+    bind_resumed(&case, LEGACY_FIXTURE_THREAD).await;
+    // The chat turn the executor ran before the pane resumed its thread.
+    let chat = executor_run(
+        &case,
+        LEGACY_FIXTURE_THREAD,
+        "2026-09-28 17:28:22.000+00:00",
+        Some("2026-09-28 17:28:33.000+00:00"),
+    )
+    .await;
+
+    reconcile(&case).await;
+
+    let entries = entries(&case).await;
+    let (executor, cli): (Vec<_>, Vec<_>) = entries
+        .iter()
+        .cloned()
+        .partition(|entry| entry.linked_execution_process_id == Some(chat));
+    assert_eq!(
+        texts(&executor),
+        ["Remember the codeword PAPAYA. Reply with just OK."]
+    );
+    assert_eq!(
+        texts(&cli)[..3],
+        [
+            "Also remember the second codeword MANGO. Reply with just OK2.",
+            "OK2",
+            "Use apply_patch to create notes.txt containing the line hello, then run ls and tell me the file count.",
+        ]
+    );
+    assert!(
+        cli.iter()
+            .all(|entry| entry.origin == NativeFeedOrigin::Cli)
+    );
+    let snapshot = case.service.snapshot(case.session.id).await.unwrap();
+    assert_eq!(snapshot.health.unknown_kinds, 0);
+}
+
+#[tokio::test]
+async fn a_paginated_rollout_renders_a_turn_once_when_it_repeats_it_as_legacy_events() {
+    let case = codex_case().await;
+    let at = Utc::now() - chrono::Duration::minutes(1);
+    let thread = thread_id_at(at, 30);
+    let meta = session_meta(&thread, &case.cwd, at, "cli").replace(
+        r#""source":"cli""#,
+        r#""source":"cli","history_mode":"paginated""#,
+    );
+    assert!(meta.contains("paginated"));
+    let legacy = |kind: &str, text: &str| {
+        format!(
+            "{}\n",
+            json!({ "timestamp": stamp(at), "type": "event_msg",
+                    "payload": { "type": kind, "message": text } })
+        )
+    };
+    write_rollout(
+        &rollout_path(&case.root, &thread, at),
+        &[
+            meta,
+            user_turn(&thread, "turn-30", at, "prompt 30"),
+            legacy("user_message", "prompt 30"),
+            legacy("agent_message", "answer to prompt 30"),
+        ]
+        .concat(),
+    );
+    bind_resumed(&case, &thread).await;
+
+    reconcile(&case).await;
+
+    assert_eq!(
+        texts(&entries(&case).await),
+        ["prompt 30", "answer to prompt 30"]
+    );
+}
+
 /// A pane launched to resume `first`, which then switches to `second` inside
 /// the TUI (`/new`), reported by its hook.
 struct SwitchedPane {
@@ -910,7 +998,12 @@ async fn a_thread_switch_inside_the_pane_binds_the_new_thread_and_keeps_the_old(
     );
     assert_eq!(
         texts(&entries(&pane.case).await),
-        ["prompt 20", "answer to prompt 20", "prompt 21", "answer to prompt 21"]
+        [
+            "prompt 20",
+            "answer to prompt 20",
+            "prompt 21",
+            "answer to prompt 21"
+        ]
     );
     // A relaunch resumes the thread the pane ran last.
     assert_eq!(
@@ -950,7 +1043,10 @@ async fn a_thread_switch_to_another_directory_never_binds() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(binding.claude_session_id.as_deref(), Some(pane.first.as_str()));
+    assert_eq!(
+        binding.claude_session_id.as_deref(),
+        Some(pane.first.as_str())
+    );
     assert!(
         ClaudeSessionLink::find(&pane.case.db.pool, &pane.second)
             .await
@@ -979,7 +1075,13 @@ async fn a_thread_switch_never_takes_another_sessions_thread() {
     .await
     .unwrap();
     // The other session's executor ran the thread the pane resumed.
-    let run = executor_run(&pane.case, &pane.second, "2026-09-28 12:00:00.000+00:00", None).await;
+    let run = executor_run(
+        &pane.case,
+        &pane.second,
+        "2026-09-28 12:00:00.000+00:00",
+        None,
+    )
+    .await;
     sqlx::query("UPDATE execution_processes SET session_id = ? WHERE id = ?")
         .bind(other.id)
         .bind(run)
@@ -993,7 +1095,10 @@ async fn a_thread_switch_never_takes_another_sessions_thread() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(binding.claude_session_id.as_deref(), Some(pane.first.as_str()));
+    assert_eq!(
+        binding.claude_session_id.as_deref(),
+        Some(pane.first.as_str())
+    );
     assert!(
         ClaudeSessionLink::find(pool, &pane.second)
             .await

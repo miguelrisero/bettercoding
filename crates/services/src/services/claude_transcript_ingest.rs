@@ -43,7 +43,10 @@ use db::{
 };
 use executors::executors::{
     claude::native::{NativeClaudeDisposition, NativeClaudeSkipReason, adapt_native_claude_line},
-    codex::rollout::{CodexRolloutDisposition, adapt_codex_rollout_line, rollout_thread_id},
+    codex::rollout::{
+        CodexRolloutDisposition, adapt_codex_rollout_line, rollout_has_legacy_history,
+        rollout_thread_id,
+    },
 };
 pub use forks::{NativeForkBranch, NativeForkView};
 use futures::StreamExt;
@@ -355,6 +358,9 @@ pub struct ClaudeTranscriptIngest {
     /// Codex only appends to a rollout; a rewrite that keeps both is caught by
     /// a forced rescan, not by this skip.
     codex_seen: Mutex<HashMap<PathBuf, (i64, Option<i64>)>>,
+    /// Whether each tracked rollout records legacy history, read once from
+    /// its `session_meta`.
+    codex_legacy_history: Mutex<HashMap<PathBuf, bool>>,
     codex_path_cache: RwLock<HashMap<String, PathBuf>>,
     /// Threads a hook asked to import since the last registry pass; each asks
     /// once per pass, so a thread that cannot be bound does not turn every
@@ -475,6 +481,7 @@ impl ClaudeTranscriptIngest {
             codex_sessions_dir: None,
             codex_files: RwLock::new(HashMap::new()),
             codex_seen: Mutex::new(HashMap::new()),
+            codex_legacy_history: Mutex::new(HashMap::new()),
             codex_path_cache: RwLock::new(HashMap::new()),
             codex_nudged: Mutex::new(HashSet::new()),
             registry_nudge: Notify::new(),
@@ -923,6 +930,10 @@ impl ClaudeTranscriptIngest {
             .lock()
             .unwrap()
             .retain(|path, _| codex_desired.contains_key(path));
+        self.codex_legacy_history
+            .lock()
+            .unwrap()
+            .retain(|path, _| codex_desired.contains_key(path));
         self.codex_path_cache
             .write()
             .await
@@ -1295,6 +1306,7 @@ impl ClaudeTranscriptIngest {
 
             let mut records = Vec::new();
             let codex_cwd = context.cwd.to_string_lossy();
+            let legacy_history = is_codex && self.codex_rollout_has_legacy_history(path);
             for complete in &tail.lines {
                 if is_codex {
                     let (record, unknown) = codex_native_record(
@@ -1302,6 +1314,7 @@ impl ClaudeTranscriptIngest {
                         claude_session_id,
                         &complete.raw,
                         &codex_cwd,
+                        legacy_history,
                     );
                     if unknown {
                         self.unknown_kinds.fetch_add(1, Ordering::Relaxed);
@@ -1427,6 +1440,24 @@ impl ClaudeTranscriptIngest {
                 .insert(path.to_path_buf(), (observed_size, observed_mtime_ms));
         }
         Ok(inserted)
+    }
+
+    /// Whether the rollout at `path` records legacy history. Only a definite
+    /// answer is kept; a rollout whose first line cannot be read yet is read
+    /// again on its next import.
+    fn codex_rollout_has_legacy_history(&self, path: &Path) -> bool {
+        if let Some(legacy) = self.codex_legacy_history.lock().unwrap().get(path) {
+            return *legacy;
+        }
+        let Some(legacy) = read_first_line(path).and_then(|line| rollout_has_legacy_history(&line))
+        else {
+            return false;
+        };
+        self.codex_legacy_history
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), legacy);
+        legacy
     }
 
     /// Import every tracked Codex rollout in `dir` that changed since its last
@@ -2082,12 +2113,17 @@ struct CodexSessionMeta {
     started: DateTime<Utc>,
 }
 
-fn codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
+/// A rollout's first line (`session_meta`), read up to a bound.
+fn read_first_line(path: &Path) -> Option<String> {
     let mut first_line = String::new();
     BufReader::new(File::open(path).ok()?.take(CODEX_SESSION_META_READ_LIMIT))
         .read_line(&mut first_line)
         .ok()?;
-    let meta: serde_json::Value = serde_json::from_str(&first_line).ok()?;
+    Some(first_line)
+}
+
+fn codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
+    let meta: serde_json::Value = serde_json::from_str(&read_first_line(path)?).ok()?;
     if meta.get("type")?.as_str()? != "session_meta" {
         return None;
     }
@@ -2117,6 +2153,7 @@ fn codex_native_record(
     thread_id: &str,
     raw: &str,
     cwd: &str,
+    legacy_history: bool,
 ) -> (Option<NewCliNativeRecord>, bool) {
     let unknown = |ts: Option<String>| NewCliNativeRecord {
         line_seq,
@@ -2130,7 +2167,7 @@ fn codex_native_record(
         user_prompt: None,
         recorded_at: None,
     };
-    let Ok(line) = adapt_codex_rollout_line(raw, cwd) else {
+    let Ok(line) = adapt_codex_rollout_line(raw, cwd, legacy_history) else {
         return (Some(unknown(None)), true);
     };
     match line.disposition {
