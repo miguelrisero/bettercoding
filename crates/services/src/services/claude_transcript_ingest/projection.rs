@@ -6,7 +6,7 @@ use std::{
 use db::models::cli_native_record::{CliNativeRecordDisposition, SessionNativeRecord};
 use executors::{
     executors::claude::native::{NativeClaudeNormalizer, adapt_native_claude_line},
-    logs::NormalizedEntry,
+    logs::{NormalizedEntry, NormalizedEntryType},
 };
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -372,7 +372,12 @@ impl NativeProjection {
             .normalizers
             .entry(row.claude_session_id.clone())
             .or_default();
-        for change in normalizer.normalize(&line, &row.dir_path) {
+        for mut change in normalizer.normalize(&line, &row.dir_path) {
+            if matches!(change.entry.entry_type, NormalizedEntryType::UserMessage)
+                && let Some(content) = unwrap_pasted_content(&change.entry.content)
+            {
+                change.entry.content = content;
+            }
             let key = (row.claude_session_id.clone(), change.index);
             if let Some(position) = self.entry_positions.get(&key).copied() {
                 self.entries[position].normalized_entry = change.entry;
@@ -452,6 +457,41 @@ impl NativeProjection {
             }
         }
     }
+}
+
+/// Claude Code writes a multi-line or large bracketed paste (the chat
+/// composer's route into the CLI) into the user turn as
+/// `<pasted_content id="…">\n…\n</pasted_content id="…">`. Chat shows the
+/// pasted text itself; the stored record keeps the wrapper. Returns `None`
+/// when `content` has no complete wrapper.
+fn unwrap_pasted_content(content: &str) -> Option<String> {
+    const OPEN: &str = "<pasted_content id=\"";
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    let mut changed = false;
+    while let Some(start) = rest.find(OPEN) {
+        let after_open = &rest[start + OPEN.len()..];
+        let Some(id_end) = after_open.find("\">") else {
+            break;
+        };
+        let id = &after_open[..id_end];
+        let body_start = &after_open[id_end + 2..];
+        let close = format!("</pasted_content id=\"{id}\">");
+        let Some(close_at) = body_start.find(&close) else {
+            break;
+        };
+        let body = &body_start[..close_at];
+        let body = body.strip_prefix('\n').unwrap_or(body);
+        let body = body.strip_suffix('\n').unwrap_or(body);
+        out.push_str(&rest[..start]);
+        out.push_str(body);
+        rest = &body_start[close_at + close.len()..];
+        changed = true;
+    }
+    changed.then(|| {
+        out.push_str(rest);
+        out
+    })
 }
 
 #[cfg(test)]
@@ -749,6 +789,33 @@ mod tests {
         }
         assert!(saw_replacement, "no sequence replaced an entry in place");
         assert!(saw_fork_change, "no sequence changed the fork topology");
+    }
+
+    #[test]
+    fn pasted_content_wrappers_unwrap_to_the_pasted_text() {
+        assert_eq!(
+            unwrap_pasted_content(
+                "fix this:\n\n<pasted_content id=\"9932\">\nline one\n    indented\n</pasted_content id=\"9932\">\nthanks"
+            )
+            .as_deref(),
+            Some("fix this:\n\nline one\n    indented\nthanks")
+        );
+        assert_eq!(
+            unwrap_pasted_content(
+                "<pasted_content id=\"a1\">\nA\n</pasted_content id=\"a1\"> and <pasted_content id=\"b2\">\nB\n</pasted_content id=\"b2\">"
+            )
+            .as_deref(),
+            Some("A and B")
+        );
+        // A bare mention or an unterminated wrapper is left alone.
+        assert_eq!(
+            unwrap_pasted_content("wraps in `<pasted_content>` tags"),
+            None
+        );
+        assert_eq!(
+            unwrap_pasted_content("<pasted_content id=\"c3\">\nhalf"),
+            None
+        );
     }
 
     #[test]
