@@ -17,6 +17,9 @@ interface CliComposerProps {
 // Unsent drafts per workspace, kept for the page's lifetime so hiding the
 // composer or switching workspaces never discards typed text.
 const drafts = new Map<string, string>();
+// Workspaces with a send in flight. Module-level because a composer remounted
+// mid-send (workspace switched away and back) starts with fresh state.
+const sendsInFlight = new Set<string>();
 
 /**
  * Opt-in text box under the CLI terminal: the text is written locally (no
@@ -37,13 +40,17 @@ export function CliComposer({ workspaceId }: CliComposerProps) {
   const canSend = !sending && text.trim() !== '';
 
   const submit = async () => {
-    if (!canSend) return;
+    if (!canSend || sendsInFlight.has(workspaceId)) return;
+    const sent = text;
+    sendsInFlight.add(workspaceId);
     setSending(true);
-    const result = await sendComposerText(text, (value) =>
+    const result = await sendComposerText(sent, (value) =>
       cliAgentApi.sendText(workspaceId, { text: value })
-    );
+    ).finally(() => sendsInFlight.delete(workspaceId));
     setSending(false);
-    if (result.clear) setText('');
+    // A composer remounted during the send may hold newer text; only the
+    // text this send delivered is cleared.
+    if (result.clear && (drafts.get(workspaceId) ?? '') === sent) setText('');
     setNotice(result.notice);
   };
 
