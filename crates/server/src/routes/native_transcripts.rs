@@ -10,7 +10,7 @@ use deployment::Deployment;
 use serde::Deserialize;
 use services::services::claude_transcript_ingest::{
     ClaudeTranscriptIngest, NativeFeedChange, NativeFeedSnapshot, NativeFeedUpdate,
-    UnassignedCliSession,
+    NativeIngestHealth, UnassignedCliSession,
 };
 use ts_rs::TS;
 use utils::{log_msg::LogMsg, response::ApiResponse};
@@ -76,22 +76,31 @@ async fn stream_native_feed_ws(
     })
 }
 
+/// Send `change` and return the health the client now holds.
 async fn send_change(
     socket: &mut MaybeSignedWebSocket,
     change: &NativeFeedChange,
-) -> anyhow::Result<()> {
+    sent_health: &NativeIngestHealth,
+) -> anyhow::Result<NativeIngestHealth> {
     socket
-        .send(change_message(change)?.to_ws_message_unchecked())
+        .send(change_message(change, sent_health)?.to_ws_message_unchecked())
         .await?;
-    Ok(())
+    Ok(match change {
+        NativeFeedChange::Full(snapshot) => snapshot.health.clone(),
+        NativeFeedChange::Delta { health, .. } => health.clone(),
+    })
 }
 
 /// A full change replaces every top-level field. A delta adds appended
 /// entries at their exact index and replaces changed ones in place, so a
 /// client whose copy has drifted fails to apply it instead of silently
-/// diverging; revision, seq and health are always replaced, and forks only
-/// when they changed.
-fn change_message(change: &NativeFeedChange) -> anyhow::Result<LogMsg> {
+/// diverging. Revision and seq are always replaced; forks only when they
+/// changed; health only in the fields and file entries that differ from
+/// `sent_health`, the health the client already holds.
+fn change_message(
+    change: &NativeFeedChange,
+    sent_health: &NativeIngestHealth,
+) -> anyhow::Result<LogMsg> {
     let (revision, seq, appended_from, appended, replaced, forks, health) = match change {
         NativeFeedChange::Full(snapshot) => return snapshot_message(snapshot),
         NativeFeedChange::Delta {
@@ -133,10 +142,54 @@ fn change_message(change: &NativeFeedChange) -> anyhow::Result<LogMsg> {
     if let Some(forks) = forks {
         ops.push(serde_json::json!({ "op": "replace", "path": "/forks", "value": forks }));
     }
-    ops.push(serde_json::json!({ "op": "replace", "path": "/health", "value": health }));
+    health_ops(sent_health, health, &mut ops)?;
     Ok(LogMsg::JsonPatch(serde_json::from_value(
         serde_json::Value::Array(ops),
     )?))
+}
+
+/// Patch operations turning `sent` into `next`. The file list only grows or
+/// changes in place within one projection, so it is patched per entry; a
+/// shorter list is replaced whole.
+fn health_ops(
+    sent: &NativeIngestHealth,
+    next: &NativeIngestHealth,
+    ops: &mut Vec<serde_json::Value>,
+) -> anyhow::Result<()> {
+    let serde_json::Value::Object(sent) = serde_json::to_value(sent)? else {
+        unreachable!("health serializes to an object")
+    };
+    let serde_json::Value::Object(next) = serde_json::to_value(next)? else {
+        unreachable!("health serializes to an object")
+    };
+    for (field, value) in &next {
+        if sent.get(field) == Some(value) {
+            continue;
+        }
+        match (field.as_str(), sent.get(field), value) {
+            ("files", Some(serde_json::Value::Array(old)), serde_json::Value::Array(new))
+                if new.len() >= old.len() =>
+            {
+                for (index, file) in new.iter().enumerate() {
+                    if old.get(index) == Some(file) {
+                        continue;
+                    }
+                    let op = if index < old.len() { "replace" } else { "add" };
+                    ops.push(serde_json::json!({
+                        "op": op,
+                        "path": format!("/health/files/{index}"),
+                        "value": file,
+                    }));
+                }
+            }
+            _ => ops.push(serde_json::json!({
+                "op": "replace",
+                "path": format!("/health/{field}"),
+                "value": value,
+            })),
+        }
+    }
+    Ok(())
 }
 
 fn snapshot_message(snapshot: &NativeFeedSnapshot) -> anyhow::Result<LogMsg> {
@@ -252,7 +305,7 @@ async fn handle_native_feed_ws(
         .await
         .map_err(anyhow::Error::from)?;
     let (mut last_seq, mut revision) = change_watermarks(&change);
-    send_change(&mut socket, &change).await?;
+    let mut sent_health = send_change(&mut socket, &change, &NativeIngestHealth::default()).await?;
     socket.send(LogMsg::Ready.to_ws_message_unchecked()).await?;
 
     loop {
@@ -296,7 +349,7 @@ async fn handle_native_feed_ws(
                     .map_err(anyhow::Error::from)?;
                 cursor = next_cursor;
                 (last_seq, revision) = change_watermarks(&change);
-                send_change(&mut socket, &change).await?;
+                sent_health = send_change(&mut socket, &change, &sent_health).await?;
             }
             inbound = socket.recv() => {
                 match inbound {
@@ -357,7 +410,6 @@ mod tests {
     use executors::logs::{NormalizedEntry, NormalizedEntryType};
     use services::services::claude_transcript_ingest::{
         NativeFeedEntry, NativeFeedFork, NativeFeedOrigin, NativeFileImportHealth, NativeForkView,
-        NativeIngestHealth,
     };
 
     use super::*;
@@ -458,9 +510,11 @@ mod tests {
             feed_document(&state),
         )];
 
-        // A tool result replaces an entry mid-list while a new one appends.
+        // A tool result replaces an entry mid-list while a new one appends,
+        // and the imported file's timestamp moves.
         state.seq = 3;
         state.entries[0] = feed_entry(1, "tool: done");
+        state.health.files[0].last_import_at = Some("2026-09-28T10:00:00+00:00".to_string());
         state.entries.push(feed_entry(3, "answer"));
         steps.push((
             "append with mid replace",
@@ -476,10 +530,18 @@ mod tests {
             feed_document(&state),
         ));
 
+        // A second transcript file joins and the ingest counted a rescan.
         state.seq = 5;
         state.entries.push(feed_entry(4, "rewound prompt"));
         state.entries.push(feed_entry(5, "rewound answer"));
         state.forks = vec![fork];
+        state.health.rescans = 1;
+        state.health.files.push(NativeFileImportHealth {
+            claude_session_id: "fixture-sid-2".to_string(),
+            file_name: "fixture-sid-2.jsonl".to_string(),
+            generation: 1,
+            last_import_at: None,
+        });
         steps.push((
             "append with fork change",
             NativeFeedChange::Delta {
@@ -510,17 +572,26 @@ mod tests {
         let fixture = serde_json::Value::Array(
             steps
                 .into_iter()
-                .map(|(name, change, expected)| {
-                    let message = change_message(&change).unwrap().to_ws_message_unchecked();
-                    let Message::Text(text) = message else {
-                        panic!("feed messages are text frames");
-                    };
-                    serde_json::json!({
-                        "name": name,
-                        "message": serde_json::from_str::<serde_json::Value>(&text).unwrap(),
-                        "expected": expected,
-                    })
-                })
+                .scan(
+                    NativeIngestHealth::default(),
+                    |sent_health, (name, change, expected)| {
+                        let message = change_message(&change, sent_health)
+                            .unwrap()
+                            .to_ws_message_unchecked();
+                        *sent_health = match &change {
+                            NativeFeedChange::Full(snapshot) => snapshot.health.clone(),
+                            NativeFeedChange::Delta { health, .. } => health.clone(),
+                        };
+                        let Message::Text(text) = message else {
+                            panic!("feed messages are text frames");
+                        };
+                        Some(serde_json::json!({
+                            "name": name,
+                            "message": serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                            "expected": expected,
+                        }))
+                    },
+                )
                 .collect(),
         );
         if std::env::var_os("UPDATE_NATIVE_FEED_FIXTURE").is_some() {

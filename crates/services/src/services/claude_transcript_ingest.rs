@@ -76,8 +76,9 @@ const IMPORT_BATCH_LINE_LIMIT: usize = 256;
 /// writes; one keeps a start-up backfill from monopolising it while live
 /// appends still interleave batch by batch (the semaphore is FIFO).
 const CONCURRENT_IMPORT_BATCHES: usize = 1;
-/// Sessions whose projection is kept for incremental feed updates. A session
-/// with a connected feed is evicted only after its last subscriber leaves.
+/// Sessions whose projection is kept for incremental feed updates. Past the
+/// cap the least recently used session is evicted, preferring ones without a
+/// connected feed; a session is also dropped when its last feed disconnects.
 const PROJECTION_CACHE_CAPACITY: usize = 32;
 
 /// Days an unreachable transcript is kept before retention removes it. `0`
@@ -238,10 +239,13 @@ impl ProjectionCache {
             && let Some(evict) = self
                 .sessions
                 .iter()
-                .filter(|(id, cached)| **id != session_id && cached.subscribers == 0)
-                .min_by_key(|(_, cached)| cached.last_used)
+                .filter(|(id, _)| **id != session_id)
+                // Unsubscribed sessions go first, least recently used first.
+                .min_by_key(|(_, cached)| (cached.subscribers > 0, cached.last_used))
                 .map(|(id, _)| *id)
         {
+            // An evicted session that still has subscribers rebuilds on its
+            // next update; its subscriptions release whatever entry exists.
             self.sessions.remove(&evict);
         }
         cell
@@ -287,6 +291,7 @@ pub enum NativeFeedChange {
 struct ScanCounts {
     directories: u64,
     files: u64,
+    failed_files: u64,
     records: u64,
 }
 
@@ -470,7 +475,8 @@ impl ClaudeTranscriptIngest {
         }
     }
 
-    pub async fn snapshot(
+    #[cfg(test)]
+    async fn snapshot(
         &self,
         session_id: Uuid,
     ) -> Result<NativeFeedSnapshot, ClaudeTranscriptIngestError> {
@@ -509,13 +515,14 @@ impl ClaudeTranscriptIngest {
         let linked_sids =
             ClaudeSessionLink::claude_session_ids_for_session(&self.db.pool, session_id).await?;
 
+        // Any link change rebuilds. A removed link drops rows, and a restored
+        // one brings back outbox rows whose seq can sit below the cached one.
+        // Link mutations outside this service (the CLI launch path) do not
+        // bump the revision, so the link set is checked on every update.
         let mut extended = false;
         if let Some(current) = cached.as_mut()
             && current.projection.revision() == revision
-            && current
-                .linked_sids
-                .iter()
-                .all(|sid| linked_sids.binary_search(sid).is_ok())
+            && current.linked_sids == linked_sids
         {
             let rows = CliNativeRecord::list_for_session_after(
                 &self.db.pool,
@@ -525,7 +532,6 @@ impl ClaudeTranscriptIngest {
             .await?;
             if current.projection.can_extend(&rows) {
                 current.projection.extend(&rows);
-                current.linked_sids = linked_sids.clone();
                 extended = true;
             }
         }
@@ -721,6 +727,7 @@ impl ClaudeTranscriptIngest {
             Ok(counts) => tracing::info!(
                 directories = counts.directories,
                 files = counts.files,
+                failed_files = counts.failed_files,
                 records = counts.records,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "initial CLI transcript backfill finished"
@@ -857,6 +864,7 @@ impl ClaudeTranscriptIngest {
             let scanned = self.scan_directory(&dir, false).await?;
             counts.directories += 1;
             counts.files += scanned.files;
+            counts.failed_files += scanned.failed_files;
             counts.records += scanned.records;
         }
         Ok(counts)
@@ -949,6 +957,7 @@ impl ClaudeTranscriptIngest {
             {
                 Ok(records) => counts.records += records,
                 Err(error) => {
+                    counts.failed_files += 1;
                     tracing::warn!(?error, path = %path.display(), "native transcript import failed")
                 }
             }
@@ -1417,6 +1426,43 @@ impl ClaudeTranscriptIngest {
         }
     }
 
+    /// Bump the revision of every cached session whose link set changed.
+    ///
+    /// Link mutations made outside this service (the CLI launch path) neither
+    /// bump a revision nor notify the publisher, so a connected feed whose
+    /// links moved away would otherwise show the moved turns until its next
+    /// update. Runs on the publisher's safety tick.
+    async fn invalidate_moved_links(&self) {
+        let cells = self
+            .projections
+            .lock()
+            .unwrap()
+            .sessions
+            .iter()
+            .map(|(session_id, cached)| (*session_id, cached.cell.clone()))
+            .collect::<Vec<_>>();
+        for (session_id, cell) in cells {
+            // A feed update holding the cell re-checks links itself.
+            let Ok(cached) = cell.try_lock() else {
+                continue;
+            };
+            let Some(cached_sids) = cached.as_ref().map(|cached| cached.linked_sids.clone()) else {
+                continue;
+            };
+            drop(cached);
+            match ClaudeSessionLink::claude_session_ids_for_session(&self.db.pool, session_id).await
+            {
+                Ok(linked_sids) if linked_sids != cached_sids => {
+                    self.invalidate_revision(session_id).await;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(?error, %session_id, "failed to check native feed links")
+                }
+            }
+        }
+    }
+
     async fn run_publisher(self: Arc<Self>, shutdown: CancellationToken) {
         // Notifications drive ordinary delivery. The slow poll recovers a
         // notification lost to a crash; persisted watermarks keep that safety
@@ -1426,7 +1472,7 @@ impl ClaudeTranscriptIngest {
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
-                _ = safety_interval.tick() => {},
+                _ = safety_interval.tick() => self.invalidate_moved_links().await,
                 _ = self.publisher_notify.notified() => {},
             }
             let maxima = match CliIngestOutbox::session_maxima(&self.db.pool).await {

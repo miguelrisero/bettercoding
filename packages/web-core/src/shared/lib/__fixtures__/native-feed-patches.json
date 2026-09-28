@@ -212,21 +212,12 @@
         },
         {
           "op": "replace",
-          "path": "/health",
+          "path": "/health/files/0",
           "value": {
-            "unknown_kinds": 0,
-            "rescans": 0,
-            "quarantined_files": 0,
-            "watch_degraded": false,
-            "foreign_writer_seen_at": null,
-            "files": [
-              {
-                "claude_session_id": "fixture-sid",
-                "file_name": "fixture-sid.jsonl",
-                "generation": 1,
-                "last_import_at": null
-              }
-            ]
+            "claude_session_id": "fixture-sid",
+            "file_name": "fixture-sid.jsonl",
+            "generation": 1,
+            "last_import_at": "2026-09-28T10:00:00+00:00"
           }
         }
       ]
@@ -308,7 +299,7 @@
             "claude_session_id": "fixture-sid",
             "file_name": "fixture-sid.jsonl",
             "generation": 1,
-            "last_import_at": null
+            "last_import_at": "2026-09-28T10:00:00+00:00"
           }
         ]
       }
@@ -394,21 +385,17 @@
         },
         {
           "op": "replace",
-          "path": "/health",
+          "path": "/health/rescans",
+          "value": 1
+        },
+        {
+          "op": "add",
+          "path": "/health/files/1",
           "value": {
-            "unknown_kinds": 0,
-            "rescans": 0,
-            "quarantined_files": 0,
-            "watch_degraded": false,
-            "foreign_writer_seen_at": null,
-            "files": [
-              {
-                "claude_session_id": "fixture-sid",
-                "file_name": "fixture-sid.jsonl",
-                "generation": 1,
-                "last_import_at": null
-              }
-            ]
+            "claude_session_id": "fixture-sid-2",
+            "file_name": "fixture-sid-2.jsonl",
+            "generation": 1,
+            "last_import_at": null
           }
         }
       ]
@@ -532,7 +519,7 @@
       ],
       "health": {
         "unknown_kinds": 0,
-        "rescans": 0,
+        "rescans": 1,
         "quarantined_files": 0,
         "watch_degraded": false,
         "foreign_writer_seen_at": null,
@@ -540,6 +527,12 @@
           {
             "claude_session_id": "fixture-sid",
             "file_name": "fixture-sid.jsonl",
+            "generation": 1,
+            "last_import_at": "2026-09-28T10:00:00+00:00"
+          },
+          {
+            "claude_session_id": "fixture-sid-2",
+            "file_name": "fixture-sid-2.jsonl",
             "generation": 1,
             "last_import_at": null
           }

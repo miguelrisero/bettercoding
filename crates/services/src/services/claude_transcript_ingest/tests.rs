@@ -2603,8 +2603,8 @@ async fn measure_append_cost(history: i64) -> AppendCost {
 }
 
 /// Per-update work in the append case must follow the appended rows, not the
-/// transcript length: one row read and adapted per appended line, a payload
-/// the size of that line, and no 10x slowdown from 1k to 10k rows of history.
+/// transcript length: at 1k and at 10k rows of history, one row is read and
+/// adapted per appended line and the payload is the size of that line.
 #[tokio::test]
 async fn append_update_cost_scales_with_appended_rows_not_history() {
     let small = measure_append_cost(1_000).await;
@@ -2624,14 +2624,8 @@ async fn append_update_cost_scales_with_appended_rows_not_history() {
     let small_payload = small.payload_bytes.iter().max().unwrap();
     let large_payload = large.payload_bytes.iter().max().unwrap();
     assert!(*large_payload <= small_payload + 16);
-    // A full rebuild is ~10x slower at 10k rows; the incremental path should
-    // stay close to constant. 4x leaves room for scheduler noise.
-    assert!(
-        large.fastest < small.fastest * 4,
-        "10k-row update {:?} vs 1k-row update {:?}",
-        large.fastest,
-        small.fastest
-    );
+    // Wall-clock time is printed, not asserted: the row-visit counter above is
+    // the deterministic form of the same bound.
 }
 
 /// A link moved to another session without a revision bump (the CLI resume
@@ -2667,16 +2661,61 @@ async fn cached_projection_rebuilds_when_a_link_moves_away() {
     )
     .await
     .unwrap();
+    // The publisher's safety tick tells the connected feed to resnapshot.
+    let mut updates = service.subscribe();
+    service.invalidate_moved_links().await;
+    assert!(matches!(
+        updates.try_recv(),
+        Ok(NativeFeedUpdate::RevisionInvalidated { session_id, .. }) if session_id == session.id
+    ));
     let (change, _) = service.feed_since(session.id, Some(cursor)).await.unwrap();
     let NativeFeedChange::Full(snapshot) = change else {
         panic!("rows left the projection, so the consumer needs a snapshot");
     };
+    service.invalidate_moved_links().await;
+    assert!(
+        updates.try_recv().is_err(),
+        "an unchanged link set stays quiet"
+    );
     assert_eq!(snapshot.entries.len(), 3);
     assert!(
         snapshot
             .entries
             .iter()
             .all(|entry| entry.claude_session_id == staying)
+    );
+
+    // Moving the link back restores outbox rows whose seq is below the cached
+    // one; only a rebuild can bring them back.
+    let (_, cursor) = service.feed_since(session.id, None).await.unwrap();
+    ClaudeSessionLink::assign_cli(
+        &db.pool,
+        moving,
+        session.id,
+        workspace.id,
+        "/tmp/native-import-test",
+        ClaudeSessionBoundVia::CliResume,
+    )
+    .await
+    .unwrap();
+    let (change, _) = service.feed_since(session.id, Some(cursor)).await.unwrap();
+    let NativeFeedChange::Full(restored) = change else {
+        panic!("restored rows predate the cursor, so the consumer needs a snapshot");
+    };
+    assert_eq!(restored.entries.len(), 6);
+    assert_eq!(
+        serde_json::to_value(&restored.entries).unwrap(),
+        serde_json::to_value(
+            &super::NativeProjection::build(
+                &CliNativeRecord::list_for_session(&db.pool, session.id)
+                    .await
+                    .unwrap(),
+                restored.revision
+            )
+            .snapshot(restored.seq, Default::default())
+            .entries
+        )
+        .unwrap()
     );
 }
 
@@ -2714,9 +2753,27 @@ async fn projection_cache_is_released_with_its_last_subscriber_and_bounded() {
         let unsubscribed = create_session(&db, workspace.id).await;
         service.feed_since(unsubscribed.id, None).await.unwrap();
     }
-    let cache = service.projections.lock().unwrap();
-    assert_eq!(cache.sessions.len(), super::PROJECTION_CACHE_CAPACITY);
-    assert!(cache.sessions.contains_key(&session.id));
+    {
+        let cache = service.projections.lock().unwrap();
+        assert_eq!(cache.sessions.len(), super::PROJECTION_CACHE_CAPACITY);
+        assert!(
+            cache.sessions.contains_key(&session.id),
+            "unsubscribed sessions are evicted first"
+        );
+    }
+
+    // Connected feeds cannot grow the cache past its cap either.
+    let mut subscriptions = Vec::new();
+    for _ in 0..super::PROJECTION_CACHE_CAPACITY + 5 {
+        let subscribed = create_session(&db, workspace.id).await;
+        subscriptions.push(service.subscribe_feed(subscribed.id));
+        service.feed_since(subscribed.id, None).await.unwrap();
+    }
+    assert_eq!(
+        service.projections.lock().unwrap().sessions.len(),
+        super::PROJECTION_CACHE_CAPACITY
+    );
+    drop(subscriptions);
 }
 
 /// Measures a start-up backfill against a copy of a real database while an
@@ -2782,16 +2839,24 @@ async fn measure_backfill_on_copied_database() {
         .await
         .unwrap();
     let backfill = started.elapsed();
+    let second_pass = service
+        .reconcile_registry(false, CancellationToken::new())
+        .await
+        .unwrap();
     done.cancel();
     let (mut latencies, busy) = load.await.unwrap();
     latencies.sort();
     let percentile = |p: usize| latencies[(latencies.len() * p / 100).min(latencies.len() - 1)];
     println!(
-        "backfill {backfill:?}: {} directories, {} files, {} records; \
+        "backfill {backfill:?}: {} directories, {} files ({} failed), {} records; \
+         second pass: {} failed, {} records; \
          API-shaped requests {} (p50 {:?}, p95 {:?}, max {:?}); SQLITE_BUSY {busy}",
         counts.directories,
         counts.files,
+        counts.failed_files,
         counts.records,
+        second_pass.failed_files,
+        second_pass.records,
         latencies.len(),
         percentile(50),
         percentile(95),
@@ -2815,10 +2880,49 @@ async fn measure_backfill_on_copied_database() {
     let snapshot_bytes = serde_json::to_vec(&snapshot).unwrap().len();
     let started = std::time::Instant::now();
     service.feed_since(largest, Some(cursor)).await.unwrap();
+    let idle = started.elapsed();
+
+    // Replay the session's last ten real rows as appends: fetch the tail as
+    // the feed does, fold it into a projection of everything before it, and
+    // size the delta a socket would send.
+    let all_rows = CliNativeRecord::list_for_session(&db.pool, largest)
+        .await
+        .unwrap();
+    let mut appends = Vec::new();
+    for split in all_rows.len() - 10..all_rows.len() {
+        let mut projection = super::NativeProjection::build(&all_rows[..split], 0);
+        let cursor = projection.cursor();
+        let started = std::time::Instant::now();
+        let tail =
+            CliNativeRecord::list_for_session_after(&db.pool, largest, projection.last_row_seq())
+                .await
+                .unwrap();
+        projection.extend(&tail[..1]);
+        let elapsed = started.elapsed();
+        let delta = projection.delta_since(cursor).unwrap();
+        let bytes = serde_json::to_vec(&delta.appended).unwrap().len()
+            + delta
+                .replaced
+                .iter()
+                .map(|(_, entry)| serde_json::to_vec(entry).unwrap().len())
+                .sum::<usize>();
+        appends.push((
+            elapsed,
+            all_rows[split].raw.len(),
+            bytes,
+            delta.forks_changed,
+        ));
+    }
     println!(
-        "largest session: {rows} rows, {} entries, {snapshot_bytes} snapshot bytes; \
-         full build {full:?}, incremental update {:?}",
+        "largest session: {rows} rows, {} entries, {} forks, {snapshot_bytes} snapshot bytes; \
+         full build {full:?}, idle update {idle:?}",
         snapshot.entries.len(),
-        started.elapsed()
+        snapshot.forks.len(),
     );
+    for (elapsed, raw_bytes, delta_bytes, forks_changed) in appends {
+        println!(
+            "  append: tail query + fold {elapsed:?}, raw line {raw_bytes} B, \
+             delta entries {delta_bytes} B, forks changed {forks_changed}"
+        );
+    }
 }

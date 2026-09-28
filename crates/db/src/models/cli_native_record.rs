@@ -635,7 +635,7 @@ impl CliNativeRecord {
                       f.dir_path,
                       f.file_name,
                       f.generation,
-                      f.last_import_at AS "last_import_at: DateTime<Utc>"
+                      f.last_import_at AS "last_import_at?: DateTime<Utc>"
                FROM cli_native_records r
                JOIN cli_native_files f ON f.id = r.file_id
                JOIN claude_session_links l

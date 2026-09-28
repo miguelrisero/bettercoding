@@ -234,6 +234,10 @@ impl NativeProjection {
             if dag.tracker.is_some() {
                 continue;
             }
+            // ponytail: a file that already has a fork recomputes its fork
+            // view on every append that touches its DAG, O(file) hashing
+            // (~0.2 s at 115k records). Maintain the fork view incrementally
+            // if forked sessions of that size become common.
             let fork = compute_fork_view(&dag.records, dag.leaf_hint.as_deref());
             if fork != dag.fork {
                 dag.fork = fork;

@@ -160,12 +160,21 @@ pub fn compute_fork_view(
 
     let mut branch_data = Vec::new();
     for raw_root_uuid in &branch_roots {
-        let mut stack = vec![(raw_root_uuid.clone(), Vec::<String>::new())];
-        while let Some((uuid, mut raw_path)) = stack.pop() {
-            if raw_path.contains(&uuid) {
+        // Depth-first with one shared path: each stack item records the depth
+        // of its parent's path, so popping it truncates back to that path.
+        // Cloning the path per child made a linear branch quadratic.
+        let mut stack = vec![(raw_root_uuid.clone(), 0usize)];
+        let mut raw_path = Vec::<String>::new();
+        let mut on_path = HashSet::<String>::new();
+        while let Some((uuid, depth)) = stack.pop() {
+            for left in raw_path.drain(depth..) {
+                on_path.remove(&left);
+            }
+            if on_path.contains(&uuid) {
                 continue;
             }
             raw_path.push(uuid.clone());
+            on_path.insert(uuid.clone());
 
             let conversational_children = children
                 .get(&uuid)
@@ -211,7 +220,7 @@ pub fn compute_fork_view(
             }
 
             for child in conversational_children.into_iter().rev() {
-                stack.push((child, raw_path.clone()));
+                stack.push((child, raw_path.len()));
             }
         }
     }
