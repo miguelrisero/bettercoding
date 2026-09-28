@@ -2719,6 +2719,117 @@ async fn cached_projection_rebuilds_when_a_link_moves_away() {
     );
 }
 
+/// A CLI resume that takes a link from another session invalidates both feeds
+/// as it happens, without waiting for the publisher's safety tick.
+#[tokio::test]
+async fn cli_launch_link_move_invalidates_both_feeds_at_once() {
+    let db = test_db().await;
+    let temp = TempDir::new().unwrap();
+    let (workspace, session) = create_workspace_and_session(&db, temp.path()).await;
+    let other_session = create_session(&db, workspace.id).await;
+    let moving = "64646464-6464-4464-8464-646464646464";
+    let staying = "65656565-6565-4565-8565-656565656565";
+    for sid in [moving, staying] {
+        let file = register_native_file(&db, workspace.id, sid).await;
+        ClaudeSessionLink::assign_manual(&db.pool, sid, session.id, "/tmp/native-import-test")
+            .await
+            .unwrap()
+            .unwrap();
+        import_chained(&db, file.id, sid, 0..3).await;
+    }
+    let service = Arc::new(ClaudeTranscriptIngest::new(db.clone(), temp.path().into()));
+    let _subscription = service.subscribe_feed(session.id);
+    let (_, cursor) = service.feed_since(session.id, None).await.unwrap();
+    let mut updates = service.subscribe();
+
+    service
+        .assign_cli_launch(
+            moving,
+            other_session.id,
+            workspace.id,
+            "/tmp/native-import-test",
+        )
+        .await
+        .unwrap();
+
+    let mut invalidated = HashSet::new();
+    while let Ok(update) = updates.try_recv() {
+        if let NativeFeedUpdate::RevisionInvalidated { session_id, .. } = update {
+            invalidated.insert(session_id);
+        }
+    }
+    assert_eq!(
+        invalidated,
+        HashSet::from([session.id, other_session.id]),
+        "both the previous and the new owner resnapshot"
+    );
+    let (change, _) = service.feed_since(session.id, Some(cursor)).await.unwrap();
+    let NativeFeedChange::Full(snapshot) = change else {
+        panic!("rows left the projection, so the consumer needs a snapshot");
+    };
+    assert!(
+        snapshot
+            .entries
+            .iter()
+            .all(|entry| entry.claude_session_id == staying)
+    );
+}
+
+/// The outbox prune holds the write lock for a full-table scan, so the
+/// publisher runs it once at start and then only after a link moves.
+#[tokio::test]
+async fn outbox_prune_runs_only_when_rows_may_be_superseded() {
+    let db = test_db().await;
+    let temp = TempDir::new().unwrap();
+    let (workspace, session) = create_workspace_and_session(&db, temp.path()).await;
+    let other_session = create_session(&db, workspace.id).await;
+    let sid = "67676767-6767-4767-8767-676767676767";
+    let file = register_native_file(&db, workspace.id, sid).await;
+    ClaudeSessionLink::assign_manual(&db.pool, sid, session.id, "/tmp/native-import-test")
+        .await
+        .unwrap()
+        .unwrap();
+    import_chained(&db, file.id, sid, 0..3).await;
+    let outbox_rows = |session_id: Uuid| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM cli_ingest_outbox WHERE session_id = ?",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let service = ClaudeTranscriptIngest::new(db.clone(), temp.path().into());
+    service.prune_outbox_if_pending().await;
+    assert_eq!(outbox_rows(session.id).await, 3);
+
+    // A link moved behind the service's back leaves the flag clear.
+    ClaudeSessionLink::assign_cli(
+        &db.pool,
+        sid,
+        other_session.id,
+        workspace.id,
+        "/tmp/native-import-test",
+        ClaudeSessionBoundVia::CliResume,
+    )
+    .await
+    .unwrap();
+    service.prune_outbox_if_pending().await;
+    assert_eq!(outbox_rows(session.id).await, 3, "no prune without a move");
+
+    // A move through the service sets it.
+    service
+        .assign_cli_launch(sid, session.id, workspace.id, "/tmp/native-import-test")
+        .await
+        .unwrap();
+    service.prune_outbox_if_pending().await;
+    assert_eq!(outbox_rows(other_session.id).await, 0);
+    assert_eq!(outbox_rows(session.id).await, 3);
+}
+
 #[tokio::test]
 async fn projection_cache_is_released_with_its_last_subscriber_and_bounded() {
     let db = test_db().await;

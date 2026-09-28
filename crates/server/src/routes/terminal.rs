@@ -944,8 +944,23 @@ async fn register_cli_launch(
         registration.bound_via,
     )
     .await?;
-    if let Some(sid) = registration.claude_session_id.as_deref()
-        && let Err(error) = ClaudeSessionLink::assign_cli(
+    let Some(sid) = registration.claude_session_id.as_deref() else {
+        return Ok(());
+    };
+    // The ingest service, when running, bumps the feed revisions of both the
+    // new and the previous owner so connected chat feeds rebuild now.
+    let assigned = match deployment.claude_transcript_ingest() {
+        Some(ingest) => {
+            ingest
+                .assign_cli_launch(
+                    sid,
+                    registration.session_id,
+                    registration.workspace_id,
+                    &registration.cwd,
+                )
+                .await
+        }
+        None => ClaudeSessionLink::assign_cli(
             &deployment.db().pool,
             sid,
             registration.session_id,
@@ -954,7 +969,9 @@ async fn register_cli_launch(
             ClaudeSessionBoundVia::CliResume,
         )
         .await
-    {
+        .map(|_| ()),
+    };
+    if let Err(error) = assigned {
         let _ = CliPaneBinding::release(&deployment.db().pool, binding.id).await;
         return Err(error.into());
     }

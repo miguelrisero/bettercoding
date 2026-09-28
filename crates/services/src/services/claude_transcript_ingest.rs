@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -373,6 +373,10 @@ pub struct ClaudeTranscriptIngest {
     revisions: RwLock<HashMap<Uuid, u64>>,
     feed_updates: broadcast::Sender<NativeFeedUpdate>,
     publisher_notify: Notify,
+    /// Set when outbox rows may have been superseded: a link moved or a file
+    /// generation was replaced. The prune scans the whole outbox under the
+    /// write lock, so the publisher runs it only when this is set.
+    outbox_prune_pending: AtomicBool,
     projections: Mutex<ProjectionCache>,
     import_permits: Semaphore,
     #[cfg(test)]
@@ -486,6 +490,8 @@ impl ClaudeTranscriptIngest {
             revisions: RwLock::new(HashMap::new()),
             feed_updates,
             publisher_notify: Notify::new(),
+            // Rows superseded before a restart are pruned on the first pass.
+            outbox_prune_pending: AtomicBool::new(true),
             projections: Mutex::new(ProjectionCache::default()),
             import_permits: Semaphore::new(CONCURRENT_IMPORT_BATCHES),
             #[cfg(test)]
@@ -762,6 +768,30 @@ impl ClaudeTranscriptIngest {
             self.process_native_path(&path, &context, false).await?;
         }
         self.publisher_notify.notify_one();
+        Ok(())
+    }
+
+    /// Link the Claude session a CLI launch resumes to `session_id`.
+    ///
+    /// A resume can take the link from another session, so both sides get a
+    /// new revision here and connected feeds resnapshot at once.
+    pub async fn assign_cli_launch(
+        &self,
+        claude_session_id: &str,
+        session_id: Uuid,
+        workspace_id: Uuid,
+        cwd: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mutation = ClaudeSessionLink::assign_cli(
+            &self.db.pool,
+            claude_session_id,
+            session_id,
+            workspace_id,
+            cwd,
+            db::models::claude_session_link::ClaudeSessionBoundVia::CliResume,
+        )
+        .await?;
+        self.apply_link_mutation(&mutation).await;
         Ok(())
     }
 
@@ -1357,6 +1387,7 @@ impl ClaudeTranscriptIngest {
                     .await?;
                 native_file = replacement.file;
                 activate_replacement = false;
+                self.outbox_prune_pending.store(true, Ordering::Relaxed);
                 self.rescans.fetch_add(1, Ordering::Relaxed);
                 if let Some(link) = &link {
                     // The replacement is committed and visible before its
@@ -1689,6 +1720,7 @@ impl ClaudeTranscriptIngest {
         if !mutation.session_changed() {
             return;
         }
+        self.outbox_prune_pending.store(true, Ordering::Relaxed);
         if let Some(previous_session_id) = mutation.previous_session_id {
             self.invalidate_revision(previous_session_id).await;
         }
@@ -1793,10 +1825,10 @@ impl ClaudeTranscriptIngest {
 
     /// Bump the revision of every cached session whose link set changed.
     ///
-    /// Link mutations made outside this service (the CLI launch path) neither
-    /// bump a revision nor notify the publisher, so a connected feed whose
-    /// links moved away would otherwise show the moved turns until its next
-    /// update. Runs on the publisher's safety tick.
+    /// Link mutations go through this service and bump revisions as they
+    /// happen. This safety net catches a link changed by any other writer,
+    /// which would otherwise leave a connected feed showing moved turns until
+    /// its next update. Runs on the publisher's safety tick.
     async fn invalidate_moved_links(&self) {
         let cells = self
             .projections
@@ -1818,6 +1850,7 @@ impl ClaudeTranscriptIngest {
             match ClaudeSessionLink::claude_session_ids_for_session(&self.db.pool, session_id).await
             {
                 Ok(linked_sids) if linked_sids != cached_sids => {
+                    self.outbox_prune_pending.store(true, Ordering::Relaxed);
                     self.invalidate_revision(session_id).await;
                 }
                 Ok(_) => {}
@@ -1869,12 +1902,20 @@ impl ClaudeTranscriptIngest {
                     );
                 }
             }
-            if let Err(error) = CliIngestOutbox::prune_superseded(&self.db.pool).await {
-                tracing::warn!(
-                    ?error,
-                    "failed to prune superseded native transcript outbox rows"
-                );
-            }
+            self.prune_outbox_if_pending().await;
+        }
+    }
+
+    async fn prune_outbox_if_pending(&self) {
+        if !self.outbox_prune_pending.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        if let Err(error) = CliIngestOutbox::prune_superseded(&self.db.pool).await {
+            self.outbox_prune_pending.store(true, Ordering::Relaxed);
+            tracing::warn!(
+                ?error,
+                "failed to prune superseded native transcript outbox rows"
+            );
         }
     }
 }
