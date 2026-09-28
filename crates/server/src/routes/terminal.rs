@@ -14,7 +14,6 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use db::models::{
     claude_session_link::{ClaudeSessionBoundVia, ClaudeSessionLink},
     cli_pane_binding::{CliPaneBinding, CliPaneBoundVia},
-    coding_agent_turn::CodingAgentTurn,
     execution_process::ExecutionProcess,
     session::Session,
     workspace::Workspace,
@@ -416,17 +415,7 @@ async fn terminal_ws(
                                 true
                             }
                         };
-                    // A Codex pane may have switched threads inside the TUI
-                    // since the executor last ran; resume the one it ran last.
-                    let sid = match CliPaneBinding::latest_codex_pane_thread(pool, s.id).await? {
-                        Some(thread) => Some(thread),
-                        None => CodingAgentTurn::find_latest_session_info(pool, s.id)
-                            .await?
-                            .map(|info| info.session_id)
-                            .or(ClaudeSessionLink::find_latest_for_session(pool, s.id)
-                                .await?
-                                .map(|link| link.claude_session_id)),
-                    };
+                    let sid = CliPaneBinding::resume_session_id(pool, s.id).await?;
                     (executor_active, sid)
                 }
                 None => (false, None),

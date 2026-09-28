@@ -21,11 +21,6 @@ use uuid::Uuid;
 const APP_SERVER_TIMEOUT: Duration = Duration::from_secs(20);
 const SET_NAME_REQUEST_ID: u64 = 2;
 
-/// Codex thread ids are UUIDv7; Claude session ids are v4.
-pub fn is_codex_thread_id(sid: &str) -> bool {
-    Uuid::parse_str(sid).is_ok_and(|id| id.get_version_num() == 7)
-}
-
 pub async fn propagate_codex_rename(
     workspace_id: Uuid,
     thread_id: &str,
@@ -105,13 +100,6 @@ fn set_name_outcome(line: &str) -> Option<Result<(), String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_codex_thread_ids_take_the_codex_path() {
-        assert!(is_codex_thread_id("01a0e8fe-4c9e-7d10-8700-c7d71eea010f"));
-        assert!(!is_codex_thread_id("55be7663-103d-4f5f-bcaf-f30fc8b0249a"));
-        assert!(!is_codex_thread_id("../01a0e8fe"));
-    }
 
     #[test]
     fn only_the_set_name_response_settles_the_exchange() {

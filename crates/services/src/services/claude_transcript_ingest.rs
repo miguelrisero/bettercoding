@@ -35,7 +35,7 @@ use db::{
             CliNativeRecord, CliNativeRecordDisposition, ImportedCursor, NativeImportContext,
             NewCliNativeRecord,
         },
-        cli_pane_binding::{CliPaneBinding, CliPaneBoundVia},
+        cli_pane_binding::{CliPaneBinding, CliPaneBoundVia, is_codex_thread_id},
         session::Session,
         workspace::{Workspace, WorkspaceError},
         workspace_cli_activity::WorkspaceCliActivity,
@@ -2074,11 +2074,6 @@ fn verify_last_line_hash(
     let mut bytes = vec![0; length];
     file.read_exact(&mut bytes)?;
     Ok(Some(hash_bytes(&bytes)))
-}
-
-/// Codex thread ids are UUIDv7; Claude session ids are v4.
-fn is_codex_thread_id(sid: &str) -> bool {
-    Uuid::parse_str(sid).is_ok_and(|id| id.get_version_num() == 7)
 }
 
 fn codex_thread_created_at(sid: &str) -> Option<DateTime<Utc>> {

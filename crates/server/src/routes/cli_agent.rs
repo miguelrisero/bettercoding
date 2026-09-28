@@ -21,8 +21,7 @@ use axum::{
     routing::{get, post},
 };
 use db::models::{
-    claude_session_link::ClaudeSessionLink, cli_pane_binding::CliPaneBinding,
-    coding_agent_turn::CodingAgentTurn, execution_process::ExecutionProcess, session::Session,
+    cli_pane_binding::CliPaneBinding, execution_process::ExecutionProcess, session::Session,
     workspace::Workspace,
 };
 use deployment::Deployment;
@@ -144,17 +143,7 @@ async fn cli_context(
                     tracing::warn!(?error, session_id = %s.id, "restart writer guard failed closed");
                     true
                 });
-            // A Codex pane may have switched threads inside the TUI
-            // since the executor last ran; resume the one it ran last.
-            let sid = match CliPaneBinding::latest_codex_pane_thread(pool, s.id).await? {
-                Some(thread) => Some(thread),
-                None => CodingAgentTurn::find_latest_session_info(pool, s.id)
-                    .await?
-                    .map(|info| info.session_id)
-                    .or(ClaudeSessionLink::find_latest_for_session(pool, s.id)
-                        .await?
-                        .map(|link| link.claude_session_id)),
-            };
+            let sid = CliPaneBinding::resume_session_id(pool, s.id).await?;
             (active, sid)
         }
         None => (false, None),

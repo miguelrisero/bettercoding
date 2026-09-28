@@ -26,8 +26,8 @@
 use std::path::{Path, PathBuf};
 
 use db::models::{
-    claude_session_link::ClaudeSessionLink, cli_pane_binding::CliPaneBinding,
-    coding_agent_turn::CodingAgentTurn, session::Session,
+    cli_pane_binding::{CliPaneBinding, is_codex_thread_id},
+    session::Session,
 };
 use local_deployment::pty::{
     CliSendResult, cli_pane_agent_running_at, latest_cli_client_activity, locate_cli_tmux_target,
@@ -36,7 +36,7 @@ use local_deployment::pty::{
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use super::codex_rename::{is_codex_thread_id, propagate_codex_rename};
+use super::codex_rename::propagate_codex_rename;
 
 /// How long the newest tmux client activity on the workspace's CLI socket must
 /// be old before `/rename` keystrokes may be injected. The gate is
@@ -101,25 +101,11 @@ async fn propagate_rename(pool: &SqlitePool, workspace_id: Uuid, name: &str) -> 
         return Ok(()); // no session: nothing running to rename
     };
 
-    // Same precedence as the attach path (cli_agent.rs): the thread a Codex
-    // pane ran last, then executor-reported turns, then the CLI binding.
-    // Neither is guaranteed to exist.
-    let codex_pane_thread = CliPaneBinding::latest_codex_pane_thread(pool, session.id)
+    // The session a CLI launch would resume (terminal.rs, cli_agent.rs);
+    // none is guaranteed to exist.
+    let claude_session_id = CliPaneBinding::resume_session_id(pool, session.id)
         .await
         .map_err(|e| e.to_string())?;
-    let claude_session_id = match codex_pane_thread {
-        Some(thread) => Some(thread),
-        None => match CodingAgentTurn::find_latest_session_info(pool, session.id)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            Some(info) => Some(info.session_id),
-            None => ClaudeSessionLink::find_latest_for_session(pool, session.id)
-                .await
-                .map_err(|e| e.to_string())?
-                .map(|link| link.claude_session_id),
-        },
-    };
     let Some(claude_session_id) = claude_session_id else {
         return Ok(()); // no claude conversation bound: nothing to rename
     };

@@ -7,7 +7,13 @@ use uuid::Uuid;
 use super::{
     claude_session_link::{ClaudeSessionLink, ClaudeSessionLinkMutation},
     cli_ingest_outbox::CliIngestOutbox,
+    coding_agent_turn::CodingAgentTurn,
 };
+
+/// Codex thread ids are UUIDv7; Claude session ids are v4.
+pub fn is_codex_thread_id(sid: &str) -> bool {
+    Uuid::parse_str(sid).is_ok_and(|id| id.get_version_num() == 7)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, TS)]
 #[sqlx(type_name = "TEXT", rename_all = "kebab-case")]
@@ -162,7 +168,25 @@ impl CliPaneBinding {
         .bind(session_id)
         .fetch_optional(pool)
         .await?;
-        Ok(sid.filter(|sid| Uuid::parse_str(sid).is_ok_and(|id| id.get_version_num() == 7)))
+        Ok(sid.filter(|sid| is_codex_thread_id(sid)))
+    }
+
+    /// The native session a CLI launch of `session_id` resumes: the Codex
+    /// thread its pane ran last, then the executor's latest turn, then the
+    /// session's latest CLI link.
+    pub async fn resume_session_id(
+        pool: &SqlitePool,
+        session_id: Uuid,
+    ) -> Result<Option<String>, sqlx::Error> {
+        if let Some(thread) = Self::latest_codex_pane_thread(pool, session_id).await? {
+            return Ok(Some(thread));
+        }
+        if let Some(info) = CodingAgentTurn::find_latest_session_info(pool, session_id).await? {
+            return Ok(Some(info.session_id));
+        }
+        Ok(ClaudeSessionLink::find_latest_for_session(pool, session_id)
+            .await?
+            .map(|link| link.claude_session_id))
     }
 
     /// Link the native session a pane runs to the pane's app session and
@@ -197,7 +221,8 @@ impl CliPaneBinding {
         let run_by_another_session: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM coding_agent_turns cat \
                  JOIN execution_processes ep ON ep.id = cat.execution_process_id \
-                 WHERE cat.agent_session_id = ? AND ep.session_id != ?)",
+                 WHERE cat.agent_session_id = ? AND ep.session_id != ? \
+                   AND ep.dropped = FALSE)",
         )
         .bind(claude_session_id)
         .bind(session_id)
