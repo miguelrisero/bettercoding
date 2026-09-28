@@ -83,6 +83,7 @@ export const useJsonPatchWsStream = <T extends object>(
         retryTimerRef.current = null;
       }
       retryAttemptsRef.current = 0;
+      resyncFailuresRef.current = 0;
       finishedRef.current = false;
       setData(undefined);
       setIsConnected(false);

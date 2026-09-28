@@ -2773,6 +2773,37 @@ async fn projection_cache_is_released_with_its_last_subscriber_and_bounded() {
         service.projections.lock().unwrap().sessions.len(),
         super::PROJECTION_CACHE_CAPACITY
     );
+
+    // An evicted session keeps its claims: two sockets on it, one leaves, and
+    // the projection rebuilt for the other stays cached.
+    let evicted = create_session(&db, workspace.id).await;
+    let first_socket = service.subscribe_feed(evicted.id);
+    let second_socket = service.subscribe_feed(evicted.id);
+    service
+        .projections
+        .lock()
+        .unwrap()
+        .sessions
+        .remove(&evicted.id);
+    service.feed_since(evicted.id, None).await.unwrap();
+    drop(first_socket);
+    assert!(
+        service
+            .projections
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key(&evicted.id)
+    );
+    drop(second_socket);
+    assert!(
+        !service
+            .projections
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key(&evicted.id)
+    );
     drop(subscriptions);
 }
 

@@ -211,13 +211,15 @@ type ProjectionCell = Arc<tokio::sync::Mutex<Option<SessionProjection>>>;
 
 struct CachedProjection {
     cell: ProjectionCell,
-    subscribers: usize,
     last_used: u64,
 }
 
 #[derive(Default)]
 struct ProjectionCache {
     sessions: HashMap<Uuid, CachedProjection>,
+    /// Live feed claims per session. Kept apart from `sessions` so evicting a
+    /// projection never loses a claim.
+    subscribers: HashMap<Uuid, usize>,
     clock: u64,
 }
 
@@ -230,7 +232,6 @@ impl ProjectionCache {
             .entry(session_id)
             .or_insert_with(|| CachedProjection {
                 cell: Arc::default(),
-                subscribers: 0,
                 last_used: clock,
             });
         cached.last_used = clock;
@@ -241,11 +242,11 @@ impl ProjectionCache {
                 .iter()
                 .filter(|(id, _)| **id != session_id)
                 // Unsubscribed sessions go first, least recently used first.
-                .min_by_key(|(_, cached)| (cached.subscribers > 0, cached.last_used))
+                .min_by_key(|(id, cached)| (self.subscribers.contains_key(*id), cached.last_used))
                 .map(|(id, _)| *id)
         {
             // An evicted session that still has subscribers rebuilds on its
-            // next update; its subscriptions release whatever entry exists.
+            // next update.
             self.sessions.remove(&evict);
         }
         cell
@@ -262,11 +263,13 @@ pub struct NativeFeedSubscription {
 impl Drop for NativeFeedSubscription {
     fn drop(&mut self) {
         let mut cache = self.ingest.projections.lock().unwrap();
-        if let Some(cached) = cache.sessions.get_mut(&self.session_id) {
-            cached.subscribers = cached.subscribers.saturating_sub(1);
-            if cached.subscribers == 0 {
-                cache.sessions.remove(&self.session_id);
-            }
+        let Some(claims) = cache.subscribers.get_mut(&self.session_id) else {
+            return;
+        };
+        *claims -= 1;
+        if *claims == 0 {
+            cache.subscribers.remove(&self.session_id);
+            cache.sessions.remove(&self.session_id);
         }
     }
 }
@@ -465,10 +468,8 @@ impl ClaudeTranscriptIngest {
     /// Keep `session_id`'s projection cached while the returned claim lives.
     pub fn subscribe_feed(self: &Arc<Self>, session_id: Uuid) -> NativeFeedSubscription {
         let mut cache = self.projections.lock().unwrap();
+        *cache.subscribers.entry(session_id).or_default() += 1;
         cache.cell(session_id);
-        if let Some(cached) = cache.sessions.get_mut(&session_id) {
-            cached.subscribers += 1;
-        }
         NativeFeedSubscription {
             ingest: self.clone(),
             session_id,
