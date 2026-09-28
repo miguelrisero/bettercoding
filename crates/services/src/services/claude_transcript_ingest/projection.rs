@@ -5,7 +5,10 @@ use std::{
 
 use db::models::cli_native_record::{CliNativeRecordDisposition, SessionNativeRecord};
 use executors::{
-    executors::claude::native::{NativeClaudeNormalizer, adapt_native_claude_line},
+    executors::{
+        claude::native::{NativeClaudeNormalizer, adapt_native_claude_line},
+        codex::rollout::{adapt_codex_rollout_line, rollout_thread_id},
+    },
     logs::{NormalizedEntry, NormalizedEntryType},
 };
 use serde::{Deserialize, Serialize};
@@ -325,6 +328,10 @@ impl NativeProjection {
             }
         }
 
+        if rollout_thread_id(&row.file_name).is_some() {
+            self.fold_codex_row(row);
+            return;
+        }
         if row.disposition == CliNativeRecordDisposition::Sidechain.as_str() {
             return;
         }
@@ -387,18 +394,7 @@ impl NativeProjection {
                 continue;
             }
 
-            let linked_execution_process_id = row
-                .linked_execution_process_id
-                .or(row.bound_turn_execution_process_id);
-            let origin = if row.linked_execution_process_id.is_some() {
-                NativeFeedOrigin::Executor
-            } else if row.bound_turn_execution_process_id.is_some()
-                || row.bound_queued_message_id.is_some()
-            {
-                NativeFeedOrigin::App
-            } else {
-                NativeFeedOrigin::Cli
-            };
+            let (origin, linked_execution_process_id) = row_origin(row);
             self.entry_positions.insert(key, self.entries.len());
             self.entries.push(NativeFeedEntry {
                 normalized_entry: change.entry,
@@ -410,6 +406,33 @@ impl NativeProjection {
                 linked_execution_process_id,
                 git_branch: metadata.git_branch.clone(),
                 version: metadata.version.clone(),
+                branch: None,
+                seq: row.seq,
+            });
+        }
+    }
+
+    /// A Codex rollout row: every completed item appends its entries once, and
+    /// a rollout has no fork DAG, so it never touches forks or branches.
+    fn fold_codex_row(&mut self, row: &SessionNativeRecord) {
+        if row.disposition != CliNativeRecordDisposition::Renderable.as_str() {
+            return;
+        }
+        let Ok(line) = adapt_codex_rollout_line(&row.raw, &row.link_cwd) else {
+            return;
+        };
+        let (origin, linked_execution_process_id) = row_origin(row);
+        for normalized_entry in line.entries {
+            self.entries.push(NativeFeedEntry {
+                normalized_entry,
+                claude_session_id: row.claude_session_id.clone(),
+                uuid: line.item_id.clone(),
+                parent_uuid: line.turn_id.clone(),
+                ts: line.timestamp.clone(),
+                origin,
+                linked_execution_process_id,
+                git_branch: None,
+                version: None,
                 branch: None,
                 seq: row.seq,
             });
@@ -457,6 +480,22 @@ impl NativeProjection {
             }
         }
     }
+}
+
+/// Who wrote a native row, and the executor process it belongs to if any.
+fn row_origin(row: &SessionNativeRecord) -> (NativeFeedOrigin, Option<Uuid>) {
+    let linked = row
+        .linked_execution_process_id
+        .or(row.bound_turn_execution_process_id);
+    let origin = if row.linked_execution_process_id.is_some() {
+        NativeFeedOrigin::Executor
+    } else if row.bound_turn_execution_process_id.is_some() || row.bound_queued_message_id.is_some()
+    {
+        NativeFeedOrigin::App
+    } else {
+        NativeFeedOrigin::Cli
+    };
+    (origin, linked)
 }
 
 /// Claude Code writes a multi-line or large bracketed paste (the chat
@@ -684,6 +723,7 @@ mod tests {
                 file_name: format!("{}.jsonl", line.sid),
                 generation: 1,
                 last_import_at: None,
+                link_cwd: "/tmp/native-projection-test".to_string(),
             });
             *line_seq += 1;
         }

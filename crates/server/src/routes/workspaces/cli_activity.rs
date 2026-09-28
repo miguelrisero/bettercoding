@@ -9,6 +9,7 @@ use db::models::workspace_cli_activity::{
     reduce_hook,
 };
 use deployment::Deployment;
+use executors::executors::codex::rollout::rollout_thread_id;
 use serde::Deserialize;
 use ts_rs::TS;
 use utils::response::ApiResponse;
@@ -77,6 +78,18 @@ pub async fn report_cli_activity(
             .await
     {
         tracing::debug!(?error, %workspace_id, "failed to record a CLI hook report");
+    }
+
+    // A CLI-mode Codex names its rollout; import a thread the feed does not
+    // track yet without waiting for the next registry pass.
+    let reports_rollout = next
+        .transcript_path
+        .as_deref()
+        .and_then(|path| std::path::Path::new(path).file_name()?.to_str())
+        .and_then(rollout_thread_id)
+        .is_some();
+    if reports_rollout && let Some(ingest) = deployment.claude_transcript_ingest() {
+        ingest.request_codex_import(&next.agent_session_id).await;
     }
 
     StatusCode::NO_CONTENT

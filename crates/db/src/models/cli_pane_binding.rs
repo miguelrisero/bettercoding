@@ -113,6 +113,21 @@ impl CliPaneBinding {
         sqlx::query_as::<_, Self>(&sql).fetch_all(pool).await
     }
 
+    /// Every native session id a CLI pane in `workspace_id` was ever bound
+    /// to, released bindings included.
+    pub async fn bound_session_ids_for_workspace(
+        pool: &SqlitePool,
+        workspace_id: Uuid,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT claude_session_id FROM cli_pane_bindings \
+             WHERE workspace_id = ? AND claude_session_id IS NOT NULL",
+        )
+        .bind(workspace_id)
+        .fetch_all(pool)
+        .await
+    }
+
     pub async fn bind_discovered_sid(
         pool: &SqlitePool,
         id: Uuid,

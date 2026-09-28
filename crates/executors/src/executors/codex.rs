@@ -2,6 +2,7 @@ pub mod client;
 pub mod jsonrpc;
 pub mod normalize_logs;
 pub mod review;
+pub mod rollout;
 pub mod slash_commands;
 use std::{
     collections::HashMap,
