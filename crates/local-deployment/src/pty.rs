@@ -1713,10 +1713,11 @@ pub async fn cli_pane_agent_running_at(target: &CliTmuxTarget, program: &str) ->
 /// of every shipped `interactive_cli_spec`).
 pub const CLI_AGENT_PROGRAMS: &[&str] = &["claude", "codex"];
 
-/// Which of `programs` owns the pane, checked in the given order against ONE
-/// process snapshot. Order matters when several match: an agent can run
-/// another as a tool (claude shelling out to `codex exec`), so callers list
-/// the program they expect first. `None` when the pane can't be read.
+/// Which of `programs` owns the pane, from ONE process snapshot. When several
+/// run (an agent can run another as a tool: claude shelling out to
+/// `codex exec`), the one closest to the pane root wins, since that is the
+/// TUI reading the pane's input; list order breaks ties. `None` when the pane
+/// can't be read.
 pub async fn cli_pane_agent_program_at<'a>(
     target: &CliTmuxTarget,
     programs: &[&'a str],
@@ -1730,10 +1731,30 @@ fn first_program_in_pane_subtree<'a>(
     root_pid: u32,
     programs: &[&'a str],
 ) -> Option<&'a str> {
-    programs
-        .iter()
-        .copied()
-        .find(|program| pane_subtree_has_program(ps_listing, root_pid, program))
+    let (comm_by_pid, children) = parse_ps_tree(ps_listing);
+    // Breadth-first from the pane root, one depth level at a time.
+    let mut level = vec![root_pid];
+    let mut visited = HashSet::new();
+    while !level.is_empty() {
+        level.retain(|pid| visited.insert(*pid));
+        let found = programs.iter().copied().find(|program| {
+            level.iter().any(|pid| {
+                comm_by_pid
+                    .get(pid)
+                    .is_some_and(|comm| comm_matches_program(comm, program))
+            })
+        });
+        if found.is_some() {
+            return found;
+        }
+        level = level
+            .iter()
+            .filter_map(|pid| children.get(pid))
+            .flatten()
+            .copied()
+            .collect();
+    }
+    None
 }
 
 async fn pane_process_listing(target: &CliTmuxTarget) -> Option<(u32, String)> {
@@ -1817,7 +1838,8 @@ fn pane_subtree_has_program(ps_listing: &str, root_pid: u32, program: &str) -> b
     !pane_subtree_program_pids(ps_listing, root_pid, program).is_empty()
 }
 
-fn pane_subtree_program_pids(ps_listing: &str, root_pid: u32, program: &str) -> Vec<u32> {
+/// `ps -eo pid=,ppid=,comm=` snapshot as (comm by pid, children by ppid).
+fn parse_ps_tree(ps_listing: &str) -> (HashMap<u32, &str>, HashMap<u32, Vec<u32>>) {
     let mut comm_by_pid: HashMap<u32, &str> = HashMap::new();
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for line in ps_listing.lines() {
@@ -1839,6 +1861,11 @@ fn pane_subtree_program_pids(ps_listing: &str, root_pid: u32, program: &str) -> 
         comm_by_pid.insert(pid, comm.trim());
         children.entry(ppid).or_default().push(pid);
     }
+    (comm_by_pid, children)
+}
+
+fn pane_subtree_program_pids(ps_listing: &str, root_pid: u32, program: &str) -> Vec<u32> {
+    let (comm_by_pid, children) = parse_ps_tree(ps_listing);
     // Depth-first from the pane root, inclusive. `visited` guards against a
     // malformed snapshot: a real ppid graph is a forest and can't cycle, but a
     // torn read must not spin.
@@ -2155,9 +2182,9 @@ async fn send_cli_keys_locked(target: &CliTmuxTarget, program: &str, text: &str)
         // Claude always enables bracketed paste at its prompt, so the stream
         // carries its own markers and goes out verbatim (`-r` keeps each LF a
         // Ctrl+J instead of tmux's default CR, which would submit the line).
-        paste_via_tmux_buffer(target, &claude_paste_stream(text), &["-r"]).await
+        paste_via_tmux_buffer(target, &claude_paste_stream(text), "-r").await
     } else {
-        paste_via_tmux_buffer(target, text, &["-p"]).await
+        paste_via_tmux_buffer(target, text, "-p").await
     };
     if !delivered {
         return CliSendResult::NotDelivered;
@@ -2233,7 +2260,7 @@ async fn load_cli_tmux_buffer(target: &CliTmuxTarget, buffer: &str, text: &str) 
 
 /// `mode` is `-p` (tmux adds the bracketed-paste markers) or `-r` (payload
 /// sent verbatim, LF kept as LF).
-async fn paste_via_tmux_buffer(target: &CliTmuxTarget, text: &str, mode: &[&str]) -> bool {
+async fn paste_via_tmux_buffer(target: &CliTmuxTarget, text: &str, mode: &str) -> bool {
     // Per-send sequence number on top of the workspace namespace: two
     // concurrent sends to the SAME workspace (e.g. a loop wake-up racing a
     // deferred initial-prompt delivery) must not overwrite each other's buffer
@@ -2247,10 +2274,19 @@ async fn paste_via_tmux_buffer(target: &CliTmuxTarget, text: &str, mode: &[&str]
         return false;
     }
 
-    let mut args = vec!["-L", target.socket.as_str(), "paste-buffer", "-d"];
-    args.extend_from_slice(mode);
-    args.extend(["-b", &buffer, "-t", &target.session_name]);
-    let pasted = run_cli_tmux(&args).await.is_ok();
+    let pasted = run_cli_tmux(&[
+        "-L",
+        &target.socket,
+        "paste-buffer",
+        "-d",
+        mode,
+        "-b",
+        &buffer,
+        "-t",
+        &target.session_name,
+    ])
+    .await
+    .is_ok();
     if !pasted {
         // `-d` only fires on a successful paste; don't leave the staged prompt
         // readable in the server-global buffer list after a failed one.
@@ -4158,8 +4194,9 @@ mod tests {
     #[test]
     fn pane_agent_program_prefers_the_expected_agent_in_list_order() {
         // Real codex 0.157 tree: a bash wrapper execs the node launcher, which
-        // spawns the native `codex`. A claude pane running `codex exec` as a
-        // tool holds both names; the caller's order picks the pane's agent.
+        // spawns the native `codex`. A pane whose agent runs the other as a
+        // tool holds both names; the one nearer the pane root is the pane's
+        // agent whatever the caller's order (it picks the paste protocol).
         let codex_pane = "\
   100     1 sh
   200   100 node
@@ -4185,6 +4222,25 @@ mod tests {
         );
         assert_eq!(
             first_program_in_pane_subtree(claude_running_codex, 100, &["codex", "claude"]),
+            Some("claude")
+        );
+        let codex_running_claude = "\
+  100     1 sh
+  200   100 node
+  300   200 codex
+  400   300 claude
+";
+        assert_eq!(
+            first_program_in_pane_subtree(codex_running_claude, 100, CLI_AGENT_PROGRAMS),
+            Some("codex")
+        );
+        let both_at_root_depth = "\
+  100     1 sh
+  200   100 codex
+  300   100 claude
+";
+        assert_eq!(
+            first_program_in_pane_subtree(both_at_root_depth, 100, &["codex", "claude"]),
             Some("codex")
         );
         assert_eq!(
