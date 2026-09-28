@@ -1202,8 +1202,8 @@ impl ClaudeTranscriptIngest {
             )
             .await?
         };
-        // Fresh Codex panes are bound during registry reconciliation; this
-        // probe only recognises a Claude process.
+        // Fresh Codex panes are bound during registry reconciliation;
+        // cli-fresh auto-binding claims Claude transcripts for Claude panes.
         if link.is_none() && !is_codex {
             link = self
                 .try_auto_bind_cli_fresh(claude_session_id, context)

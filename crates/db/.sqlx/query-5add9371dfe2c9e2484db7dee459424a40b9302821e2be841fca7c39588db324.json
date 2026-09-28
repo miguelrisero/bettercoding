@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id AS \"id!: Uuid\"\n                               FROM session_queued_messages\n                               WHERE session_id = $1\n                                 AND (\n                                     state IN ('pasting', 'pasted')\n                                     OR (\n                                         state = 'queued'\n                                         AND failure_reason = $6\n                                     )\n                                 )\n                                 AND (prompt = $2 OR trim(prompt, char(9, 10, 13, 32)) = $2)\n                                 AND (claude_session_id IS NULL OR claude_session_id = $3)\n                                 AND pasted_at IS NOT NULL\n                                 AND julianday(pasted_at) >= julianday($4)\n                                 AND julianday(pasted_at) <= julianday($5)\n                               ORDER BY pasted_at DESC\n                               LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "5add9371dfe2c9e2484db7dee459424a40b9302821e2be841fca7c39588db324"
+}

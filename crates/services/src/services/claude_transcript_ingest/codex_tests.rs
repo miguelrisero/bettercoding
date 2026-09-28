@@ -1095,16 +1095,19 @@ async fn a_codex_turn_written_outside_the_app_pane_marks_a_foreign_writer() {
     assert!(!codex_foreign_writer_flagged(true).await);
 }
 
-#[tokio::test]
-async fn a_codex_turn_acknowledges_the_collaboration_paste_of_its_prompt() {
+/// State of a collaboration paste of `pasted` after the pane records `typed`.
+async fn codex_paste_state(
+    pasted: &str,
+    typed: &str,
+) -> db::models::session_queued_message::QueuedMessageState {
     use db::models::session_queued_message::{
-        QueuedMessageSource, QueuedMessageState, SessionQueuedMessage, StoreQueuedMessageResult,
+        QueuedMessageSource, SessionQueuedMessage, StoreQueuedMessageResult,
     };
     let case = codex_case().await;
     let now = Utc::now();
     let thread = thread_id_at(now, 3);
     bind_resumed(&case, &thread).await;
-    let prompt = "routed from chat";
+    let prompt = pasted;
     let StoreQueuedMessageResult::Stored(row) = SessionQueuedMessage::store(
         &case.db.pool,
         case.session.id,
@@ -1130,17 +1133,34 @@ async fn a_codex_turn_acknowledges_the_collaboration_paste_of_its_prompt() {
         &rollout_path(&case.root, &thread, now),
         &[
             session_meta(&thread, &case.cwd, now, "cli"),
-            user_turn(&thread, "routed-turn", now, prompt),
+            user_turn(&thread, "routed-turn", now, typed),
         ]
         .concat(),
     );
 
     reconcile(&case).await;
 
-    let acknowledged = SessionQueuedMessage::find_by_id(&case.db.pool, row.id)
+    SessionQueuedMessage::find_by_id(&case.db.pool, row.id)
         .await
         .unwrap()
-        .unwrap();
-    assert_eq!(acknowledged.state, QueuedMessageState::Imported);
-    assert!(acknowledged.acked_at.is_some());
+        .unwrap()
+        .state
+}
+
+#[tokio::test]
+async fn a_codex_turn_acknowledges_the_collaboration_paste_of_its_prompt() {
+    use db::models::session_queued_message::QueuedMessageState::{Imported, Pasted};
+    assert_eq!(
+        codex_paste_state("routed from chat", "routed from chat").await,
+        Imported
+    );
+    // The TUI submits the paste trimmed.
+    assert_eq!(
+        codex_paste_state("\n routed from chat \t\n", "routed from chat").await,
+        Imported
+    );
+    assert_eq!(
+        codex_paste_state("routed from chat", "something else").await,
+        Pasted
+    );
 }

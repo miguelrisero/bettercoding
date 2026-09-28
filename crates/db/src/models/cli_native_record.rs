@@ -438,6 +438,8 @@ impl CliNativeRecord {
 
             let bound_queued_message_id =
                 if record.kind == "user" && !linked_to_execution && bound_turn_id.is_none() {
+                    // Claude Code and Codex both submit a paste with its
+                    // surrounding whitespace trimmed.
                     let prompt = record
                         .user_prompt
                         .as_deref()
@@ -462,7 +464,7 @@ impl CliNativeRecord {
                                          AND failure_reason = $6
                                      )
                                  )
-                                 AND prompt = $2
+                                 AND (prompt = $2 OR trim(prompt, char(9, 10, 13, 32)) = $2)
                                  AND (claude_session_id IS NULL OR claude_session_id = $3)
                                  AND pasted_at IS NOT NULL
                                  AND julianday(pasted_at) >= julianday($4)

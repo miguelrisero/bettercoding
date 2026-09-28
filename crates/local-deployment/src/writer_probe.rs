@@ -62,7 +62,9 @@ fn resume_evidence(cmdlines: &[String]) -> SidEvidence {
 
 /// Codex options that take a separate value (`codex --help`, `codex resume
 /// --help`, codex-cli 0.158). Needed to find the first positional argument,
-/// which names the subcommand.
+/// which names the subcommand. A value option a later Codex adds reads its
+/// value as that positional; the launch then shows no resume subcommand and
+/// the lease stays ambiguous (queued) until this list learns the option.
 const CODEX_VALUE_OPTIONS: &[&str] = &[
     "-c",
     "--config",
