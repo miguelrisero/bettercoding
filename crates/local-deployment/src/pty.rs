@@ -1726,6 +1726,30 @@ pub async fn cli_pane_agent_program_at<'a>(
     Some(first_program_in_pane_subtree(&listing, pane_pid, programs))
 }
 
+/// The pane's agent, if it is one of `programs`. Ownership is decided among
+/// every shipped agent, so an agent that merely runs as a descendant of
+/// another (claude shelling out to `codex exec`) never counts as the owner.
+/// `programs` keeps its tie-break priority.
+async fn pane_owner_among<'a>(target: &CliTmuxTarget, programs: &[&'a str]) -> Option<&'a str> {
+    let (pane_pid, listing) = pane_process_listing(target).await?;
+    owner_among(&listing, pane_pid, programs)
+}
+
+fn owner_among<'a>(ps_listing: &str, root_pid: u32, programs: &[&'a str]) -> Option<&'a str> {
+    let order: Vec<&str> = programs
+        .iter()
+        .copied()
+        .chain(
+            CLI_AGENT_PROGRAMS
+                .iter()
+                .copied()
+                .filter(|agent| !programs.contains(agent)),
+        )
+        .collect();
+    let owner = first_program_in_pane_subtree(ps_listing, root_pid, &order)?;
+    programs.iter().copied().find(|program| *program == owner)
+}
+
 fn first_program_in_pane_subtree<'a>(
     ps_listing: &str,
     root_pid: u32,
@@ -1800,9 +1824,10 @@ async fn pane_process_listing(target: &CliTmuxTarget) -> Option<(u32, String)> {
 pub struct CliPaneAgentProcess {
     pub pid: u32,
     pub cmdline: String,
-    /// Exact argument vector (`/proc/<pid>/cmdline` on Linux). Elsewhere, and
-    /// if `/proc` is unreadable, `cmdline` split at whitespace.
-    pub argv: Vec<String>,
+    /// Exact argument vector (`/proc/<pid>/cmdline` on Linux). `None` where
+    /// it cannot be read: `cmdline` joins arguments with spaces, so it cannot
+    /// tell a prompt from the arguments around it.
+    pub argv: Option<Vec<String>>,
 }
 
 /// The agent that owns the pane (of `programs`, chosen as in
@@ -1838,8 +1863,7 @@ async fn cli_pane_agent_processes_at<'a>(
             return None;
         }
         let cmdline = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let argv = process_argv(pid)
-            .unwrap_or_else(|| cmdline.split_whitespace().map(str::to_string).collect());
+        let argv = process_argv(pid);
         processes.push(CliPaneAgentProcess { pid, cmdline, argv });
     }
     Some((Some(program), processes))
@@ -2131,10 +2155,7 @@ async fn send_detached(
         let program = match programs {
             Some(programs) => {
                 let programs: Vec<&str> = programs.iter().map(String::as_str).collect();
-                cli_pane_agent_program_at(&target, &programs)
-                    .await
-                    .flatten()?
-                    .to_owned()
+                pane_owner_among(&target, &programs).await?.to_owned()
             }
             None => String::new(),
         };
@@ -4300,6 +4321,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_send_reaches_only_the_agent_that_owns_the_pane() {
+        let claude_running_codex = "\
+  100     1 sh
+  200   100 claude
+  300   200 node
+  400   300 codex
+";
+        // A codex lease must not deliver into the Claude TUI that runs it.
+        assert_eq!(owner_among(claude_running_codex, 100, &["codex"]), None);
+        assert_eq!(
+            owner_among(claude_running_codex, 100, &["claude"]),
+            Some("claude")
+        );
+        let both_at_root_depth = "\
+  100     1 sh
+  200   100 codex
+  300   100 claude
+";
+        // The caller's order still breaks a tie.
+        assert_eq!(
+            owner_among(both_at_root_depth, 100, &["codex", "claude"]),
+            Some("codex")
+        );
+        assert_eq!(
+            owner_among(both_at_root_depth, 100, &["claude"]),
+            Some("claude")
+        );
+    }
+
     #[tokio::test]
     async fn send_refuses_text_holding_the_paste_end_marker() {
         // Refused before any tmux call, so the socket need not exist.
@@ -4442,7 +4493,7 @@ mod tests {
         assert_eq!(program, Some("codex"));
         assert_eq!(processes.len(), 1);
         assert_eq!(
-            processes[0].argv[1..],
+            processes[0].argv.as_ref().unwrap()[1..],
             ["-c", "sleep 30; :", "resume", thread]
         );
         let (program, _) = cli_pane_agent_processes_at(&claude, CLI_AGENT_PROGRAMS)

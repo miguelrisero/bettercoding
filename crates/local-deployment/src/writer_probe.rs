@@ -108,12 +108,17 @@ fn codex_positionals(argv: &[String]) -> (Vec<&str>, bool) {
 
 /// Resume evidence from Codex argument vectors. `codex resume <uuid>` names
 /// the thread. `codex resume --last`, a session name, or the resume picker
-/// name no verifiable thread, so they are ambiguous. Any other launch
-/// (`codex`, `codex <prompt>`, `codex fork …`) starts a new thread.
-fn codex_resume_evidence(argvs: &[Vec<String>]) -> SidEvidence {
+/// name no verifiable thread, so they are ambiguous, as is a process whose
+/// exact argv is unreadable. Any other launch (`codex`, `codex <prompt>`,
+/// `codex fork …`) starts a new thread.
+fn codex_resume_evidence(argvs: &[Option<Vec<String>>]) -> SidEvidence {
     let mut ids = HashSet::new();
     let mut ambiguous = false;
     for argv in argvs {
+        let Some(argv) = argv else {
+            ambiguous = true;
+            continue;
+        };
         let (positionals, last) = codex_positionals(argv);
         if positionals.first() != Some(&"resume") {
             continue;
@@ -336,7 +341,7 @@ mod tests {
             &[CliPaneAgentProcess {
                 pid: 42,
                 cmdline: format!("claude --resume {observed}"),
-                argv: Vec::new(),
+                argv: None,
             }],
             None,
             None,
@@ -356,7 +361,7 @@ mod tests {
             &[CliPaneAgentProcess {
                 pid: 43,
                 cmdline: "claude --model opus".to_string(),
-                argv: Vec::new(),
+                argv: None,
             }],
             None,
             None,
@@ -388,7 +393,7 @@ mod tests {
             &[CliPaneAgentProcess {
                 pid: 44,
                 cmdline: format!("claude --resume {observed}"),
-                argv: Vec::new(),
+                argv: None,
             }],
             None,
             Some(expected),
@@ -404,7 +409,7 @@ mod tests {
             &[CliPaneAgentProcess {
                 pid: 45,
                 cmdline: "claude --model opus".to_string(),
-                argv: Vec::new(),
+                argv: None,
             }],
             None,
             Some(expected),
@@ -413,8 +418,8 @@ mod tests {
         assert_eq!(no_resume.sid_evidence, SidEvidence::NoResumeArg);
     }
 
-    fn argv(args: &[&str]) -> Vec<String> {
-        args.iter().map(|arg| arg.to_string()).collect()
+    fn argv(args: &[&str]) -> Option<Vec<String>> {
+        Some(args.iter().map(|arg| arg.to_string()).collect())
     }
 
     const THREAD: &str = "019e6f10-4f27-7d02-9a4b-4f3c2d1e0a55";
@@ -487,6 +492,13 @@ mod tests {
                 "{args:?}"
             );
         }
+    }
+
+    #[test]
+    fn codex_evidence_without_an_exact_argv_is_ambiguous() {
+        // `ps` joins argv with spaces, so `codex "resume <uuid>"` and
+        // `codex resume <uuid>` read the same there.
+        assert_eq!(codex_resume_evidence(&[None]), SidEvidence::Ambiguous);
     }
 
     #[test]

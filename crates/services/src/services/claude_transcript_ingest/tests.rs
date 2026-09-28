@@ -527,6 +527,14 @@ async fn cli_fresh_file_quarantines_for_released_dead_or_nonexclusive_panes() {
             false,
             writer_report(true, Some(true), SidEvidence::NoResumeArg, Some(false)),
         ),
+        // A fresh Codex pane never claims a Claude transcript.
+        (
+            false,
+            ProbeReport {
+                agent_program: Some("codex".to_string()),
+                ..healthy_report()
+            },
+        ),
     ];
 
     for (release_binding, report) in cases {

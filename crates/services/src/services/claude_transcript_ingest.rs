@@ -1693,6 +1693,7 @@ impl ClaudeTranscriptIngest {
         if report.probe_failed
             || !report.pane_session_exists
             || report.agent_running != Some(true)
+            || report.agent_program.as_deref() != Some("claude")
             || report.sid_evidence != SidEvidence::NoResumeArg
             || report.only_active_claude_in_cwd != Some(true)
         {
