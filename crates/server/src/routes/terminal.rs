@@ -166,7 +166,9 @@ pub(super) async fn resolve_cli_launch_spec(
     // inline with `-c` so neither ~/.codex nor the worktree is touched.
     if spec.program == "codex" {
         spec.session_args = codex_hook_args(&spec.base_args, workspace_id).await;
-        spec.session_args.extend(codex_mcp_args().await);
+        if runs_unrestricted(&spec) {
+            spec.session_args.extend(codex_mcp_args().await);
+        }
     }
 
     // Everything else keeps the tmux poller's guess.
@@ -174,7 +176,11 @@ pub(super) async fn resolve_cli_launch_spec(
         // `--mcp-config` takes several values, so it must be followed by
         // another flag or it would swallow a positional prompt. It is only
         // ever pushed right before `--settings`.
-        let mcp_config = write_cli_mcp_config(workspace_id).await;
+        let mcp_config = if runs_unrestricted(&spec) {
+            write_cli_mcp_config(workspace_id).await
+        } else {
+            None
+        };
         if let Some(settings) = write_cli_hook_settings(workspace_id).await {
             if let Some(mcp_config) = mcp_config {
                 spec.base_args.push("--mcp-config".to_string());
@@ -254,10 +260,7 @@ fn hook_report_command(port: u16, workspace_id: Uuid) -> String {
 /// command unasked, so hooks are only registered in that sandbox mode; a
 /// restricted session keeps the tmux poller's guess and its trust prompts.
 async fn codex_hook_args(base_args: &[String], workspace_id: Uuid) -> Vec<String> {
-    let full_access = base_args
-        .windows(2)
-        .any(|pair| pair[0] == "-s" && pair[1] == "danger-full-access");
-    if !full_access {
+    if !codex_full_access(base_args) {
         return Vec::new();
     }
     let Ok(port) = utils::port_file::read_port_file("vibe-kanban").await else {
@@ -282,7 +285,28 @@ fn codex_hook_args_for(port: u16, workspace_id: Uuid) -> Vec<String> {
     args
 }
 
-/// Name of the MCP server every CLI agent is launched with.
+fn codex_full_access(base_args: &[String]) -> bool {
+    base_args
+        .windows(2)
+        .any(|pair| pair[0] == "-s" && pair[1] == "danger-full-access")
+}
+
+/// Whether the agent already runs any command without asking. Only such an
+/// agent gets the BetterCoding MCP: its tools start and message unrestricted
+/// agents in other workspaces, which would let a sandboxed agent escape its
+/// sandbox.
+fn runs_unrestricted(spec: &CliLaunchSpec) -> bool {
+    match spec.program.as_str() {
+        "claude" => spec
+            .base_args
+            .iter()
+            .any(|arg| arg == "--dangerously-skip-permissions"),
+        "codex" => codex_full_access(&spec.base_args),
+        _ => false,
+    }
+}
+
+/// Name of the MCP server every unrestricted CLI agent is launched with.
 const MCP_SERVER_NAME: &str = "bettercoding";
 
 /// How to start this server's own MCP: the running binary's `mcp` subcommand,
@@ -1662,7 +1686,7 @@ mod tripwire_tests {
 
     use super::{
         AttachInputTripwire, HOOK_EVENTS, codex_hook_args_for, codex_mcp_args_for, hex_dump,
-        hook_report_command,
+        hook_report_command, runs_unrestricted,
     };
 
     fn tripwire() -> AttachInputTripwire {
@@ -1729,6 +1753,30 @@ mod tripwire_tests {
                 Some(hook_report_command(4111, id).as_str())
             );
         }
+    }
+
+    /// A sandboxed agent never gets the MCP: its tools reach unrestricted
+    /// agents in other workspaces.
+    #[test]
+    fn only_unrestricted_agents_get_the_mcp() {
+        use executors::executors::cli::CliLaunchSpec;
+        let spec = |program: &str, args: &[&str]| {
+            CliLaunchSpec::new(program, args.iter().map(|a| a.to_string()).collect())
+        };
+        assert!(runs_unrestricted(&spec(
+            "claude",
+            &["--dangerously-skip-permissions"]
+        )));
+        assert!(!runs_unrestricted(&spec("claude", &["--model", "opus"])));
+        assert!(runs_unrestricted(&spec(
+            "codex",
+            &["-s", "danger-full-access"]
+        )));
+        assert!(!runs_unrestricted(&spec(
+            "codex",
+            &["-s", "workspace-write"]
+        )));
+        assert!(!runs_unrestricted(&spec("gemini", &[])));
     }
 
     /// The MCP overrides merge into one valid `mcp_servers.bettercoding` table
