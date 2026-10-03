@@ -285,6 +285,7 @@ async fn restart_agent(
     )
     .await
     .map_err(|error| ApiError::BadGateway(error.to_string()))?;
+    terminal::forget_ended_session(&deployment.db().pool, workspace_id).await;
 
     Ok(ResponseJson(ApiResponse::success(CliRestartResponse {
         restarted: true,

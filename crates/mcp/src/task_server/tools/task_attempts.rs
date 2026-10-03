@@ -32,6 +32,14 @@ struct StartWorkspaceRequest {
     executor: String,
     #[schemars(description = "Optional executor variant, if needed")]
     variant: Option<String>,
+    #[schemars(
+        description = "Optional model ID for the agent (e.g. 'opus', 'claude-opus-5-5', 'gpt-6-sol'). Omit for the default."
+    )]
+    model_id: Option<String>,
+    #[schemars(
+        description = "Optional reasoning effort (e.g. 'low', 'medium', 'high', 'xhigh', 'max'). Omit for the default."
+    )]
+    reasoning_id: Option<String>,
     #[schemars(description = "Repository selection for the workspace")]
     repositories: Vec<McpWorkspaceRepoInput>,
     #[schemars(
@@ -43,6 +51,13 @@ struct StartWorkspaceRequest {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct StartWorkspaceResponse {
     workspace_id: String,
+    #[schemars(description = "Whether the workspace's CLI agent was started with the prompt")]
+    agent_launched: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Why the agent did not start. The prompt stays queued and runs when the agent is launched (launch_workspace_agent) or the workspace is opened."
+    )]
+    launch_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -89,7 +104,9 @@ fn build_workspace_prompt_from_issue(issue: &api_types::Issue) -> Option<String>
 
 #[tool_router(router = task_attempts_tools_router, vis = "pub")]
 impl McpServer {
-    #[tool(description = "Create a new workspace and start its first session.")]
+    #[tool(
+        description = "Create a new workspace and start its CLI agent (Claude Code or Codex) on the prompt, in the background. Use list_repos for repository IDs; `branch` is the base branch to start from (e.g. 'main')."
+    )]
     async fn start_workspace(
         &self,
         Parameters(StartWorkspaceRequest {
@@ -99,6 +116,8 @@ impl McpServer {
             variant,
             repositories,
             issue_id,
+            model_id,
+            reasoning_id,
         }): Parameters<StartWorkspaceRequest>,
     ) -> Result<CallToolResult, ErrorData> {
         if repositories.is_empty() {
@@ -181,9 +200,9 @@ impl McpServer {
             executor_config: ExecutorConfig {
                 executor: base_executor,
                 variant,
-                model_id: None,
+                model_id: model_id.filter(|m| !m.trim().is_empty()),
                 agent_id: None,
-                reasoning_id: None,
+                reasoning_id: reasoning_id.filter(|r| !r.trim().is_empty()),
                 permission_policy: None,
             },
             prompt: workspace_prompt,
@@ -212,8 +231,19 @@ impl McpServer {
             return Ok(Self::tool_error(e));
         }
 
+        // Creation only queues the prompt for the workspace's CLI agent; start
+        // the agent now so it does not wait for someone to open the workspace.
+        let workspace_id = create_and_start_response.workspace.id;
+        let launch_error = self.launch_cli_agent(workspace_id).await.err().map(|e| {
+            e.details
+                .map(|details| format!("{}: {details}", e.message))
+                .unwrap_or(e.message)
+        });
+
         let response = StartWorkspaceResponse {
-            workspace_id: create_and_start_response.workspace.id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            agent_launched: launch_error.is_none(),
+            launch_error,
         };
 
         McpServer::success(&response)

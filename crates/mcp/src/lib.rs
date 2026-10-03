@@ -7,4 +7,5 @@ pub struct ApiResponseEnvelope<T> {
     pub message: Option<String>,
 }
 
+pub mod cli;
 pub mod task_server;

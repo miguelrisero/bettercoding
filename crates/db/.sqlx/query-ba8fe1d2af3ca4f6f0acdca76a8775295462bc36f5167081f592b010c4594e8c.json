@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE workspace_cli_activity\n               SET phase = NULL, tasks = NULL, crons = NULL\n               WHERE workspace_id = $1 AND phase = 'ended'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "ba8fe1d2af3ca4f6f0acdca76a8775295462bc36f5167081f592b010c4594e8c"
+}

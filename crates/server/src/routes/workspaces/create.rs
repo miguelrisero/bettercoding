@@ -340,8 +340,11 @@ pub async fn create_and_start_workspace(
     )))
 }
 
-/// Background best-effort naming. Two paths:
+/// Background best-effort naming. Three paths:
 ///
+/// 0. A name the caller chose (MCP, API) is kept, and only seeds the branch. The
+///    web app sends the prompt's first line (maybe truncated) as the name, so
+///    any name that is not a prefix of that line was chosen on purpose.
 /// 1. If the first line already reads like a deliberate title (Miguel's
 ///    `keyword -> gist` format, or a short first line with a body), we KEEP it
 ///    verbatim and derive the branch deterministically from it — no model call,
@@ -358,6 +361,15 @@ async fn apply_generated_workspace_names(
     workspace: &Workspace,
     first_message: &str,
 ) {
+    if let Some(name) = workspace
+        .name
+        .as_deref()
+        .filter(|name| is_explicit_name(name, first_message))
+    {
+        apply_name_and_branch(deployment, workspace, name, name).await;
+        return;
+    }
+
     // Path 1: a deliberate first-line title hint wins — keep it verbatim, no
     // model call, branch derived deterministically from the hint.
     if let Some(hint) = executors::title_gen::first_line_title_hint(first_message) {
@@ -381,6 +393,13 @@ async fn apply_generated_workspace_names(
         return;
     };
     apply_name_and_branch(deployment, workspace, &names.title, &names.branch_slug).await;
+}
+
+/// Whether `name` was chosen by the caller rather than cut from the prompt.
+fn is_explicit_name(name: &str, prompt: &str) -> bool {
+    let first_line = prompt.trim().lines().next().unwrap_or_default();
+    let name = name.trim();
+    !name.is_empty() && !first_line.starts_with(name)
 }
 
 /// Compare-and-set the workspace `name` to `title` (only if it still equals the
@@ -471,7 +490,23 @@ mod tests {
     use db::models::file::File;
     use uuid::Uuid;
 
-    use super::{ImportedIssueAttachment, rewrite_imported_issue_attachments_markdown};
+    use super::{
+        ImportedIssueAttachment, is_explicit_name, rewrite_imported_issue_attachments_markdown,
+    };
+
+    #[test]
+    fn only_a_name_cut_from_the_prompt_is_replaced_by_a_generated_one() {
+        let prompt = "  fix the flaky login test because it keeps failing\nmore detail";
+        // The web app sends the first line, sometimes cut at a word boundary.
+        assert!(!is_explicit_name(
+            "fix the flaky login test because it keeps failing",
+            prompt
+        ));
+        assert!(!is_explicit_name("fix the flaky login test", prompt));
+        assert!(!is_explicit_name("  ", prompt));
+        // MCP and API callers name the workspace themselves.
+        assert!(is_explicit_name("auth -> flaky login test", prompt));
+    }
 
     fn imported_file(
         attachment_id: Uuid,

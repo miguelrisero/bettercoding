@@ -52,3 +52,17 @@ pub struct SendCliTextRequest {
 pub struct SendCliTextResponse {
     pub submitted: bool,
 }
+
+/// Result of `POST /workspaces/{id}/cli/launch`. `launched: false` means the
+/// agent's pane was already up; a parked prompt was still delivered to it.
+#[derive(Debug, Deserialize, Serialize, TS)]
+pub struct LaunchCliAgentResponse {
+    pub launched: bool,
+}
+
+/// Result of `GET /workspaces/{id}/cli/screen`: the visible text of the
+/// workspace's CLI pane, or `None` when it has no pane.
+#[derive(Debug, Deserialize, Serialize, TS)]
+pub struct CliScreenResponse {
+    pub screen: Option<String>,
+}

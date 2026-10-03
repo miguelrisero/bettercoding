@@ -175,7 +175,7 @@ pub async fn get_workspace_summaries(
                 has_running_dev_server: dev_server_workspaces.contains(&id),
                 has_unseen_turns: unseen_workspaces.contains(&id),
                 cli_attention: cli_attention_workspaces.contains(&id),
-                cli_phase: cli.and_then(|row| row.phase),
+                cli_phase: cli.and_then(WorkspaceCliActivity::shown_phase),
                 cli_phase_at: cli.and_then(|row| row.hook_at),
                 cli_tasks: cli_hook.and_then(|hook| hook.tasks),
                 cli_crons: cli_hook.and_then(|hook| hook.crons),
