@@ -162,7 +162,7 @@ async function extractAndRun(
       fs.unlinkSync(binPath);
     }
   } catch (err: unknown) {
-    if (process.env.VIBE_KANBAN_DEBUG) {
+    if (process.env.BC_DEBUG) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`Warning: Could not delete existing binary: ${msg}`);
     }
@@ -231,7 +231,7 @@ function checkForUpdates(): void {
       if (latest && latest !== CLI_VERSION) {
         setTimeout(() => {
           console.log(`\nUpdate available: ${CLI_VERSION} -> ${latest}`);
-          console.log(`Run: npx vibe-kanban@latest`);
+          console.log(`Run: npx bettercoding@latest`);
         }, 2000);
       }
     })
@@ -239,7 +239,7 @@ function checkForUpdates(): void {
 }
 
 async function runMcp(args: string[]): Promise<void> {
-  await extractAndRun("vibe-kanban-mcp", (bin) => {
+  await extractAndRun("bettercoding-mcp", (bin) => {
     const proc = spawn(bin, buildMcpArgs(args), {
       stdio: "inherit",
     });
@@ -256,7 +256,7 @@ async function runMcp(args: string[]): Promise<void> {
 }
 
 async function runReview(args: string[]): Promise<void> {
-  await extractAndRun("vibe-kanban-review", (bin) => {
+  await extractAndRun("bettercoding-review", (bin) => {
     const proc = spawn(bin, args, { stdio: "inherit" });
     proc.on("exit", (c) => process.exit(c || 0));
     proc.on("error", (e) => {
@@ -277,7 +277,7 @@ async function runMain(desktopMode: boolean): Promise<void> {
   if (desktopMode && tauriPlatform) {
     try {
       console.log(
-        `Starting vibe-kanban desktop v${CLI_VERSION}${modeLabel}...`,
+        `Starting bettercoding desktop v${CLI_VERSION}${modeLabel}...`,
       );
       const bundleInfo = await ensureDesktopBundle(tauriPlatform, showProgress);
       console.error(""); // newline after progress
@@ -297,8 +297,8 @@ async function runMain(desktopMode: boolean): Promise<void> {
   }
 
   // Browser mode (default — headless server + opens browser)
-  console.log(`Starting vibe-kanban v${CLI_VERSION}${modeLabel}...`);
-  await extractAndRun("vibe-kanban", (bin) => {
+  console.log(`Starting bettercoding v${CLI_VERSION}${modeLabel}...`);
+  await extractAndRun("bettercoding", (bin) => {
     execSync(`"${bin}"`, { stdio: "inherit" });
   });
 }
@@ -323,7 +323,7 @@ function runOrExit(task: Promise<void>): void {
   void task.catch((err: unknown) => {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("Fatal error:", msg);
-    if (process.env.VIBE_KANBAN_DEBUG && err instanceof Error) {
+    if (process.env.BC_DEBUG && err instanceof Error) {
       console.error(err.stack);
     }
     process.exit(1);
@@ -332,10 +332,10 @@ function runOrExit(task: Promise<void>): void {
 
 async function main(): Promise<void> {
   fs.mkdirSync(versionCacheDir, { recursive: true });
-  const cli = cac("vibe-kanban");
+  const cli = cac("bettercoding");
 
   cli
-    .command("[...args]", "Launch the local vibe-kanban app")
+    .command("[...args]", "Launch the local bettercoding app")
     .option("--desktop", "Launch the desktop app instead of browser mode")
     .allowUnknownOptions()
     .action((_args: string[], options: RootOptions) => {
@@ -364,7 +364,7 @@ async function main(): Promise<void> {
 main().catch((err: unknown) => {
   const msg = err instanceof Error ? err.message : String(err);
   console.error("Fatal error:", msg);
-  if (process.env.VIBE_KANBAN_DEBUG && err instanceof Error) {
+  if (process.env.BC_DEBUG && err instanceof Error) {
     console.error(err.stack);
   }
   process.exit(1);

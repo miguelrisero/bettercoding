@@ -5,13 +5,17 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-} from '@vibe/ui/components/KeyboardDialog';
+} from '@bettercoding/ui/components/KeyboardDialog';
 import { Label } from '@radix-ui/react-label';
-import { Textarea } from '@vibe/ui/components/Textarea';
-import { Button } from '@vibe/ui/components/Button';
-import { Input } from '@vibe/ui/components/Input';
-import { Checkbox } from '@vibe/ui/components/Checkbox';
-import { Alert, AlertDescription, AlertTitle } from '@vibe/ui/components/Alert';
+import { Textarea } from '@bettercoding/ui/components/Textarea';
+import { Button } from '@bettercoding/ui/components/Button';
+import { Input } from '@bettercoding/ui/components/Input';
+import { Checkbox } from '@bettercoding/ui/components/Checkbox';
+import {
+  Alert,
+  AlertDescription,
+  AlertTitle,
+} from '@bettercoding/ui/components/Alert';
 import BranchSelector from '@/shared/components/tasks/BranchSelector';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { workspacesApi } from '@/shared/lib/api';
@@ -48,8 +52,7 @@ export type CreatePRDialogResult = {
   error?: string;
 };
 
-// TODO(bc-legacy-cleanup): PR title suffix is externally visible persisted identity; keep stable.
-const PR_TITLE_SUFFIX = ' (vibe-kanban)';
+const PR_TITLE_SUFFIX = ' (bettercoding)';
 
 const appendPrTitleSuffix = (title: string): string => {
   const trimmedTitle = title.trim();

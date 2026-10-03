@@ -34,7 +34,7 @@ import { profilesApi } from '@/shared/lib/api';
 import { useUserSystem } from '@/shared/hooks/useUserSystem';
 import { getResolvedTheme, useTheme } from '@/shared/hooks/useTheme';
 import { useModelSelectorConfig } from '@/shared/hooks/useExecutorDiscovery';
-import { ModelSelectorPopover } from '@vibe/ui/components/ModelSelectorPopover';
+import { ModelSelectorPopover } from '@bettercoding/ui/components/ModelSelectorPopover';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -42,7 +42,7 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTriggerButton,
-} from '@vibe/ui/components/Dropdown';
+} from '@bettercoding/ui/components/Dropdown';
 
 interface ModelSelectorContainerProps {
   agent: BaseCodingAgent | null;

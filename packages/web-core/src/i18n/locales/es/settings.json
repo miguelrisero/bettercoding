@@ -144,7 +144,7 @@
         "description": "Configurar preferencias de nombres de ramas git",
         "branchPrefix": {
           "label": "Prefijo de Rama",
-          "placeholder": "vk",
+          "placeholder": "bc",
           "helper": "Prefijo para nombres de ramas generadas automáticamente. Dejar vacío para no usar prefijo.",
           "preview": "Vista previa:",
           "previewWithPrefix": "{{prefix}}/1a2b-nombre-tarea",
@@ -161,10 +161,10 @@
         "workspaceDir": {
           "label": "Directorio de Espacios de Trabajo",
           "placeholder": "~/",
-          "helper": "Los espacios de trabajo se crearán en un subdirectorio .vibe-kanban-workspaces dentro de esta ruta. Dejar vacío para usar el valor predeterminado del sistema. Los cambios requieren reiniciar la aplicación.",
+          "helper": "Los espacios de trabajo se crearán en un subdirectorio .bettercoding-workspaces dentro de esta ruta. Dejar vacío para usar el valor predeterminado del sistema. Los cambios requieren reiniciar la aplicación.",
           "browse": "Explorar",
           "dialogTitle": "Seleccionar Directorio de Espacios de Trabajo",
-          "dialogDescription": "Elija un directorio. Los espacios de trabajo se crearán en un subdirectorio .vibe-kanban-workspaces dentro de él."
+          "dialogDescription": "Elija un directorio. Los espacios de trabajo se crearán en un subdirectorio .bettercoding-workspaces dentro de él."
         }
       },
       "pullRequests": {

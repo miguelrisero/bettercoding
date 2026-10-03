@@ -157,7 +157,7 @@ impl EditorConfig {
         let mut cmd = std::process::Command::new(&executable);
         cmd.args(&args)
             .arg("--install-extension")
-            // TODO(bc-legacy-cleanup): editor extension id is externally published; keep stable.
+            // The upstream extension, published by Bloop on the marketplaces.
             .arg("bloop.vibe-kanban");
         let _ = cmd.no_window().spawn();
     }

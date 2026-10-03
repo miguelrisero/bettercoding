@@ -67,19 +67,19 @@ mod tests {
 
     #[test]
     fn builds_vscode_url_by_default() {
-        let url = build_editor_url("vk-abc", "/tmp/ws", None);
+        let url = build_editor_url("bc-abc", "/tmp/ws", None);
         assert_eq!(
             url,
-            "vscode://vscode-remote/ssh-remote+vk-abc/tmp/ws?windowId=_blank"
+            "vscode://vscode-remote/ssh-remote+bc-abc/tmp/ws?windowId=_blank"
         );
     }
 
     #[test]
     fn builds_known_editor_schemes() {
-        let zed = build_editor_url("vk-abc", "/tmp/ws", Some("zed"));
-        assert_eq!(zed, "zed://ssh/vk-abc/tmp/ws");
+        let zed = build_editor_url("bc-abc", "/tmp/ws", Some("zed"));
+        assert_eq!(zed, "zed://ssh/bc-abc/tmp/ws");
 
-        let cursor = build_editor_url("vk-abc", "/tmp/ws", Some("cursor"));
-        assert_eq!(cursor, "cursor://vscode-remote/ssh-remote+vk-abc/tmp/ws");
+        let cursor = build_editor_url("bc-abc", "/tmp/ws", Some("cursor"));
+        assert_eq!(cursor, "cursor://vscode-remote/ssh-remote+bc-abc/tmp/ws");
     }
 }

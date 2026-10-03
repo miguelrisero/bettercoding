@@ -87,19 +87,18 @@ pnpm run prepare-db           # refresh SQLx offline metadata
 | `MCP_HOST` | Runtime | `HOST` | MCP server connection host |
 | `MCP_PORT` | Runtime | `BACKEND_PORT` | MCP server connection port |
 | `DISABLE_WORKTREE_CLEANUP` | Runtime | Not set | Disable git worktree cleanup (debugging) |
-| `VK_ALLOWED_ORIGINS` | Runtime | Not set | Comma-separated origins allowed to call the backend API |
-| `VK_SHARED_API_BASE` | Runtime | Not set | Base URL of a self-hosted remote API (optional) |
-| `VK_SHARED_RELAY_API_BASE` | Runtime | Not set | Base URL of the relay API for tunnel-mode connections |
-| `VK_TUNNEL` | Runtime | Not set | Enable relay tunnel mode |
+| `BC_ALLOWED_ORIGINS` | Runtime | Not set | Comma-separated origins allowed to call the backend API |
+| `BC_SHARED_API_BASE` | Runtime | Not set | Base URL of a self-hosted remote API (optional) |
+| `BC_SHARED_RELAY_API_BASE` | Runtime | Not set | Base URL of the relay API for tunnel-mode connections |
 | `BC_MSG_HISTORY_BYTES` | Runtime | `16777216` (16 MiB) | In-memory log scrollback retained per store — roughly one store per concurrent execution, plus one process-wide. Lower it under memory pressure with many agents; raise it if long runs lose early scrollback |
 | `BC_MSG_BROADCAST_CAPACITY` | Runtime | `32768` | Live log ring size per store, in messages (tokio rounds up to a power of two). Allocated eagerly, so it costs roughly 2 MB per store at the default. Raise it if the logs show `MsgStore broadcast lagged`; lower it under memory pressure |
 
 ### Reverse proxy / custom domain
 
-Behind a reverse proxy (nginx, Caddy, Traefik) or on a custom domain, set `VK_ALLOWED_ORIGINS` to the full origin(s) the frontend is served from, otherwise API requests are rejected with 403:
+Behind a reverse proxy (nginx, Caddy, Traefik) or on a custom domain, set `BC_ALLOWED_ORIGINS` to the full origin(s) the frontend is served from, otherwise API requests are rejected with 403:
 
 ```bash
-VK_ALLOWED_ORIGINS=https://coding.example.com
+BC_ALLOWED_ORIGINS=https://coding.example.com
 ```
 
 ### Remote server + local editor

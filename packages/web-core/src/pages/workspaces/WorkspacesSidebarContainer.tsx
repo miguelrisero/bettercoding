@@ -25,25 +25,25 @@ import { SettingsDialog } from '@/shared/dialogs/settings/SettingsDialog';
 import {
   WorkspacesSidebar,
   type WorkspacesSidebarPersistKeys,
-} from '@vibe/ui/components/WorkspacesSidebar';
+} from '@bettercoding/ui/components/WorkspacesSidebar';
 import type {
   BulkDeleteDialogBranchStatus,
   BulkDeleteDialogItemResult,
-} from '@vibe/ui/components/BulkDeleteArchivedWorkspacesDialog';
-import { PropertyDropdown } from '@vibe/ui/components/PropertyDropdown';
-import { PrimaryButton } from '@vibe/ui/components/PrimaryButton';
-import { IconButton } from '@vibe/ui/components/IconButton';
+} from '@bettercoding/ui/components/BulkDeleteArchivedWorkspacesDialog';
+import { PropertyDropdown } from '@bettercoding/ui/components/PropertyDropdown';
+import { PrimaryButton } from '@bettercoding/ui/components/PrimaryButton';
+import { IconButton } from '@bettercoding/ui/components/IconButton';
 import {
   ButtonGroup,
   ButtonGroupItem,
-} from '@vibe/ui/components/IconButtonGroup';
+} from '@bettercoding/ui/components/IconButtonGroup';
 import {
   Dialog,
   DialogContent,
   DialogDescription,
   DialogHeader,
   DialogTitle,
-} from '@vibe/ui/components/Dialog';
+} from '@bettercoding/ui/components/Dialog';
 import {
   FunnelIcon,
   GitPullRequestIcon,

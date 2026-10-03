@@ -33,7 +33,7 @@ Date: 2026-02-21
 
 ## Refactor Status Legend
 
-- `extract-now`: move in first `@vibe/ui` package wave.
+- `extract-now`: move in first `@bettercoding/ui` package wave.
 - `extract-later`: reusable, but move only after API/dependency decoupling.
 - `keep-app`: stay in frontend app package (feature/domain/integration UI).
 
@@ -41,7 +41,7 @@ Date: 2026-02-21
 
 - Start with `extract-now` components from `components/ui` and selected `components/ui-new/primitives`.
 - Keep all `containers`, `views`, and feature `dialogs` in the app package.
-- Treat `components/ui/wysiwyg` as a separate future package (`@vibe/editor-ui`) after `@vibe/ui` lands.
+- Treat `components/ui/wysiwyg` as a separate future package (`@bettercoding/editor-ui`) after `@bettercoding/ui` lands.
 
 ## Full Component Map
 
@@ -49,54 +49,54 @@ Date: 2026-02-21
 
 | Component | Status | Target package | Notes |
 | --- | --- | --- | --- |
-| `ui-new/primitives/Accordion.tsx` | `extract-now` | `@vibe/ui` | Primitive UI component; good first package candidate. |
+| `ui-new/primitives/Accordion.tsx` | `extract-now` | `@bettercoding/ui` | Primitive UI component; good first package candidate. |
 | `ui-new/primitives/AppBar.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
 | `ui-new/primitives/AppBarButton.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
 | `ui-new/primitives/AppBarSocialLink.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
 | `ui-new/primitives/AppBarUserPopover.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
-| `ui-new/primitives/AutoResizeTextarea.tsx` | `extract-now` | `@vibe/ui` | Primitive UI component; good first package candidate. |
+| `ui-new/primitives/AutoResizeTextarea.tsx` | `extract-now` | `@bettercoding/ui` | Primitive UI component; good first package candidate. |
 | `ui-new/primitives/ChatBoxBase.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
-| `ui-new/primitives/CollapsibleSectionHeader.tsx` | `extract-later` | `@vibe/ui` | Primitive UI component; good first package candidate. Move after decoupling @/stores. |
-| `ui-new/primitives/ColorPicker.tsx` | `extract-now` | `@vibe/ui` | Primitive UI component; good first package candidate. |
-| `ui-new/primitives/Command.tsx` | `extract-now` | `@vibe/ui` | Primitive UI component; good first package candidate. |
-| `ui-new/primitives/CommandBar.tsx` | `extract-later` | `@vibe/ui` | Potentially reusable but needs API cleanup. Requires decoupling from @/components/*. |
+| `ui-new/primitives/CollapsibleSectionHeader.tsx` | `extract-later` | `@bettercoding/ui` | Primitive UI component; good first package candidate. Move after decoupling @/stores. |
+| `ui-new/primitives/ColorPicker.tsx` | `extract-now` | `@bettercoding/ui` | Primitive UI component; good first package candidate. |
+| `ui-new/primitives/Command.tsx` | `extract-now` | `@bettercoding/ui` | Primitive UI component; good first package candidate. |
+| `ui-new/primitives/CommandBar.tsx` | `extract-later` | `@bettercoding/ui` | Potentially reusable but needs API cleanup. Requires decoupling from @/components/*. |
 | `ui-new/primitives/CommentCard.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
 | `ui-new/primitives/ContextBar.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
 | `ui-new/primitives/ContextUsageGauge.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
 | `ui-new/primitives/CreateChatBox.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
-| `ui-new/primitives/Dialog.tsx` | `extract-later` | `@vibe/ui` | Primitive UI component; good first package candidate. Move after decoupling @/contexts. |
-| `ui-new/primitives/Dropdown.tsx` | `extract-later` | `@vibe/ui` | Primitive UI component; good first package candidate. Move after decoupling @/contexts. |
-| `ui-new/primitives/EmojiPicker.tsx` | `extract-later` | `@vibe/ui` | Potentially reusable but needs API cleanup. Requires decoupling from @/contexts. |
-| `ui-new/primitives/ErrorAlert.tsx` | `extract-now` | `@vibe/ui` | Primitive UI component; good first package candidate. |
+| `ui-new/primitives/Dialog.tsx` | `extract-later` | `@bettercoding/ui` | Primitive UI component; good first package candidate. Move after decoupling @/contexts. |
+| `ui-new/primitives/Dropdown.tsx` | `extract-later` | `@bettercoding/ui` | Primitive UI component; good first package candidate. Move after decoupling @/contexts. |
+| `ui-new/primitives/EmojiPicker.tsx` | `extract-later` | `@bettercoding/ui` | Potentially reusable but needs API cleanup. Requires decoupling from @/contexts. |
+| `ui-new/primitives/ErrorAlert.tsx` | `extract-now` | `@bettercoding/ui` | Primitive UI component; good first package candidate. |
 | `ui-new/primitives/GoogleLogo.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
-| `ui-new/primitives/IconButton.tsx` | `extract-now` | `@vibe/ui` | Primitive UI component; good first package candidate. |
-| `ui-new/primitives/IconButtonGroup.tsx` | `extract-now` | `@vibe/ui` | Primitive UI component; good first package candidate. |
-| `ui-new/primitives/InputField.tsx` | `extract-now` | `@vibe/ui` | Primitive UI component; good first package candidate. |
+| `ui-new/primitives/IconButton.tsx` | `extract-now` | `@bettercoding/ui` | Primitive UI component; good first package candidate. |
+| `ui-new/primitives/IconButtonGroup.tsx` | `extract-now` | `@bettercoding/ui` | Primitive UI component; good first package candidate. |
+| `ui-new/primitives/InputField.tsx` | `extract-now` | `@bettercoding/ui` | Primitive UI component; good first package candidate. |
 | `ui-new/primitives/KanbanAssignee.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
 | `ui-new/primitives/KanbanBadge.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
-| `ui-new/primitives/MultiSelectCommandBar.tsx` | `extract-later` | `@vibe/ui` | Potentially reusable but needs API cleanup. |
-| `ui-new/primitives/MultiSelectDropdown.tsx` | `extract-now` | `@vibe/ui` | Primitive UI component; good first package candidate. |
+| `ui-new/primitives/MultiSelectCommandBar.tsx` | `extract-later` | `@bettercoding/ui` | Potentially reusable but needs API cleanup. |
+| `ui-new/primitives/MultiSelectDropdown.tsx` | `extract-now` | `@bettercoding/ui` | Primitive UI component; good first package candidate. |
 | `ui-new/primitives/OAuthButtons.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
-| `ui-new/primitives/Popover.tsx` | `extract-later` | `@vibe/ui` | Primitive UI component; good first package candidate. Move after decoupling @/contexts. |
+| `ui-new/primitives/Popover.tsx` | `extract-later` | `@bettercoding/ui` | Primitive UI component; good first package candidate. Move after decoupling @/contexts. |
 | `ui-new/primitives/PrBadge.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
-| `ui-new/primitives/PrimaryButton.tsx` | `extract-now` | `@vibe/ui` | Primitive UI component; good first package candidate. |
+| `ui-new/primitives/PrimaryButton.tsx` | `extract-now` | `@bettercoding/ui` | Primitive UI component; good first package candidate. |
 | `ui-new/primitives/PriorityIcon.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
 | `ui-new/primitives/ProcessListItem.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
 | `ui-new/primitives/PropertyDropdown.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
 | `ui-new/primitives/RelationshipBadge.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
 | `ui-new/primitives/RepoCard.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
-| `ui-new/primitives/RunningDots.tsx` | `extract-now` | `@vibe/ui` | Primitive UI component; good first package candidate. |
-| `ui-new/primitives/SearchableDropdown.tsx` | `extract-now` | `@vibe/ui` | Primitive UI component; good first package candidate. |
+| `ui-new/primitives/RunningDots.tsx` | `extract-now` | `@bettercoding/ui` | Primitive UI component; good first package candidate. |
+| `ui-new/primitives/SearchableDropdown.tsx` | `extract-now` | `@bettercoding/ui` | Primitive UI component; good first package candidate. |
 | `ui-new/primitives/SearchableTagDropdown.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
 | `ui-new/primitives/SessionChatBox.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
-| `ui-new/primitives/SplitButton.tsx` | `extract-now` | `@vibe/ui` | Primitive UI component; good first package candidate. |
-| `ui-new/primitives/StatusDot.tsx` | `extract-now` | `@vibe/ui` | Primitive UI component; good first package candidate. |
+| `ui-new/primitives/SplitButton.tsx` | `extract-now` | `@bettercoding/ui` | Primitive UI component; good first package candidate. |
+| `ui-new/primitives/StatusDot.tsx` | `extract-now` | `@bettercoding/ui` | Primitive UI component; good first package candidate. |
 | `ui-new/primitives/SubIssueRow.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
 | `ui-new/primitives/SyncErrorIndicator.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
 | `ui-new/primitives/TodoProgressPopup.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
-| `ui-new/primitives/Toggle.tsx` | `extract-now` | `@vibe/ui` | Primitive UI component; good first package candidate. |
-| `ui-new/primitives/Toolbar.tsx` | `extract-now` | `@vibe/ui` | Primitive UI component; good first package candidate. |
-| `ui-new/primitives/Tooltip.tsx` | `extract-later` | `@vibe/ui` | Primitive UI component; good first package candidate. Move after decoupling @/contexts. |
+| `ui-new/primitives/Toggle.tsx` | `extract-now` | `@bettercoding/ui` | Primitive UI component; good first package candidate. |
+| `ui-new/primitives/Toolbar.tsx` | `extract-now` | `@bettercoding/ui` | Primitive UI component; good first package candidate. |
+| `ui-new/primitives/Tooltip.tsx` | `extract-later` | `@bettercoding/ui` | Primitive UI component; good first package candidate. Move after decoupling @/contexts. |
 | `ui-new/primitives/UserAvatar.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
 | `ui-new/primitives/ViewNavTabs.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
 | `ui-new/primitives/WorkspaceSummary.tsx` | `keep-app` | `frontend-app` | Domain-specific primitive for kanban/chat/workspace flows. |
@@ -273,48 +273,48 @@ Date: 2026-02-21
 
 | Component | Status | Target package | Notes |
 | --- | --- | --- | --- |
-| `ui/wysiwyg/context/task-attempt-context.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. |
-| `ui/wysiwyg/context/typeahead-open-context.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. |
-| `ui/wysiwyg/lib/create-decorator-node.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. |
-| `ui/wysiwyg/nodes/component-info-node.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. |
-| `ui/wysiwyg/nodes/image-node.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. Requires decoupling from @/hooks, @/components/*. |
-| `ui/wysiwyg/nodes/pr-comment-node.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. |
-| `ui/wysiwyg/plugins/clickable-code-plugin.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. |
-| `ui/wysiwyg/plugins/code-block-shortcut-plugin.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. |
-| `ui/wysiwyg/plugins/code-highlight-plugin.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. |
-| `ui/wysiwyg/plugins/component-info-keyboard-plugin.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. |
-| `ui/wysiwyg/plugins/file-tag-typeahead-plugin.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. Requires decoupling from @/components/*, @/contexts, @/lib/*api, @/stores. |
-| `ui/wysiwyg/plugins/image-keyboard-plugin.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. |
-| `ui/wysiwyg/plugins/keyboard-commands-plugin.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. |
-| `ui/wysiwyg/plugins/markdown-sync-plugin.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. |
-| `ui/wysiwyg/plugins/paste-markdown-plugin.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. |
-| `ui/wysiwyg/plugins/read-only-link-plugin.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. |
-| `ui/wysiwyg/plugins/slash-command-typeahead-plugin.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. Requires decoupling from @/contexts, @/hooks. |
-| `ui/wysiwyg/plugins/static-toolbar-plugin.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. |
-| `ui/wysiwyg/plugins/toolbar-plugin.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. Requires decoupling from @/contexts. |
-| `ui/wysiwyg/plugins/typeahead-menu-components.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. |
+| `ui/wysiwyg/context/task-attempt-context.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. |
+| `ui/wysiwyg/context/typeahead-open-context.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. |
+| `ui/wysiwyg/lib/create-decorator-node.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. |
+| `ui/wysiwyg/nodes/component-info-node.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. |
+| `ui/wysiwyg/nodes/image-node.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. Requires decoupling from @/hooks, @/components/*. |
+| `ui/wysiwyg/nodes/pr-comment-node.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. |
+| `ui/wysiwyg/plugins/clickable-code-plugin.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. |
+| `ui/wysiwyg/plugins/code-block-shortcut-plugin.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. |
+| `ui/wysiwyg/plugins/code-highlight-plugin.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. |
+| `ui/wysiwyg/plugins/component-info-keyboard-plugin.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. |
+| `ui/wysiwyg/plugins/file-tag-typeahead-plugin.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. Requires decoupling from @/components/*, @/contexts, @/lib/*api, @/stores. |
+| `ui/wysiwyg/plugins/image-keyboard-plugin.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. |
+| `ui/wysiwyg/plugins/keyboard-commands-plugin.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. |
+| `ui/wysiwyg/plugins/markdown-sync-plugin.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. |
+| `ui/wysiwyg/plugins/paste-markdown-plugin.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. |
+| `ui/wysiwyg/plugins/read-only-link-plugin.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. |
+| `ui/wysiwyg/plugins/slash-command-typeahead-plugin.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. Requires decoupling from @/contexts, @/hooks. |
+| `ui/wysiwyg/plugins/static-toolbar-plugin.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. |
+| `ui/wysiwyg/plugins/toolbar-plugin.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. Requires decoupling from @/contexts. |
+| `ui/wysiwyg/plugins/typeahead-menu-components.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. |
 
 ### ui
 
 | Component | Status | Target package | Notes |
 | --- | --- | --- | --- |
-| `ui/alert.tsx` | `extract-now` | `@vibe/ui` | Core shadcn-style primitive with low business coupling. |
-| `ui/auto-expanding-textarea.tsx` | `extract-now` | `@vibe/ui` | Core shadcn-style primitive with low business coupling. |
-| `ui/badge.tsx` | `extract-now` | `@vibe/ui` | Core shadcn-style primitive with low business coupling. |
-| `ui/button.tsx` | `extract-now` | `@vibe/ui` | Core shadcn-style primitive with low business coupling. |
-| `ui/card.tsx` | `extract-now` | `@vibe/ui` | Core shadcn-style primitive with low business coupling. |
-| `ui/checkbox.tsx` | `extract-now` | `@vibe/ui` | Core shadcn-style primitive with low business coupling. |
-| `ui/dialog.tsx` | `extract-later` | `@vibe/ui` | Reusable but currently tied to app context/portal behavior. Requires decoupling from @/keyboard. |
-| `ui/dropdown-menu.tsx` | `extract-later` | `@vibe/ui` | Reusable but currently tied to app context/portal behavior. Requires decoupling from @/contexts. |
-| `ui/input.tsx` | `extract-now` | `@vibe/ui` | Core shadcn-style primitive with low business coupling. |
-| `ui/label.tsx` | `extract-now` | `@vibe/ui` | Core shadcn-style primitive with low business coupling. |
-| `ui/loader.tsx` | `extract-now` | `@vibe/ui` | Core shadcn-style primitive with low business coupling. |
+| `ui/alert.tsx` | `extract-now` | `@bettercoding/ui` | Core shadcn-style primitive with low business coupling. |
+| `ui/auto-expanding-textarea.tsx` | `extract-now` | `@bettercoding/ui` | Core shadcn-style primitive with low business coupling. |
+| `ui/badge.tsx` | `extract-now` | `@bettercoding/ui` | Core shadcn-style primitive with low business coupling. |
+| `ui/button.tsx` | `extract-now` | `@bettercoding/ui` | Core shadcn-style primitive with low business coupling. |
+| `ui/card.tsx` | `extract-now` | `@bettercoding/ui` | Core shadcn-style primitive with low business coupling. |
+| `ui/checkbox.tsx` | `extract-now` | `@bettercoding/ui` | Core shadcn-style primitive with low business coupling. |
+| `ui/dialog.tsx` | `extract-later` | `@bettercoding/ui` | Reusable but currently tied to app context/portal behavior. Requires decoupling from @/keyboard. |
+| `ui/dropdown-menu.tsx` | `extract-later` | `@bettercoding/ui` | Reusable but currently tied to app context/portal behavior. Requires decoupling from @/contexts. |
+| `ui/input.tsx` | `extract-now` | `@bettercoding/ui` | Core shadcn-style primitive with low business coupling. |
+| `ui/label.tsx` | `extract-now` | `@bettercoding/ui` | Core shadcn-style primitive with low business coupling. |
+| `ui/loader.tsx` | `extract-now` | `@bettercoding/ui` | Core shadcn-style primitive with low business coupling. |
 | `ui/pr-comment-card.tsx` | `keep-app` | `frontend-app` | PR domain card component. |
-| `ui/select.tsx` | `extract-later` | `@vibe/ui` | Reusable but currently tied to app context/portal behavior. Requires decoupling from @/contexts. |
-| `ui/switch.tsx` | `extract-now` | `@vibe/ui` | Core shadcn-style primitive with low business coupling. |
-| `ui/textarea.tsx` | `extract-now` | `@vibe/ui` | Core shadcn-style primitive with low business coupling. |
-| `ui/tooltip.tsx` | `extract-later` | `@vibe/ui` | Reusable but currently tied to app context/portal behavior. Requires decoupling from @/contexts. |
-| `ui/wysiwyg.tsx` | `extract-later` | `@vibe/editor-ui` | Editor subsystem; split as a dedicated package later. Requires decoupling from @/vscode. |
+| `ui/select.tsx` | `extract-later` | `@bettercoding/ui` | Reusable but currently tied to app context/portal behavior. Requires decoupling from @/contexts. |
+| `ui/switch.tsx` | `extract-now` | `@bettercoding/ui` | Core shadcn-style primitive with low business coupling. |
+| `ui/textarea.tsx` | `extract-now` | `@bettercoding/ui` | Core shadcn-style primitive with low business coupling. |
+| `ui/tooltip.tsx` | `extract-later` | `@bettercoding/ui` | Reusable but currently tied to app context/portal behavior. Requires decoupling from @/contexts. |
+| `ui/wysiwyg.tsx` | `extract-later` | `@bettercoding/editor-ui` | Editor subsystem; split as a dedicated package later. Requires decoupling from @/vscode. |
 
 ### tasks
 
@@ -383,8 +383,8 @@ Date: 2026-02-21
 
 | Component | Status | Target package | Notes |
 | --- | --- | --- | --- |
-| `ui/table/data-table.tsx` | `extract-later` | `@vibe/ui` | Reusable table building blocks; defer until core package is stable. |
-| `ui/table/table.tsx` | `extract-later` | `@vibe/ui` | Reusable table building blocks; defer until core package is stable. |
+| `ui/table/data-table.tsx` | `extract-later` | `@bettercoding/ui` | Reusable table building blocks; defer until core package is stable. |
+| `ui/table/table.tsx` | `extract-later` | `@bettercoding/ui` | Reusable table building blocks; defer until core package is stable. |
 
 ### agents
 

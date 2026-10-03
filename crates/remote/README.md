@@ -8,7 +8,7 @@ Create `crates/remote/.env.remote`:
 
 ```env
 # Required
-VIBEKANBAN_REMOTE_JWT_SECRET=replace_with_openssl_rand_base64_48
+BC_REMOTE_JWT_SECRET=replace_with_openssl_rand_base64_48
 ELECTRIC_ROLE_PASSWORD=replace_with_secure_password
 
 # Configure at least one auth option
@@ -136,8 +136,8 @@ Update your OAuth callback URLs accordingly:
 ### Test relay tunnel end-to-end
 
 ```bash
-export VK_SHARED_API_BASE=https://localhost:3001
-export VK_SHARED_RELAY_API_BASE=https://relay.localhost:3001
+export BC_SHARED_API_BASE=https://localhost:3001
+export BC_SHARED_RELAY_API_BASE=https://relay.localhost:3001
 
 pnpm run dev
 ```
@@ -156,6 +156,6 @@ If the relay health endpoint returns HTML instead of `{"status":"ok"}`, your Cad
 To run the desktop/local app against this remote stack:
 
 ```bash
-export VK_SHARED_API_BASE=http://localhost:3000
+export BC_SHARED_API_BASE=http://localhost:3000
 pnpm run dev
 ```

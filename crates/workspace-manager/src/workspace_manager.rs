@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use db::{
     DBService,
@@ -544,14 +547,23 @@ impl WorkspaceManager {
             return;
         }
 
-        // Always clean up the default directory
-        let default_dir = WorktreeManager::get_default_worktree_base_dir();
-        self.cleanup_orphans_in_directory(&default_dir).await;
-
-        // Also clean up custom directory if it's different from the default
-        let current_dir = Self::get_workspace_base_dir();
-        if current_dir != default_dir {
-            self.cleanup_orphans_in_directory(&current_dir).await;
+        // The default and the current roots, plus every root a workspace still
+        // lives in: a workspace keeps its absolute path when the root changes.
+        let mut roots = BTreeSet::from([
+            WorktreeManager::get_default_worktree_base_dir(),
+            Self::get_workspace_base_dir(),
+        ]);
+        match DbWorkspace::fetch_all(&self.db.pool).await {
+            Ok(workspaces) => roots.extend(
+                workspaces
+                    .iter()
+                    .filter_map(|w| Path::new(w.container_ref.as_deref()?).parent())
+                    .map(Path::to_path_buf),
+            ),
+            Err(e) => warn!("Failed to list workspace roots for orphan cleanup: {}", e),
+        }
+        for root in roots {
+            self.cleanup_orphans_in_directory(&root).await;
         }
     }
 

@@ -1,7 +1,7 @@
 import { useState, memo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { PrimaryButton } from '@vibe/ui/components/PrimaryButton';
-import { CommentCard } from '@vibe/ui/components/CommentCard';
+import { PrimaryButton } from '@bettercoding/ui/components/PrimaryButton';
+import { CommentCard } from '@bettercoding/ui/components/CommentCard';
 import WYSIWYGEditor from '@/shared/components/WYSIWYGEditor';
 import { useReview, type ReviewComment } from '@/shared/hooks/useReview';
 

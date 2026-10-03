@@ -14,8 +14,8 @@ import {
   generateChallenge,
   storeVerifier,
 } from "@remote/shared/lib/pkce";
-import { Input } from "@vibe/ui/components/Input";
-import { Label } from "@vibe/ui/components/Label";
+import { Input } from "@bettercoding/ui/components/Input";
+import { Label } from "@bettercoding/ui/components/Label";
 
 export default function LoginPage() {
   const { next } = useSearch({ from: "/account" });

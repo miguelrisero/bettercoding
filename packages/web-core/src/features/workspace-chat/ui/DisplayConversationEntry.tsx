@@ -31,29 +31,29 @@ import {
   ScriptFixerDialog,
   type ScriptType,
 } from '@/shared/dialogs/scripts/ScriptFixerDialog';
-import { ChatToolSummary } from '@vibe/ui/components/ChatToolSummary';
-import { ChatTodoList } from '@vibe/ui/components/ChatTodoList';
+import { ChatToolSummary } from '@bettercoding/ui/components/ChatToolSummary';
+import { ChatTodoList } from '@bettercoding/ui/components/ChatTodoList';
 import {
   ChatFileEntry,
   type ChatFileEntryDiffInput,
-} from '@vibe/ui/components/ChatFileEntry';
-import { ChatApprovalCard } from '@vibe/ui/components/ChatApprovalCard';
-import { ChatUserMessage } from '@vibe/ui/components/ChatUserMessage';
-import { ChatAssistantMessage } from '@vibe/ui/components/ChatAssistantMessage';
-import { ChatSystemMessage } from '@vibe/ui/components/ChatSystemMessage';
-import { ChatThinkingMessage } from '@vibe/ui/components/ChatThinkingMessage';
-import { ChatErrorMessage } from '@vibe/ui/components/ChatErrorMessage';
-import { ChatScriptEntry } from '@vibe/ui/components/ChatScriptEntry';
-import { ChatSubagentEntry } from '@vibe/ui/components/ChatSubagentEntry';
-import { ChatAggregatedToolEntries } from '@vibe/ui/components/ChatAggregatedToolEntries';
-import { ChatAggregatedDiffEntries } from '@vibe/ui/components/ChatAggregatedDiffEntries';
-import { ChatCollapsedThinking } from '@vibe/ui/components/ChatCollapsedThinking';
-import { ChatMarkdown } from '@vibe/ui/components/ChatMarkdown';
-import { Badge } from '@vibe/ui/components/Badge';
+} from '@bettercoding/ui/components/ChatFileEntry';
+import { ChatApprovalCard } from '@bettercoding/ui/components/ChatApprovalCard';
+import { ChatUserMessage } from '@bettercoding/ui/components/ChatUserMessage';
+import { ChatAssistantMessage } from '@bettercoding/ui/components/ChatAssistantMessage';
+import { ChatSystemMessage } from '@bettercoding/ui/components/ChatSystemMessage';
+import { ChatThinkingMessage } from '@bettercoding/ui/components/ChatThinkingMessage';
+import { ChatErrorMessage } from '@bettercoding/ui/components/ChatErrorMessage';
+import { ChatScriptEntry } from '@bettercoding/ui/components/ChatScriptEntry';
+import { ChatSubagentEntry } from '@bettercoding/ui/components/ChatSubagentEntry';
+import { ChatAggregatedToolEntries } from '@bettercoding/ui/components/ChatAggregatedToolEntries';
+import { ChatAggregatedDiffEntries } from '@bettercoding/ui/components/ChatAggregatedDiffEntries';
+import { ChatCollapsedThinking } from '@bettercoding/ui/components/ChatCollapsedThinking';
+import { ChatMarkdown } from '@bettercoding/ui/components/ChatMarkdown';
+import { Badge } from '@bettercoding/ui/components/Badge';
 import {
   DiffViewBody,
   useDiffData,
-} from '@vibe/ui/components/PierreConversationDiff';
+} from '@bettercoding/ui/components/PierreConversationDiff';
 import { inIframe, openFileInVSCode } from '@/integrations/vscode/bridge';
 import { useDiffViewMode } from '@/shared/stores/useDiffViewStore';
 import type {

@@ -1,7 +1,7 @@
 import { useState, useMemo, useRef, useEffect, useCallback, memo } from 'react';
 import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
 import { useTranslation } from 'react-i18next';
-import { Button } from '@vibe/ui/components/Button';
+import { Button } from '@bettercoding/ui/components/Button';
 import { ArrowDown, GitBranch as GitBranchIcon, Search } from 'lucide-react';
 import {
   DropdownMenu,
@@ -9,14 +9,14 @@ import {
   DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
-} from '@vibe/ui/components/DropdownMenu';
+} from '@bettercoding/ui/components/DropdownMenu';
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
-} from '@vibe/ui/components/RadixTooltip';
-import { Input } from '@vibe/ui/components/Input';
+} from '@bettercoding/ui/components/RadixTooltip';
+import { Input } from '@bettercoding/ui/components/Input';
 import type { GitBranch } from 'shared/types';
 
 type Props = {

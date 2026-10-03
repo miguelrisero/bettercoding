@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Button } from '@vibe/ui/components/Button';
+import { Button } from '@bettercoding/ui/components/Button';
 import {
   Dialog,
   DialogContent,
@@ -7,8 +7,8 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-} from '@vibe/ui/components/KeyboardDialog';
-import { Alert, AlertDescription } from '@vibe/ui/components/Alert';
+} from '@bettercoding/ui/components/KeyboardDialog';
+import { Alert, AlertDescription } from '@bettercoding/ui/components/Alert';
 import { Loader2 } from 'lucide-react';
 import { create, useModal } from '@ebay/nice-modal-react';
 import { useTranslation } from 'react-i18next';

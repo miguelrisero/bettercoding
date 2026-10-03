@@ -144,7 +144,7 @@
         "description": "Git 브랜치 이름 지정 기본 설정 구성",
         "branchPrefix": {
           "label": "브랜치 접두사",
-          "placeholder": "vk",
+          "placeholder": "bc",
           "helper": "자동 생성된 브랜치 이름의 접두사입니다. 접두사가 없으려면 비워두세요.",
           "preview": "미리보기:",
           "previewWithPrefix": "{{prefix}}/1a2b-task-name",
@@ -161,10 +161,10 @@
         "workspaceDir": {
           "label": "워크스페이스 디렉토리",
           "placeholder": "~/",
-          "helper": "이 경로 내의 .vibe-kanban-workspaces 하위 디렉토리에 워크스페이스가 생성됩니다. 시스템 기본값을 사용하려면 비워두세요. 변경 사항은 앱을 다시 시작해야 적용됩니다.",
+          "helper": "이 경로 내의 .bettercoding-workspaces 하위 디렉토리에 워크스페이스가 생성됩니다. 시스템 기본값을 사용하려면 비워두세요. 변경 사항은 앱을 다시 시작해야 적용됩니다.",
           "browse": "찾아보기",
           "dialogTitle": "워크스페이스 디렉토리 선택",
-          "dialogDescription": "디렉토리를 선택하세요. 워크스페이스는 해당 디렉토리 내의 .vibe-kanban-workspaces 하위 디렉토리에 생성됩니다."
+          "dialogDescription": "디렉토리를 선택하세요. 워크스페이스는 해당 디렉토리 내의 .bettercoding-workspaces 하위 디렉토리에 생성됩니다."
         }
       },
       "pullRequests": {

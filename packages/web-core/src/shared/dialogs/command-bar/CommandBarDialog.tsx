@@ -3,11 +3,11 @@ import { create, useModal } from '@ebay/nice-modal-react';
 import { useQueryClient } from '@tanstack/react-query';
 import type { Workspace } from 'shared/types';
 import { defineModal } from '@/shared/lib/modals';
-import { CommandDialog } from '@vibe/ui/components/Command';
+import { CommandDialog } from '@bettercoding/ui/components/Command';
 import {
   CommandBar,
   type CommandBarGroupItem,
-} from '@vibe/ui/components/CommandBar';
+} from '@bettercoding/ui/components/CommandBar';
 import { useActions } from '@/shared/hooks/useActions';
 import { useWorkspaceContext } from '@/shared/hooks/useWorkspaceContext';
 import { workspaceRecordKeys } from '@/shared/hooks/useWorkspaceRecord';

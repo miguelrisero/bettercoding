@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react';
 import { useState, useMemo, useCallback, useRef } from 'react';
 import { VirtuosoHandle } from 'react-virtuoso';
-import { SearchableDropdown } from '@vibe/ui/components/SearchableDropdown';
+import { SearchableDropdown } from '@bettercoding/ui/components/SearchableDropdown';
 
 interface SearchableDropdownContainerProps<T> {
   /** Array of items to display */

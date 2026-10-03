@@ -7,15 +7,15 @@
 //     --version 0.2.0 \
 //     --notes "Bug fixes" \
 //     --artifacts-dir ./tauri-artifacts \
-//     --download-base "https://github.com/BloopAI/vibe-kanban/releases/download/v0.2.0" \
+//     --download-base "https://github.com/miguelrisero/bettercoding/releases/download/v0.2.0" \
 //     --output latest.json
 //
 // The artifacts-dir should contain Tauri bundle outputs with .sig files:
 //   tauri-artifacts/
-//     darwin-aarch64/  -> vibe-kanban.app.tar.gz, vibe-kanban.app.tar.gz.sig
-//     darwin-x86_64/   -> vibe-kanban.app.tar.gz, vibe-kanban.app.tar.gz.sig
-//     linux-x86_64/    -> vibe-kanban.AppImage.tar.gz, vibe-kanban.AppImage.tar.gz.sig
-//     windows-x86_64/  -> vibe-kanban-setup.exe, vibe-kanban-setup.exe.sig (NSIS)
+//     darwin-aarch64/  -> bettercoding.app.tar.gz, bettercoding.app.tar.gz.sig
+//     darwin-x86_64/   -> bettercoding.app.tar.gz, bettercoding.app.tar.gz.sig
+//     linux-x86_64/    -> bettercoding.AppImage.tar.gz, bettercoding.AppImage.tar.gz.sig
+//     windows-x86_64/  -> bettercoding-setup.exe, bettercoding-setup.exe.sig (NSIS)
 //
 
 const fs = require('fs');

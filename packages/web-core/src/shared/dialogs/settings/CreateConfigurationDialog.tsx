@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
-import { Button } from '@vibe/ui/components/Button';
-import { Input } from '@vibe/ui/components/Input';
-import { Label } from '@vibe/ui/components/Label';
+import { Button } from '@bettercoding/ui/components/Button';
+import { Input } from '@bettercoding/ui/components/Input';
+import { Label } from '@bettercoding/ui/components/Label';
 import {
   Dialog,
   DialogContent,
@@ -9,15 +9,15 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-} from '@vibe/ui/components/KeyboardDialog';
+} from '@bettercoding/ui/components/KeyboardDialog';
 import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from '@vibe/ui/components/Select';
-import { Alert, AlertDescription } from '@vibe/ui/components/Alert';
+} from '@bettercoding/ui/components/Select';
+import { Alert, AlertDescription } from '@bettercoding/ui/components/Alert';
 import { create, useModal } from '@ebay/nice-modal-react';
 import { defineModal } from '@/shared/lib/modals';
 

@@ -6,8 +6,8 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-} from '@vibe/ui/components/KeyboardDialog';
-import { Button } from '@vibe/ui/components/Button';
+} from '@bettercoding/ui/components/KeyboardDialog';
+import { Button } from '@bettercoding/ui/components/Button';
 import { AlertTriangle, GitCommit, Loader2 } from 'lucide-react';
 import { create, useModal } from '@ebay/nice-modal-react';
 import { defineModal } from '@/shared/lib/modals';

@@ -145,9 +145,7 @@ async fn bulk_delete_validates_each_submitted_snapshot_and_continues_after_failu
     unsafe {
         std::env::set_var("BC_DATA_DIR", data_dir.path());
         std::env::remove_var("BC_SHARED_API_BASE");
-        std::env::remove_var("VK_SHARED_API_BASE");
         std::env::remove_var("BC_SHARED_RELAY_API_BASE");
-        std::env::remove_var("VK_SHARED_RELAY_API_BASE");
     }
 
     let shutdown = CancellationToken::new();

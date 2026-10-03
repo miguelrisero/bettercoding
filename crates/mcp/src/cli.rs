@@ -32,9 +32,9 @@ where
 {
     let LaunchConfig { mode } = resolve_launch_config_from_iter(args)?;
     let version = env!("CARGO_PKG_VERSION");
-    init_process_logging("vibe-kanban-mcp", version);
+    init_process_logging("bettercoding-mcp", version);
 
-    let base_url = resolve_base_url("vibe-kanban-mcp").await?;
+    let base_url = resolve_base_url("bettercoding-mcp").await?;
 
     let server = match mode {
         McpLaunchMode::Global => McpServer::new_global(&base_url),
@@ -64,12 +64,12 @@ where
                 })?);
             }
             "-h" | "--help" => {
-                println!("Usage: vibe-kanban-mcp --mode <global|orchestrator>");
+                println!("Usage: bettercoding-mcp --mode <global|orchestrator>");
                 std::process::exit(0);
             }
             _ => {
                 return Err(anyhow::anyhow!(
-                    "Unknown argument '{arg}'. Usage: vibe-kanban-mcp --mode <global|orchestrator>"
+                    "Unknown argument '{arg}'. Usage: bettercoding-mcp --mode <global|orchestrator>"
                 ));
             }
         }
@@ -95,9 +95,9 @@ where
 }
 
 async fn resolve_base_url(log_prefix: &str) -> anyhow::Result<String> {
-    if let Ok(url) = std::env::var("VIBE_BACKEND_URL") {
+    if let Ok(url) = std::env::var("BC_BACKEND_URL") {
         tracing::info!(
-            "[{}] Using backend URL from VIBE_BACKEND_URL: {}",
+            "[{}] Using backend URL from BC_BACKEND_URL: {}",
             log_prefix,
             url
         );
@@ -119,7 +119,7 @@ async fn resolve_base_url(log_prefix: &str) -> anyhow::Result<String> {
                 .map_err(|error| anyhow::anyhow!("Invalid port value '{}': {}", port_str, error))?
         }
         Err(_) => {
-            let port = read_port_file("vibe-kanban").await?;
+            let port = read_port_file("bettercoding").await?;
             tracing::info!("[{}] Using port from port file: {}", log_prefix, port);
             port
         }

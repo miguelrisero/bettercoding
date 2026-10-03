@@ -13,7 +13,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
   DropdownMenuTriggerButton,
-} from '@vibe/ui/components/Dropdown';
+} from '@bettercoding/ui/components/Dropdown';
 import {
   SettingsCard,
   SettingsField,

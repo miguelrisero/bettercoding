@@ -144,7 +144,7 @@
         "description": "Gitブランチ名の設定",
         "branchPrefix": {
           "label": "ブランチプレフィックス",
-          "placeholder": "vk",
+          "placeholder": "bc",
           "helper": "自動生成されるブランチ名のプレフィックス。空欄にするとプレフィックスなしになります。",
           "preview": "プレビュー：",
           "previewWithPrefix": "{{prefix}}/1a2b-タスク名",
@@ -161,10 +161,10 @@
         "workspaceDir": {
           "label": "ワークスペースディレクトリ",
           "placeholder": "~/",
-          "helper": "このパス内の .vibe-kanban-workspaces サブディレクトリにワークスペースが作成されます。システムのデフォルトを使用する場合は空白のままにしてください。変更を反映するにはアプリの再起動が必要です。",
+          "helper": "このパス内の .bettercoding-workspaces サブディレクトリにワークスペースが作成されます。システムのデフォルトを使用する場合は空白のままにしてください。変更を反映するにはアプリの再起動が必要です。",
           "browse": "参照",
           "dialogTitle": "ワークスペースディレクトリを選択",
-          "dialogDescription": "ディレクトリを選択してください。ワークスペースはその中の .vibe-kanban-workspaces サブディレクトリに作成されます。"
+          "dialogDescription": "ディレクトリを選択してください。ワークスペースはその中の .bettercoding-workspaces サブディレクトリに作成されます。"
         }
       },
       "pullRequests": {

@@ -7,12 +7,12 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-} from '@vibe/ui/components/KeyboardDialog';
-import { Button } from '@vibe/ui/components/Button';
-import { Textarea } from '@vibe/ui/components/Textarea';
-import { Label } from '@vibe/ui/components/Label';
-import { Switch } from '@vibe/ui/components/Switch';
-import { Checkbox } from '@vibe/ui/components/Checkbox';
+} from '@bettercoding/ui/components/KeyboardDialog';
+import { Button } from '@bettercoding/ui/components/Button';
+import { Textarea } from '@bettercoding/ui/components/Textarea';
+import { Label } from '@bettercoding/ui/components/Label';
+import { Switch } from '@bettercoding/ui/components/Switch';
+import { Checkbox } from '@bettercoding/ui/components/Checkbox';
 import { AgentSelector } from '@/shared/components/tasks/AgentSelector';
 import { ConfigSelector } from '@/shared/components/tasks/ConfigSelector';
 import { useUserSystem } from '@/shared/hooks/useUserSystem';

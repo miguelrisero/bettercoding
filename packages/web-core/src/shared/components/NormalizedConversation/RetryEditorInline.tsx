@@ -3,8 +3,8 @@ import { useTranslation } from 'react-i18next';
 import WYSIWYGEditor from '@/shared/components/WYSIWYGEditor';
 import { cn } from '@/shared/lib/utils';
 import { VariantSelector } from '@/shared/components/VariantSelector';
-import { Button } from '@vibe/ui/components/Button';
-import { Alert, AlertDescription } from '@vibe/ui/components/Alert';
+import { Button } from '@bettercoding/ui/components/Button';
+import { Alert, AlertDescription } from '@bettercoding/ui/components/Alert';
 import { AlertCircle, Loader2, Paperclip, Send, X } from 'lucide-react';
 import { attachmentsApi } from '@/shared/lib/api';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
@@ -15,7 +15,7 @@ import { useVariant } from '@/shared/hooks/useVariant';
 import { useRetryProcess } from '@/shared/hooks/useRetryProcess';
 import { executorConfigFromAction } from '@/shared/lib/executor';
 import { buildWorkspaceAttachmentMarkdown } from '@/shared/lib/workspaceAttachments';
-import { ConfirmDialog } from '@vibe/ui/components/ConfirmDialog';
+import { ConfirmDialog } from '@bettercoding/ui/components/ConfirmDialog';
 import type { QueueStatus } from 'shared/types';
 
 export function RetryEditorInline({

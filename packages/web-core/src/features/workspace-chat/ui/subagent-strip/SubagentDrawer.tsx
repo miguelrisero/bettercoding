@@ -5,13 +5,13 @@ import { CaretDownIcon } from '@phosphor-icons/react';
 import {
   ChatSubagentEntry,
   type ChatSubagentEntryRenderProps,
-} from '@vibe/ui/components/ChatSubagentEntry';
+} from '@bettercoding/ui/components/ChatSubagentEntry';
 import {
   Popover,
   PopoverContent,
   PopoverTrigger,
-} from '@vibe/ui/components/Popover';
-import { cn } from '@vibe/ui/lib/cn';
+} from '@bettercoding/ui/components/Popover';
+import { cn } from '@bettercoding/ui/lib/cn';
 import type { SubagentDescriptor } from '../../model/subagent-strip-model';
 import { AppChatMarkdown } from '../DisplayConversationEntry';
 

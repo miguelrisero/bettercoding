@@ -89,9 +89,9 @@ impl McpServer {
 
         if context.is_none() {
             self.tool_router.map.remove("get_context");
-            tracing::debug!("VK context not available, get_context tool will not be registered");
+            tracing::debug!("MCP context not available, get_context tool will not be registered");
         } else {
-            tracing::info!("VK context loaded, get_context tool available");
+            tracing::info!("MCP context loaded, get_context tool available");
         }
 
         self.context = context;

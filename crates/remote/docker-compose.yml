@@ -76,7 +76,6 @@ services:
       dockerfile: crates/remote/Dockerfile
       args:
         # Build-time image/frontend args.
-        FEATURES: ${FEATURES:-}
         POSTHOG_API_KEY: ${POSTHOG_API_KEY:-}
         POSTHOG_API_ENDPOINT: ${POSTHOG_API_ENDPOINT:-}
         SENTRY_DSN_REMOTE: ${SENTRY_DSN_REMOTE:-}
@@ -99,7 +98,7 @@ services:
       ELECTRIC_URL: http://electric:3000
       ELECTRIC_ROLE_PASSWORD: ${ELECTRIC_ROLE_PASSWORD:-remote}
       SERVER_PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3000}
-      VIBEKANBAN_REMOTE_JWT_SECRET: ${VIBEKANBAN_REMOTE_JWT_SECRET:?set in .env.remote}
+      BC_REMOTE_JWT_SECRET: ${BC_REMOTE_JWT_SECRET:?set in .env.remote}
 
       # Auth 
       # Configure at least one OAuth provider, or set self-host local auth credentials.
@@ -168,7 +167,7 @@ services:
       RUST_LOG: info
       SERVER_DATABASE_URL: postgres://remote:remote@remote-db:5432/remote
       RELAY_LISTEN_ADDR: 0.0.0.0:8082
-      VIBEKANBAN_REMOTE_JWT_SECRET: ${VIBEKANBAN_REMOTE_JWT_SECRET:?set in .env.remote}
+      BC_REMOTE_JWT_SECRET: ${BC_REMOTE_JWT_SECRET:?set in .env.remote}
     ports:
       - "127.0.0.1:8082:8082"
     restart: unless-stopped

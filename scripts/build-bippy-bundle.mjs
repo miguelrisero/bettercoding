@@ -2,7 +2,7 @@
  * Build a vendored bippy IIFE bundle for injection into proxied HTML pages.
  *
  * Produces: crates/preview-proxy/src/bippy_bundle.js
- * Global:   window.VKBippy
+ * Global:   window.BCBippy
  *
  * Usage: node scripts/build-bippy-bundle.mjs
  */
@@ -61,7 +61,7 @@ try {
     entryPoints: [tmpEntry],
     bundle: true,
     format: 'iife',
-    globalName: 'VKBippy',
+    globalName: 'BCBippy',
     platform: 'browser',
     target: ['es2020'],
     minify: true,

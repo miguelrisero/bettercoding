@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 use super::jwt::{GitHubAppJwt, JwtError};
 use crate::config::GitHubAppConfig;
 
-const USER_AGENT: &str = "VibeKanbanRemote/1.0";
+const USER_AGENT: &str = "BetterCodingRemote/1.0";
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
 #[derive(Debug, Error)]

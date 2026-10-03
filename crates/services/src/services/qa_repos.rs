@@ -22,7 +22,7 @@ const QA_REPOS: &[(&str, &str)] = &[
 
 /// Persistent directory for QA repos - survives server restarts
 static QA_REPOS_DIR: Lazy<PathBuf> =
-    Lazy::new(|| qa_repos_dir_in(&utils::path::get_vibe_kanban_temp_dir()));
+    Lazy::new(|| qa_repos_dir_in(&utils::path::get_bettercoding_temp_dir()));
 
 fn qa_repos_dir_in(base: &Path) -> PathBuf {
     let dir = base.join("qa-repos");

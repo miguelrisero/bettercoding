@@ -330,8 +330,7 @@ pub async fn delete_workspace_core(
     // Reap the CLI tmux session BEFORE deleting the DB row, so a detached
     // `claude` session can't outlive its workspace. The interactive session is
     // not an execution_process, so the running-process guard above misses it;
-    // without this, deletion can orphan a current `bc_<id>` or legacy
-    // `vk_<id>` tmux session.
+    // without this, deletion can orphan a `bc_<id>` tmux session.
     // Best-effort + idempotent (no-op if already gone or tmux is absent).
     deployment.container().kill_cli_session(workspace_id).await;
 

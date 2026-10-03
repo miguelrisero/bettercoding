@@ -10,8 +10,8 @@ import {
   Navbar,
   type MobileTabId,
   type NavbarSectionItem,
-} from '@vibe/ui/components/Navbar';
-import { Tooltip } from '@vibe/ui/components/Tooltip';
+} from '@bettercoding/ui/components/Navbar';
+import { Tooltip } from '@bettercoding/ui/components/Tooltip';
 import { AppBarUserPopoverContainer } from './AppBarUserPopoverContainer';
 import { AppBarNotificationBellContainer } from '@/pages/workspaces/AppBarNotificationBellContainer';
 import { useUserSystem } from '@/shared/hooks/useUserSystem';

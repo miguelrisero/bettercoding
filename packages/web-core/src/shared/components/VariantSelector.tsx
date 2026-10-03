@@ -1,12 +1,12 @@
 import { memo, forwardRef, useEffect, useState } from 'react';
 import { ChevronDown, Settings2 } from 'lucide-react';
-import { Button } from '@vibe/ui/components/Button';
+import { Button } from '@bettercoding/ui/components/Button';
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
-} from '@vibe/ui/components/DropdownMenu';
+} from '@bettercoding/ui/components/DropdownMenu';
 import { cn } from '@/shared/lib/utils';
 import { getSortedExecutorVariantKeys } from '@/shared/lib/executor';
 import type { ExecutorProfile } from 'shared/types';

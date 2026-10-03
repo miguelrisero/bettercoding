@@ -8,15 +8,15 @@ import {
   XIcon,
 } from '@phosphor-icons/react';
 
-import { Switch } from '@vibe/ui/components/Switch';
-import { Button } from '@vibe/ui/components/Button';
-import { IconButton } from '@vibe/ui/components/IconButton';
-import { Tooltip } from '@vibe/ui/components/Tooltip';
+import { Switch } from '@bettercoding/ui/components/Switch';
+import { Button } from '@bettercoding/ui/components/Button';
+import { IconButton } from '@bettercoding/ui/components/IconButton';
+import { Tooltip } from '@bettercoding/ui/components/Tooltip';
 import {
   Popover,
   PopoverContent,
   PopoverTrigger,
-} from '@vibe/ui/components/Popover';
+} from '@bettercoding/ui/components/Popover';
 import { useLoopAutomation } from '@/shared/hooks/useLoopAutomation';
 
 interface LoopAutomationControlProps {

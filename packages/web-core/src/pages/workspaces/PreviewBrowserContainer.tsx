@@ -11,7 +11,7 @@ import {
   MOBILE_WIDTH,
   MOBILE_HEIGHT,
   PHONE_FRAME_PADDING,
-} from '@vibe/ui/components/PreviewBrowser';
+} from '@bettercoding/ui/components/PreviewBrowser';
 import { usePreviewDevServer } from '@/features/workspace/model/hooks/usePreviewDevServer';
 import { usePreviewUrl } from '@/shared/hooks/usePreviewUrl';
 import { useIsMobile } from '@/shared/hooks/useIsMobile';
@@ -287,8 +287,8 @@ export function PreviewBrowserContainer({
     if (!previewProxyPort) return undefined;
 
     // Don't proxy to BetterCoding's own ports (would create infinite loop)
-    const vibeKanbanPort = window.location.port || '80';
-    if (devServerPort === vibeKanbanPort) {
+    const appPort = window.location.port || '80';
+    if (devServerPort === appPort) {
       console.warn(
         `[Preview] Ignoring dev server URL with same port as BetterCoding (${devServerPort}). ` +
           'This usually means the dev server failed to start or reported the wrong port.'
@@ -827,7 +827,7 @@ export function PreviewBrowserContainer({
 
     iframe.contentWindow.postMessage(
       {
-        source: 'vibe-kanban',
+        source: 'bettercoding',
         command: visible ? 'show-eruda' : 'hide-eruda',
       },
       '*'

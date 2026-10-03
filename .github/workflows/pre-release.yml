@@ -1,5 +1,4 @@
 name: Create GitHub Pre-Release
-# TODO(bc-legacy-cleanup): vibe-kanban artifact/zip names are release identity; zip filenames are coupled to artifact ids.
 
 on:
   workflow_dispatch:
@@ -53,13 +52,6 @@ jobs:
       - name: setup node
         uses: ./.github/actions/setup-node
 
-      - name: Setup SSH Agent for private dependencies
-        id: ssh-setup
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-        uses: webfactory/ssh-agent@dc588b651fe13675774614f8e6a936a468676387 # v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.VK_PRIVATE_DEPLOY_KEY }}
-
       - name: Generate branch suffix
         id: branch
         run: |
@@ -74,7 +66,7 @@ jobs:
         id: version
         run: |
           # Get the latest version from npm registry
-          latest_npm_version=$(npm view vibe-kanban version 2>/dev/null || echo "0.0.0")
+          latest_npm_version=$(npm view bettercoding version 2>/dev/null || echo "0.0.0")
           echo "Latest npm version: $latest_npm_version"
 
           # Get current repo version
@@ -138,15 +130,10 @@ jobs:
           echo "new_tag=$new_tag" >> $GITHUB_OUTPUT
 
       - name: Update remote crate lockfile
-        if: ${{ steps.ssh-setup.outcome == 'success' }}
         run: cargo metadata --format-version 1 --manifest-path crates/remote/Cargo.toml > /dev/null
 
       - name: Update relay-tunnel crate lockfile
         run: cargo metadata --format-version 1 --manifest-path crates/relay-tunnel/Cargo.toml > /dev/null
-
-      - name: Stop SSH agent
-        if: ${{ steps.ssh-setup.outcome == 'success' }}
-        run: ssh-agent -k
 
       - name: Commit changes and create tag
         run: |
@@ -166,7 +153,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       VITE_PUBLIC_REACT_VIRTUOSO_LICENSE_KEY: ${{ secrets.PUBLIC_REACT_VIRTUOSO_LICENSE_KEY }}
-      VITE_VK_SHARED_API_BASE: ${{ secrets.VK_SHARED_API_BASE }}
+      VITE_BC_SHARED_API_BASE: ${{ secrets.BC_SHARED_API_BASE }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -344,12 +331,12 @@ jobs:
       - name: Build backend (Linux)
         if: runner.os == 'Linux' && !contains(matrix.target, 'windows')
         run: |
-          cargo zigbuild --release --target ${{ matrix.target }} -p server -p mcp -p review --bin server --bin vibe-kanban-mcp --bin review
+          cargo zigbuild --release --target ${{ matrix.target }} -p server -p mcp -p review --bin server --bin bettercoding-mcp --bin review
         env:
           POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
           POSTHOG_API_ENDPOINT: ${{ secrets.POSTHOG_API_ENDPOINT }}
-          VK_SHARED_API_BASE: ${{ secrets.VK_SHARED_API_BASE }}
-          VK_SHARED_RELAY_API_BASE: ${{ secrets.VK_SHARED_RELAY_API_BASE }}
+          BC_SHARED_API_BASE: ${{ secrets.BC_SHARED_API_BASE }}
+          BC_SHARED_RELAY_API_BASE: ${{ secrets.BC_SHARED_RELAY_API_BASE }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
 
       - name: Build backend (macOS)
@@ -360,12 +347,12 @@ jobs:
           elif [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
             export MACOSX_DEPLOYMENT_TARGET=11.0
           fi
-          cargo build --release --target ${{ matrix.target }} -p server -p mcp -p review --bin server --bin vibe-kanban-mcp --bin review
+          cargo build --release --target ${{ matrix.target }} -p server -p mcp -p review --bin server --bin bettercoding-mcp --bin review
         env:
           POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
           POSTHOG_API_ENDPOINT: ${{ secrets.POSTHOG_API_ENDPOINT }}
-          VK_SHARED_API_BASE: ${{ secrets.VK_SHARED_API_BASE }}
-          VK_SHARED_RELAY_API_BASE: ${{ secrets.VK_SHARED_RELAY_API_BASE }}
+          BC_SHARED_API_BASE: ${{ secrets.BC_SHARED_API_BASE }}
+          BC_SHARED_RELAY_API_BASE: ${{ secrets.BC_SHARED_RELAY_API_BASE }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
 
       - name: Build backend (Windows)
@@ -379,12 +366,12 @@ jobs:
             export DEFAULT_CC=clang-cl
             export CC_aarch64_pc_windows_msvc="${{ github.workspace }}/scripts/ring-cc-wrapper.sh"
           fi
-          cargo xwin build --cross-compiler clang-cl --release --target ${{ matrix.target }} -p server -p mcp -p review --bin server --bin vibe-kanban-mcp --bin review
+          cargo xwin build --cross-compiler clang-cl --release --target ${{ matrix.target }} -p server -p mcp -p review --bin server --bin bettercoding-mcp --bin review
         env:
           POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
           POSTHOG_API_ENDPOINT: ${{ secrets.POSTHOG_API_ENDPOINT }}
-          VK_SHARED_API_BASE: ${{ secrets.VK_SHARED_API_BASE }}
-          VK_SHARED_RELAY_API_BASE: ${{ secrets.VK_SHARED_RELAY_API_BASE }}
+          BC_SHARED_API_BASE: ${{ secrets.BC_SHARED_API_BASE }}
+          BC_SHARED_RELAY_API_BASE: ${{ secrets.BC_SHARED_RELAY_API_BASE }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           # Avoid aws-lc-sys CMake failures when Rust's `release` profile includes debug info.
           # Without this, cmake-rs selects RelWithDebInfo and CMake fails when ASM is enabled.
@@ -407,13 +394,13 @@ jobs:
         run: |
           mkdir -p dist
           if [[ "${{ matrix.name }}" == *"windows"* ]]; then
-            cp target/${{ matrix.target }}/release/server.exe dist/vibe-kanban-${{ matrix.name }}.exe
-            cp target/${{ matrix.target }}/release/vibe-kanban-mcp.exe dist/vibe-kanban-mcp-${{ matrix.name }}.exe
-            cp target/${{ matrix.target }}/release/review.exe dist/vibe-kanban-review-${{ matrix.name }}.exe
+            cp target/${{ matrix.target }}/release/server.exe dist/bettercoding-${{ matrix.name }}.exe
+            cp target/${{ matrix.target }}/release/bettercoding-mcp.exe dist/bettercoding-mcp-${{ matrix.name }}.exe
+            cp target/${{ matrix.target }}/release/review.exe dist/bettercoding-review-${{ matrix.name }}.exe
           else
-            cp target/${{ matrix.target }}/release/server dist/vibe-kanban-${{ matrix.name }}
-            cp target/${{ matrix.target }}/release/vibe-kanban-mcp dist/vibe-kanban-mcp-${{ matrix.name }}
-            cp target/${{ matrix.target }}/release/review dist/vibe-kanban-review-${{ matrix.name }}
+            cp target/${{ matrix.target }}/release/server dist/bettercoding-${{ matrix.name }}
+            cp target/${{ matrix.target }}/release/bettercoding-mcp dist/bettercoding-mcp-${{ matrix.name }}
+            cp target/${{ matrix.target }}/release/review dist/bettercoding-review-${{ matrix.name }}
           fi
 
       # Code signing for macOS only
@@ -433,7 +420,7 @@ jobs:
         uses: BloopAI/apple-code-sign-action@v1
         with:
           input_path: target/${{ matrix.target }}/release/server
-          output_path: vibe-kanban
+          output_path: bettercoding
           p12_file: certificate.p12
           p12_password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           sign: true
@@ -441,14 +428,14 @@ jobs:
 
       - name: Package main binary (macOS)
         if: runner.os == 'macOS'
-        run: zip vibe-kanban.zip vibe-kanban
+        run: zip bettercoding.zip bettercoding
 
       - name: Sign MCP binary (macOS)
         if: runner.os == 'macOS'
         uses: BloopAI/apple-code-sign-action@v1
         with:
-          input_path: target/${{ matrix.target }}/release/vibe-kanban-mcp
-          output_path: vibe-kanban-mcp
+          input_path: target/${{ matrix.target }}/release/bettercoding-mcp
+          output_path: bettercoding-mcp
           p12_file: certificate.p12
           p12_password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           sign: true
@@ -456,14 +443,14 @@ jobs:
 
       - name: Package MCP binary (macOS)
         if: runner.os == 'macOS'
-        run: zip vibe-kanban-mcp.zip vibe-kanban-mcp
+        run: zip bettercoding-mcp.zip bettercoding-mcp
 
       - name: Sign Review binary (macOS)
         if: runner.os == 'macOS'
         uses: BloopAI/apple-code-sign-action@v1
         with:
           input_path: target/${{ matrix.target }}/release/review
-          output_path: vibe-kanban-review
+          output_path: bettercoding-review
           p12_file: certificate.p12
           p12_password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           sign: true
@@ -471,7 +458,7 @@ jobs:
 
       - name: Package Review binary (macOS)
         if: runner.os == 'macOS'
-        run: zip vibe-kanban-review.zip vibe-kanban-review
+        run: zip bettercoding-review.zip bettercoding-review
 
       - name: Notarize signed binaries (macOS)
         if: runner.os == 'macOS'
@@ -479,9 +466,9 @@ jobs:
         continue-on-error: true
         with:
           input_path: |
-            vibe-kanban.zip
-            vibe-kanban-mcp.zip
-            vibe-kanban-review.zip
+            bettercoding.zip
+            bettercoding-mcp.zip
+            bettercoding-review.zip
           sign: false
           notarize: true
           app_store_connect_api_key_json_file: app_store_key.json
@@ -490,9 +477,9 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           mkdir -p dist
-          cp vibe-kanban.zip dist/vibe-kanban-${{ matrix.name }}.zip
-          cp vibe-kanban-mcp.zip dist/vibe-kanban-mcp-${{ matrix.name }}.zip
-          cp vibe-kanban-review.zip dist/vibe-kanban-review-${{ matrix.name }}.zip
+          cp bettercoding.zip dist/bettercoding-${{ matrix.name }}.zip
+          cp bettercoding-mcp.zip dist/bettercoding-mcp-${{ matrix.name }}.zip
+          cp bettercoding-review.zip dist/bettercoding-review-${{ matrix.name }}.zip
 
       - name: Clean up certificates (macOS)
         if: runner.os == 'macOS'
@@ -524,34 +511,34 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             name: linux-x64
-            binary: vibe-kanban
-            mcp_binary: vibe-kanban-mcp
-            review_binary: vibe-kanban-review
+            binary: bettercoding
+            mcp_binary: bettercoding-mcp
+            review_binary: bettercoding-review
           - target: x86_64-pc-windows-msvc
             name: windows-x64
-            binary: vibe-kanban.exe
-            mcp_binary: vibe-kanban-mcp.exe
-            review_binary: vibe-kanban-review.exe
+            binary: bettercoding.exe
+            mcp_binary: bettercoding-mcp.exe
+            review_binary: bettercoding-review.exe
           - target: x86_64-apple-darwin
             name: macos-x64
-            binary: vibe-kanban
-            mcp_binary: vibe-kanban-mcp
-            review_binary: vibe-kanban-review
+            binary: bettercoding
+            mcp_binary: bettercoding-mcp
+            review_binary: bettercoding-review
           - target: aarch64-apple-darwin
             name: macos-arm64
-            binary: vibe-kanban
-            mcp_binary: vibe-kanban-mcp
-            review_binary: vibe-kanban-review
+            binary: bettercoding
+            mcp_binary: bettercoding-mcp
+            review_binary: bettercoding-review
           - target: aarch64-pc-windows-msvc
             name: windows-arm64
-            binary: vibe-kanban.exe
-            mcp_binary: vibe-kanban-mcp.exe
-            review_binary: vibe-kanban-review.exe
+            binary: bettercoding.exe
+            mcp_binary: bettercoding-mcp.exe
+            review_binary: bettercoding-review.exe
           - target: aarch64-unknown-linux-musl
             name: linux-arm64
-            binary: vibe-kanban
-            mcp_binary: vibe-kanban-mcp
-            review_binary: vibe-kanban-review
+            binary: bettercoding
+            mcp_binary: bettercoding-mcp
+            review_binary: bettercoding-review
     steps:
       - uses: actions/checkout@v6
         with:
@@ -578,26 +565,26 @@ jobs:
         if: matrix.name != 'macos-arm64' && matrix.name != 'macos-x64'
         run: |
           mkdir -p npx-cli/dist/${{ matrix.name }}
-          mkdir vibe-kanban-${{ matrix.name }}
-          mkdir vibe-kanban-mcp-${{ matrix.name }}
-          mkdir vibe-kanban-review-${{ matrix.name }}
+          mkdir bettercoding-${{ matrix.name }}
+          mkdir bettercoding-mcp-${{ matrix.name }}
+          mkdir bettercoding-review-${{ matrix.name }}
 
-          cp dist/vibe-kanban-${{ matrix.name }}* vibe-kanban-${{ matrix.name }}/${{ matrix.binary }}
-          cp dist/vibe-kanban-mcp-${{ matrix.name }}* vibe-kanban-mcp-${{ matrix.name }}/${{ matrix.mcp_binary }}
-          cp dist/vibe-kanban-review-${{ matrix.name }}* vibe-kanban-review-${{ matrix.name }}/${{ matrix.review_binary }}
+          cp dist/bettercoding-${{ matrix.name }}* bettercoding-${{ matrix.name }}/${{ matrix.binary }}
+          cp dist/bettercoding-mcp-${{ matrix.name }}* bettercoding-mcp-${{ matrix.name }}/${{ matrix.mcp_binary }}
+          cp dist/bettercoding-review-${{ matrix.name }}* bettercoding-review-${{ matrix.name }}/${{ matrix.review_binary }}
 
-          zip -j npx-cli/dist/${{ matrix.name }}/vibe-kanban.zip vibe-kanban-${{ matrix.name }}/${{ matrix.binary }}
-          zip -j npx-cli/dist/${{ matrix.name }}/vibe-kanban-mcp.zip vibe-kanban-mcp-${{ matrix.name }}/${{ matrix.mcp_binary }}
-          zip -j npx-cli/dist/${{ matrix.name }}/vibe-kanban-review.zip vibe-kanban-review-${{ matrix.name }}/${{ matrix.review_binary }}
+          zip -j npx-cli/dist/${{ matrix.name }}/bettercoding.zip bettercoding-${{ matrix.name }}/${{ matrix.binary }}
+          zip -j npx-cli/dist/${{ matrix.name }}/bettercoding-mcp.zip bettercoding-mcp-${{ matrix.name }}/${{ matrix.mcp_binary }}
+          zip -j npx-cli/dist/${{ matrix.name }}/bettercoding-review.zip bettercoding-review-${{ matrix.name }}/${{ matrix.review_binary }}
 
       - name: Create platform package (macOS)
         if: matrix.name == 'macos-arm64' || matrix.name == 'macos-x64'
         run: |
           mkdir -p npx-cli/dist/${{ matrix.name }}
-          mkdir vibe-kanban-${{ matrix.name }}
-          cp dist/vibe-kanban-${{ matrix.name }}* npx-cli/dist/${{ matrix.name }}/vibe-kanban.zip
-          cp dist/vibe-kanban-mcp-${{ matrix.name }}* npx-cli/dist/${{ matrix.name }}/vibe-kanban-mcp.zip
-          cp dist/vibe-kanban-review-${{ matrix.name }}* npx-cli/dist/${{ matrix.name }}/vibe-kanban-review.zip
+          mkdir bettercoding-${{ matrix.name }}
+          cp dist/bettercoding-${{ matrix.name }}* npx-cli/dist/${{ matrix.name }}/bettercoding.zip
+          cp dist/bettercoding-mcp-${{ matrix.name }}* npx-cli/dist/${{ matrix.name }}/bettercoding-mcp.zip
+          cp dist/bettercoding-review-${{ matrix.name }}* npx-cli/dist/${{ matrix.name }}/bettercoding-review.zip
 
       - name: Upload platform package artifact
         uses: actions/upload-artifact@v6
@@ -644,7 +631,7 @@ jobs:
             const crypto = require('crypto');
             const manifest = { version: '$TAG', platforms: {} };
             const platforms = ['linux-x64', 'linux-arm64', 'windows-x64', 'windows-arm64', 'macos-x64', 'macos-arm64'];
-            const binaries = ['vibe-kanban', 'vibe-kanban-mcp', 'vibe-kanban-review'];
+            const binaries = ['bettercoding', 'bettercoding-mcp', 'bettercoding-review'];
 
             for (const platform of platforms) {
               manifest.platforms[platform] = {};
@@ -666,7 +653,7 @@ jobs:
 
           # Upload binaries (use full tag for path, allows multiple pre-releases to coexist)
           for platform in linux-x64 linux-arm64 windows-x64 windows-arm64 macos-x64 macos-arm64; do
-            for binary in vibe-kanban vibe-kanban-mcp vibe-kanban-review; do
+            for binary in bettercoding bettercoding-mcp bettercoding-review; do
               if [ -f "binaries/$platform/$binary.zip" ]; then
                 echo "Uploading binaries/$platform/$binary.zip..."
                 aws s3 cp "binaries/$platform/$binary.zip" \
@@ -915,8 +902,8 @@ jobs:
           APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
           POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
           POSTHOG_API_ENDPOINT: ${{ secrets.POSTHOG_API_ENDPOINT }}
-          VK_SHARED_API_BASE: ${{ secrets.VK_SHARED_API_BASE }}
-          VK_SHARED_RELAY_API_BASE: ${{ secrets.VK_SHARED_RELAY_API_BASE }}
+          BC_SHARED_API_BASE: ${{ secrets.BC_SHARED_API_BASE }}
+          BC_SHARED_RELAY_API_BASE: ${{ secrets.BC_SHARED_RELAY_API_BASE }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
 
       - name: Build MSI with wixl
@@ -1133,9 +1120,9 @@ jobs:
 
       - name: Zip frontend
         run: |
-          mkdir vibe-kanban-${{ needs.bump-version.outputs.new_tag }}
-          mv packages/local-web/dist vibe-kanban-${{ needs.bump-version.outputs.new_tag }}
-          zip -r vibe-kanban-${{ needs.bump-version.outputs.new_tag }}.zip vibe-kanban-${{ needs.bump-version.outputs.new_tag }}
+          mkdir bettercoding-${{ needs.bump-version.outputs.new_tag }}
+          mv packages/local-web/dist bettercoding-${{ needs.bump-version.outputs.new_tag }}
+          zip -r bettercoding-${{ needs.bump-version.outputs.new_tag }}.zip bettercoding-${{ needs.bump-version.outputs.new_tag }}
 
       - name: Setup Node for npm pack
         uses: ./.github/actions/setup-node
@@ -1162,6 +1149,6 @@ jobs:
           prerelease: true
           generate_release_notes: true
           files: |
-            vibe-kanban-${{ needs.bump-version.outputs.new_tag }}.zip
-            npx-cli/vibe-kanban-*.tgz
+            bettercoding-${{ needs.bump-version.outputs.new_tag }}.zip
+            npx-cli/bettercoding-*.tgz
             tauri-installers/*

@@ -1,12 +1,4 @@
 {
-  "vibe_kanban": {
-    "command": "npx",
-    "args": [
-      "-y",
-      "vibe-kanban@latest",
-      "--mcp"
-    ]
-  },
   "context7": {
     "type": "http",
     "url": "https://mcp.context7.com/mcp",
@@ -45,12 +37,6 @@
     ]
   },
   "meta": {
-    "vibe_kanban": {
-      "name": "BetterCoding",
-      "description": "Create, update and delete BetterCoding tasks",
-      "url": "https://github.com/miguelrisero/bettercoding",
-      "icon": "favicon-light.svg"
-    },
     "context7": {
       "name": "Context7",
       "description": "Fetch up-to-date documentation and code examples",

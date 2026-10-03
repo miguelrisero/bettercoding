@@ -7,10 +7,10 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-} from '@vibe/ui/components/KeyboardDialog';
-import { Button } from '@vibe/ui/components/Button';
-import { Label } from '@vibe/ui/components/Label';
-import { Switch } from '@vibe/ui/components/Switch';
+} from '@bettercoding/ui/components/KeyboardDialog';
+import { Button } from '@bettercoding/ui/components/Button';
+import { Label } from '@bettercoding/ui/components/Label';
+import { Switch } from '@bettercoding/ui/components/Switch';
 import { AgentSelector } from '@/shared/components/tasks/AgentSelector';
 import { ConfigSelector } from '@/shared/components/tasks/ConfigSelector';
 import { useUserSystem } from '@/shared/hooks/useUserSystem';
@@ -26,7 +26,7 @@ import { useExecutionProcesses } from '@/shared/hooks/useExecutionProcesses';
 import { getLatestConfigFromProcesses } from '@/shared/lib/executor';
 import { dispatchWithConflictResolution } from '@/shared/lib/dispatchWithConflictResolution';
 import { shouldReportResolveConflictsError } from './resolveConflictsError';
-import { ConfirmDialog } from '@vibe/ui/components/ConfirmDialog';
+import { ConfirmDialog } from '@bettercoding/ui/components/ConfirmDialog';
 import type {
   BaseCodingAgent,
   ExecutorProfileId,

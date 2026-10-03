@@ -5,7 +5,7 @@ import { workspaceSummaryKeys } from '@/shared/hooks/workspaceSummaryKeys';
 import { makeLocalApiRequest } from '@/shared/lib/localApiTransport';
 import { useHostId } from '@/shared/providers/HostIdProvider';
 import { workspaceStatusTag } from '@/shared/lib/workspaceStatusTag';
-import type { WorkspaceStatusTag } from '@vibe/ui/components/WorkspaceSummary';
+import type { WorkspaceStatusTag } from '@bettercoding/ui/components/WorkspaceSummary';
 import type {
   WorkspaceWithStatus,
   WorkspaceSummary,

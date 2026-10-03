@@ -3,8 +3,8 @@ import { CopyIcon } from '@phosphor-icons/react';
 import {
   ContextBar,
   type ContextBarRenderItem,
-} from '@vibe/ui/components/ContextBar';
-import { Tooltip } from '@vibe/ui/components/Tooltip';
+} from '@bettercoding/ui/components/ContextBar';
+import { Tooltip } from '@bettercoding/ui/components/Tooltip';
 import { useActions } from '@/shared/hooks/useActions';
 import { useUserSystem } from '@/shared/hooks/useUserSystem';
 import { IdeIcon } from '@/shared/components/IdeIcon';

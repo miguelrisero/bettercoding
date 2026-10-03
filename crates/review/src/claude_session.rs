@@ -126,7 +126,7 @@ pub(crate) fn discover_projects() -> Result<Vec<ClaudeProject>, ReviewError> {
 /// Extract a friendly project name from the Claude directory name
 fn extract_project_name(dir_name: &str) -> String {
     // Directory names look like:
-    // "-private-var-folders-m1-9q-ct1913z10v6wbnv54j25r0000gn-T-vibe-kanban-worktrees-a04a-store-payloads-i"
+    // "-private-var-folders-m1-9q-ct1913z10v6wbnv54j25r0000gn-T-bettercoding-worktrees-a04a-store-payloads-i"
     // We want to extract the meaningful part after "worktrees-"
     if let Some(idx) = dir_name.find("worktrees-") {
         let after_worktrees = &dir_name[idx + "worktrees-".len()..];
@@ -289,7 +289,7 @@ fn branches_match(target: &str, session_branch: &str) -> bool {
         return true;
     }
 
-    // Check if the slug portions match (e.g., "feature-auth" matches "vk/feature-auth")
+    // Check if the slug portions match (e.g., "feature-auth" matches "bc/feature-auth")
     let target_slug = extract_branch_slug(&target_normalized);
     let session_slug = extract_branch_slug(&session_normalized);
 
@@ -304,7 +304,7 @@ fn normalize_branch(branch: &str) -> String {
 }
 
 /// Extract the "slug" portion of a branch name
-/// e.g., "vk/a04a-store-payloads-i" -> "a04a-store-payloads-i"
+/// e.g., "bc/a04a-store-payloads-i" -> "a04a-store-payloads-i"
 fn extract_branch_slug(branch: &str) -> String {
     // Split by '/' and take the last part
     branch.rsplit('/').next().unwrap_or(branch).to_string()
@@ -455,14 +455,14 @@ mod tests {
     fn test_extract_project_name() {
         assert_eq!(
             extract_project_name(
-                "-private-var-folders-m1-9q-ct1913z10v6wbnv54j25r0000gn-T-vibe-kanban-worktrees-a04a-store-payloads-i"
+                "-private-var-folders-m1-9q-ct1913z10v6wbnv54j25r0000gn-T-bettercoding-worktrees-a04a-store-payloads-i"
             ),
             "store-payloads-i"
         );
 
         assert_eq!(
             extract_project_name(
-                "-private-var-folders-m1-9q-ct1913z10v6wbnv54j25r0000gn-T-vibe-kanban-worktrees-1ff1-new-rust-binary"
+                "-private-var-folders-m1-9q-ct1913z10v6wbnv54j25r0000gn-T-bettercoding-worktrees-1ff1-new-rust-binary"
             ),
             "new-rust-binary"
         );
@@ -474,13 +474,13 @@ mod tests {
         assert!(branches_match("feature-auth", "feature-auth"));
 
         // With prefix
-        assert!(branches_match("feature-auth", "vk/feature-auth"));
-        assert!(branches_match("vk/feature-auth", "feature-auth"));
+        assert!(branches_match("feature-auth", "bc/feature-auth"));
+        assert!(branches_match("bc/feature-auth", "feature-auth"));
 
         // Slug matching
         assert!(branches_match(
             "a04a-store-payloads-i",
-            "vk/a04a-store-payloads-i"
+            "bc/a04a-store-payloads-i"
         ));
 
         // Case insensitive
@@ -492,8 +492,8 @@ mod tests {
 
         // Regression tests: substring matches should NOT match
         // (these were incorrectly matching before the fix)
-        assert!(!branches_match("vk/d13f-remove-compare-c", "c"));
-        assert!(!branches_match("vk/d13f-remove-compare-c", "compare"));
+        assert!(!branches_match("bc/d13f-remove-compare-c", "c"));
+        assert!(!branches_match("bc/d13f-remove-compare-c", "compare"));
         assert!(!branches_match("feature-auth", "auth"));
         assert!(!branches_match("feature-auth", "feature"));
     }
@@ -502,12 +502,12 @@ mod tests {
     fn test_normalize_branch() {
         assert_eq!(normalize_branch("refs/heads/main"), "main");
         assert_eq!(normalize_branch("Feature-Auth"), "feature-auth");
-        assert_eq!(normalize_branch("vk/feature-auth"), "vk/feature-auth");
+        assert_eq!(normalize_branch("bc/feature-auth"), "bc/feature-auth");
     }
 
     #[test]
     fn test_extract_branch_slug() {
-        assert_eq!(extract_branch_slug("vk/feature-auth"), "feature-auth");
+        assert_eq!(extract_branch_slug("bc/feature-auth"), "feature-auth");
         assert_eq!(extract_branch_slug("feature-auth"), "feature-auth");
         assert_eq!(
             extract_branch_slug("user/prefix/feature-auth"),

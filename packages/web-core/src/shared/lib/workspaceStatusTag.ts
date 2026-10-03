@@ -2,7 +2,7 @@ import type { CliManual, CliPhase } from 'shared/types';
 import type {
   WorkspaceStatusGroup,
   WorkspaceStatusTag,
-} from '@vibe/ui/components/WorkspaceSummary';
+} from '@bettercoding/ui/components/WorkspaceSummary';
 
 // Display rules adapted from Herdr's claude activity row (herdr-activity.md):
 // the phase the agent reports about itself, whether the user has looked since,

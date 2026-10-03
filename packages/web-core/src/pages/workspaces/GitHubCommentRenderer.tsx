@@ -5,7 +5,7 @@ import {
   ArrowSquareOutIcon,
   ChatsCircleIcon,
 } from '@phosphor-icons/react';
-import { CommentCard } from '@vibe/ui/components/CommentCard';
+import { CommentCard } from '@bettercoding/ui/components/CommentCard';
 import { formatRelativeTime } from '@/shared/lib/date';
 import type { NormalizedGitHubComment } from '@/shared/hooks/useWorkspaceContext';
 import { MarkdownPreview } from '@/shared/components/MarkdownPreview';

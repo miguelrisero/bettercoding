@@ -14,7 +14,7 @@ import type {
   RepoWithTargetBranch,
 } from 'shared/types';
 import { createWorkspaceWithSession } from '@/shared/types/attempt';
-import { WorkspacesMain } from '@vibe/ui/components/WorkspacesMain';
+import { WorkspacesMain } from '@bettercoding/ui/components/WorkspacesMain';
 import {
   ConversationList,
   type ConversationListHandle,

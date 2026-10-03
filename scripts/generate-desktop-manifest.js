@@ -12,11 +12,11 @@
 //
 // The artifacts-dir should contain Tauri bundle outputs per platform:
 //   tauri-artifacts/
-//     darwin-aarch64/  -> vibe-kanban.app.tar.gz
-//     darwin-x86_64/   -> vibe-kanban.app.tar.gz
-//     linux-x86_64/    -> vibe-kanban.AppImage.tar.gz
-//     linux-aarch64/   -> vibe-kanban.AppImage.tar.gz
-//     windows-x86_64/  -> vibe-kanban-setup.exe (NSIS)
+//     darwin-aarch64/  -> bettercoding.app.tar.gz
+//     darwin-x86_64/   -> bettercoding.app.tar.gz
+//     linux-x86_64/    -> bettercoding.AppImage.tar.gz
+//     linux-aarch64/   -> bettercoding.AppImage.tar.gz
+//     windows-x86_64/  -> bettercoding-setup.exe (NSIS)
 //
 
 const fs = require('fs');

@@ -139,11 +139,9 @@ fn default_port(https: bool) -> u16 {
 fn allowed_origins() -> &'static Vec<OriginKey> {
     static ALLOWED: OnceLock<Vec<OriginKey>> = OnceLock::new();
     ALLOWED.get_or_init(|| {
-        let value =
-            match utils::env::env_var_with_legacy("BC_ALLOWED_ORIGINS", "VK_ALLOWED_ORIGINS") {
-                Some(value) => value,
-                None => return Vec::new(),
-            };
+        let Ok(value) = std::env::var("BC_ALLOWED_ORIGINS") else {
+            return Vec::new();
+        };
 
         value
             .split(',')

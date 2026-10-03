@@ -1,5 +1,5 @@
 import type { AttachmentResponse } from 'shared/types';
-import type { LocalAttachmentMetadata } from '@vibe/ui/components/WorkspaceContext';
+import type { LocalAttachmentMetadata } from '@bettercoding/ui/components/WorkspaceContext';
 
 function escapeMarkdownLabel(value: string): string {
   return value.replace(/[[\]\\]/g, '\\$&');

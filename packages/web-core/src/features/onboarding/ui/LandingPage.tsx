@@ -27,7 +27,7 @@ import { getIdeName } from '@/shared/lib/ideName';
 import { cn, playSound } from '@/shared/lib/utils';
 import { isTauriApp } from '@/shared/lib/platform';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
-import { PrimaryButton } from '@vibe/ui/components/PrimaryButton';
+import { PrimaryButton } from '@bettercoding/ui/components/PrimaryButton';
 
 type SoundOption = {
   value: SoundFile;

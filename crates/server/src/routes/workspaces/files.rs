@@ -38,8 +38,8 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use super::file_policy::{
-    self, LEGACY_UPLOADS_DIR, MAX_LIST_ENTRIES, MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_FILES,
-    MAX_UPLOAD_REQUEST_BYTES, MAX_ZIP_ENTRIES, MAX_ZIP_UNCOMPRESSED_BYTES, UPLOADS_DIR,
+    self, MAX_LIST_ENTRIES, MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_FILES, MAX_UPLOAD_REQUEST_BYTES,
+    MAX_ZIP_ENTRIES, MAX_ZIP_UNCOMPRESSED_BYTES, UPLOADS_DIR,
 };
 use crate::{DeploymentImpl, error::ApiError, middleware::load_workspace_middleware};
 
@@ -532,182 +532,23 @@ async fn create_real_uploads_directory(uploads_dir: &Path) -> Result<(), ApiErro
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum ResolvedUploadsDirectory {
-    Current,
-    Legacy,
-}
-
-async fn probe_resolved_state(
-    uploads_dir: &Path,
-    legacy_uploads_dir: &Path,
-) -> Result<ResolvedUploadsDirectory, ApiError> {
-    if is_real_directory(uploads_dir).await? {
-        Ok(ResolvedUploadsDirectory::Current)
-    } else if is_real_directory(legacy_uploads_dir).await? {
-        Ok(ResolvedUploadsDirectory::Legacy)
-    } else {
-        // Both paths may vanish between earlier probes and this re-check.
-        // Re-create the current directory instead of returning a dead path.
-        create_real_uploads_directory(uploads_dir).await?;
-        Ok(ResolvedUploadsDirectory::Current)
-    }
-}
-
-/// Resolve the default upload directory, migrating the legacy directory when
-/// possible while preserving it as a lossless fallback on any rename failure.
-/// The migration takes the per-workspace write lock only with
-/// `try_write_owned`, so a request already holding a read lock is never blocked
-/// or renamed underneath.
-async fn resolve_uploads_dir_impl<F, R>(
-    canonical_base: &Path,
-    after_state_probes: F,
-    before_rename: R,
-) -> Result<PathBuf, ApiError>
-where
-    F: FnOnce(&Path, &Path),
-    R: FnOnce() + Send + 'static,
-{
+/// Resolve the default upload directory, creating it on first use. A symlink
+/// at the uploads path is refused rather than followed.
+async fn resolve_uploads_dir(canonical_base: &Path) -> Result<PathBuf, ApiError> {
     let uploads_dir = canonical_base.join(UPLOADS_DIR);
-    let legacy_uploads_dir = canonical_base.join(LEGACY_UPLOADS_DIR);
-
-    let uploads_exists = is_real_directory(&uploads_dir).await?;
-    let legacy_exists = is_real_directory(&legacy_uploads_dir).await?;
-
-    // Test seam for deterministic cross-process-style create/rename races.
-    after_state_probes(&uploads_dir, &legacy_uploads_dir);
-
-    // A legacy symlink is ignored so a fresh current directory can be created,
-    // but the current name is authoritative: never fall back around a symlink
-    // there, even when a real legacy directory is also present.
     if is_symlink(&uploads_dir).await? {
         return Err(ApiError::BadRequest(
             "Upload directory must be a real directory".to_string(),
         ));
     }
-
-    let mut _contention_read_guard = None;
-    let resolved_dir = match (uploads_exists, legacy_exists) {
-        (true, _) => ResolvedUploadsDirectory::Current,
-        (false, true) => {
-            let filesystem_lock = workspace_filesystem_lock(canonical_base);
-            match filesystem_lock.clone().try_write_owned() {
-                Ok(write_guard) => {
-                    let rename_old_path = legacy_uploads_dir.clone();
-                    let rename_new_path = uploads_dir.clone();
-                    let rename_result = tokio::task::spawn_blocking(move || {
-                        // Keep the owned guard inside the blocking task. Dropping
-                        // the awaiting resolver detaches this task, so the guard
-                        // must live here until the real filesystem call returns.
-                        let _write_guard = write_guard;
-                        before_rename();
-                        std::fs::rename(rename_old_path, rename_new_path)
-                    })
-                    .await;
-                    let rename_result = match rename_result {
-                        Ok(result) => result,
-                        Err(error) => Err(std::io::Error::other(format!(
-                            "Uploads directory migration task failed: {error}"
-                        ))),
-                    };
-
-                    match rename_result {
-                        Ok(()) => {
-                            tracing::info!(
-                                old_path = %legacy_uploads_dir.display(),
-                                new_path = %uploads_dir.display(),
-                                "Migrated workspace uploads directory"
-                            );
-                            ResolvedUploadsDirectory::Current
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                old_path = %legacy_uploads_dir.display(),
-                                new_path = %uploads_dir.display(),
-                                error = %error,
-                                "Uploads directory migration rename failed; resolving current state"
-                            );
-                            // Keep this re-check even with the in-process lock: an
-                            // old binary or another process can still win the race.
-                            probe_resolved_state(&uploads_dir, &legacy_uploads_dir).await?
-                        }
-                    }
-                }
-                Err(_) => {
-                    tracing::debug!(
-                        old_path = %legacy_uploads_dir.display(),
-                        new_path = %uploads_dir.display(),
-                        "Skipping uploads directory migration because the workspace filesystem lock is contended"
-                    );
-
-                    // Usually contention is an in-flight reader, so this takes
-                    // another read guard immediately (including when the caller
-                    // already holds one). If a rename writer is active, wait only
-                    // for that already-started atomic operation; every handler
-                    // would need the same read side before resolving a path.
-                    _contention_read_guard = Some(match filesystem_lock.clone().try_read_owned() {
-                        Ok(guard) => guard,
-                        Err(_) => filesystem_lock.clone().read_owned().await,
-                    });
-
-                    probe_resolved_state(&uploads_dir, &legacy_uploads_dir).await?
-                }
-            }
-        }
-        (false, false) => {
-            create_real_uploads_directory(&uploads_dir).await?;
-            ResolvedUploadsDirectory::Current
-        }
-    };
-
-    // Both-present is intentional. Validate containment before writing either
-    // .gitignore, then assert the ignore file on every real upload directory.
-    let mut current = if uploads_exists || matches!(resolved_dir, ResolvedUploadsDirectory::Current)
-    {
-        existing_canonical_uploads(canonical_base, &uploads_dir).await?
-    } else {
-        None
-    };
-    let mut legacy = if legacy_exists || matches!(resolved_dir, ResolvedUploadsDirectory::Legacy) {
-        existing_canonical_uploads(canonical_base, &legacy_uploads_dir).await?
-    } else {
-        None
-    };
-
-    if current.is_none() && legacy.is_none() {
-        // The two probes above can straddle another process's atomic legacy ->
-        // current rename (current absent just before it, legacy absent just
-        // after it). A final current-path probe closes that false-neither edge.
-        current = existing_canonical_uploads(canonical_base, &uploads_dir).await?;
-        if current.is_none() {
-            legacy = existing_canonical_uploads(canonical_base, &legacy_uploads_dir).await?;
-        }
+    if !is_real_directory(&uploads_dir).await? {
+        create_real_uploads_directory(&uploads_dir).await?;
     }
-
-    if let Some(directory) = &current {
-        ensure_uploads_gitignore(directory).await?;
-    }
-    if let Some(directory) = &legacy {
-        ensure_uploads_gitignore(directory).await?;
-    }
-
-    match resolved_dir {
-        ResolvedUploadsDirectory::Current => current
-            .or(legacy)
-            .ok_or_else(|| ApiError::BadRequest("Upload directory no longer exists".to_string())),
-        // A concurrent in-process writer may complete its rename after this
-        // resolver skips migration. Prefer the still-present legacy directory,
-        // but converge on current if legacy moved before the final check.
-        ResolvedUploadsDirectory::Legacy => legacy.or(current).ok_or_else(|| {
-            ApiError::BadRequest("Legacy upload directory no longer exists".to_string())
-        }),
-    }
-}
-
-/// Resolve the default upload directory; see [`LEGACY_UPLOADS_DIR`] for the
-/// rollback caveat.
-async fn resolve_uploads_dir(canonical_base: &Path) -> Result<PathBuf, ApiError> {
-    resolve_uploads_dir_impl(canonical_base, |_, _| {}, || {}).await
+    let directory = existing_canonical_uploads(canonical_base, &uploads_dir)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("Upload directory no longer exists".to_string()))?;
+    ensure_uploads_gitignore(&directory).await?;
+    Ok(directory)
 }
 
 async fn publish_upload_once(
@@ -736,20 +577,6 @@ async fn cleanup_upload_temp(path: &Path) {
     }
 }
 
-async fn cleanup_upload_temp_paths(original: &Path, relocated: Option<&Path>) {
-    cleanup_upload_temp(original).await;
-    if let Some(relocated) = relocated.filter(|path| *path != original) {
-        cleanup_upload_temp(relocated).await;
-    }
-}
-
-async fn upload_target_is_missing(target_dir: &Path) -> bool {
-    matches!(
-        tokio::fs::symlink_metadata(target_dir).await,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound
-    )
-}
-
 fn map_upload_publish_error(error: std::io::Error, name: &str, overwrite: bool) -> ApiError {
     if !overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
         ApiError::Conflict(format!("File '{name}' already exists"))
@@ -759,62 +586,20 @@ fn map_upload_publish_error(error: std::io::Error, name: &str, overwrite: bool) 
 }
 
 async fn publish_streamed_upload(
-    canonical_base: &Path,
     target_dir: &Path,
     tmp_name: &str,
     name: &str,
     overwrite: bool,
-    retry_default_publish: bool,
-) -> Result<(PathBuf, PathBuf), ApiError> {
-    let original_tmp_path = target_dir.join(tmp_name);
-    let original_final_path = target_dir.join(name);
-    let initial_error =
-        match publish_upload_once(&original_tmp_path, &original_final_path, overwrite).await {
-            Ok(()) => {
-                cleanup_upload_temp_paths(&original_tmp_path, None).await;
-                return Ok((target_dir.to_path_buf(), original_final_path));
-            }
-            Err(error) => error,
-        };
-
-    let retry_after_move = retry_default_publish
-        && initial_error.kind() == std::io::ErrorKind::NotFound
-        && upload_target_is_missing(target_dir).await;
-    if !retry_after_move {
-        cleanup_upload_temp_paths(&original_tmp_path, None).await;
-        return Err(map_upload_publish_error(initial_error, name, overwrite));
-    }
-
-    tracing::warn!(
-        original_target_dir = %target_dir.display(),
-        error = %initial_error,
-        "Default uploads directory moved during publish; re-resolving and retrying once"
-    );
-
-    let retry_target_dir = match resolve_uploads_dir(canonical_base).await {
-        Ok(directory) => directory,
-        Err(error) => {
-            // If resolution itself fails, the atomic migration can only have
-            // moved this UUID-named temp file between the two default dirs.
-            let current_tmp = canonical_base.join(UPLOADS_DIR).join(tmp_name);
-            let legacy_tmp = canonical_base.join(LEGACY_UPLOADS_DIR).join(tmp_name);
-            cleanup_upload_temp_paths(&original_tmp_path, Some(&current_tmp)).await;
-            cleanup_upload_temp_paths(&original_tmp_path, Some(&legacy_tmp)).await;
-            return Err(error);
-        }
-    };
-    let retry_tmp_path = retry_target_dir.join(tmp_name);
-    let retry_final_path = retry_target_dir.join(name);
-    let retry_result = publish_upload_once(&retry_tmp_path, &retry_final_path, overwrite).await;
-
-    // Whether the retry succeeds or fails, the hard-link publication path and
-    // every error path get best-effort cleanup at both possible locations.
-    cleanup_upload_temp_paths(&original_tmp_path, Some(&retry_tmp_path)).await;
-
-    match retry_result {
-        Ok(()) => Ok((retry_target_dir, retry_final_path)),
-        Err(error) => Err(map_upload_publish_error(error, name, overwrite)),
-    }
+) -> Result<PathBuf, ApiError> {
+    let tmp_path = target_dir.join(tmp_name);
+    let final_path = target_dir.join(name);
+    let result = publish_upload_once(&tmp_path, &final_path, overwrite).await;
+    // The hard-link publication leaves the temp file behind, and so does every
+    // failure.
+    cleanup_upload_temp(&tmp_path).await;
+    result
+        .map(|()| final_path)
+        .map_err(|error| map_upload_publish_error(error, name, overwrite))
 }
 
 pub async fn upload_files(
@@ -827,22 +612,9 @@ pub async fn upload_files(
         canonical_workspace(&deployment, &workspace).await?;
     let custom_path = query.path.as_deref().filter(|path| !path.trim().is_empty());
 
-    if custom_path.is_none() {
-        // Give migration one non-blocking, best-effort chance before taking this
-        // request's read guard. The result is deliberately discarded: after
-        // acquiring the read side we resolve again, so no other in-process
-        // migration can move the selected directory during multipart streaming
-        // and publication. That guarded resolve remains authoritative.
-        if let Err(error) = resolve_uploads_dir(&canonical_base).await {
-            tracing::warn!(
-                error = %error,
-                "Best-effort uploads directory resolve failed before acquiring the workspace filesystem lock"
-            );
-        }
-    }
     let _read_guard = filesystem_lock.read_owned().await;
 
-    let mut target_dir = match custom_path {
+    let target_dir = match custom_path {
         Some(path) => file_policy::resolve_existing_dir(&base, path)?,
         None => resolve_uploads_dir(&canonical_base).await?,
     };
@@ -908,19 +680,9 @@ pub async fn upload_files(
         drop(out);
 
         // Publish atomically. For no-overwrite, hard_link fails if the target
-        // already exists, closing the try_exists -> rename race (TOCTOU). A
-        // default-folder publish gets one recovery attempt if another process
-        // atomically migrates the directory after streaming began.
-        let (published_target_dir, final_path) = publish_streamed_upload(
-            &canonical_base,
-            &target_dir,
-            &tmp_name,
-            &name,
-            query.overwrite,
-            custom_path.is_none(),
-        )
-        .await?;
-        target_dir = published_target_dir;
+        // already exists, closing the try_exists -> rename race (TOCTOU).
+        let final_path =
+            publish_streamed_upload(&target_dir, &tmp_name, &name, query.overwrite).await?;
 
         let meta = tokio::fs::symlink_metadata(&final_path).await.ok();
         uploaded.push(WorkspaceFileEntry {
@@ -1027,199 +789,6 @@ mod tests {
 
         assert_eq!(resolved, expected);
         assert!(expected.is_dir());
-        assert!(!base.join(LEGACY_UPLOADS_DIR).exists());
-        assert_gitignored(&expected);
-    }
-
-    #[tokio::test]
-    async fn uploads_dir_resolver_migrates_legacy_only_dir() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let base = fs::canonicalize(tempdir.path()).unwrap();
-        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
-        fs::create_dir_all(legacy.join("nested")).unwrap();
-        fs::write(legacy.join("report.txt"), b"legacy report").unwrap();
-        fs::write(legacy.join("nested/data.bin"), b"legacy data").unwrap();
-        let expected = base.join(UPLOADS_DIR);
-
-        let resolved = resolve_uploads_dir(&base).await.unwrap();
-
-        assert_eq!(resolved, expected);
-        assert!(expected.is_dir());
-        assert!(!legacy.exists());
-        assert_gitignored(&expected);
-        assert_eq!(
-            fs::read(expected.join("report.txt")).unwrap(),
-            b"legacy report"
-        );
-        assert_eq!(
-            fs::read(expected.join("nested/data.bin")).unwrap(),
-            b"legacy data"
-        );
-    }
-
-    #[tokio::test]
-    async fn uploads_dir_migration_skips_in_flight_request_then_converges() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let base = fs::canonicalize(tempdir.path()).unwrap();
-        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
-        let temporary = legacy.join(".bc-upload-in-flight.tmp");
-        let published = legacy.join("report.txt");
-        fs::write(&temporary, b"streamed upload").unwrap();
-        let expected = base.join(UPLOADS_DIR);
-
-        let filesystem_lock = workspace_filesystem_lock(&base);
-        let read_guard = filesystem_lock.clone().read_owned().await;
-
-        let resolved_while_streaming = resolve_uploads_dir(&base).await.unwrap();
-
-        assert_eq!(resolved_while_streaming, legacy);
-        assert!(legacy.is_dir());
-        assert!(!expected.exists());
-        fs::rename(&temporary, &published).unwrap();
-        drop(read_guard);
-
-        let resolved_after_publish = resolve_uploads_dir(&base).await.unwrap();
-
-        assert_eq!(resolved_after_publish, expected);
-        assert!(!legacy.exists());
-        assert!(!expected.join(".bc-upload-in-flight.tmp").exists());
-        assert_eq!(
-            fs::read(expected.join("report.txt")).unwrap(),
-            b"streamed upload"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn uploads_dir_migration_guard_outlives_resolver_cancellation() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let base = fs::canonicalize(tempdir.path()).unwrap();
-        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
-        fs::write(legacy.join("report.txt"), b"legacy report").unwrap();
-        let expected = base.join(UPLOADS_DIR);
-        let filesystem_lock = workspace_filesystem_lock(&base);
-        let (rename_started_tx, rename_started_rx) = tokio::sync::oneshot::channel();
-        let (release_rename_tx, release_rename_rx) = tokio::sync::oneshot::channel();
-
-        let resolver_base = base.clone();
-        let resolver = tokio::spawn(async move {
-            resolve_uploads_dir_impl(
-                &resolver_base,
-                |_, _| {},
-                move || {
-                    let _ = rename_started_tx.send(());
-                    let _ = release_rename_rx.blocking_recv();
-                },
-            )
-            .await
-        });
-
-        tokio::time::timeout(Duration::from_secs(5), rename_started_rx)
-            .await
-            .expect("blocking rename did not start")
-            .unwrap();
-        resolver.abort();
-        assert!(resolver.await.unwrap_err().is_cancelled());
-
-        // The blocking task has not renamed yet, but it must still own the
-        // write guard after its awaiting resolver has been cancelled.
-        assert!(legacy.is_dir());
-        assert!(!expected.exists());
-        assert_eq!(
-            fs::read(legacy.join("report.txt")).unwrap(),
-            b"legacy report"
-        );
-        assert!(filesystem_lock.clone().try_read_owned().is_err());
-
-        release_rename_tx.send(()).unwrap();
-        let completed_guard =
-            tokio::time::timeout(Duration::from_secs(5), filesystem_lock.clone().read_owned())
-                .await
-                .expect("blocking rename did not release the write guard");
-        drop(completed_guard);
-
-        assert!(expected.is_dir());
-        assert!(!legacy.exists());
-        assert_eq!(
-            fs::read(expected.join("report.txt")).unwrap(),
-            b"legacy report"
-        );
-        assert_eq!(resolve_uploads_dir(&base).await.unwrap(), expected);
-    }
-
-    #[tokio::test]
-    async fn uploads_dir_resolver_rechecks_after_losing_rename_race() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let base = fs::canonicalize(tempdir.path()).unwrap();
-        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
-        fs::write(legacy.join("report.txt"), b"legacy report").unwrap();
-        let expected = base.join(UPLOADS_DIR);
-
-        let resolved = resolve_uploads_dir_impl(
-            &base,
-            |current, legacy| {
-                fs::rename(legacy, current).unwrap();
-            },
-            || {},
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(resolved, expected);
-        assert!(!legacy.exists());
-        assert_eq!(
-            fs::read(expected.join("report.txt")).unwrap(),
-            b"legacy report"
-        );
-        assert_gitignored(&expected);
-    }
-
-    #[tokio::test]
-    async fn uploads_dir_resolver_converges_when_create_races_rename() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let base = fs::canonicalize(tempdir.path()).unwrap();
-        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
-        fs::write(legacy.join("legacy.txt"), b"legacy data").unwrap();
-        let expected = base.join(UPLOADS_DIR);
-
-        let resolved = resolve_uploads_dir_impl(
-            &base,
-            |current, _legacy| {
-                fs::create_dir(current).unwrap();
-                fs::write(current.join("new.txt"), b"new data").unwrap();
-            },
-            || {},
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(resolved, expected);
-        assert!(legacy.is_dir());
-        assert_eq!(fs::read(expected.join("new.txt")).unwrap(), b"new data");
-        assert_eq!(fs::read(legacy.join("legacy.txt")).unwrap(), b"legacy data");
-        assert_gitignored(&expected);
-        assert_gitignored(&legacy);
-    }
-
-    #[tokio::test]
-    async fn uploads_dir_resolver_creates_current_when_legacy_vanishes() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let base = fs::canonicalize(tempdir.path()).unwrap();
-        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
-        let expected = base.join(UPLOADS_DIR);
-
-        let resolved = resolve_uploads_dir_impl(
-            &base,
-            |_current, legacy| {
-                fs::remove_dir_all(legacy).unwrap();
-            },
-            || {},
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(resolved, expected);
-        assert!(!legacy.exists());
-        assert!(expected.is_dir());
         assert_gitignored(&expected);
     }
 
@@ -1235,7 +804,6 @@ mod tests {
 
         assert_eq!(resolved, expected);
         assert!(expected.is_dir());
-        assert!(!base.join(LEGACY_UPLOADS_DIR).exists());
         assert_gitignored(&expected);
         assert_eq!(fs::read(expected.join("new.txt")).unwrap(), b"new data");
     }
@@ -1342,37 +910,6 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn uploads_dir_resolver_ignores_legacy_symlink_and_creates_real_current_dir() {
-        use std::os::unix::fs::symlink;
-
-        let tempdir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let base = fs::canonicalize(tempdir.path()).unwrap();
-        let legacy = base.join(LEGACY_UPLOADS_DIR);
-        let expected = base.join(UPLOADS_DIR);
-        symlink(outside.path(), &legacy).unwrap();
-
-        let resolved = resolve_uploads_dir(&base).await.unwrap();
-
-        assert_eq!(resolved, expected);
-        assert!(
-            fs::symlink_metadata(&legacy)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert!(
-            fs::symlink_metadata(&expected)
-                .unwrap()
-                .file_type()
-                .is_dir()
-        );
-        assert_gitignored(&expected);
-        assert!(!outside.path().join(".gitignore").exists());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
     async fn uploads_dir_resolver_rejects_current_symlink_outside_workspace() {
         use std::os::unix::fs::symlink;
 
@@ -1380,7 +917,6 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(tempdir.path()).unwrap();
         let current = base.join(UPLOADS_DIR);
-        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
         symlink(outside.path(), &current).unwrap();
 
         let error = resolve_uploads_dir(&base).await.unwrap_err();
@@ -1392,131 +928,7 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
-        assert!(legacy.is_dir());
         assert!(!outside.path().join(".gitignore").exists());
-    }
-
-    #[tokio::test]
-    async fn uploads_dir_resolver_prefers_new_dir_when_both_exist() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let base = fs::canonicalize(tempdir.path()).unwrap();
-        let expected = seed_upload_dir(&base, UPLOADS_DIR);
-        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
-        fs::write(expected.join("new.txt"), b"new data").unwrap();
-        fs::write(legacy.join("legacy.txt"), b"legacy data").unwrap();
-        fs::remove_file(expected.join(".gitignore")).unwrap();
-        fs::remove_file(legacy.join(".gitignore")).unwrap();
-
-        let resolved = resolve_uploads_dir(&base).await.unwrap();
-
-        assert_eq!(resolved, expected);
-        assert!(expected.is_dir());
-        assert!(legacy.is_dir());
-        assert_gitignored(&expected);
-        assert_gitignored(&legacy);
-        assert_eq!(fs::read(expected.join("new.txt")).unwrap(), b"new data");
-        assert_eq!(fs::read(legacy.join("legacy.txt")).unwrap(), b"legacy data");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_uploads_dir_resolvers_preserve_legacy_files() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let base = fs::canonicalize(tempdir.path()).unwrap();
-        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
-        fs::create_dir_all(legacy.join("nested")).unwrap();
-        fs::write(legacy.join("first.txt"), b"first").unwrap();
-        fs::write(legacy.join("nested/second.txt"), b"second").unwrap();
-        let expected = base.join(UPLOADS_DIR);
-
-        let mut calls = Vec::new();
-        for _ in 0..4 {
-            let base = base.clone();
-            calls.push(tokio::spawn(
-                async move { resolve_uploads_dir(&base).await },
-            ));
-        }
-        for call in calls {
-            assert_eq!(call.await.unwrap().unwrap(), expected);
-        }
-
-        assert!(expected.is_dir());
-        assert!(!legacy.exists());
-        assert_gitignored(&expected);
-        assert_eq!(fs::read(expected.join("first.txt")).unwrap(), b"first");
-        assert_eq!(
-            fs::read(expected.join("nested/second.txt")).unwrap(),
-            b"second"
-        );
-    }
-
-    #[tokio::test]
-    async fn uploads_dir_resolver_falls_back_to_legacy_on_rename_failure() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let base = fs::canonicalize(tempdir.path()).unwrap();
-        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
-        fs::write(legacy.join("keep.txt"), b"do not lose me").unwrap();
-        fs::remove_file(legacy.join(".gitignore")).unwrap();
-        let blocked_new_path = base.join(UPLOADS_DIR);
-        fs::write(&blocked_new_path, b"not a directory").unwrap();
-
-        let resolved = resolve_uploads_dir(&base).await.unwrap();
-
-        assert_eq!(resolved, legacy);
-        assert!(legacy.is_dir());
-        assert_gitignored(&legacy);
-        assert_eq!(
-            fs::read(legacy.join("keep.txt")).unwrap(),
-            b"do not lose me"
-        );
-        assert_eq!(fs::read(blocked_new_path).unwrap(), b"not a directory");
-        // When both paths are directories, new-dir precedence is covered by
-        // uploads_dir_resolver_prefers_new_dir_when_both_exist.
-    }
-
-    #[tokio::test]
-    async fn default_upload_publish_retries_after_external_migration() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let base = fs::canonicalize(tempdir.path()).unwrap();
-        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
-        let expected = base.join(UPLOADS_DIR);
-        let tmp_name = ".bc-upload-retry.tmp";
-        fs::write(legacy.join(tmp_name), b"streamed upload").unwrap();
-        fs::rename(&legacy, &expected).unwrap();
-
-        let (published_dir, final_path) =
-            publish_streamed_upload(&base, &legacy, tmp_name, "report.txt", false, true)
-                .await
-                .unwrap();
-
-        assert_eq!(published_dir, expected);
-        assert_eq!(final_path, expected.join("report.txt"));
-        assert_eq!(fs::read(final_path).unwrap(), b"streamed upload");
-        assert!(!legacy.join(tmp_name).exists());
-        assert!(!expected.join(tmp_name).exists());
-    }
-
-    #[tokio::test]
-    async fn default_upload_publish_retry_failure_cleans_both_temp_paths() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let base = fs::canonicalize(tempdir.path()).unwrap();
-        let legacy = seed_upload_dir(&base, LEGACY_UPLOADS_DIR);
-        let expected = base.join(UPLOADS_DIR);
-        let tmp_name = ".bc-upload-conflict.tmp";
-        fs::write(legacy.join(tmp_name), b"streamed upload").unwrap();
-        fs::write(legacy.join("report.txt"), b"existing report").unwrap();
-        fs::rename(&legacy, &expected).unwrap();
-
-        let error = publish_streamed_upload(&base, &legacy, tmp_name, "report.txt", false, true)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(error, ApiError::Conflict(_)));
-        assert_eq!(
-            fs::read(expected.join("report.txt")).unwrap(),
-            b"existing report"
-        );
-        assert!(!legacy.join(tmp_name).exists());
-        assert!(!expected.join(tmp_name).exists());
     }
 
     #[test]

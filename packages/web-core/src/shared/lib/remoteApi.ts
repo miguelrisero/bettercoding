@@ -15,12 +15,10 @@ import type {
 import { getAuthRuntime } from '@/shared/lib/auth/runtime';
 import { syncRelayApiBaseWithRemote } from '@/shared/lib/relayBackendApi';
 
-// TODO(bc-legacy-cleanup): migrate this VITE_VK_ build-time variable with its
-// CI configuration.
-const BUILD_TIME_API_BASE = import.meta.env.VITE_VK_SHARED_API_BASE || '';
+const BUILD_TIME_API_BASE = import.meta.env.VITE_BC_SHARED_API_BASE || '';
 
 // Mutable module-level variable — overridden at runtime by ConfigProvider
-// when VK_SHARED_API_BASE is set (for self-hosting support)
+// when BC_SHARED_API_BASE is set (for self-hosting support)
 let _remoteApiBase: string = BUILD_TIME_API_BASE;
 
 /**

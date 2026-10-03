@@ -115,7 +115,10 @@ impl McpServer {
         rb: reqwest::RequestBuilder,
     ) -> Result<T, ToolError> {
         let resp = rb.send().await.map_err(|error| {
-            ToolError::new("Failed to connect to VK API", Some(error.to_string()))
+            ToolError::new(
+                "Failed to connect to BetterCoding API",
+                Some(error.to_string()),
+            )
         })?;
 
         if !resp.status().is_success() {
@@ -126,17 +129,20 @@ impl McpServer {
             .json::<ApiResponseEnvelope<T>>()
             .await
             .map_err(|error| {
-                ToolError::new("Failed to parse VK API response", Some(error.to_string()))
+                ToolError::new(
+                    "Failed to parse BetterCoding API response",
+                    Some(error.to_string()),
+                )
             })?;
 
         if !api_response.success {
             let msg = api_response.message.as_deref().unwrap_or("Unknown error");
-            return Err(ToolError::new("VK API returned error", Some(msg)));
+            return Err(ToolError::new("BetterCoding API returned error", Some(msg)));
         }
 
         api_response
             .data
-            .ok_or_else(|| ToolError::message("VK API response missing data field"))
+            .ok_or_else(|| ToolError::message("BetterCoding API response missing data field"))
     }
 
     /// A non-2xx response as a tool error that keeps the server's own message
@@ -149,12 +155,18 @@ impl McpServer {
             .await
             .ok()
             .and_then(|body| body["message"].as_str().map(str::to_string));
-        ToolError::new(format!("VK API returned error status: {status}"), message)
+        ToolError::new(
+            format!("BetterCoding API returned error status: {status}"),
+            message,
+        )
     }
 
     async fn send_empty_json(&self, rb: reqwest::RequestBuilder) -> Result<(), ToolError> {
         let resp = rb.send().await.map_err(|error| {
-            ToolError::new("Failed to connect to VK API", Some(error.to_string()))
+            ToolError::new(
+                "Failed to connect to BetterCoding API",
+                Some(error.to_string()),
+            )
         })?;
 
         if !resp.status().is_success() {
@@ -168,12 +180,15 @@ impl McpServer {
         }
 
         let api_response = resp.json::<EmptyApiResponse>().await.map_err(|error| {
-            ToolError::new("Failed to parse VK API response", Some(error.to_string()))
+            ToolError::new(
+                "Failed to parse BetterCoding API response",
+                Some(error.to_string()),
+            )
         })?;
 
         if !api_response.success {
             let msg = api_response.message.as_deref().unwrap_or("Unknown error");
-            return Err(ToolError::new("VK API returned error", Some(msg)));
+            return Err(ToolError::new("BetterCoding API returned error", Some(msg)));
         }
 
         Ok(())

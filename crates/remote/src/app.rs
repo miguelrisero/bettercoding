@@ -134,7 +134,7 @@ impl Server {
         }
 
         let http_client = reqwest::Client::builder()
-            .user_agent("VibeKanbanRemote/1.0")
+            .user_agent("BetterCodingRemote/1.0")
             .build()
             .context("failed to create HTTP client")?;
 

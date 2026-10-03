@@ -5,8 +5,8 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
-} from '@vibe/ui/components/KeyboardDialog';
-import { Loader } from '@vibe/ui/components/Loader';
+} from '@bettercoding/ui/components/KeyboardDialog';
+import { Loader } from '@bettercoding/ui/components/Loader';
 import GitOperations from '@/shared/components/tasks/Toolbar/GitOperations';
 import { useWorkspaceWithSession } from '@/shared/hooks/useWorkspace';
 import { useBranchStatus } from '@/shared/hooks/useBranchStatus';

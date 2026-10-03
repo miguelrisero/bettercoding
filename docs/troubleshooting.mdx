@@ -1,6 +1,6 @@
 ---
 title: "Troubleshooting"
-description: "Common issues and solutions when using Vibe Kanban"
+description: "Common issues and solutions when using BetterCoding"
 ---
 
 ## Agent Reports Empty Codebase
@@ -24,14 +24,14 @@ If you need more detailed logs to help debug an issue, you can enable debug-leve
 **Usage:**
 
 ```bash
-RUST_LOG=debug npx vibe-kanban
+RUST_LOG=debug npx bettercoding
 ```
 
 This will provide verbose logging output that can help identify the root cause of issues.
 
 ## DANGER: Wiping Your Database 
 
-If you encounter irrecoverable errors and need to completely wipe your Vibe Kanban database, delete the application data directory selected at startup. Fresh installs use the BetterCoding data home, while installations with an existing Vibe Kanban database adopt the legacy `vibe-kanban` home in place. `BC_DATA_DIR` hard-overrides both candidates.
+If you encounter irrecoverable errors and need to completely wipe your BetterCoding database, delete the application data directory selected at startup. Fresh installs use the BetterCoding data home, while installations with an existing BetterCoding database adopt the legacy `bettercoding` home in place. `BC_DATA_DIR` hard-overrides both candidates.
 
 Check the **Resolved data directory** startup log entry for the active path. If both default candidates contain a database, delete both to prevent the resolver from falling back to the other home.
 
@@ -45,20 +45,20 @@ This action is irreversible and will result in the loss of ALL your tasks and se
 <Tab title="macOS">
 Fresh: `~/Library/Application Support/ai.bloop.bettercoding/`
 
-Legacy: `~/Library/Application Support/ai.bloop.vibe-kanban/`
+Legacy: `~/Library/Application Support/ai.bloop.bettercoding/`
 </Tab>
 
 <Tab title="Linux">
 Fresh: `~/.local/share/bettercoding/`
 
-Legacy: `~/.local/share/vibe-kanban/`
+Legacy: `~/.local/share/bettercoding/`
 </Tab>
 
 <Tab title="Windows">
 Fresh: `%APPDATA%\bloop\bettercoding\data\`
 
-Legacy: `%APPDATA%\bloop\vibe-kanban\data\`
+Legacy: `%APPDATA%\bloop\bettercoding\data\`
 </Tab>
 </Tabs>
 
-After deleting the application data directory, restart Vibe Kanban to reset with an empty database and default settings.
+After deleting the application data directory, restart BetterCoding to reset with an empty database and default settings.

@@ -272,7 +272,7 @@ impl LocalContainerService {
 
     async fn cleanup_workspace(&self, workspace: &Workspace) {
         // The workspace's CLI tmux session (if any) must not outlive its
-        // worktree. Best-effort; targets current `bc_` and legacy `vk_` namespaces.
+        // worktree. Best-effort.
         crate::pty::kill_cli_tmux_session(workspace.id).await;
 
         let Some(container_ref) = &workspace.container_ref else {
@@ -1597,9 +1597,6 @@ impl ContainerService for LocalContainerService {
         let workspace_id = workspace.id.to_string();
         env.insert("BC_WORKSPACE_ID", &workspace_id);
         env.insert("BC_WORKSPACE_BRANCH", &workspace.branch);
-        // TODO(bc-legacy-cleanup): remove legacy VK_ workspace context variables.
-        env.insert("VK_WORKSPACE_ID", &workspace_id);
-        env.insert("VK_WORKSPACE_BRANCH", &workspace.branch);
 
         // Create the child and stream, add to execution tracker with timeout
         let mut spawned = tokio::time::timeout(

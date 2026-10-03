@@ -27,8 +27,8 @@ impl RelayServerConfig {
         let listen_addr =
             env::var("RELAY_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8082".to_string());
 
-        let jwt_secret_str = env::var("VIBEKANBAN_REMOTE_JWT_SECRET")
-            .map_err(|_| ConfigError::MissingVar("VIBEKANBAN_REMOTE_JWT_SECRET"))?;
+        let jwt_secret_str = env::var("BC_REMOTE_JWT_SECRET")
+            .map_err(|_| ConfigError::MissingVar("BC_REMOTE_JWT_SECRET"))?;
         validate_jwt_secret(&jwt_secret_str)?;
         let jwt_secret = SecretString::new(jwt_secret_str.into());
 
@@ -43,10 +43,10 @@ impl RelayServerConfig {
 fn validate_jwt_secret(secret: &str) -> Result<(), ConfigError> {
     let decoded = BASE64_STANDARD
         .decode(secret.as_bytes())
-        .map_err(|_| ConfigError::InvalidVar("VIBEKANBAN_REMOTE_JWT_SECRET"))?;
+        .map_err(|_| ConfigError::InvalidVar("BC_REMOTE_JWT_SECRET"))?;
 
     if decoded.len() < 32 {
-        return Err(ConfigError::InvalidVar("VIBEKANBAN_REMOTE_JWT_SECRET"));
+        return Err(ConfigError::InvalidVar("BC_REMOTE_JWT_SECRET"));
     }
 
     Ok(())

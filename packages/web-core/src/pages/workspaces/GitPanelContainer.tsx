@@ -5,12 +5,12 @@ import { usePush } from '@/shared/hooks/usePush';
 import { useRenameBranch } from '@/shared/hooks/useRenameBranch';
 import { useBranchStatus } from '@/shared/hooks/useBranchStatus';
 import { useUiPreferencesStore } from '@/shared/stores/useUiPreferencesStore';
-import { ConfirmDialog } from '@vibe/ui/components/ConfirmDialog';
+import { ConfirmDialog } from '@bettercoding/ui/components/ConfirmDialog';
 import { ForcePushDialog } from '@/shared/dialogs/command-bar/ForcePushDialog';
 import { CommandBarDialog } from '@/shared/dialogs/command-bar/CommandBarDialog';
-import { GitPanel, type RepoInfo } from '@vibe/ui/components/GitPanel';
+import { GitPanel, type RepoInfo } from '@bettercoding/ui/components/GitPanel';
 import { Actions } from '@/shared/actions';
-import type { RepoAction } from '@vibe/ui/components/RepoCard';
+import type { RepoAction } from '@bettercoding/ui/components/RepoCard';
 import type { Workspace, RepoWithTargetBranch, Merge } from 'shared/types';
 
 export interface GitPanelContainerProps {

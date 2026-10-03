@@ -115,7 +115,7 @@
     if (!stack) return false;
     for (var i = 0; i < stack.length; i++) {
       if (stack[i].isServer) return true;
-      if (stack[i].fileName && typeof VKBippy !== 'undefined' && VKBippy.isSourceFile(stack[i].fileName)) return true;
+      if (stack[i].fileName && typeof BCBippy !== 'undefined' && BCBippy.isSourceFile(stack[i].fileName)) return true;
     }
     return false;
   }
@@ -131,9 +131,9 @@
         count++;
         continue;
       }
-      if (frame.fileName && typeof VKBippy !== 'undefined' && VKBippy.isSourceFile(frame.fileName)) {
+      if (frame.fileName && typeof BCBippy !== 'undefined' && BCBippy.isSourceFile(frame.fileName)) {
         var name = '';
-        var file = VKBippy.normalizeFileName(frame.fileName);
+        var file = BCBippy.normalizeFileName(frame.fileName);
         if (frame.lineNumber && frame.columnNumber) {
           file += ':' + frame.lineNumber + ':' + frame.columnNumber;
         }
@@ -149,13 +149,13 @@
 
   // --- Get component names by walking fiber tree ---
   function getComponentNamesFromFiber(element, maxCount) {
-    var fiber = VKBippy.getFiberFromHostInstance(element);
+    var fiber = BCBippy.getFiberFromHostInstance(element);
     if (!fiber) return [];
     var names = [];
-    VKBippy.traverseFiber(fiber, function(f) {
+    BCBippy.traverseFiber(fiber, function(f) {
       if (names.length >= maxCount) return true;
-      if (VKBippy.isCompositeFiber(f)) {
-        var name = VKBippy.getDisplayName(f.type);
+      if (BCBippy.isCompositeFiber(f)) {
+        var name = BCBippy.getDisplayName(f.type);
         if (name && isUsefulComponentName(name)) names.push(name);
       }
       return false;
@@ -165,13 +165,13 @@
 
   // --- Get nearest component display name (for overlay label) ---
   function getNearestComponentName(element) {
-    if (typeof VKBippy === 'undefined' || !VKBippy.isInstrumentationActive()) return null;
-    var fiber = VKBippy.getFiberFromHostInstance(element);
+    if (typeof BCBippy === 'undefined' || !BCBippy.isInstrumentationActive()) return null;
+    var fiber = BCBippy.getFiberFromHostInstance(element);
     if (!fiber) return null;
     var current = fiber.return;
     while (current) {
-      if (VKBippy.isCompositeFiber(current)) {
-        var name = VKBippy.getDisplayName(current.type);
+      if (BCBippy.isCompositeFiber(current)) {
+        var name = BCBippy.getDisplayName(current.type);
         if (name && isUsefulComponentName(name)) return name;
       }
       current = current.return;
@@ -183,19 +183,19 @@
     name: 'react',
 
     detect: function(element) {
-      return typeof VKBippy !== 'undefined' &&
-        VKBippy.isInstrumentationActive() &&
-        !!VKBippy.getFiberFromHostInstance(element);
+      return typeof BCBippy !== 'undefined' &&
+        BCBippy.isInstrumentationActive() &&
+        !!BCBippy.getFiberFromHostInstance(element);
     },
 
     getComponentInfo: function(element) {
-      var fiber = VKBippy.getFiberFromHostInstance(element);
+      var fiber = BCBippy.getFiberFromHostInstance(element);
       if (!fiber) return Promise.resolve(null);
 
       var htmlPreview = getHTMLPreview(element);
       var componentName = getNearestComponentName(element) || element.tagName.toLowerCase();
 
-      return VKBippy.getOwnerStack(fiber).then(function(stack) {
+      return BCBippy.getOwnerStack(fiber).then(function(stack) {
         if (hasSourceFiles(stack)) {
           var payload = {
             framework: 'react',
@@ -206,8 +206,8 @@
           try {
             for (var i = 0; i < stack.length; i++) {
               var frame = stack[i];
-              if (!frame.isServer && frame.fileName && VKBippy.isSourceFile(frame.fileName)) {
-                payload.file = VKBippy.normalizeFileName(frame.fileName);
+              if (!frame.isServer && frame.fileName && BCBippy.isSourceFile(frame.fileName)) {
+                payload.file = BCBippy.normalizeFileName(frame.fileName);
                 if (frame.lineNumber != null) payload.line = frame.lineNumber;
                 if (frame.columnNumber != null) payload.column = frame.columnNumber;
                 break;
@@ -643,8 +643,8 @@
     var detected = [];
     // Check for Astro islands
     if (document.querySelector('astro-island')) detected.push('astro');
-    // Check for React (VKBippy)
-    if (typeof VKBippy !== 'undefined' && VKBippy.isInstrumentationActive && VKBippy.isInstrumentationActive()) detected.push('react');
+    // Check for React (BCBippy)
+    if (typeof BCBippy !== 'undefined' && BCBippy.isInstrumentationActive && BCBippy.isInstrumentationActive()) detected.push('react');
     // Check for Vue
     if (window.__VUE__ || document.querySelector('[data-v-app]')) detected.push('vue');
     // Check for Svelte (check for svelte CSS classes)
@@ -794,9 +794,9 @@
   // --- Log detected frameworks on page load (diagnostic only) ---
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', function() {
-      console.debug('[vk-ctc] Detected frameworks:', detectFrameworks().join(', ') || 'none');
+      console.debug('[bc-ctc] Detected frameworks:', detectFrameworks().join(', ') || 'none');
     });
   } else {
-    console.debug('[vk-ctc] Detected frameworks:', detectFrameworks().join(', ') || 'none');
+    console.debug('[bc-ctc] Detected frameworks:', detectFrameworks().join(', ') || 'none');
   }
 })();
