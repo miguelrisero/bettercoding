@@ -1,19 +1,30 @@
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, sync::OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct PortInfo {
     pub main_port: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview_proxy_port: Option<u16>,
 }
 
+/// The ports of the server running in this process, once it has bound them.
+///
+/// In-process readers use this rather than the file: the file lives in a
+/// shared temp dir, so a temp cleaner can delete it and a second server on the
+/// same machine (a dev stack) overwrites it with its own ports.
+static OWN_PORTS: OnceLock<PortInfo> = OnceLock::new();
+
 pub async fn write_port_file_with_proxy(
     main_port: u16,
     preview_proxy_port: Option<u16>,
 ) -> std::io::Result<PathBuf> {
+    let _ = OWN_PORTS.set(PortInfo {
+        main_port,
+        preview_proxy_port,
+    });
     // TODO(bc-legacy-cleanup): temp dir and vibe-kanban.port are discovery identities; keep stable.
     let dir = env::temp_dir().join("vibe-kanban");
     let path = dir.join("vibe-kanban.port");
@@ -34,6 +45,9 @@ pub async fn read_port_file(app_name: &str) -> std::io::Result<u16> {
 }
 
 pub async fn read_port_info(app_name: &str) -> std::io::Result<PortInfo> {
+    if let Some(info) = OWN_PORTS.get() {
+        return Ok(*info);
+    }
     let dir = env::temp_dir().join(app_name);
     let path = dir.join(format!("{app_name}.port"));
     tracing::debug!("Reading port from {:?}", path);

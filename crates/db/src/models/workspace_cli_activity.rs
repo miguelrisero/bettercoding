@@ -422,6 +422,16 @@ impl WorkspaceCliActivity {
             .flatten()
     }
 
+    /// The phase to show for this workspace. An `ended` report stops counting
+    /// once the pane changes after it: the poller only writes on a change, so
+    /// a later write means a newer agent that has not reported (or cannot).
+    pub fn shown_phase(&self) -> Option<CliPhase> {
+        match (self.phase, self.hook_at) {
+            (Some(CliPhase::Ended), Some(at)) if self.updated_at > at => None,
+            (phase, _) => phase,
+        }
+    }
+
     /// Set a workspace's CLI activity state. No-op write avoidance is the
     /// caller's job (the monitor only calls this on transitions).
     pub async fn upsert(
@@ -513,6 +523,25 @@ impl WorkspaceCliActivity {
             workspace_id,
             kind,
             note
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Forget a finished session's `ended` phase when a new agent is launched
+    /// in the workspace. Without this a pane relaunched after an archive and
+    /// restore reads "Closed" until its agent reports, and an agent that
+    /// reports nothing never does.
+    pub async fn clear_ended_phase(
+        pool: &SqlitePool,
+        workspace_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            r#"UPDATE workspace_cli_activity
+               SET phase = NULL, tasks = NULL, crons = NULL
+               WHERE workspace_id = $1 AND phase = 'ended'"#,
+            workspace_id
         )
         .execute(pool)
         .await?;
@@ -844,6 +873,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(manual(pool.clone()).await, None);
+    }
+
+    #[test]
+    fn an_ended_report_stops_counting_once_the_pane_changes() {
+        let at = Utc::now();
+        let row = |updated_at| WorkspaceCliActivity {
+            workspace_id: Uuid::new_v4(),
+            state: CliActivityState::Idle,
+            updated_at,
+            phase: Some(CliPhase::Ended),
+            hook: None,
+            hook_at: Some(at),
+        };
+        assert_eq!(row(at).shown_phase(), Some(CliPhase::Ended));
+        assert_eq!(row(at + chrono::Duration::seconds(5)).shown_phase(), None);
     }
 
     #[test]
