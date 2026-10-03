@@ -3,7 +3,9 @@ use std::{
     str::FromStr,
 };
 
-use api_types::{SendCliTextRequest, SendCliTextResponse};
+use api_types::{
+    CliScreenResponse, LaunchCliAgentResponse, SendCliTextRequest, SendCliTextResponse,
+};
 use axum::{
     Router,
     extract::{Query, State, ws::Message},
@@ -17,7 +19,9 @@ use db::models::{
     execution_process::ExecutionProcess,
     session::Session,
     workspace::Workspace,
-    workspace_cli_activity::{CODEX_HOOK_EVENTS, CODEX_ONLY_HOOK_EVENTS, HOOK_EVENTS},
+    workspace_cli_activity::{
+        CODEX_HOOK_EVENTS, CODEX_ONLY_HOOK_EVENTS, HOOK_EVENTS, WorkspaceCliActivity,
+    },
     workspace_repo::WorkspaceRepo,
     workspace_spawn_reservation::{SpawnReservationHolder, WorkspaceSpawnReservation},
 };
@@ -29,7 +33,7 @@ use executors::{
 };
 use local_deployment::pty::{
     CLI_AGENT_PROGRAMS, CLI_PROMPT_PARKED_NOTICE, CliPromptDelivery, CliPromptRouting,
-    CliSendResult, PtyCommand, cli_pane_agent_running_at, cli_prompt_file_exists,
+    CliSendResult, PtyCommand, capture_cli_pane, cli_pane_agent_running_at, cli_prompt_file_exists,
     cli_tmux_available, cli_tmux_session_exists_checked, cli_tmux_target_exists,
     kill_cli_tmux_session, locate_cli_tmux_target, remove_cli_prompt_file,
     remove_cli_resume_ready_file, resolved_cli_tmux_session_name, route_followup_prompt,
@@ -162,11 +166,21 @@ pub(super) async fn resolve_cli_launch_spec(
     // inline with `-c` so neither ~/.codex nor the worktree is touched.
     if spec.program == "codex" {
         spec.session_args = codex_hook_args(&spec.base_args, workspace_id).await;
+        spec.session_args.extend(codex_mcp_args().await);
     }
 
     // Everything else keeps the tmux poller's guess.
     if spec.program == "claude" {
+        // `--mcp-config` takes several values, so it must be followed by
+        // another flag or it would swallow a positional prompt. It is only
+        // ever pushed right before `--settings`.
+        let mcp_config = write_cli_mcp_config(workspace_id).await;
         if let Some(settings) = write_cli_hook_settings(workspace_id).await {
+            if let Some(mcp_config) = mcp_config {
+                spec.base_args.push("--mcp-config".to_string());
+                spec.base_args
+                    .push(mcp_config.to_string_lossy().into_owned());
+            }
             spec.base_args.push("--settings".to_string());
             spec.base_args.push(settings.to_string_lossy().into_owned());
         }
@@ -268,6 +282,77 @@ fn codex_hook_args_for(port: u16, workspace_id: Uuid) -> Vec<String> {
     args
 }
 
+/// Name of the MCP server every CLI agent is launched with.
+const MCP_SERVER_NAME: &str = "bettercoding";
+
+/// How to start this server's own MCP: the running binary's `mcp` subcommand,
+/// pointed at this server. `None` when either is unknown.
+async fn mcp_server_launch() -> Option<(String, String)> {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe.to_string_lossy().into_owned(),
+        Err(error) => {
+            tracing::debug!(?error, "no current exe; MCP not registered");
+            return None;
+        }
+    };
+    let port = utils::port_file::read_port_file("vibe-kanban").await.ok()?;
+    Some((exe, format!("http://127.0.0.1:{port}")))
+}
+
+/// Write the per-workspace MCP config that gives claude the BetterCoding tools
+/// (create, update, archive and delete workspaces, sessions, repos), and return
+/// its path for `claude --mcp-config`. Like `--settings`, it adds to the
+/// user's own MCP servers without editing their config.
+async fn write_cli_mcp_config(workspace_id: Uuid) -> Option<PathBuf> {
+    let (exe, url) = mcp_server_launch().await?;
+    let config = serde_json::json!({
+        "mcpServers": {
+            MCP_SERVER_NAME: {
+                "type": "stdio",
+                "command": exe,
+                "args": ["mcp"],
+                "env": { "VIBE_BACKEND_URL": url },
+            }
+        }
+    });
+    let dir = utils::assets::asset_dir().join("cli-mcp");
+    if let Err(error) = tokio::fs::create_dir_all(&dir).await {
+        tracing::debug!(?error, "could not create the CLI MCP config directory");
+        return None;
+    }
+    let path = dir.join(format!("{workspace_id}.json"));
+    match tokio::fs::write(&path, config.to_string()).await {
+        Ok(()) => Some(path),
+        Err(error) => {
+            tracing::debug!(?error, "could not write the CLI MCP config file");
+            None
+        }
+    }
+}
+
+/// The inline `-c mcp_servers.<name>.*` overrides that give codex the same MCP
+/// server, without touching `~/.codex`.
+async fn codex_mcp_args() -> Vec<String> {
+    match mcp_server_launch().await {
+        Some((exe, url)) => codex_mcp_args_for(&exe, &url),
+        None => Vec::new(),
+    }
+}
+
+fn codex_mcp_args_for(exe: &str, url: &str) -> Vec<String> {
+    // A JSON string literal is a valid TOML basic string.
+    let quote = |value: &str| serde_json::to_string(value).expect("a string always serializes");
+    let key = format!("mcp_servers.{MCP_SERVER_NAME}");
+    vec![
+        "-c".to_string(),
+        format!("{key}.command={}", quote(exe)),
+        "-c".to_string(),
+        format!("{key}.args=[\"mcp\"]"),
+        "-c".to_string(),
+        format!("{key}.env={{VIBE_BACKEND_URL={}}}", quote(url)),
+    ]
+}
+
 /// Write the per-workspace settings file that registers the activity hooks, and
 /// return its path for `claude --settings`.
 ///
@@ -317,6 +402,305 @@ async fn write_cli_hook_settings(workspace_id: Uuid) -> Option<PathBuf> {
     }
 }
 
+/// The workspace's directory, which must exist for any terminal to open in it.
+#[allow(clippy::result_large_err)]
+fn workspace_dir(workspace: &Workspace) -> Result<PathBuf, ApiError> {
+    let container_ref = workspace
+        .container_ref
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("Attempt has no workspace directory".to_string()))?;
+
+    let base_dir = PathBuf::from(container_ref);
+    if !base_dir.exists() {
+        return Err(ApiError::BadRequest(
+            "Workspace directory does not exist".to_string(),
+        ));
+    }
+    Ok(base_dir)
+}
+
+/// A CLI attach resolved and ready to spawn.
+struct CliAttach {
+    working_dir: PathBuf,
+    command: PtyCommand,
+    prompt_delivery: Option<PromptDelivery>,
+    registration: Option<CliLaunchRegistration>,
+}
+
+/// Resolve a CLI attach: the session, directory and agent launch, whether this
+/// attach launches a fresh pane, and the parked prompt it carries. Shared by
+/// the terminal WebSocket and the headless launch.
+async fn prepare_cli_attach(
+    deployment: &DeploymentImpl,
+    workspace: &Workspace,
+    base_dir: &Path,
+    requested_session_id: Option<Uuid>,
+    connect_hidden: bool,
+) -> Result<CliAttach, ApiError> {
+    let mut prompt_delivery: Option<PromptDelivery> = None;
+    let mut cli_launch_registration: Option<CliLaunchRegistration> = None;
+    let pool = &deployment.db().pool;
+
+    // Resolve the uix session driving the handover. A mid-switch
+    // frontend can briefly send the PREVIOUS workspace's session id;
+    // honoring it would resume a foreign conversation (observed live
+    // as "No conversation found with session ID …" and the pane
+    // dropping to a bare shell), so any session that doesn't belong
+    // to this workspace is discarded in favor of the workspace's
+    // latest session.
+    let mut session = match requested_session_id {
+        Some(session_id) => Session::find_by_id(pool, session_id)
+            .await?
+            .filter(|s| s.workspace_id == workspace.id),
+        None => None,
+    };
+    if session.is_none() {
+        session = Session::find_latest_by_workspace_id(pool, workspace.id).await?;
+    }
+
+    // Run claude exactly where the coding agent runs: the workspace
+    // root plus the session's relative agent_working_dir (mirrors
+    // CodingAgentInitialRequest::effective_dir). claude keys
+    // conversation storage by cwd, so --resume/--continue only find
+    // the executor's transcript from that directory.
+    let mut dir = base_dir.to_path_buf();
+    if let Some(rel) = session
+        .as_ref()
+        .and_then(|s| s.agent_working_dir.as_deref())
+        .filter(|d| !d.is_empty())
+    {
+        let candidate = base_dir.join(rel);
+        if candidate.exists() {
+            dir = candidate;
+        }
+    }
+
+    // Resolve claude's session id for the selected uix chat so CLI
+    // mode resumes the exact conversation (handover). With no prior
+    // turn the bootstrap starts a fresh TUI. While the headless
+    // executor is actively RUNNING this session, never hand its id to
+    // a second claude — resuming a session mid-write forks it and the
+    // user ends up with chat and CLI doing the same work twice.
+    let (executor_active, known_claude_session_id) = match &session {
+        Some(s) => {
+            let executor_active = match ExecutionProcess::has_running_coding_agent_for_session(
+                pool, s.id,
+            )
+            .await
+            {
+                Ok(active) => active,
+                Err(error) => {
+                    tracing::warn!(?error, session_id = %s.id, "terminal writer guard failed closed");
+                    true
+                }
+            };
+            let sid = CliPaneBinding::resume_session_id(pool, s.id).await?;
+            (executor_active, sid)
+        }
+        None => (false, None),
+    };
+    let resume_session_id = (!executor_active)
+        .then(|| known_claude_session_id.clone())
+        .flatten();
+    let tmux_available = cli_tmux_available();
+    let cli_session_exists = if tmux_available {
+        cli_tmux_session_exists_checked(workspace.id).await?
+    } else {
+        false
+    };
+    if tmux_available && !cli_session_exists {
+        let launch_session = session.as_ref().ok_or_else(|| {
+            ApiError::BadRequest(
+                "CLI mode requires a BetterCoding session for this workspace".to_string(),
+            )
+        })?;
+        let reservation =
+            WorkspaceSpawnReservation::acquire(pool, workspace.id, SpawnReservationHolder::Cli)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::Conflict(
+                        "Another writer is starting for this workspace; retry the terminal attach"
+                            .to_string(),
+                    )
+                })?;
+        if executor_active {
+            remove_cli_resume_ready_file(workspace.id);
+        }
+        cli_launch_registration = Some(CliLaunchRegistration {
+            workspace_id: workspace.id,
+            session_id: launch_session.id,
+            claude_session_id: known_claude_session_id.clone(),
+            bound_via: if known_claude_session_id.is_some() {
+                CliPaneBoundVia::CliResume
+            } else {
+                CliPaneBoundVia::CliFresh
+            },
+            cwd: dir.to_string_lossy().into_owned(),
+            fence: reservation.fence,
+        });
+    }
+
+    // A parked prompt (CLI-first creation, or a re-parked loop wake-up)
+    // is only ever PEEKED here (read, don't clear); the clear happens
+    // after delivery is CONFIRMED (see handle_terminal_ws), so no
+    // failure between WS upgrade and agent hand-off can destroy the
+    // user's only copy. Racing attaches are serialized by the
+    // CliPromptDelivery claim — the loser attaches without the prompt.
+    //
+    // Gate on tmux availability: with tmux down, CLI mode degrades to
+    // an ephemeral shell that can't run claude, so the bootstrap would
+    // never deliver the prompt — peeking+clearing it would lose it.
+    // Since availability is process-cached, `true` here means
+    // `create_session` also takes the tmux branch, so a successful
+    // spawn really did carry the prompt into a tmux session.
+    // Workspace-scoped peek: creation parks on the CLI-first session,
+    // loop wake-ups re-park on the LATEST session, and this attach may
+    // have resolved a third (frontend-selected) session — a
+    // session-scoped peek would strand a prompt parked on a sibling
+    // row.
+    let carried: Option<(String, CliPromptDelivery, Uuid)> = if cli_tmux_available() {
+        match CliPromptDelivery::try_claim(workspace.id) {
+            Some(claim) => {
+                match Session::peek_pending_cli_prompt_for_workspace(pool, workspace.id).await {
+                    Ok(Some((owning_session_id, prompt))) => {
+                        Some((prompt, claim, owning_session_id))
+                    }
+                    // Nothing parked: release the claim (drop).
+                    Ok(None) => None,
+                    Err(e) => {
+                        // The prompt is not lost — it stays parked and
+                        // the next attach re-peeks — but a transient DB
+                        // error here delays delivery, so make it
+                        // observable.
+                        tracing::warn!(
+                            "Failed to read pending CLI prompt for workspace {}: {}",
+                            workspace.id,
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            None => {
+                tracing::debug!(
+                    "CLI prompt delivery for workspace {} already in flight; \
+                     attaching without the prompt",
+                    workspace.id
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Honor the workspace's selected agent + model/effort at launch
+    // (defaults to claude at Opus/max when nothing was selected).
+    let (model_id, reasoning_id) = resolve_cli_model_effort(pool, session.as_ref()).await;
+    let spec = resolve_cli_launch_spec(
+        session.as_ref(),
+        model_id,
+        reasoning_id,
+        &dir,
+        workspace.id,
+        workspace.name.as_deref(),
+    )
+    .await;
+
+    // How the parked prompt travels:
+    // - Genuine first attach (no tmux session yet, nothing to resume):
+    //   small prompts ride the bootstrap's temp-file transport (baked
+    //   into the launch); prompts too large for one argv entry are
+    //   pasted after the agent owns the pane.
+    // - Otherwise (the session already exists — e.g. an earlier
+    //   delivery went unconfirmed, or a loop wake-up was re-parked —
+    //   or an existing conversation is being resumed, which always
+    //   wins the launch itself): deliver by paste into the running
+    //   agent, as a follow-up. Without this branch a parked prompt
+    //   behind a live session or a resume would be stranded forever.
+    // Either way the parked prompt is cleared only after delivery is
+    // confirmed.
+    let mut baked_prompt = None;
+    let mut deferred_prompt_pending = false;
+    if let Some((peeked, claim, clear_session_id)) = carried {
+        // Match the bootstrap's resume predicate EXACTLY (it filters the
+        // id through is_uuid before resuming): a non-UUID resume id is
+        // NOT resumed by the launch, so it must count as a fresh launch
+        // here too. Otherwise the prompt would route as a follow-up
+        // paste into a continue_launch's doomed `--continue` leg (the
+        // same loss hazard the racing-attach path avoids).
+        let resume_will_apply = resume_session_id
+            .as_deref()
+            .is_some_and(|id| Uuid::parse_str(id).is_ok());
+        let fresh_launch = !resume_will_apply && !cli_session_exists;
+        let routed = if fresh_launch {
+            route_initial_prompt(Some(peeked.clone()), &spec.prompt_arg)
+        } else {
+            route_followup_prompt(&peeked)
+        };
+        match routed {
+            CliPromptRouting::None => {
+                // Blank-after-trim: nothing can ever be delivered, so
+                // clear the parked blank (CAS keeps a newer prompt
+                // safe) instead of re-claiming and re-probing it on
+                // every future attach. The claim drops here.
+                match Session::clear_pending_cli_prompt(pool, clear_session_id, &peeked).await {
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        "Failed to clear blank parked CLI prompt for session {}: {}",
+                        clear_session_id,
+                        e
+                    ),
+                }
+            }
+            CliPromptRouting::Baked(prompt) => {
+                baked_prompt = Some(prompt);
+                prompt_delivery = Some(PromptDelivery {
+                    workspace_id: workspace.id,
+                    clear_session_id,
+                    peeked,
+                    deferred: None,
+                    program: spec.program.clone(),
+                    claim,
+                });
+            }
+            CliPromptRouting::Deferred(prompt) => {
+                // Request the bare-TUI bootstrap whenever a resume won't
+                // apply — not just when the session is currently absent.
+                // A live session can exit between this check and
+                // `new-session -A`; if it does, the freshly created pane
+                // must NOT run `continue_launch`'s doomed `--continue`
+                // leg (the deferred paste could land on it and be lost).
+                // When the session survives, the bootstrap is ignored by
+                // `-A`, so requesting it is harmless.
+                deferred_prompt_pending = !resume_will_apply;
+                prompt_delivery = Some(PromptDelivery {
+                    workspace_id: workspace.id,
+                    clear_session_id,
+                    peeked,
+                    deferred: Some(prompt),
+                    program: spec.program.clone(),
+                    claim,
+                });
+            }
+        }
+    }
+
+    Ok(CliAttach {
+        working_dir: dir,
+        command: PtyCommand::TmuxCli {
+            workspace_id: workspace.id,
+            resume_session_id,
+            busy_wait_for_resume: executor_active,
+            initial_prompt: baked_prompt,
+            deferred_prompt_pending,
+            connect_hidden,
+            spec,
+        },
+        prompt_delivery,
+        registration: cli_launch_registration,
+    })
+}
+
 async fn terminal_ws(
     ws: SignedWsUpgrade,
     State(deployment): State<DeploymentImpl>,
@@ -326,16 +710,7 @@ async fn terminal_ws(
         .await?
         .ok_or_else(|| ApiError::BadRequest("Attempt not found".to_string()))?;
 
-    let container_ref = attempt
-        .container_ref
-        .ok_or_else(|| ApiError::BadRequest("Attempt has no workspace directory".to_string()))?;
-
-    let base_dir = PathBuf::from(&container_ref);
-    if !base_dir.exists() {
-        return Err(ApiError::BadRequest(
-            "Workspace directory does not exist".to_string(),
-        ));
-    }
+    let base_dir = workspace_dir(&attempt)?;
 
     // Set inside the Cli arm when this attach carries the workspace's parked
     // prompt; consumed by handle_terminal_ws to confirm delivery and clear it.
@@ -361,273 +736,17 @@ async fn terminal_ws(
                 );
             }
 
-            let pool = &deployment.db().pool;
-
-            // Resolve the uix session driving the handover. A mid-switch
-            // frontend can briefly send the PREVIOUS workspace's session id;
-            // honoring it would resume a foreign conversation (observed live
-            // as "No conversation found with session ID …" and the pane
-            // dropping to a bare shell), so any session that doesn't belong
-            // to this workspace is discarded in favor of the workspace's
-            // latest session.
-            let mut session = match query.session_id {
-                Some(session_id) => Session::find_by_id(pool, session_id)
-                    .await?
-                    .filter(|s| s.workspace_id == query.workspace_id),
-                None => None,
-            };
-            if session.is_none() {
-                session = Session::find_latest_by_workspace_id(pool, query.workspace_id).await?;
-            }
-
-            // Run claude exactly where the coding agent runs: the workspace
-            // root plus the session's relative agent_working_dir (mirrors
-            // CodingAgentInitialRequest::effective_dir). claude keys
-            // conversation storage by cwd, so --resume/--continue only find
-            // the executor's transcript from that directory.
-            let mut dir = base_dir.clone();
-            if let Some(rel) = session
-                .as_ref()
-                .and_then(|s| s.agent_working_dir.as_deref())
-                .filter(|d| !d.is_empty())
-            {
-                let candidate = base_dir.join(rel);
-                if candidate.exists() {
-                    dir = candidate;
-                }
-            }
-
-            // Resolve claude's session id for the selected uix chat so CLI
-            // mode resumes the exact conversation (handover). With no prior
-            // turn the bootstrap starts a fresh TUI. While the headless
-            // executor is actively RUNNING this session, never hand its id to
-            // a second claude — resuming a session mid-write forks it and the
-            // user ends up with chat and CLI doing the same work twice.
-            let (executor_active, known_claude_session_id) = match &session {
-                Some(s) => {
-                    let executor_active =
-                        match ExecutionProcess::has_running_coding_agent_for_session(pool, s.id)
-                            .await
-                        {
-                            Ok(active) => active,
-                            Err(error) => {
-                                tracing::warn!(?error, session_id = %s.id, "terminal writer guard failed closed");
-                                true
-                            }
-                        };
-                    let sid = CliPaneBinding::resume_session_id(pool, s.id).await?;
-                    (executor_active, sid)
-                }
-                None => (false, None),
-            };
-            let resume_session_id = (!executor_active)
-                .then(|| known_claude_session_id.clone())
-                .flatten();
-            let tmux_available = cli_tmux_available();
-            let cli_session_exists = if tmux_available {
-                cli_tmux_session_exists_checked(query.workspace_id).await?
-            } else {
-                false
-            };
-            if tmux_available && !cli_session_exists {
-                let launch_session = session.as_ref().ok_or_else(|| {
-                    ApiError::BadRequest(
-                        "CLI mode requires a BetterCoding session for this workspace".to_string(),
-                    )
-                })?;
-                let reservation = WorkspaceSpawnReservation::acquire(
-                    pool,
-                    query.workspace_id,
-                    SpawnReservationHolder::Cli,
-                )
-                .await?
-                .ok_or_else(|| {
-                    ApiError::Conflict(
-                        "Another writer is starting for this workspace; retry the terminal attach"
-                            .to_string(),
-                    )
-                })?;
-                if executor_active {
-                    remove_cli_resume_ready_file(query.workspace_id);
-                }
-                cli_launch_registration = Some(CliLaunchRegistration {
-                    workspace_id: query.workspace_id,
-                    session_id: launch_session.id,
-                    claude_session_id: known_claude_session_id.clone(),
-                    bound_via: if known_claude_session_id.is_some() {
-                        CliPaneBoundVia::CliResume
-                    } else {
-                        CliPaneBoundVia::CliFresh
-                    },
-                    cwd: dir.to_string_lossy().into_owned(),
-                    fence: reservation.fence,
-                });
-            }
-
-            // A parked prompt (CLI-first creation, or a re-parked loop wake-up)
-            // is only ever PEEKED here (read, don't clear); the clear happens
-            // after delivery is CONFIRMED (see handle_terminal_ws), so no
-            // failure between WS upgrade and agent hand-off can destroy the
-            // user's only copy. Racing attaches are serialized by the
-            // CliPromptDelivery claim — the loser attaches without the prompt.
-            //
-            // Gate on tmux availability: with tmux down, CLI mode degrades to
-            // an ephemeral shell that can't run claude, so the bootstrap would
-            // never deliver the prompt — peeking+clearing it would lose it.
-            // Since availability is process-cached, `true` here means
-            // `create_session` also takes the tmux branch, so a successful
-            // spawn really did carry the prompt into a tmux session.
-            // Workspace-scoped peek: creation parks on the CLI-first session,
-            // loop wake-ups re-park on the LATEST session, and this attach may
-            // have resolved a third (frontend-selected) session — a
-            // session-scoped peek would strand a prompt parked on a sibling
-            // row.
-            let carried: Option<(String, CliPromptDelivery, Uuid)> = if cli_tmux_available() {
-                match CliPromptDelivery::try_claim(query.workspace_id) {
-                    Some(claim) => {
-                        match Session::peek_pending_cli_prompt_for_workspace(
-                            pool,
-                            query.workspace_id,
-                        )
-                        .await
-                        {
-                            Ok(Some((owning_session_id, prompt))) => {
-                                Some((prompt, claim, owning_session_id))
-                            }
-                            // Nothing parked: release the claim (drop).
-                            Ok(None) => None,
-                            Err(e) => {
-                                // The prompt is not lost — it stays parked and
-                                // the next attach re-peeks — but a transient DB
-                                // error here delays delivery, so make it
-                                // observable.
-                                tracing::warn!(
-                                    "Failed to read pending CLI prompt for workspace {}: {}",
-                                    query.workspace_id,
-                                    e
-                                );
-                                None
-                            }
-                        }
-                    }
-                    None => {
-                        tracing::debug!(
-                            "CLI prompt delivery for workspace {} already in flight; \
-                             attaching without the prompt",
-                            query.workspace_id
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            // Honor the workspace's selected agent + model/effort at launch
-            // (defaults to claude at Opus/max when nothing was selected).
-            let (model_id, reasoning_id) = resolve_cli_model_effort(pool, session.as_ref()).await;
-            let spec = resolve_cli_launch_spec(
-                session.as_ref(),
-                model_id,
-                reasoning_id,
-                &dir,
-                query.workspace_id,
-                attempt.name.as_deref(),
+            let attach = prepare_cli_attach(
+                &deployment,
+                &attempt,
+                &base_dir,
+                query.session_id,
+                query.hidden,
             )
-            .await;
-
-            // How the parked prompt travels:
-            // - Genuine first attach (no tmux session yet, nothing to resume):
-            //   small prompts ride the bootstrap's temp-file transport (baked
-            //   into the launch); prompts too large for one argv entry are
-            //   pasted after the agent owns the pane.
-            // - Otherwise (the session already exists — e.g. an earlier
-            //   delivery went unconfirmed, or a loop wake-up was re-parked —
-            //   or an existing conversation is being resumed, which always
-            //   wins the launch itself): deliver by paste into the running
-            //   agent, as a follow-up. Without this branch a parked prompt
-            //   behind a live session or a resume would be stranded forever.
-            // Either way the parked prompt is cleared only after delivery is
-            // confirmed.
-            let mut baked_prompt = None;
-            let mut deferred_prompt_pending = false;
-            if let Some((peeked, claim, clear_session_id)) = carried {
-                // Match the bootstrap's resume predicate EXACTLY (it filters the
-                // id through is_uuid before resuming): a non-UUID resume id is
-                // NOT resumed by the launch, so it must count as a fresh launch
-                // here too. Otherwise the prompt would route as a follow-up
-                // paste into a continue_launch's doomed `--continue` leg (the
-                // same loss hazard the racing-attach path avoids).
-                let resume_will_apply = resume_session_id
-                    .as_deref()
-                    .is_some_and(|id| Uuid::parse_str(id).is_ok());
-                let fresh_launch = !resume_will_apply && !cli_session_exists;
-                let routed = if fresh_launch {
-                    route_initial_prompt(Some(peeked.clone()), &spec.prompt_arg)
-                } else {
-                    route_followup_prompt(&peeked)
-                };
-                match routed {
-                    CliPromptRouting::None => {
-                        // Blank-after-trim: nothing can ever be delivered, so
-                        // clear the parked blank (CAS keeps a newer prompt
-                        // safe) instead of re-claiming and re-probing it on
-                        // every future attach. The claim drops here.
-                        match Session::clear_pending_cli_prompt(pool, clear_session_id, &peeked)
-                            .await
-                        {
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!(
-                                "Failed to clear blank parked CLI prompt for session {}: {}",
-                                clear_session_id,
-                                e
-                            ),
-                        }
-                    }
-                    CliPromptRouting::Baked(prompt) => {
-                        baked_prompt = Some(prompt);
-                        prompt_delivery = Some(PromptDelivery {
-                            workspace_id: query.workspace_id,
-                            clear_session_id,
-                            peeked,
-                            deferred: None,
-                            program: spec.program.clone(),
-                            claim,
-                        });
-                    }
-                    CliPromptRouting::Deferred(prompt) => {
-                        // Request the bare-TUI bootstrap whenever a resume won't
-                        // apply — not just when the session is currently absent.
-                        // A live session can exit between this check and
-                        // `new-session -A`; if it does, the freshly created pane
-                        // must NOT run `continue_launch`'s doomed `--continue`
-                        // leg (the deferred paste could land on it and be lost).
-                        // When the session survives, the bootstrap is ignored by
-                        // `-A`, so requesting it is harmless.
-                        deferred_prompt_pending = !resume_will_apply;
-                        prompt_delivery = Some(PromptDelivery {
-                            workspace_id: query.workspace_id,
-                            clear_session_id,
-                            peeked,
-                            deferred: Some(prompt),
-                            program: spec.program.clone(),
-                            claim,
-                        });
-                    }
-                }
-            }
-
-            (
-                dir,
-                PtyCommand::TmuxCli {
-                    workspace_id: query.workspace_id,
-                    resume_session_id,
-                    busy_wait_for_resume: executor_active,
-                    initial_prompt: baked_prompt,
-                    deferred_prompt_pending,
-                    connect_hidden: query.hidden,
-                    spec,
-                },
-            )
+            .await?;
+            prompt_delivery = attach.prompt_delivery;
+            cli_launch_registration = attach.registration;
+            (attach.working_dir, attach.command)
         }
         // Side terminals open in the repo for single-repo workspaces — the
         // most useful default for running project commands by hand.
@@ -705,15 +824,24 @@ struct CliLaunchRegistration {
     fence: String,
 }
 
-async fn handle_terminal_ws(
-    mut socket: MaybeSignedWebSocket,
-    deployment: DeploymentImpl,
+/// A spawned terminal: its PTY session and output stream.
+struct SpawnedTerminal {
+    session_id: Uuid,
+    output_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    tripwire_session: String,
+}
+
+/// Spawn the PTY for an attach, register a fresh CLI launch, and start
+/// delivering the parked prompt it carries. `Err` is the message for the
+/// client; nothing is left behind on that path.
+async fn spawn_terminal(
+    deployment: &DeploymentImpl,
     working_dir: PathBuf,
     dimensions: (u16, u16),
     command: PtyCommand,
     prompt_delivery: Option<PromptDelivery>,
     cli_launch_registration: Option<CliLaunchRegistration>,
-) {
+) -> Result<SpawnedTerminal, String> {
     let (cols, rows) = dimensions;
     // FIX 4 tripwire label: the pty session name, captured before `command` is
     // moved into `create_session`. For CLI mode this is the actual current
@@ -727,7 +855,7 @@ async fn handle_terminal_ws(
         PtyCommand::Shell => "shell".to_string(),
     };
 
-    let (session_id, mut output_rx) = match deployment
+    let (session_id, output_rx) = match deployment
         .pty()
         .create_session(working_dir, cols, rows, command)
         .await
@@ -749,14 +877,13 @@ async fn handle_terminal_ws(
                 )
                 .await;
             }
-            let _ = send_error(&mut socket, &e.to_string()).await;
-            return;
+            return Err(e.to_string());
         }
     };
 
     if let Some(registration) = cli_launch_registration {
         let registered = match wait_for_cli_session(registration.workspace_id).await {
-            Ok(true) => register_cli_launch(&deployment, &registration).await,
+            Ok(true) => register_cli_launch(deployment, &registration).await,
             Ok(false) => Err(ApiError::Conflict(
                 "CLI tmux session did not become ready".to_string(),
             )),
@@ -773,21 +900,11 @@ async fn handle_terminal_ws(
             if let Some(delivery) = &prompt_delivery {
                 remove_cli_prompt_file(delivery.workspace_id);
             }
-            let _ = send_error(&mut socket, &error.to_string()).await;
             let _ = deployment.pty().close_session(session_id).await;
-            return;
+            return Err(error.to_string());
         }
     }
 
-    // FIX 4 input tripwire — bounds and rationale live on `AttachInputTripwire`.
-    let mut tripwire = AttachInputTripwire::new(tripwire_session, session_id);
-
-    // create_session returning Ok only means the tmux *client* process spawned;
-    // the tmux server can still reject the command moments later (historically:
-    // an over-long prompt baked into `new-session`). So confirm the session
-    // actually exists before doing anything with the parked prompt. A session
-    // that never comes up leaves the prompt saved for the next attach and tells
-    // the user so, instead of silently destroying it.
     if let Some(delivery) = prompt_delivery {
         let workspace_id = delivery.workspace_id;
         if matches!(wait_for_cli_session(workspace_id).await, Ok(true)) {
@@ -852,15 +969,54 @@ async fn handle_terminal_ws(
                 "CLI tmux session for workspace {} never came up; prompt left parked",
                 workspace_id
             );
-            let _ = send_error(&mut socket, CLI_PROMPT_PARKED_NOTICE).await;
             // Tear down the PtyService entry for the (already-dead) tmux client
             // before bailing; otherwise this early return leaks the session map
             // entry — one per failed attach — that the normal exit path below
             // would have reaped via close_session.
             let _ = deployment.pty().close_session(session_id).await;
-            return;
+            return Err(CLI_PROMPT_PARKED_NOTICE.to_string());
         }
     }
+
+    Ok(SpawnedTerminal {
+        session_id,
+        output_rx,
+        tripwire_session,
+    })
+}
+
+async fn handle_terminal_ws(
+    mut socket: MaybeSignedWebSocket,
+    deployment: DeploymentImpl,
+    working_dir: PathBuf,
+    dimensions: (u16, u16),
+    command: PtyCommand,
+    prompt_delivery: Option<PromptDelivery>,
+    cli_launch_registration: Option<CliLaunchRegistration>,
+) {
+    let SpawnedTerminal {
+        session_id,
+        mut output_rx,
+        tripwire_session,
+    } = match spawn_terminal(
+        &deployment,
+        working_dir,
+        dimensions,
+        command,
+        prompt_delivery,
+        cli_launch_registration,
+    )
+    .await
+    {
+        Ok(spawned) => spawned,
+        Err(message) => {
+            let _ = send_error(&mut socket, &message).await;
+            return;
+        }
+    };
+
+    // FIX 4 input tripwire — bounds and rationale live on `AttachInputTripwire`.
+    let mut tripwire = AttachInputTripwire::new(tripwire_session, session_id);
 
     let pty_service = deployment.pty().clone();
     let session_id_for_input = session_id;
@@ -930,6 +1086,7 @@ async fn register_cli_launch(
     deployment: &DeploymentImpl,
     registration: &CliLaunchRegistration,
 ) -> Result<(), ApiError> {
+    forget_ended_session(&deployment.db().pool, registration.workspace_id).await;
     let binding = CliPaneBinding::record_launch(
         &deployment.db().pool,
         registration.workspace_id,
@@ -970,6 +1127,15 @@ async fn register_cli_launch(
         return Err(error.into());
     }
     Ok(())
+}
+
+/// A freshly launched agent replaces the session whose `ended` report the
+/// sidebar would otherwise keep showing. Best effort: a failure costs a stale
+/// tag, never the launch.
+pub(super) async fn forget_ended_session(pool: &SqlitePool, workspace_id: Uuid) {
+    if let Err(error) = WorkspaceCliActivity::clear_ended_phase(pool, workspace_id).await {
+        tracing::warn!(?error, %workspace_id, "could not clear the ended CLI phase");
+    }
 }
 
 async fn wait_for_cli_session(workspace_id: Uuid) -> Result<bool, local_deployment::pty::PtyError> {
@@ -1239,10 +1405,67 @@ async fn send_cli_text(
     }
 }
 
+/// Grid of the pane a headless launch creates. The first browser attach
+/// resizes it to the real terminal.
+const HEADLESS_COLS: u16 = 160;
+const HEADLESS_ROWS: u16 = 48;
+
+/// Start the workspace's CLI agent with no browser attached, so a workspace
+/// created through the API or MCP starts working at once. It is the terminal
+/// attach without the WebSocket: same launch, same parked-prompt delivery,
+/// then the PTY client detaches and the tmux session keeps running.
+async fn launch_cli_agent(
+    State(deployment): State<DeploymentImpl>,
+    axum::extract::Path(workspace_id): axum::extract::Path<Uuid>,
+) -> Result<Json<ApiResponse<LaunchCliAgentResponse>>, ApiError> {
+    if !cli_tmux_available() {
+        return Err(ApiError::Conflict(
+            "tmux is not available, so no CLI agent can run".to_string(),
+        ));
+    }
+    let workspace = Workspace::find_by_id(&deployment.db().pool, workspace_id)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("Workspace not found".to_string()))?;
+    let base_dir = workspace_dir(&workspace)?;
+    let already_up = cli_tmux_session_exists_checked(workspace_id).await?;
+
+    let attach = prepare_cli_attach(&deployment, &workspace, &base_dir, None, false).await?;
+    let spawned = spawn_terminal(
+        &deployment,
+        attach.working_dir,
+        (HEADLESS_COLS, HEADLESS_ROWS),
+        attach.command,
+        attach.prompt_delivery,
+        attach.registration,
+    )
+    .await
+    .map_err(ApiError::Conflict)?;
+    let _ = deployment.pty().close_session(spawned.session_id).await;
+
+    Ok(Json(ApiResponse::success(LaunchCliAgentResponse {
+        launched: !already_up,
+    })))
+}
+
+/// The visible text of the workspace's CLI pane, for callers that cannot
+/// attach a terminal (MCP tools).
+async fn get_cli_screen(
+    axum::extract::Path(workspace_id): axum::extract::Path<Uuid>,
+) -> Json<ApiResponse<CliScreenResponse>> {
+    Json(ApiResponse::success(CliScreenResponse {
+        screen: capture_cli_pane(workspace_id).await,
+    }))
+}
+
 pub(super) fn router() -> Router<DeploymentImpl> {
     Router::new()
         .route("/terminal/ws", get(terminal_ws))
         .route("/workspaces/{workspace_id}/cli/send", post(send_cli_text))
+        .route(
+            "/workspaces/{workspace_id}/cli/launch",
+            post(launch_cli_agent),
+        )
+        .route("/workspaces/{workspace_id}/cli/screen", get(get_cli_screen))
 }
 
 #[cfg(test)]
@@ -1438,7 +1661,8 @@ mod tripwire_tests {
     use uuid::Uuid;
 
     use super::{
-        AttachInputTripwire, HOOK_EVENTS, codex_hook_args_for, hex_dump, hook_report_command,
+        AttachInputTripwire, HOOK_EVENTS, codex_hook_args_for, codex_mcp_args_for, hex_dump,
+        hook_report_command,
     };
 
     fn tripwire() -> AttachInputTripwire {
@@ -1505,6 +1729,28 @@ mod tripwire_tests {
                 Some(hook_report_command(4111, id).as_str())
             );
         }
+    }
+
+    /// The MCP overrides merge into one valid `mcp_servers.bettercoding` table
+    /// that starts this binary's `mcp` subcommand against this server.
+    #[test]
+    fn codex_mcp_overrides_are_valid_toml() {
+        let args = codex_mcp_args_for("/opt/bc dir/server \"x\"", "http://127.0.0.1:4111");
+        let mut server = toml::Table::new();
+        for pair in args.chunks(2) {
+            assert_eq!(pair[0], "-c");
+            let doc: toml::Table = pair[1]
+                .parse()
+                .unwrap_or_else(|e| panic!("{}: {e}", pair[1]));
+            let entry = &doc["mcp_servers"]["bettercoding"];
+            server.extend(entry.as_table().unwrap().clone());
+        }
+        assert_eq!(server["command"].as_str(), Some("/opt/bc dir/server \"x\""));
+        assert_eq!(server["args"][0].as_str(), Some("mcp"));
+        assert_eq!(
+            server["env"]["VIBE_BACKEND_URL"].as_str(),
+            Some("http://127.0.0.1:4111")
+        );
     }
 
     #[test]

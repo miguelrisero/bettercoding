@@ -31,6 +31,14 @@ pub enum BetterCodingError {
 
 #[tokio::main]
 async fn main() -> Result<(), BetterCodingError> {
+    // `<server> mcp [--mode ...]` serves the BetterCoding MCP over stdio. CLI
+    // agents are launched with this, so they never depend on a separately
+    // installed MCP binary.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("mcp") {
+        return Ok(mcp::cli::run(args).await?);
+    }
+
     // Install rustls crypto provider before any TLS operations
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()

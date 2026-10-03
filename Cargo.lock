@@ -8829,6 +8829,7 @@ dependencies = [
  "git-host",
  "http",
  "local-deployment",
+ "mcp",
  "mime_guess",
  "os_info",
  "preview-proxy",

@@ -1,10 +1,14 @@
-use mcp::task_server::McpServer;
+//! The stdio MCP server, shared by the standalone binary and the server
+//! binary's `mcp` subcommand.
+
 use rmcp::{ServiceExt, transport::stdio};
 use tracing_subscriber::{EnvFilter, prelude::*};
 use utils::{
     port_file::read_port_file,
     sentry::{self as sentry_utils, SentrySource, sentry_layer},
 };
+
+use crate::task_server::McpServer;
 
 const HOST_ENV: &str = "MCP_HOST";
 const PORT_ENV: &str = "MCP_PORT";
@@ -20,37 +24,30 @@ struct LaunchConfig {
     mode: McpLaunchMode,
 }
 
-fn main() -> anyhow::Result<()> {
-    let launch_config = resolve_launch_config()?;
+/// Serve MCP over stdio until the client disconnects. `args` excludes the
+/// program name (and the `mcp` subcommand, when there is one).
+pub async fn run<I>(args: I) -> anyhow::Result<()>
+where
+    I: Iterator<Item = String>,
+{
+    let LaunchConfig { mode } = resolve_launch_config_from_iter(args)?;
+    let version = env!("CARGO_PKG_VERSION");
+    init_process_logging("vibe-kanban-mcp", version);
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async move {
-            let version = env!("CARGO_PKG_VERSION");
-            init_process_logging("vibe-kanban-mcp", version);
+    let base_url = resolve_base_url("vibe-kanban-mcp").await?;
 
-            let base_url = resolve_base_url("vibe-kanban-mcp").await?;
-            let LaunchConfig { mode } = launch_config;
+    let server = match mode {
+        McpLaunchMode::Global => McpServer::new_global(&base_url),
+        McpLaunchMode::Orchestrator => McpServer::new_orchestrator(&base_url),
+    };
 
-            let server = match mode {
-                McpLaunchMode::Global => McpServer::new_global(&base_url),
-                McpLaunchMode::Orchestrator => McpServer::new_orchestrator(&base_url),
-            };
+    let service = server.init().await?.serve(stdio()).await.map_err(|error| {
+        tracing::error!("serving error: {:?}", error);
+        error
+    })?;
 
-            let service = server.init().await?.serve(stdio()).await.map_err(|error| {
-                tracing::error!("serving error: {:?}", error);
-                error
-            })?;
-
-            service.waiting().await?;
-            Ok(())
-        })
-}
-
-fn resolve_launch_config() -> anyhow::Result<LaunchConfig> {
-    resolve_launch_config_from_iter(std::env::args().skip(1))
+    service.waiting().await?;
+    Ok(())
 }
 
 fn resolve_launch_config_from_iter<I>(mut args: I) -> anyhow::Result<LaunchConfig>
@@ -134,9 +131,8 @@ async fn resolve_base_url(log_prefix: &str) -> anyhow::Result<String> {
 }
 
 fn init_process_logging(log_prefix: &str, version: &str) {
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
+    // The server binary's `mcp` subcommand may have installed one already.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     sentry_utils::init_once(SentrySource::Mcp);
 

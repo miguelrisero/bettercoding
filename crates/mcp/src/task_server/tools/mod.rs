@@ -45,12 +45,14 @@ mod remote_issues;
 mod repos;
 mod sessions;
 mod task_attempts;
+mod workspace_agents;
 mod workspaces;
 
 impl McpServer {
     pub fn global_mode_router() -> rmcp::handler::server::tool::ToolRouter<Self> {
         Self::context_tools_router()
             + Self::workspaces_tools_router()
+            + Self::workspace_agents_tools_router()
             + Self::organizations_tools_router()
             + Self::repos_tools_router()
             + Self::remote_issues_tools_router()
@@ -117,11 +119,7 @@ impl McpServer {
         })?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            return Err(ToolError::message(format!(
-                "VK API returned error status: {}",
-                status
-            )));
+            return Err(Self::status_error(resp).await);
         }
 
         let api_response = resp
@@ -141,17 +139,26 @@ impl McpServer {
             .ok_or_else(|| ToolError::message("VK API response missing data field"))
     }
 
+    /// A non-2xx response as a tool error that keeps the server's own message
+    /// (e.g. "No live Claude Code or Codex agent is running ..."), which tells
+    /// the calling agent what to do next.
+    async fn status_error(resp: reqwest::Response) -> ToolError {
+        let status = resp.status();
+        let message = resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|body| body["message"].as_str().map(str::to_string));
+        ToolError::new(format!("VK API returned error status: {status}"), message)
+    }
+
     async fn send_empty_json(&self, rb: reqwest::RequestBuilder) -> Result<(), ToolError> {
         let resp = rb.send().await.map_err(|error| {
             ToolError::new("Failed to connect to VK API", Some(error.to_string()))
         })?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            return Err(ToolError::message(format!(
-                "VK API returned error status: {}",
-                status
-            )));
+            return Err(Self::status_error(resp).await);
         }
 
         #[derive(Deserialize)]

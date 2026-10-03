@@ -167,7 +167,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Update a workspace's archived, pinned, or name fields. `workspace_id` is optional if running inside that workspace context."
+        description = "Rename, pin/unpin, or archive/unarchive a workspace. Archiving stops its CLI agent; after unarchiving, call launch_workspace_agent to start it again. `workspace_id` is optional if running inside that workspace context."
     )]
     async fn update_workspace(
         &self,

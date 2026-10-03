@@ -11,6 +11,7 @@ uninlined-format-args = "allow"
 api-types = { path = "../api-types" }
 deployment = { path = "../deployment" }
 executors = { path = "../executors" }
+mcp = { path = "../mcp" }
 local-deployment = { path = "../local-deployment" }
 utils = { path = "../utils" }
 which = "8.0.0"
