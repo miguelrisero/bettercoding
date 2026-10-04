@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { CheckIcon, type Icon } from '@phosphor-icons/react';
 import { cn } from '@/shared/lib/utils';
-import { Tooltip } from '@vibe/ui/components/Tooltip';
+import { Tooltip } from '@bettercoding/ui/components/Tooltip';
 
 interface CopyButtonProps {
   onCopy: () => void;

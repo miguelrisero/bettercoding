@@ -99,7 +99,7 @@ const CODEX_SESSION_META_READ_LIMIT: u64 = 1024 * 1024;
 
 /// Days an unreachable transcript is kept before retention removes it. `0`
 /// disables retention and lets the store grow without bound.
-const RETENTION_ENV: &str = "VIBE_KANBAN_CLI_TRANSCRIPT_RETENTION_DAYS";
+const RETENTION_ENV: &str = "BC_CLI_TRANSCRIPT_RETENTION_DAYS";
 const DEFAULT_RETENTION_DAYS: u32 = 14;
 const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// Retention competes for the same write lock as ingest, so the first sweep

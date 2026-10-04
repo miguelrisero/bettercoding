@@ -1,7 +1,7 @@
 import { useNavigate } from '@tanstack/react-router';
 import { BellIcon } from '@phosphor-icons/react';
-import { cn } from '@vibe/ui/lib/cn';
-import { Tooltip } from '@vibe/ui/components/Tooltip';
+import { cn } from '@bettercoding/ui/lib/cn';
+import { Tooltip } from '@bettercoding/ui/components/Tooltip';
 import { useNotifications } from '@/shared/hooks/useNotifications';
 
 export function AppBarNotificationBellContainer() {

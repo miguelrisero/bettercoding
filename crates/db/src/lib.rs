@@ -22,7 +22,7 @@ pub mod models;
 /// revert; the likely one is that WAL needs an mmap-able `-shm` sidecar and so
 /// fails on network mounts. [`connect_pool`] detects that and falls back, and
 /// this variable forces the old behaviour outright.
-const JOURNAL_MODE_ENV: &str = "VIBE_KANBAN_SQLITE_JOURNAL_MODE";
+const JOURNAL_MODE_ENV: &str = "BC_SQLITE_JOURNAL_MODE";
 
 /// SQLite serialises writers, so contention is normal and waiting is correct.
 /// sqlx defaults to 5s, which a slow commit can exceed — and losing that race

@@ -7,9 +7,9 @@
  * not reproduce, so it stays in the tree behind a flag for the next time.
  *
  * Enable from the browser console, then reproduce:
- *   - `window.__VK_SCROLL_DEBUG = true`   → turn it on for this tab, reload.
- *   - `window.__vkScrollReport()`         → grouped by-source write summary.
- *   - `JSON.stringify(window.__vkScrollLog)` → raw ring buffer.
+ *   - `window.__BC_SCROLL_DEBUG = true`   → turn it on for this tab, reload.
+ *   - `window.__bcScrollReport()`         → grouped by-source write summary.
+ *   - `JSON.stringify(window.__bcScrollLog)` → raw ring buffer.
  *
  * Once on, it intercepts EVERY programmatic scroll write on the conversation
  * container (native wheel/touch scrolling doesn't go through these JS setters,
@@ -31,10 +31,10 @@ interface ScrollWriteRecord {
 }
 
 interface ScrollDebugWindow {
-  __VK_SCROLL_DEBUG?: boolean;
-  __vkScrollLog?: ScrollWriteRecord[];
-  __vkScrollReport?: () => void;
-  __vkScrollProbeInstalled?: boolean;
+  __BC_SCROLL_DEBUG?: boolean;
+  __bcScrollLog?: ScrollWriteRecord[];
+  __bcScrollReport?: () => void;
+  __bcScrollProbeInstalled?: boolean;
 }
 
 const MAX_RECORDS = 5000;
@@ -57,7 +57,7 @@ function dbgWindow(): ScrollDebugWindow | null {
 
 function enabled(w: ScrollDebugWindow): boolean {
   // Opt-in: silent unless explicitly turned on.
-  return w.__VK_SCROLL_DEBUG === true;
+  return w.__BC_SCROLL_DEBUG === true;
 }
 
 // One-shot attribution for the next intercepted write. Our own code sets this
@@ -73,7 +73,7 @@ let lastUserInputAt = 0;
 let lastUserDir: 'up' | 'down' | 'none' = 'none';
 
 function record(w: ScrollDebugWindow, rec: ScrollWriteRecord): void {
-  const log = (w.__vkScrollLog ??= []);
+  const log = (w.__bcScrollLog ??= []);
   log.push(rec);
   if (log.length > MAX_RECORDS) log.splice(0, log.length - MAX_RECORDS);
 }
@@ -98,7 +98,7 @@ export function scrollDebug(
     msSinceUserInput: Math.round(performance.now() - lastUserInputAt),
   });
   // eslint-disable-next-line no-console
-  console.log('[vk-scroll]', event, data ?? '');
+  console.log('[bc-scroll]', event, data ?? '');
 }
 
 /**
@@ -107,8 +107,8 @@ export function scrollDebug(
  */
 export function installScrollProbe(el: HTMLElement): () => void {
   const w = dbgWindow();
-  if (!w || !enabled(w) || w.__vkScrollProbeInstalled) return () => {};
-  w.__vkScrollProbeInstalled = true;
+  if (!w || !enabled(w) || w.__bcScrollProbeInstalled) return () => {};
+  w.__bcScrollProbeInstalled = true;
 
   const now = () => Math.round(performance.now());
   const proto = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
@@ -135,9 +135,9 @@ export function installScrollProbe(el: HTMLElement): () => void {
         .join(' ');
       // eslint-disable-next-line no-console
       console.warn(
-        `[vk-scroll] ⚠ FIGHT — ${pendingFight.length} programmatic scrolls ` +
+        `[bc-scroll] ⚠ FIGHT — ${pendingFight.length} programmatic scrolls ` +
           `moved the view ${Math.round(travel)}px while you were scrolling ` +
-          `(${sources}). window.__vkScrollReport() for detail.`
+          `(${sources}). window.__bcScrollReport() for detail.`
       );
       pendingFight = [];
     }, FLUSH_INTERVAL_MS);
@@ -219,8 +219,8 @@ export function installScrollProbe(el: HTMLElement): () => void {
   el.addEventListener('touchmove', onTouch, { passive: true, capture: true });
   el.addEventListener('keydown', onKey, { capture: true });
 
-  w.__vkScrollReport = () => {
-    const log = w.__vkScrollLog ?? [];
+  w.__bcScrollReport = () => {
+    const log = w.__bcScrollLog ?? [];
     const bySource: Record<string, { writes: number; px: number }> = {};
     for (const r of log) {
       if (r.kind === 'event') continue;
@@ -236,7 +236,7 @@ export function installScrollProbe(el: HTMLElement): () => void {
     );
     // eslint-disable-next-line no-console
     console.log(
-      `[vk-scroll] report: ${log.length} records, ` +
+      `[bc-scroll] report: ${log.length} records, ` +
         `${duringActivity.length} programmatic writes during user scrolling`
     );
     // eslint-disable-next-line no-console
@@ -246,7 +246,7 @@ export function installScrollProbe(el: HTMLElement): () => void {
   // Make it obvious the diagnostics are live (visible level).
   // eslint-disable-next-line no-console
   console.log(
-    '%c[vk-scroll] diagnostics active — reproduce the jank, then run window.__vkScrollReport()',
+    '%c[bc-scroll] diagnostics active — reproduce the jank, then run window.__bcScrollReport()',
     'color:#a60; font-weight:bold'
   );
   void lastUserDir;

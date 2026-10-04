@@ -6,7 +6,7 @@ import { QueryClientProvider } from '@tanstack/react-query';
 import posthog from 'posthog-js';
 import { PostHogProvider } from 'posthog-js/react';
 import App from '@web/app/entry/App';
-import { CrashScreen } from '@vibe/ui/components/CrashScreen';
+import { CrashScreen } from '@bettercoding/ui/components/CrashScreen';
 import '@/i18n';
 import { router } from '@web/app/router';
 import { oauthApi } from '@/shared/lib/api';

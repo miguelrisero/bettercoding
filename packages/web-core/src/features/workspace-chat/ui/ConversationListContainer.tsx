@@ -52,13 +52,13 @@ import { usePaneVisible } from '@/shared/hooks/PaneVisibilityContext';
 import { useSetTokenUsageInfo } from '../model/contexts/EntriesContext';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
 import type { NativeFeedOrigin, RepoWithTargetBranch } from 'shared/types';
-import { ChatEmptyState } from '@vibe/ui/components/ChatEmptyState';
+import { ChatEmptyState } from '@bettercoding/ui/components/ChatEmptyState';
 import { useUiPreferencesStore } from '@/shared/stores/useUiPreferencesStore';
-import { ChatScriptPlaceholder } from '@vibe/ui/components/ChatScriptPlaceholder';
+import { ChatScriptPlaceholder } from '@bettercoding/ui/components/ChatScriptPlaceholder';
 import { ScriptFixerDialog } from '@/shared/dialogs/scripts/ScriptFixerDialog';
-import { ChatForkBranches } from '@vibe/ui/components/ChatForkBranches';
-import { Badge } from '@vibe/ui/components/Badge';
-import { RunningDots } from '@vibe/ui/components/RunningDots';
+import { ChatForkBranches } from '@bettercoding/ui/components/ChatForkBranches';
+import { Badge } from '@bettercoding/ui/components/Badge';
+import { RunningDots } from '@bettercoding/ui/components/RunningDots';
 import { UnassignedCliSessions } from './UnassignedCliSessions';
 import { shouldShowForeignWriterBanner } from '../model/foreignWriterBanner';
 import { sessionsApi } from '@/shared/lib/api';
@@ -68,7 +68,7 @@ import {
 } from '../model/collaborationUiState';
 import { sessionQueueKeys } from '../model/hooks/useSessionQueueInteraction';
 import { useTransientToast } from '@/shared/hooks/useTransientToast';
-import { Toast } from '@vibe/ui/components/Toast';
+import { Toast } from '@bettercoding/ui/components/Toast';
 
 interface ConversationListProps {
   attempt: WorkspaceWithSession;

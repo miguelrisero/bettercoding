@@ -9,8 +9,8 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-} from '@vibe/ui/components/KeyboardDialog';
-import { Button } from '@vibe/ui/components/Button';
+} from '@bettercoding/ui/components/KeyboardDialog';
+import { Button } from '@bettercoding/ui/components/Button';
 import BranchSelector from '@/shared/components/tasks/BranchSelector';
 import type { GitOperationError } from 'shared/types';
 import { create, useModal } from '@ebay/nice-modal-react';
@@ -28,7 +28,7 @@ import { useWorkspaceContext } from '@/shared/hooks/useWorkspaceContext';
 import { useWorkspaces } from '@/shared/hooks/useWorkspaces';
 import { workspacesApi, type Result } from '@/shared/lib/api';
 import { ResolveConflictsDialog } from '@/shared/dialogs/tasks/ResolveConflictsDialog';
-import { RebaseInProgressDialog } from '@vibe/ui/components/RebaseInProgressDialog';
+import { RebaseInProgressDialog } from '@bettercoding/ui/components/RebaseInProgressDialog';
 
 export interface RebaseDialogProps {
   workspaceId: string;

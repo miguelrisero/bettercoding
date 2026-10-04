@@ -1,13 +1,13 @@
 import { useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button } from '@vibe/ui/components/Button';
+import { Button } from '@bettercoding/ui/components/Button';
 import { ChevronsUpDown, FolderGit } from 'lucide-react';
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
-} from '@vibe/ui/components/DropdownMenu';
+} from '@bettercoding/ui/components/DropdownMenu';
 import type { Repo } from 'shared/types';
 
 type Props = {

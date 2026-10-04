@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button } from '@vibe/ui/components/Button';
-import { Input } from '@vibe/ui/components/Input';
+import { Button } from '@bettercoding/ui/components/Button';
+import { Input } from '@bettercoding/ui/components/Input';
 import {
   Dialog,
   DialogContent,
@@ -9,8 +9,8 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-} from '@vibe/ui/components/KeyboardDialog';
-import { Alert, AlertDescription } from '@vibe/ui/components/Alert';
+} from '@bettercoding/ui/components/KeyboardDialog';
+import { Alert, AlertDescription } from '@bettercoding/ui/components/Alert';
 import {
   AlertCircle,
   ChevronUp,

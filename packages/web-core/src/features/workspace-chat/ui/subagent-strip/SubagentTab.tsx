@@ -2,8 +2,8 @@ import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { CheckCircleIcon, CpuIcon, XCircleIcon } from '@phosphor-icons/react';
 
-import { RunningDots } from '@vibe/ui/components/RunningDots';
-import { cn } from '@vibe/ui/lib/cn';
+import { RunningDots } from '@bettercoding/ui/components/RunningDots';
+import { cn } from '@bettercoding/ui/lib/cn';
 import type { SubagentDescriptor } from '../../model/subagent-strip-model';
 
 function formatSubagentName(name: string | null, fallback: string): string {

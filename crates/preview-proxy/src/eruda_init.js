@@ -1,8 +1,8 @@
 (function() {
   'use strict';
   
-  const SOURCE = 'vibe-devtools';
-  const COMMAND_SOURCE = 'vibe-kanban';
+  const SOURCE = 'bettercoding-devtools';
+  const COMMAND_SOURCE = 'bettercoding';
   
   // === Helper: Send message to parent ===
   function send(type, payload) {

@@ -199,7 +199,7 @@ async function installAndLaunchWindows(
 
   const sentinel = readSentinel(dir);
   if (sentinel?.appPath) {
-    const appExe = path.join(sentinel.appPath, 'Vibe Kanban.exe');
+    const appExe = path.join(sentinel.appPath, 'BetterCoding.exe');
     if (fs.existsSync(appExe)) {
       return launchWindowsApp(appExe);
     }
@@ -219,7 +219,7 @@ async function installAndLaunchWindows(
   const installerPath = path.join(dir, installer);
   const installDir = path.join(dir, 'app');
 
-  console.error('Installing Vibe Kanban...');
+  console.error('Installing BetterCoding...');
   try {
     // NSIS supports /S for silent install and /D= for install directory
     execSync(`"${installerPath}" /S /D="${installDir}"`, {
@@ -235,38 +235,38 @@ async function installAndLaunchWindows(
     // For interactive install, the default location is used
     const defaultDir = path.join(
       process.env.LOCALAPPDATA || '',
-      'vibe-kanban'
+      'bettercoding'
     );
-    if (fs.existsSync(path.join(defaultDir, 'Vibe Kanban.exe'))) {
+    if (fs.existsSync(path.join(defaultDir, 'BetterCoding.exe'))) {
       writeSentinel(dir, {
         type: 'nsis-exe',
         appPath: defaultDir,
       });
       return launchWindowsApp(
-        path.join(defaultDir, 'Vibe Kanban.exe')
+        path.join(defaultDir, 'BetterCoding.exe')
       );
     }
     console.error(
-      'Installation complete. Please launch Vibe Kanban from your Start menu.'
+      'Installation complete. Please launch BetterCoding from your Start menu.'
     );
     return 0;
   }
 
   writeSentinel(dir, { type: 'nsis-exe', appPath: installDir });
 
-  const appExe = path.join(installDir, 'Vibe Kanban.exe');
+  const appExe = path.join(installDir, 'BetterCoding.exe');
   if (fs.existsSync(appExe)) {
     return launchWindowsApp(appExe);
   }
 
   console.error(
-    'Installation complete. Please launch Vibe Kanban from your Start menu.'
+    'Installation complete. Please launch BetterCoding from your Start menu.'
   );
   return 0;
 }
 
 function launchWindowsApp(appExe: string): number {
-  console.error('Launching Vibe Kanban...');
+  console.error('Launching BetterCoding...');
   spawn(appExe, [], { detached: true, stdio: 'ignore' }).unref();
   return 0;
 }

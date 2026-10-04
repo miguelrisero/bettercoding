@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import type { OrganizationWithRole } from "shared/types";
-import { AppBarUserPopover } from "@vibe/ui/components/AppBarUserPopover";
+import { AppBarUserPopover } from "@bettercoding/ui/components/AppBarUserPopover";
 import { logout } from "@remote/shared/lib/api";
 import { SettingsDialog } from "@/shared/dialogs/settings/SettingsDialog";
 import { useAuth } from "@/shared/hooks/auth/useAuth";

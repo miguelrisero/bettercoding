@@ -34,10 +34,10 @@ use executors::{
 use local_deployment::pty::{
     CLI_AGENT_PROGRAMS, CLI_PROMPT_PARKED_NOTICE, CliPromptDelivery, CliPromptRouting,
     CliSendResult, PtyCommand, capture_cli_pane, cli_pane_agent_running_at, cli_prompt_file_exists,
-    cli_tmux_available, cli_tmux_session_exists_checked, cli_tmux_target_exists,
-    kill_cli_tmux_session, locate_cli_tmux_target, remove_cli_prompt_file,
-    remove_cli_resume_ready_file, resolved_cli_tmux_session_name, route_followup_prompt,
-    route_initial_prompt, send_cli_keys_to_live_agent,
+    cli_tmux_available, cli_tmux_session_exists_checked, cli_tmux_session_name,
+    cli_tmux_target_exists, kill_cli_tmux_session, locate_cli_tmux_target, remove_cli_prompt_file,
+    remove_cli_resume_ready_file, route_followup_prompt, route_initial_prompt,
+    send_cli_keys_to_live_agent,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -263,7 +263,7 @@ async fn codex_hook_args(base_args: &[String], workspace_id: Uuid) -> Vec<String
     if !codex_full_access(base_args) {
         return Vec::new();
     }
-    let Ok(port) = utils::port_file::read_port_file("vibe-kanban").await else {
+    let Ok(port) = utils::port_file::read_port_file("bettercoding").await else {
         tracing::debug!("no port file; codex activity hooks not registered");
         return Vec::new();
     };
@@ -319,7 +319,9 @@ async fn mcp_server_launch() -> Option<(String, String)> {
             return None;
         }
     };
-    let port = utils::port_file::read_port_file("vibe-kanban").await.ok()?;
+    let port = utils::port_file::read_port_file("bettercoding")
+        .await
+        .ok()?;
     Some((exe, format!("http://127.0.0.1:{port}")))
 }
 
@@ -335,7 +337,7 @@ async fn write_cli_mcp_config(workspace_id: Uuid) -> Option<PathBuf> {
                 "type": "stdio",
                 "command": exe,
                 "args": ["mcp"],
-                "env": { "VIBE_BACKEND_URL": url },
+                "env": { "BC_BACKEND_URL": url },
             }
         }
     });
@@ -373,7 +375,7 @@ fn codex_mcp_args_for(exe: &str, url: &str) -> Vec<String> {
         "-c".to_string(),
         format!("{key}.args=[\"mcp\"]"),
         "-c".to_string(),
-        format!("{key}.env={{VIBE_BACKEND_URL={}}}", quote(url)),
+        format!("{key}.env={{BC_BACKEND_URL={}}}", quote(url)),
     ]
 }
 
@@ -390,7 +392,7 @@ fn codex_mcp_args_for(exe: &str, url: &str) -> Vec<String> {
 /// Returns `None` on any failure. A missing activity signal is a worse sidebar,
 /// not a broken launch.
 async fn write_cli_hook_settings(workspace_id: Uuid) -> Option<PathBuf> {
-    let port = match utils::port_file::read_port_file("vibe-kanban").await {
+    let port = match utils::port_file::read_port_file("bettercoding").await {
         Ok(port) => port,
         Err(error) => {
             tracing::debug!(?error, "no port file; CLI activity hooks not registered");
@@ -868,14 +870,10 @@ async fn spawn_terminal(
 ) -> Result<SpawnedTerminal, String> {
     let (cols, rows) = dimensions;
     // FIX 4 tripwire label: the pty session name, captured before `command` is
-    // moved into `create_session`. For CLI mode this is the actual current
-    // `bc_<uuid>` or legacy `vk_<uuid>` name, so the bytes line up with tmux logs.
+    // moved into `create_session`. For CLI mode this is the `bc_<uuid>` name,
+    // so the bytes line up with tmux logs.
     let tripwire_session = match &command {
-        // Resolve the workspace-derived name through both homes so legacy
-        // attaches carry their real `vk_<uuid>` label rather than a `bc_` guess.
-        PtyCommand::TmuxCli { workspace_id, .. } => {
-            resolved_cli_tmux_session_name(*workspace_id).await
-        }
+        PtyCommand::TmuxCli { workspace_id, .. } => cli_tmux_session_name(*workspace_id),
         PtyCommand::Shell => "shell".to_string(),
     };
 
@@ -1281,8 +1279,8 @@ async fn deliver_deferred_prompt(workspace_id: Uuid, text: &str, program: &str) 
 /// integer compare with no allocation, so it is permanently safe to leave
 /// enabled.
 struct AttachInputTripwire {
-    /// The pty session name (current `bc_<uuid>` or legacy `vk_<uuid>` in CLI
-    /// mode) so the logged bytes line up with tmux server logs.
+    /// The pty session name (`bc_<uuid>` in CLI mode) so the logged bytes line
+    /// up with tmux server logs.
     session: String,
     /// The per-attach PTY session id.
     attach_id: Uuid,
@@ -1796,7 +1794,7 @@ mod tripwire_tests {
         assert_eq!(server["command"].as_str(), Some("/opt/bc dir/server \"x\""));
         assert_eq!(server["args"][0].as_str(), Some("mcp"));
         assert_eq!(
-            server["env"]["VIBE_BACKEND_URL"].as_str(),
+            server["env"]["BC_BACKEND_URL"].as_str(),
             Some("http://127.0.0.1:4111")
         );
     }

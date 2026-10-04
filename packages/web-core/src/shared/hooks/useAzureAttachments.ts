@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import type { LocalAttachmentMetadata } from '@vibe/ui/components/WorkspaceContext';
+import type { LocalAttachmentMetadata } from '@bettercoding/ui/components/WorkspaceContext';
 import {
   computeFileHash,
   confirmAttachmentUpload,

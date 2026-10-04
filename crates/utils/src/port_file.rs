@@ -25,9 +25,8 @@ pub async fn write_port_file_with_proxy(
         main_port,
         preview_proxy_port,
     });
-    // TODO(bc-legacy-cleanup): temp dir and vibe-kanban.port are discovery identities; keep stable.
-    let dir = env::temp_dir().join("vibe-kanban");
-    let path = dir.join("vibe-kanban.port");
+    let dir = env::temp_dir().join("bettercoding");
+    let path = dir.join("bettercoding.port");
     let port_info = PortInfo {
         main_port,
         preview_proxy_port,

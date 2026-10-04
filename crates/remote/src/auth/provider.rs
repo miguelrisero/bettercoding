@@ -10,7 +10,7 @@ use thiserror::Error;
 use tracing::info;
 use url::Url;
 
-const USER_AGENT: &str = "VibeKanbanRemote/1.0";
+const USER_AGENT: &str = "BetterCodingRemote/1.0";
 
 const TOKEN_EXPIRATION_LEEWAY_SECONDS: i64 = 20;
 pub(super) const VALIDATE_TOKEN_MAX_RETRIES: u32 = 3;

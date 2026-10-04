@@ -59,7 +59,7 @@ pub async fn begin_tx(pool: &PgPool) -> Result<Tx<'_>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let ctx = TX_CONTEXT.try_with(|c| c.clone()).ok().flatten();
     if let Some(ctx) = ctx {
-        let name = format!("vk r:{}", ctx.request_id.replace('-', ""));
+        let name = format!("bc r:{}", ctx.request_id.replace('-', ""));
         sqlx::query("SELECT set_config('application_name', $1, true)")
             .bind(&name)
             .execute(&mut *tx)
@@ -88,7 +88,7 @@ pub(crate) async fn migrate(pool: &PgPool) -> Result<(), MigrateError> {
 pub async fn create_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     let options: PgConnectOptions = database_url
         .parse::<PgConnectOptions>()?
-        .application_name("vibe-kanban-remote");
+        .application_name("bettercoding-remote");
 
     PgPoolOptions::new()
         .max_connections(10)

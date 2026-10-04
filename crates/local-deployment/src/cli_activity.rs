@@ -3,8 +3,8 @@
 //!
 //! The chat path gets its Running/Needs-Attention signals from execution
 //! processes and agent turns; a claude running inside a CLI tmux session is
-//! invisible to all of that. This monitor polls the current and legacy tmux
-//! sockets and derives an equivalent signal from pane behavior:
+//! invisible to all of that. This monitor polls the CLI tmux socket and
+//! derives an equivalent signal from pane behavior:
 //!
 //! - pane producing output recently            → `running`
 //! - run went quiet while nobody was attached  → `attention`
@@ -38,13 +38,13 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::pty::{
-    CliClientPresence, PtyService, cli_tmux_socket, is_legacy_home_enabled, legacy_cli_tmux_socket,
-    now_unix_secs, refresh_cli_tmux_client_ignore_size, run_cli_tmux, run_cli_tmux_output,
-    tmux_available, tmux_client_flags_supported, workspace_id_from_cli_session_name,
+    CliClientPresence, PtyService, cli_tmux_socket, now_unix_secs,
+    refresh_cli_tmux_client_ignore_size, run_cli_tmux, run_cli_tmux_output, tmux_available,
+    tmux_client_flags_supported, workspace_id_from_cli_session_name,
 };
 
 /// Poll cadence. Two seconds keeps bucket transitions snappy while the cost
-/// stays two `tmux list-panes` forks per tick during the legacy transition.
+/// stays one `tmux list-panes` fork per tick.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Client sizing is a safety/repair pass, not activity UI state, so keep it to
@@ -157,7 +157,7 @@ struct SocketTmuxClientRow {
 }
 
 /// Parse one tab-delimited `list-clients` row and discard clients outside the
-/// current `bc_<uuid>` and legacy `vk_<uuid>` namespaces. `client_flags` is
+/// `bc_<uuid>` namespace. `client_flags` is
 /// comma-separated; `ignore-size` may appear anywhere in it.
 fn parse_cli_client_line(line: &str) -> Option<TmuxClientRow> {
     let mut fields = line.split('\t');
@@ -370,11 +370,7 @@ async fn cli_pane_pids_for(workspace_id: Uuid) -> Option<Vec<u32>> {
     if !tmux_available() {
         return None;
     }
-    let mut sockets = vec![cli_tmux_socket()];
-    if is_legacy_home_enabled() {
-        // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
-        sockets.push(legacy_cli_tmux_socket());
-    }
+    let sockets = [cli_tmux_socket()];
 
     let mut pane_pids = Vec::new();
     for socket in &sockets {
@@ -448,11 +444,7 @@ pub async fn probe_workspace_agent(workspace_id: Uuid, program: &str) -> AgentPr
     if !tmux_available() {
         return AgentPresence::Unknown;
     }
-    let mut sockets = vec![cli_tmux_socket()];
-    if is_legacy_home_enabled() {
-        // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
-        sockets.push(legacy_cli_tmux_socket());
-    }
+    let sockets = [cli_tmux_socket()];
 
     let mut rows = Vec::new();
     for socket in &sockets {
@@ -734,11 +726,7 @@ async fn sweep_client_size_flags(pty: &PtyService, state: &mut ClientSizeSweepSt
         return;
     }
 
-    let mut sockets = vec![cli_tmux_socket()];
-    if is_legacy_home_enabled() {
-        // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
-        sockets.push(legacy_cli_tmux_socket());
-    }
+    let sockets = [cli_tmux_socket()];
     let mut clients = Vec::new();
     for &socket in &sockets {
         match list_cli_tmux_clients_on(socket).await {
@@ -975,16 +963,12 @@ fn should_transition_missing_to_idle(
     snapshot_complete && !observed && previous != CliActivityState::Idle
 }
 
-/// Snapshot current `bc_*` and legacy `vk_*` sessions across both tmux sockets.
+/// Snapshot `bc_*` sessions across the CLI tmux sockets.
 /// Normal no-server exits are complete empty snapshots. A failed socket keeps
 /// rows observed elsewhere but marks the aggregate incomplete so missing
 /// sessions cannot be declared gone.
 async fn observe_tmux() -> TmuxObservationSnapshot {
-    let mut sockets = vec![cli_tmux_socket()];
-    if is_legacy_home_enabled() {
-        // TODO(bc-legacy-cleanup): remove when no vk_ sessions remain.
-        sockets.push(legacy_cli_tmux_socket());
-    }
+    let sockets = [cli_tmux_socket()];
     observe_tmux_on(&sockets).await
 }
 
@@ -1223,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_current_and_legacy_cli_clients_and_finds_ignore_size() {
+    fn parses_cli_clients_and_finds_ignore_size() {
         let row = parse_cli_client_line(
             "4242\t/dev/pts/30\t999900\tattached,ignore-size,focused\t\
              bc_00000000000000000000000000000001",
@@ -1241,7 +1225,7 @@ mod tests {
 
         let unflagged = parse_cli_client_line(
             "4243\t/dev/pts/31\t999901\tattached,focused\t\
-             vk_00000000000000000000000000000001",
+             bc_00000000000000000000000000000002",
         )
         .expect("unflagged CLI client row");
         assert!(!unflagged.ignore_size);
@@ -1251,19 +1235,19 @@ mod tests {
     fn client_parser_skips_malformed_and_non_cli_rows() {
         assert!(
             parse_cli_client_line(
-                "bad\t/dev/pts/1\t10\tattached\tvk_00000000000000000000000000000001"
+                "bad\t/dev/pts/1\t10\tattached\tbc_00000000000000000000000000000002"
             )
             .is_none()
         );
         assert!(
             parse_cli_client_line(
-                "1\t/dev/pts/1\tbad\tattached\tvk_00000000000000000000000000000001"
+                "1\t/dev/pts/1\tbad\tattached\tbc_00000000000000000000000000000002"
             )
             .is_none()
         );
         assert!(
             parse_cli_client_line(
-                "1\t/dev/pts/1\t-1\tattached\tvk_00000000000000000000000000000001"
+                "1\t/dev/pts/1\t-1\tattached\tbc_00000000000000000000000000000002"
             )
             .is_none()
         );
@@ -1271,7 +1255,7 @@ mod tests {
         assert!(parse_cli_client_line("1\t/dev/pts/1\t10\tattached\twork").is_none());
         assert!(
             parse_cli_client_line(
-                "1\t/dev/pts/1\t10\tattached\tvk_00000000000000000000000000000001\textra"
+                "1\t/dev/pts/1\t10\tattached\tbc_00000000000000000000000000000002\textra"
             )
             .is_none()
         );
@@ -1573,11 +1557,12 @@ mod tests {
     fn session_names_round_trip() {
         let id = Uuid::new_v4();
         let current = crate::pty::cli_tmux_session_name(id);
-        let legacy = format!("vk_{}", id.simple());
         assert_eq!(workspace_id_from_cli_session_name(&current), Some(id));
-        assert_eq!(workspace_id_from_cli_session_name(&legacy), Some(id));
+        assert_eq!(
+            workspace_id_from_cli_session_name(&format!("vk_{}", id.simple())),
+            None
+        );
         assert_eq!(workspace_id_from_cli_session_name("bc_short"), None);
-        assert_eq!(workspace_id_from_cli_session_name("vk_short"), None);
         assert_eq!(workspace_id_from_cli_session_name("other_session"), None);
     }
 }

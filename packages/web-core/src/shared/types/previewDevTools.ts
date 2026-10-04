@@ -1,5 +1,5 @@
 // Message source identifier
-export const PREVIEW_DEVTOOLS_SOURCE = 'vibe-devtools' as const;
+export const PREVIEW_DEVTOOLS_SOURCE = 'bettercoding-devtools' as const;
 export type PreviewDevToolsSource = typeof PREVIEW_DEVTOOLS_SOURCE;
 
 // === Entry Types (for state management) ===

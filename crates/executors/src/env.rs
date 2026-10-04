@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn profile_overrides_runtime_env() {
         let mut base = ExecutionEnv::new(RepoContext::default(), false, String::new());
-        base.insert("VK_PROJECT_NAME", "runtime");
+        base.insert("BC_PROJECT_NAME", "runtime");
         base.insert("FOO", "runtime");
 
         let mut profile = HashMap::new();
@@ -155,7 +155,7 @@ mod tests {
 
         let merged = base.with_overrides(&profile);
 
-        assert_eq!(merged.vars.get("VK_PROJECT_NAME").unwrap(), "runtime");
+        assert_eq!(merged.vars.get("BC_PROJECT_NAME").unwrap(), "runtime");
         assert_eq!(merged.vars.get("FOO").unwrap(), "profile"); // overrides
         assert_eq!(merged.vars.get("BAR").unwrap(), "profile");
     }

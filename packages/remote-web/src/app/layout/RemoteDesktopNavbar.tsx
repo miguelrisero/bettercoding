@@ -2,7 +2,10 @@ import { useMemo, useCallback } from "react";
 import { useWorkspaceContext } from "@/shared/hooks/useWorkspaceContext";
 import { useActions } from "@/shared/hooks/useActions";
 import { useSyncErrorContext } from "@/shared/hooks/useSyncErrorContext";
-import { Navbar, type NavbarSectionItem } from "@vibe/ui/components/Navbar";
+import {
+  Navbar,
+  type NavbarSectionItem,
+} from "@bettercoding/ui/components/Navbar";
 import { NavbarActionGroups } from "@/shared/actions";
 import {
   NavbarDivider,

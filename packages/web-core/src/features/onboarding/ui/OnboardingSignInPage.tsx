@@ -8,8 +8,8 @@ import {
 } from '@/shared/dialogs/global/OAuthDialog';
 import { usePostHog } from 'posthog-js/react';
 import { useUserSystem } from '@/shared/hooks/useUserSystem';
-import { OAuthSignInButton } from '@vibe/ui/components/OAuthButtons';
-import { PrimaryButton } from '@vibe/ui/components/PrimaryButton';
+import { OAuthSignInButton } from '@bettercoding/ui/components/OAuthButtons';
+import { PrimaryButton } from '@bettercoding/ui/components/PrimaryButton';
 import { oauthApi, type AuthMethodsResponse } from '@/shared/lib/api';
 import { isTauriApp } from '@/shared/lib/platform';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';

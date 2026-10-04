@@ -7,8 +7,8 @@ import {
 } from "react";
 import { useLocation, useNavigate, useParams } from "@tanstack/react-router";
 import { XIcon, PlusIcon, HouseIcon, LinkIcon } from "@phosphor-icons/react";
-import { MobileDrawer } from "@vibe/ui/components/MobileDrawer";
-import { Tooltip } from "@vibe/ui/components/Tooltip";
+import { MobileDrawer } from "@bettercoding/ui/components/MobileDrawer";
+import { Tooltip } from "@bettercoding/ui/components/Tooltip";
 import { useIsMobile } from "@/shared/hooks/useIsMobile";
 import { cn } from "@/shared/lib/utils";
 import { useUserOrganizations } from "@/shared/hooks/useUserOrganizations";

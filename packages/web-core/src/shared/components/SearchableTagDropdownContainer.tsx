@@ -4,7 +4,7 @@ import type { Tag } from 'shared/remote-types';
 import {
   SearchableTagDropdown,
   TAG_COLORS,
-} from '@vibe/ui/components/SearchableTagDropdown';
+} from '@bettercoding/ui/components/SearchableTagDropdown';
 
 interface SearchableTagDropdownContainerProps {
   tags: Tag[];

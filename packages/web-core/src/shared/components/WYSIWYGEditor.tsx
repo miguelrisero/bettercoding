@@ -16,51 +16,51 @@ import { AutoFocusPlugin } from '@lexical/react/LexicalAutoFocusPlugin';
 import { ContentEditable } from '@lexical/react/LexicalContentEditable';
 import { TRANSFORMERS, type Transformer } from '@lexical/markdown';
 import { MarkdownShortcutPlugin } from '@lexical/react/LexicalMarkdownShortcutPlugin';
-import { CodeBlockEscapePlugin } from '@vibe/ui/components/CodeBlockEscapePlugin';
-import { InlineCodeBoundaryPlugin } from '@vibe/ui/components/InlineCodeBoundaryPlugin';
+import { CodeBlockEscapePlugin } from '@bettercoding/ui/components/CodeBlockEscapePlugin';
+import { InlineCodeBoundaryPlugin } from '@bettercoding/ui/components/InlineCodeBoundaryPlugin';
 import {
   PrCommentNode,
   PR_COMMENT_TRANSFORMER,
   PR_COMMENT_EXPORT_TRANSFORMER,
-} from '@vibe/ui/components/pr-comment-node';
-import { createImageNode } from '@vibe/ui/components/image-node';
-import { createAttachmentNode } from '@vibe/ui/components/attachment-node';
+} from '@bettercoding/ui/components/pr-comment-node';
+import { createImageNode } from '@bettercoding/ui/components/image-node';
+import { createAttachmentNode } from '@bettercoding/ui/components/attachment-node';
 import {
   ComponentInfoNode,
   COMPONENT_INFO_TRANSFORMER,
   COMPONENT_INFO_EXPORT_TRANSFORMER,
   $isComponentInfoNode,
-} from '@vibe/ui/components/component-info-node';
-import { TABLE_TRANSFORMER } from '@vibe/ui/lib/table-transformer';
+} from '@bettercoding/ui/components/component-info-node';
+import { TABLE_TRANSFORMER } from '@bettercoding/ui/lib/table-transformer';
 import {
   WorkspaceContext as EditorWorkspaceContext,
   SessionContext,
   LocalAttachmentsContext,
   type LocalAttachmentMetadata,
-} from '@vibe/ui/components/WorkspaceContext';
-import { TypeaheadOpenProvider } from '@vibe/ui/components/TypeaheadOpenContext';
+} from '@bettercoding/ui/components/WorkspaceContext';
+import { TypeaheadOpenProvider } from '@bettercoding/ui/components/TypeaheadOpenContext';
 import {
   FileTagTypeaheadPlugin,
   type RepoLike,
   type SearchResultItemLike,
-} from '@vibe/ui/components/FileTagTypeaheadPlugin';
-import { SlashCommandTypeaheadPlugin } from '@vibe/ui/components/SlashCommandTypeaheadPlugin';
-import { KeyboardCommandsPlugin } from '@vibe/ui/components/KeyboardCommandsPlugin';
-import { ImageKeyboardPlugin } from '@vibe/ui/components/ImageKeyboardPlugin';
-import { ComponentInfoKeyboardPlugin } from '@vibe/ui/components/ComponentInfoKeyboardPlugin';
-import { ReadOnlyLinkPlugin } from '@vibe/ui/components/ReadOnlyLinkPlugin';
-import { ClickableCodePlugin } from '@vibe/ui/components/ClickableCodePlugin';
-import { ToolbarPlugin } from '@vibe/ui/components/ToolbarPlugin';
-import { StaticToolbarPlugin } from '@vibe/ui/components/StaticToolbarPlugin';
-import { PasteMarkdownPlugin } from '@vibe/ui/components/PasteMarkdownPlugin';
-import { MarkdownSyncPlugin } from '@vibe/ui/components/MarkdownSyncPlugin';
+} from '@bettercoding/ui/components/FileTagTypeaheadPlugin';
+import { SlashCommandTypeaheadPlugin } from '@bettercoding/ui/components/SlashCommandTypeaheadPlugin';
+import { KeyboardCommandsPlugin } from '@bettercoding/ui/components/KeyboardCommandsPlugin';
+import { ImageKeyboardPlugin } from '@bettercoding/ui/components/ImageKeyboardPlugin';
+import { ComponentInfoKeyboardPlugin } from '@bettercoding/ui/components/ComponentInfoKeyboardPlugin';
+import { ReadOnlyLinkPlugin } from '@bettercoding/ui/components/ReadOnlyLinkPlugin';
+import { ClickableCodePlugin } from '@bettercoding/ui/components/ClickableCodePlugin';
+import { ToolbarPlugin } from '@bettercoding/ui/components/ToolbarPlugin';
+import { StaticToolbarPlugin } from '@bettercoding/ui/components/StaticToolbarPlugin';
+import { PasteMarkdownPlugin } from '@bettercoding/ui/components/PasteMarkdownPlugin';
+import { MarkdownSyncPlugin } from '@bettercoding/ui/components/MarkdownSyncPlugin';
 import { LexicalErrorBoundary } from '@lexical/react/LexicalErrorBoundary';
 import { HeadingNode, QuoteNode } from '@lexical/rich-text';
 import { ListNode, ListItemNode } from '@lexical/list';
 import { ListPlugin } from '@lexical/react/LexicalListPlugin';
 import { CodeNode, CodeHighlightNode } from '@lexical/code';
-import { CodeHighlightPlugin } from '@vibe/ui/components/CodeHighlightPlugin';
-import { CODE_HIGHLIGHT_CLASSES } from '@vibe/ui/lib/code-highlight-theme';
+import { CodeHighlightPlugin } from '@bettercoding/ui/components/CodeHighlightPlugin';
+import { CODE_HIGHLIGHT_CLASSES } from '@bettercoding/ui/lib/code-highlight-theme';
 import { LinkNode } from '@lexical/link';
 import { TableNode, TableRowNode, TableCellNode } from '@lexical/table';
 import { TablePlugin } from '@lexical/react/LexicalTablePlugin';
@@ -72,7 +72,7 @@ import { useUiPreferencesStore } from '@/shared/stores/useUiPreferencesStore';
 import { cn } from '@/shared/lib/utils';
 import { repoApi } from '@/shared/lib/api';
 import { searchTagsAndFiles } from '@/shared/lib/searchTagsAndFiles';
-import { Button } from '@vibe/ui/components/Button';
+import { Button } from '@bettercoding/ui/components/Button';
 import { Check, Clipboard, Pencil, Trash2 } from 'lucide-react';
 import type { RepoItem } from '@/shared/types/selectionItems';
 import { TagEditDialog } from '@/shared/dialogs/shared/TagEditDialog';

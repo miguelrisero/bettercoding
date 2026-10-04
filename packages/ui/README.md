@@ -1,4 +1,4 @@
-# @vibe/ui
+# @bettercoding/ui
 
 Shared UI package for reusable web app primitives.
 

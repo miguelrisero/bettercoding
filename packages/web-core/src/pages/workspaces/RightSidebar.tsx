@@ -23,7 +23,7 @@ import {
 import {
   CollapsibleSectionHeader,
   type SectionAction,
-} from '@vibe/ui/components/CollapsibleSectionHeader';
+} from '@bettercoding/ui/components/CollapsibleSectionHeader';
 
 type SectionDef = {
   title: string;

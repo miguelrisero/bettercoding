@@ -600,11 +600,8 @@ async fn http_proxy_handler(
 
                 // Inject Eruda CDN, init, devtools and click-to-component scripts before </body>
                 if let Some(pos) = html.to_lowercase().rfind("</body>") {
-                    let nav_script_disabled = utils::env::env_var_with_legacy(
-                        "BC_PREVIEW_DISABLE_NAV_SCRIPT",
-                        "VK_PREVIEW_DISABLE_NAV_SCRIPT",
-                    )
-                    .is_some_and(|value| env_flag_enabled(&value));
+                    let nav_script_disabled = std::env::var("BC_PREVIEW_DISABLE_NAV_SCRIPT")
+                        .is_ok_and(|value| env_flag_enabled(&value));
                     let scripts = if nav_script_disabled {
                         format!(
                             "<script src=\"https://cdn.jsdelivr.net/npm/eruda@3.4.3/eruda.js\"></script><script>{}</script><script>{}</script>",

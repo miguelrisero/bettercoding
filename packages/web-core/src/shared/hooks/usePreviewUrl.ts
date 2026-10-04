@@ -81,7 +81,7 @@ const isBetterPreviewUrlCandidate = (
   return false;
 };
 
-const getVibeKanbanPort = (): string | null => {
+const getAppPort = (): string | null => {
   if (typeof window !== 'undefined' && window.location.port) {
     return window.location.port;
   }
@@ -156,7 +156,7 @@ export const detectPreviewUrl = (line: string): PreviewUrlInfo | null => {
     /:(\d(?:[\d\s]{0,8}\d))(?=\/|\s|$)/g,
     (_match, rawPort) => `:${rawPort.replace(/\s+/g, '')}`
   );
-  const vibeKanbanPort = getVibeKanbanPort();
+  const appPort = getAppPort();
 
   const fullUrlMatch = urlPatterns[0].exec(normalized);
   if (fullUrlMatch) {
@@ -171,7 +171,7 @@ export const detectPreviewUrl = (line: string): PreviewUrlInfo | null => {
       } else {
         parsed.hostname = normalizedHost;
 
-        if (vibeKanbanPort && parsed.port === vibeKanbanPort) {
+        if (appPort && parsed.port === appPort) {
           return null;
         }
 
@@ -200,7 +200,7 @@ export const detectPreviewUrl = (line: string): PreviewUrlInfo | null => {
     const host = normalizeDetectedHost(hostPortMatch[1]);
     const port = Number(hostPortMatch[2]);
 
-    if (vibeKanbanPort && String(port) === vibeKanbanPort) {
+    if (appPort && String(port) === appPort) {
       continue;
     }
 

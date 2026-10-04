@@ -13,7 +13,7 @@ import {
   Scope,
 } from '@/shared/keyboard/registry';
 import { isMac, getModifierKey } from '@/shared/lib/platform';
-import { Tooltip } from '@vibe/ui/components/Tooltip';
+import { Tooltip } from '@bettercoding/ui/components/Tooltip';
 
 interface ShortcutItem {
   keys: string | string[];

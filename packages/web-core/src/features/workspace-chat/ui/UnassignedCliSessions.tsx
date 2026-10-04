@@ -4,16 +4,16 @@ import { useTranslation } from 'react-i18next';
 import type { UnassignedCliSession } from 'shared/types';
 
 import { cn } from '@/shared/lib/utils';
-import { Alert, AlertDescription } from '@vibe/ui/components/Alert';
-import { Badge } from '@vibe/ui/components/Badge';
-import { Button } from '@vibe/ui/components/Button';
+import { Alert, AlertDescription } from '@bettercoding/ui/components/Alert';
+import { Badge } from '@bettercoding/ui/components/Badge';
+import { Button } from '@bettercoding/ui/components/Button';
 import {
   Dialog,
   DialogContent,
   DialogDescription,
   DialogHeader,
   DialogTitle,
-} from '@vibe/ui/components/Dialog';
+} from '@bettercoding/ui/components/Dialog';
 import { partitionCliSessionsByKind } from '../model/partitionCliSessionsByKind';
 
 interface UnassignedCliSessionsProps {

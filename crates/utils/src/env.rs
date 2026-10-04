@@ -1,20 +1,9 @@
 use std::{ffi::OsString, path::PathBuf};
 
-/// Read an environment variable, preferring its current name over its legacy
-/// compatibility alias.
-/// A current variable set to an empty string deliberately wins: `std::env::var`
-/// still treats it as set, matching single-variable environment behaviour.
-// TODO(bc-legacy-cleanup): drop legacy VK_ fallback.
-pub fn env_var_with_legacy(new_name: &str, legacy_name: &str) -> Option<String> {
-    select_env_var_with_legacy(|name| std::env::var(name).ok(), new_name, legacy_name)
-}
-
 /// Read and normalise a filesystem path override from the environment.
 ///
-/// This deliberately differs from [`env_var_with_legacy`], where an empty
-/// current string variable wins over its legacy alias. An empty or non-UTF-8
-/// path can never be a valid persisted target, so path overrides treat either
-/// value as unset and emit a warning instead.
+/// An empty or non-UTF-8 path can never be a valid persisted target, so path
+/// overrides treat either value as unset and emit a warning instead.
 pub fn env_path_override(name: &str) -> Option<PathBuf> {
     normalize_path_override(name, std::env::var_os(name))
 }
@@ -130,13 +119,6 @@ pub(crate) fn evaluate_enable_flag(name: &str, value: Option<String>) -> bool {
     }
 }
 
-fn select_env_var_with_legacy<F>(lookup: F, new_name: &str, legacy_name: &str) -> Option<String>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    lookup(new_name).or_else(|| lookup(legacy_name))
-}
-
 /// Read a positive `usize` tunable from the environment, falling back to
 /// `default` when unset, unparseable, or zero.
 pub fn env_usize(name: &str, default: usize) -> usize {
@@ -172,20 +154,10 @@ pub(crate) fn evaluate_usize_override(name: &str, value: Option<String>, default
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
 
     use super::*;
-
-    fn select(vars: &[(&str, &str)], new_name: &str, legacy_name: &str) -> Option<String> {
-        let vars = vars.iter().copied().collect::<HashMap<_, _>>();
-        select_env_var_with_legacy(
-            |name| vars.get(name).map(|value| (*value).to_string()),
-            new_name,
-            legacy_name,
-        )
-    }
 
     #[test]
     fn disable_flag_is_unset_when_variable_is_absent() {
@@ -241,51 +213,6 @@ mod tests {
     #[test]
     fn unrecognized_values_do_not_enable() {
         assert!(!evaluate_enable_flag("ENABLE_X", Some("ture".to_string())));
-    }
-
-    #[test]
-    fn returns_legacy_value_when_only_legacy_is_set() {
-        assert_eq!(
-            select(&[("OLD_NAME", "legacy")], "NEW_NAME", "OLD_NAME"),
-            Some("legacy".to_string())
-        );
-    }
-
-    #[test]
-    fn returns_new_value_when_only_new_is_set() {
-        assert_eq!(
-            select(&[("NEW_NAME", "new")], "NEW_NAME", "OLD_NAME"),
-            Some("new".to_string())
-        );
-    }
-
-    #[test]
-    fn prefers_new_value_when_both_are_set() {
-        assert_eq!(
-            select(
-                &[("NEW_NAME", "new"), ("OLD_NAME", "legacy")],
-                "NEW_NAME",
-                "OLD_NAME",
-            ),
-            Some("new".to_string())
-        );
-    }
-
-    #[test]
-    fn prefers_empty_new_value_when_both_are_set() {
-        assert_eq!(
-            select(
-                &[("NEW_NAME", ""), ("OLD_NAME", "legacy")],
-                "NEW_NAME",
-                "OLD_NAME",
-            ),
-            Some(String::new())
-        );
-    }
-
-    #[test]
-    fn returns_none_when_neither_is_set() {
-        assert_eq!(select(&[], "NEW_NAME", "OLD_NAME"), None);
     }
 
     #[test]

@@ -41,7 +41,7 @@ const iconPath = path.join(tauriAppDir, 'icons', 'icon.ico');
 
 // Read tauri.conf.json for product metadata
 const conf = JSON.parse(fs.readFileSync(confPath, 'utf8'));
-const productName = conf.productName || 'Vibe Kanban';
+const productName = conf.productName || 'BetterCoding';
 const confVersion = conf.version || '0.0.0';
 
 // Version from CLI or config
@@ -53,7 +53,7 @@ while (parts.length < 3) parts.push('0');
 version = parts.slice(0, 3).join('.');
 
 // Manufacturer from identifier (reverse domain → organization)
-const manufacturer = 'Bloop';
+const manufacturer = 'BetterCoding';
 
 // Stable upgrade code (UUID v5-style, derived from identifier — must never change)
 const upgradeCode = 'E8C15B4D-5F9A-4B3E-8C1A-7D2F6E9A3B8C';
@@ -76,7 +76,7 @@ if (!wixArch) {
 }
 
 // Binary path
-const binaryName = 'vibe-kanban-tauri.exe';
+const binaryName = 'bettercoding-tauri.exe';
 const mainBinaryPath = path.join(projectRoot, 'target', target, 'release', binaryName);
 
 if (!fs.existsSync(mainBinaryPath)) {

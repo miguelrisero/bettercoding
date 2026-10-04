@@ -24,7 +24,7 @@ import {
   ArchiveIcon,
   ArrowLeftIcon,
 } from "@phosphor-icons/react";
-import { RunningDots } from "@vibe/ui/components/RunningDots";
+import { RunningDots } from "@bettercoding/ui/components/RunningDots";
 
 export const Route = createFileRoute("/hosts/$hostId/workspaces")({
   beforeLoad: async ({ location }) => {

@@ -1,5 +1,5 @@
 {
-  "name": "@vibe/remote-web",
+  "name": "@bettercoding/remote-web",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -19,8 +19,8 @@
     "@tanstack/react-query": "^5.85.5",
     "@tanstack/react-router": "^1.161.1",
     "@tanstack/zod-adapter": "^1.161.1",
-    "@vibe/ui": "workspace:*",
-    "@vibe/web-core": "workspace:*",
+    "@bettercoding/ui": "workspace:*",
+    "@bettercoding/web-core": "workspace:*",
     "clsx": "^2.1.1",
     "posthog-js": "^1.283.0",
     "prettier": "^3.6.1",

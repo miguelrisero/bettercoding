@@ -19,16 +19,16 @@ use crate::DesktopBridgeError;
 
 /// Provision an SSH identity for the given signing service and remote host.
 ///
-/// Writes the OpenSSH PEM private key to `~/.vk-ssh/keys/{hash}` and returns
-/// the path and the host alias (`vk-{host_id}`).
+/// Writes the OpenSSH PEM private key to `~/.bettercoding-ssh/keys/{hash}` and returns
+/// the path and the host alias (`bc-{host_id}`).
 pub(crate) fn provision_ssh_key(
     signing: &RelaySigningService,
     host_id: &str,
 ) -> Result<(PathBuf, String), DesktopBridgeError> {
     let key_hash = short_key_hash(signing);
-    let alias = format!("vk-{host_id}");
+    let alias = format!("bc-{host_id}");
 
-    let ssh_dir = vk_ssh_dir()?;
+    let ssh_dir = app_ssh_dir()?;
     let keys_dir = ssh_dir.join("keys");
     fs::create_dir_all(&keys_dir)?;
 
@@ -62,18 +62,18 @@ pub(crate) fn provision_ssh_key(
 
 /// Write (or update) an SSH config entry for the given host alias.
 ///
-/// The config is written to `~/.vk-ssh/config` and points at the local tunnel port.
+/// The config is written to `~/.bettercoding-ssh/config` and points at the local tunnel port.
 pub(crate) fn update_ssh_config(
     alias: &str,
     port: u16,
     key_path: &std::path::Path,
 ) -> Result<(), DesktopBridgeError> {
-    let ssh_dir = vk_ssh_dir()?;
+    let ssh_dir = app_ssh_dir()?;
     let config_path = ssh_dir.join("config");
     let null_known_hosts = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
     let entry = format!(
-        "\nHost {alias}\n    HostName 127.0.0.1\n    Port {port}\n    User vk\n    IdentityFile {key}\n    StrictHostKeyChecking no\n    UserKnownHostsFile {null_known_hosts}\n",
+        "\nHost {alias}\n    HostName 127.0.0.1\n    Port {port}\n    User bettercoding\n    IdentityFile {key}\n    StrictHostKeyChecking no\n    UserKnownHostsFile {null_known_hosts}\n",
         key = key_path.display(),
     );
 
@@ -85,7 +85,7 @@ pub(crate) fn update_ssh_config(
     Ok(())
 }
 
-/// Ensure `~/.ssh/config` includes our `~/.vk-ssh/config`.
+/// Ensure `~/.ssh/config` includes our `~/.bettercoding-ssh/config`.
 pub(crate) fn ensure_ssh_include() -> Result<(), DesktopBridgeError> {
     let ssh_dir = dirs::home_dir()
         .ok_or(DesktopBridgeError::NoHomeDirectory)?
@@ -93,7 +93,7 @@ pub(crate) fn ensure_ssh_include() -> Result<(), DesktopBridgeError> {
     fs::create_dir_all(&ssh_dir)?;
 
     let config_path = ssh_dir.join("config");
-    let include_line = "Include ~/.vk-ssh/config";
+    let include_line = "Include ~/.bettercoding-ssh/config";
 
     let existing = fs::read_to_string(&config_path).unwrap_or_default();
     if existing.contains(include_line) {
@@ -107,9 +107,9 @@ pub(crate) fn ensure_ssh_include() -> Result<(), DesktopBridgeError> {
     Ok(())
 }
 
-fn vk_ssh_dir() -> Result<PathBuf, DesktopBridgeError> {
+fn app_ssh_dir() -> Result<PathBuf, DesktopBridgeError> {
     let home = dirs::home_dir().ok_or(DesktopBridgeError::NoHomeDirectory)?;
-    Ok(home.join(".vk-ssh"))
+    Ok(home.join(".bettercoding-ssh"))
 }
 
 fn atomic_write_text_file(path: &Path, content: &str) -> Result<(), DesktopBridgeError> {

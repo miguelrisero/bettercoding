@@ -13,7 +13,7 @@ import { useCurrentAppDestination } from '@/shared/hooks/useCurrentAppDestinatio
 import { isLocalWorkspacesDestination } from '@/shared/lib/routes/appNavigation';
 import { useWorkspaceSidebarPreviewController } from '@/shared/hooks/useWorkspaceSidebarPreviewController';
 import { WorkspacesSidebarContainer } from '@/pages/workspaces/WorkspacesSidebarContainer';
-import { WorkspacesSidebarReopenTag } from '@vibe/ui/components/WorkspacesSidebar';
+import { WorkspacesSidebarReopenTag } from '@bettercoding/ui/components/WorkspacesSidebar';
 
 export function SharedAppLayout() {
   const currentDestination = useCurrentAppDestination();

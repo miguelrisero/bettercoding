@@ -1,7 +1,6 @@
 # syntax=docker/dockerfile:1.6
 
 ARG APP_NAME=remote
-ARG FEATURES=""
 ARG VITE_RELAY_API_BASE_URL=""
 ARG VITE_PUBLIC_REACT_VIRTUOSO_LICENSE_KEY=""
 
@@ -35,7 +34,6 @@ RUN pnpm -C packages/remote-web build
 
 FROM rust:1.93-slim-bookworm AS builder
 ARG APP_NAME
-ARG FEATURES
 ARG POSTHOG_API_KEY=""
 ARG POSTHOG_API_ENDPOINT=""
 ARG SENTRY_DSN_REMOTE=""
@@ -85,21 +83,10 @@ COPY assets assets
 
 RUN mkdir -p /app/bin
 
-# When building without FEATURES (self-hosted), strip the private billing dependency
-# and its feature flag from Cargo.toml so cargo doesn't try to fetch the private git repo.
-# Also remove the Cargo.lock which references the private repo.
-RUN if [ -z "${FEATURES}" ]; then \
-      sed -i '/^billing = {.*vibe-kanban-private.*/d' crates/remote/Cargo.toml; \
-      sed -i '/^# private crate for billing/d' crates/remote/Cargo.toml; \
-      sed -i 's/^vk-billing = \["dep:billing"\]/vk-billing = []/' crates/remote/Cargo.toml; \
-      rm -f crates/remote/Cargo.lock; \
-    fi
-
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=remote-target,target=/app/target \
-    --mount=type=ssh \
-    cargo build ${FEATURES:+--locked} --release --manifest-path crates/remote/Cargo.toml ${FEATURES:+--features ${FEATURES}} \
+    cargo build --locked --release --manifest-path crates/remote/Cargo.toml \
  && cp /app/target/release/${APP_NAME} /app/bin/${APP_NAME}
 
 FROM debian:bookworm-slim AS runtime

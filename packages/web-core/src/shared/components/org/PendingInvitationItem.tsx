@@ -1,5 +1,5 @@
-import { Badge } from '@vibe/ui/components/Badge';
-import { Button } from '@vibe/ui/components/Button';
+import { Badge } from '@bettercoding/ui/components/Badge';
+import { Button } from '@bettercoding/ui/components/Button';
 import type { Invitation } from 'shared/types';
 import { MemberRole } from 'shared/types';
 import { useTranslation } from 'react-i18next';

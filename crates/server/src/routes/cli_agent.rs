@@ -27,10 +27,7 @@ use db::models::{
 use deployment::Deployment;
 use local_deployment::{
     cli_activity::{AgentPresence, probe_workspace_agent},
-    pty::{
-        CliRespawnClaim, cli_restart_bootstrap, cli_tmux_available, cli_tmux_session_is_legacy,
-        respawn_cli_tmux_pane,
-    },
+    pty::{CliRespawnClaim, cli_restart_bootstrap, cli_tmux_available, respawn_cli_tmux_pane},
 };
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -50,9 +47,6 @@ pub enum CliRestartBlocker {
     /// A headless executor still owns this conversation. Respawning would put a
     /// second agent on the same transcript and fork it.
     ExecutorRunning,
-    /// A legacy `vk_` session. These are attach-only by design and carry no
-    /// bootstrap we could re-run; the user must reopen the workspace instead.
-    LegacySession,
     /// tmux or /proc could not be read, so liveness is unknown. Never offer a
     /// restart on evidence this weak.
     Unknown,
@@ -197,13 +191,9 @@ async fn get_agent_status(
     // ExecutorRunning, so the UI explains the wait instead of offering a button
     // that would only ever be refused.
     let blocker = if agent_alive == Some(false) {
-        if context.executor_active {
-            Some(CliRestartBlocker::ExecutorRunning)
-        } else if cli_tmux_session_is_legacy(workspace_id).await {
-            Some(CliRestartBlocker::LegacySession)
-        } else {
-            None
-        }
+        context
+            .executor_active
+            .then_some(CliRestartBlocker::ExecutorRunning)
     } else {
         blocker
     };
@@ -226,12 +216,6 @@ async fn restart_agent(
     if context.executor_active {
         return Err(ApiError::Conflict(
             "A headless run still owns this conversation; wait for it to finish before restarting"
-                .to_string(),
-        ));
-    }
-    if cli_tmux_session_is_legacy(workspace_id).await {
-        return Err(ApiError::BadRequest(
-            "This is a legacy session and cannot be restarted in place; reopen the workspace"
                 .to_string(),
         ));
     }

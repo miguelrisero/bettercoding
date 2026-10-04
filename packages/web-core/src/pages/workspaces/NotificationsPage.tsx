@@ -1,7 +1,7 @@
 import { useCallback } from 'react';
 import { useRouter } from '@tanstack/react-router';
 import { BellIcon, CheckIcon, ChecksIcon } from '@phosphor-icons/react';
-import { UserAvatar } from '@vibe/ui/components/UserAvatar';
+import { UserAvatar } from '@bettercoding/ui/components/UserAvatar';
 import { useNotifications } from '@/shared/hooks/useNotifications';
 import { useNotificationMembers } from '@/shared/hooks/useNotificationMembers';
 import type { GroupedNotification } from '@/shared/lib/notifications';

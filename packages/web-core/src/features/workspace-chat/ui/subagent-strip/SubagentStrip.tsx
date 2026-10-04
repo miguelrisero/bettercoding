@@ -3,13 +3,13 @@ import { useTranslation } from 'react-i18next';
 import type { BaseCodingAgent } from 'shared/types';
 import { CaretDownIcon, CpuIcon, UserCircleIcon } from '@phosphor-icons/react';
 
-import { RunningDots } from '@vibe/ui/components/RunningDots';
+import { RunningDots } from '@bettercoding/ui/components/RunningDots';
 import {
   Popover,
   PopoverContent,
   PopoverTrigger,
-} from '@vibe/ui/components/Popover';
-import { cn } from '@vibe/ui/lib/cn';
+} from '@bettercoding/ui/components/Popover';
+import { cn } from '@bettercoding/ui/lib/cn';
 import { AgentIcon } from '@/shared/components/AgentIcon';
 import { useIsMobile } from '@/shared/hooks/useIsMobile';
 import { useSubagentStrip } from '../../model/hooks/useSubagentStrip';

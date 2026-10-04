@@ -152,7 +152,7 @@
         "description": "Configure git branch naming preferences",
         "branchPrefix": {
           "label": "Branch Prefix",
-          "placeholder": "vk",
+          "placeholder": "bc",
           "helper": "Prefix for auto-generated branch names. Leave empty for no prefix.",
           "preview": "Preview:",
           "previewWithPrefix": "{{prefix}}/1a2b-task-name",
@@ -169,10 +169,10 @@
         "workspaceDir": {
           "label": "Workspace Directory",
           "placeholder": "~/",
-          "helper": "Workspaces will be created in a .vibe-kanban-workspaces subdirectory within this path. Leave empty to use the system default. Changes require an app restart.",
+          "helper": "Workspaces will be created in a .bettercoding-workspaces subdirectory within this path. Leave empty to use the system default. Changes require an app restart.",
           "browse": "Browse",
           "dialogTitle": "Select Workspace Directory",
-          "dialogDescription": "Choose a directory. Workspaces will be created in a .vibe-kanban-workspaces subdirectory within it."
+          "dialogDescription": "Choose a directory. Workspaces will be created in a .bettercoding-workspaces subdirectory within it."
         }
       },
       "pullRequests": {

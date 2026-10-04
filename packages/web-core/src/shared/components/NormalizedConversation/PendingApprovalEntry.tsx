@@ -8,13 +8,13 @@ import {
 } from 'react';
 import type { ReactNode } from 'react';
 import type { ApprovalStatus, ToolStatus } from 'shared/types';
-import { Button } from '@vibe/ui/components/Button';
+import { Button } from '@bettercoding/ui/components/Button';
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
-} from '@vibe/ui/components/RadixTooltip';
+} from '@bettercoding/ui/components/RadixTooltip';
 import { approvalsApi } from '@/shared/lib/api';
 import { Check, X } from 'lucide-react';
 import WYSIWYGEditor from '@/shared/components/WYSIWYGEditor';

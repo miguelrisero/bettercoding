@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, type ReactNode } from "react";
 import { useLocation, useNavigate, useParams } from "@tanstack/react-router";
-import { MOBILE_TABS, Navbar } from "@vibe/ui/components/Navbar";
+import { MOBILE_TABS, Navbar } from "@bettercoding/ui/components/Navbar";
 import { SettingsDialog } from "@/shared/dialogs/settings/SettingsDialog";
 import { CommandBarDialog } from "@/shared/dialogs/command-bar/CommandBarDialog";
 import { useMobileActiveTab } from "@/shared/stores/useUiPreferencesStore";

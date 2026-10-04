@@ -14,7 +14,7 @@ use crate::{
 
 const PROJECT_ROOT: &str = env!("CARGO_MANIFEST_DIR");
 pub const DB_FILE_NAME: &str = "db.v2.sqlite";
-// TODO(bc-legacy-cleanup): remove after legacy databases no longer need adoption.
+/// Pre-v2 database name; its presence alone still marks a data home.
 pub const LEGACY_DB_FILE_NAME: &str = "db.sqlite";
 
 static PROD_ASSET_DIR: OnceLock<Result<PathBuf, String>> = OnceLock::new();
@@ -41,26 +41,21 @@ pub fn asset_dir() -> std::path::PathBuf {
         std::fs::create_dir_all(&path).expect("Failed to create asset directory");
     }
 
-    // Production resolution is dual-home: existing database state in either the
-    // BetterCoding or legacy vibe-kanban home determines which directory is used.
     path
 }
 
 /// Returns the production data directory, resolving and caching it once per process.
 ///
 /// Resolution order is: `BC_DATA_DIR`; a BetterCoding home containing
-/// `db.v2.sqlite`; a legacy home containing `db.v2.sqlite` or `db.sqlite`; then a
-/// fresh BetterCoding home. An unknowable database probe returns an error instead
-/// of guessing. Without an override, [`asset_dir`] keeps using `dev_assets` in
-/// debug builds. Unit tests exercise `resolve_data_dir` directly and never mutate
-/// process env.
+/// `db.v2.sqlite`; then a fresh BetterCoding home. A pre-rename home (the
+/// `vibe-kanban` data dir) that holds a database is moved into the BetterCoding
+/// home once, before anything opens it; see [`migrate_pre_rename_home`]. An
+/// unknowable database probe or a failed move returns an error instead of
+/// guessing. Without an override, [`asset_dir`] keeps using `dev_assets` in
+/// debug builds. Unit tests exercise `resolve_data_dir` directly and never
+/// mutate process env.
 /// Startup-critical consumers deliberately panic if resolution is unknowable;
 /// best-effort consumers should use [`try_prod_asset_dir_path`] instead.
-///
-/// In-repo downgrade caveat: a fresh install stores state under the BetterCoding
-/// home, which pre-dual-home binaries never probe. Downgrading therefore boots an
-/// empty database at the legacy path; older binaries also ignore `BC_DATA_DIR`
-/// and `BC_WORKTREE_BASE`.
 pub fn prod_asset_dir_path() -> PathBuf {
     try_prod_asset_dir_path().unwrap_or_else(|error| {
         panic!("Cannot safely resolve the startup-critical data directory: {error}")
@@ -89,13 +84,12 @@ fn cached_prod_asset_dir_path(override_dir: Option<PathBuf>) -> Result<PathBuf, 
                     .ok_or_else(|| "OS didn't give us a home directory".to_string())?
                     .data_dir()
                     .to_path_buf();
-                // TODO(bc-legacy-cleanup): remove legacy ProjectDirs discovery.
-                let legacy_dir = ProjectDirs::from("ai", "bloop", "vibe-kanban")
+                let pre_rename_dir = ProjectDirs::from("ai", "bloop", "vibe-kanban")
                     .ok_or_else(|| "OS didn't give us a home directory".to_string())?
                     .data_dir()
                     .to_path_buf();
 
-                resolve_data_dir(None, bettercoding_dir, legacy_dir)
+                resolve_data_dir(None, bettercoding_dir, pre_rename_dir)
                     .map_err(|error| error.to_string())
             }?;
 
@@ -111,7 +105,7 @@ fn cached_prod_asset_dir_path(override_dir: Option<PathBuf>) -> Result<PathBuf, 
 
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "failed to inspect data file candidate `{path}`: {source}; refusing to guess the data directory to protect existing data"
+    "failed to resolve the data directory at `{path}`: {source}; refusing to guess the data directory to protect existing data"
 )]
 struct DataDirResolveError {
     path: PathBuf,
@@ -129,7 +123,7 @@ enum FileProbe {
 fn resolve_data_dir(
     override_dir: Option<PathBuf>,
     bettercoding_dir: PathBuf,
-    legacy_dir: PathBuf,
+    pre_rename_dir: PathBuf,
 ) -> Result<Resolution, DataDirResolveError> {
     if let Some(override_dir) = override_dir {
         return Ok(Resolution {
@@ -149,12 +143,12 @@ fn resolve_data_dir(
         FileProbe::Absent => {}
     }
 
-    match probe_legacy_database(&legacy_dir) {
+    match probe_home_database(&pre_rename_dir) {
         FileProbe::Present => {
-            // TODO(bc-legacy-cleanup): remove when no vibe-kanban installs remain.
+            migrate_pre_rename_home(&pre_rename_dir, &bettercoding_dir)?;
             return Ok(Resolution {
-                path: legacy_dir,
-                reason: ResolutionReason::LegacyAdopt,
+                path: bettercoding_dir,
+                reason: ResolutionReason::Migrated,
             });
         }
         FileProbe::Unknown(error) => return Err(error),
@@ -169,12 +163,47 @@ fn resolve_data_dir(
 
 /// Probes the v2 database first. An unknown v2 result short-circuits instead of
 /// probing the pre-v2 name, matching the parent resolver's refuse-to-guess policy.
-// TODO(bc-legacy-cleanup): remove with support for the legacy data home.
-fn probe_legacy_database(legacy_dir: &Path) -> FileProbe {
-    match probe_file(&legacy_dir.join(DB_FILE_NAME)) {
-        FileProbe::Absent => probe_file(&legacy_dir.join(LEGACY_DB_FILE_NAME)),
+fn probe_home_database(dir: &Path) -> FileProbe {
+    match probe_file(&dir.join(DB_FILE_NAME)) {
+        FileProbe::Absent => probe_file(&dir.join(LEGACY_DB_FILE_NAME)),
         result => result,
     }
+}
+
+/// Move the pre-rename data home into the BetterCoding home with one atomic
+/// `rename`, so the database, its WAL and every sidecar move together.
+///
+/// It runs at most once: afterwards the BetterCoding home holds the database
+/// and wins resolution. A BetterCoding home that already exists without a
+/// database must be empty, or the move fails and nothing is touched. On Unix
+/// the old path is left as a symlink to the new home, so absolute paths held
+/// outside the app (running agents' hook settings files, a supervisor's log
+/// path) keep resolving.
+fn migrate_pre_rename_home(from: &Path, to: &Path) -> Result<(), DataDirResolveError> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| DataDirResolveError {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    std::fs::rename(from, to).map_err(|source| DataDirResolveError {
+        path: to.to_path_buf(),
+        source,
+    })?;
+    tracing::info!(
+        from = %from.display(),
+        to = %to.display(),
+        "Moved the pre-rename data directory into the BetterCoding data directory"
+    );
+    #[cfg(unix)]
+    if let Err(error) = std::os::unix::fs::symlink(to, from) {
+        tracing::warn!(
+            path = %from.display(),
+            error = %error,
+            "Could not leave a symlink at the pre-rename data directory"
+        );
+    }
+    Ok(())
 }
 
 fn probe_file(path: &Path) -> FileProbe {
@@ -263,43 +292,70 @@ mod tests {
     }
 
     #[test]
-    fn uses_legacy_dir_when_only_legacy_has_database() {
+    fn moves_pre_rename_home_with_database_into_bettercoding_dir() {
         let root = TempDir::new().expect("create scratch directory");
         let (bettercoding_dir, legacy_dir) = candidates(&root);
         seed_database(&legacy_dir);
+        fs::create_dir_all(legacy_dir.join("cli-hooks")).expect("seed sidecar directory");
+        fs::write(legacy_dir.join("db.v2.sqlite-wal"), b"wal").expect("seed WAL");
 
         assert_resolution(
-            resolve_data_dir(None, bettercoding_dir, legacy_dir.clone()),
-            &legacy_dir,
-            ResolutionReason::LegacyAdopt,
+            resolve_data_dir(None, bettercoding_dir.clone(), legacy_dir.clone()),
+            &bettercoding_dir,
+            ResolutionReason::Migrated,
+        );
+        assert_eq!(
+            fs::read(bettercoding_dir.join(DB_FILE_NAME)).unwrap(),
+            b"scratch database"
+        );
+        assert!(bettercoding_dir.join("db.v2.sqlite-wal").is_file());
+        assert!(bettercoding_dir.join("cli-hooks").is_dir());
+
+        // The old path still reaches the same files, and the next start
+        // resolves to the BetterCoding home without moving anything.
+        #[cfg(unix)]
+        assert!(
+            fs::symlink_metadata(&legacy_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        #[cfg(unix)]
+        assert!(legacy_dir.join(DB_FILE_NAME).is_file());
+        assert_resolution(
+            resolve_data_dir(None, bettercoding_dir.clone(), legacy_dir),
+            &bettercoding_dir,
+            ResolutionReason::Bettercoding,
         );
     }
 
     #[test]
-    fn uses_legacy_dir_when_it_only_has_pre_v2_database() {
+    fn moves_pre_rename_home_into_an_empty_bettercoding_dir() {
         let root = TempDir::new().expect("create scratch directory");
         let (bettercoding_dir, legacy_dir) = candidates(&root);
+        fs::create_dir_all(&bettercoding_dir).expect("create empty BetterCoding directory");
         seed_database_named(&legacy_dir, LEGACY_DB_FILE_NAME);
 
         assert_resolution(
-            resolve_data_dir(None, bettercoding_dir, legacy_dir.clone()),
-            &legacy_dir,
-            ResolutionReason::LegacyAdopt,
+            resolve_data_dir(None, bettercoding_dir.clone(), legacy_dir),
+            &bettercoding_dir,
+            ResolutionReason::Migrated,
         );
+        assert!(bettercoding_dir.join(LEGACY_DB_FILE_NAME).is_file());
     }
 
     #[test]
-    fn ignores_pre_v2_database_in_bettercoding_dir() {
+    fn refuses_to_move_into_a_non_empty_bettercoding_dir() {
         let root = TempDir::new().expect("create scratch directory");
         let (bettercoding_dir, legacy_dir) = candidates(&root);
         seed_database_named(&bettercoding_dir, LEGACY_DB_FILE_NAME);
         seed_database(&legacy_dir);
 
-        assert_resolution(
-            resolve_data_dir(None, bettercoding_dir, legacy_dir.clone()),
-            &legacy_dir,
-            ResolutionReason::LegacyAdopt,
-        );
+        let error = resolve_data_dir(None, bettercoding_dir.clone(), legacy_dir.clone())
+            .expect_err("a non-empty target must not be overwritten");
+        assert_eq!(error.path, bettercoding_dir);
+        assert!(legacy_dir.join(DB_FILE_NAME).is_file());
+        assert!(bettercoding_dir.join(LEGACY_DB_FILE_NAME).is_file());
     }
 
     #[test]
@@ -362,12 +418,11 @@ mod tests {
         let (bettercoding_dir, legacy_dir) = candidates(&root);
         fs::create_dir_all(bettercoding_dir.join(DB_FILE_NAME))
             .expect("create wrong-type database candidate");
-        seed_database(&legacy_dir);
 
         assert_resolution(
-            resolve_data_dir(None, bettercoding_dir, legacy_dir.clone()),
-            &legacy_dir,
-            ResolutionReason::LegacyAdopt,
+            resolve_data_dir(None, bettercoding_dir.clone(), legacy_dir),
+            &bettercoding_dir,
+            ResolutionReason::Fresh,
         );
     }
 

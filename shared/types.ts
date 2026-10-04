@@ -437,7 +437,7 @@ blocker: CliRestartBlocker | null,
  */
 program: string, };
 
-export type CliRestartBlocker = "no_session" | "executor_running" | "legacy_session" | "unknown";
+export type CliRestartBlocker = "no_session" | "executor_running" | "unknown";
 
 export type CliRestartResponse = { 
 /**

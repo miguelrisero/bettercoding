@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { OrganizationWithRole } from 'shared/types';
-import { AppBarUserPopover } from '@vibe/ui/components/AppBarUserPopover';
+import { AppBarUserPopover } from '@bettercoding/ui/components/AppBarUserPopover';
 import { SettingsDialog } from '@/shared/dialogs/settings/SettingsDialog';
 import { useAuth } from '@/shared/hooks/auth/useAuth';
 import { useUserSystem } from '@/shared/hooks/useUserSystem';

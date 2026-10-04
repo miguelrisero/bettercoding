@@ -47,7 +47,7 @@ import {
   SessionChatBox,
   type ExecutionStatus,
   type SessionChatBoxEditorRenderProps,
-} from '@vibe/ui/components/SessionChatBox';
+} from '@bettercoding/ui/components/SessionChatBox';
 import { ModelSelectorContainer } from '@/shared/components/ModelSelectorContainer';
 import {
   useWorkspacePanelState,
@@ -65,12 +65,12 @@ import {
 import { SettingsDialog } from '@/shared/dialogs/settings/SettingsDialog';
 import { useActionVisibilityContext } from '@/shared/hooks/useActionVisibilityContext';
 import { PrCommentsDialog } from '@/shared/dialogs/tasks/PrCommentsDialog';
-import type { NormalizedComment } from '@vibe/ui/components/pr-comment-node';
+import type { NormalizedComment } from '@bettercoding/ui/components/pr-comment-node';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
 import { sessionsApi } from '@/shared/lib/api';
-import { RenameSessionDialog } from '@vibe/ui/components/RenameSessionDialog';
-import type { TurnNavigationItem } from '@vibe/ui/components/TurnNavigationPopup';
-import { ConfirmDialog } from '@vibe/ui/components/ConfirmDialog';
+import { RenameSessionDialog } from '@bettercoding/ui/components/RenameSessionDialog';
+import type { TurnNavigationItem } from '@bettercoding/ui/components/TurnNavigationPopup';
+import { ConfirmDialog } from '@bettercoding/ui/components/ConfirmDialog';
 import {
   assertNever,
   deriveQueueChipState,

@@ -6,4 +6,4 @@ export {
   archiveBucketForTimestamp,
   archiveBucketFromAgeMilliseconds,
   isArchivedRecently,
-} from '@vibe/ui/lib/archiveBuckets';
+} from '@bettercoding/ui/lib/archiveBuckets';

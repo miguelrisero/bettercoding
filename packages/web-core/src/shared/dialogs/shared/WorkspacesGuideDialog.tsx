@@ -6,7 +6,7 @@ import { defineModal, type NoProps } from '@/shared/lib/modals';
 import {
   GuideDialogShell,
   type GuideDialogTopic,
-} from '@vibe/ui/components/GuideDialogShell';
+} from '@bettercoding/ui/components/GuideDialogShell';
 
 const TOPIC_IDS = [
   'welcome',
