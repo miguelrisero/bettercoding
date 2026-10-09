@@ -233,6 +233,7 @@ impl RemoteClient {
                     updated.access_token.ok_or(RemoteClientError::Auth)
                 }
                 Err(err) if err.is_definitive_auth_failure() => {
+                    warn!(error = %err, "token refresh rejected; clearing stored credentials, sign in again");
                     let _ = self.auth_context.clear_credentials().await;
                     self.auth_context.clear_remote_auth_degraded_slug().await;
                     Err(err)
