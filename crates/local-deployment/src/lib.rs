@@ -473,6 +473,9 @@ impl LocalDeployment {
                 }
             }
             Err(RemoteClientError::Auth) => {
+                tracing::warn!(
+                    "profile request unauthorized; clearing stored credentials, sign in again"
+                );
                 let _ = self.auth_context.clear_credentials().await;
                 self.auth_context.clear_profile().await;
                 self.auth_context.clear_remote_auth_degraded_slug().await;
