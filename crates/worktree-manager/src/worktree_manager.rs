@@ -655,3 +655,91 @@ async fn repo_mutation_lock_uses_the_canonical_repo_path() {
         .expect("repo lock waiter should proceed after release")
         .expect("repo lock waiter task should complete");
 }
+
+#[cfg(test)]
+#[test]
+fn cleanup_keeps_unavailable_sibling_registration() {
+    use std::process::Command;
+
+    use tempfile::TempDir;
+
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let result = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-b", "main"]);
+    fs::write(repo.join("base.txt"), "base").unwrap();
+    git(&["add", "base.txt"]);
+    git(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "seed",
+    ]);
+    git(&["config", "gc.worktreePruneExpire", "now"]);
+    let target = temp.path().join("lane-a");
+    let sibling = temp.path().join("lane-b");
+    git(&[
+        "worktree",
+        "add",
+        "-b",
+        "lane-a",
+        target.to_str().unwrap(),
+        "main",
+    ]);
+    git(&[
+        "worktree",
+        "add",
+        "-b",
+        "lane-b",
+        sibling.to_str().unwrap(),
+        "main",
+    ]);
+    fs::write(sibling.join("keep.txt"), "uncommitted work").unwrap();
+    let sibling_admin = repo.join(".git/worktrees/lane-b");
+    let head = fs::read(sibling_admin.join("HEAD")).unwrap();
+    let index = fs::read(sibling_admin.join("index")).unwrap();
+    let hidden = temp.path().join("temporarily-unavailable");
+    fs::rename(&sibling, &hidden).unwrap();
+
+    WorktreeManager::comprehensive_worktree_cleanup(&repo, &target).unwrap();
+
+    assert!(!target.exists());
+    assert!(!repo.join(".git/worktrees/lane-a").exists());
+    assert!(
+        sibling_admin.exists(),
+        "cleaning one lane pruned another lane's registration"
+    );
+    assert_eq!(fs::read(sibling_admin.join("HEAD")).unwrap(), head);
+    assert_eq!(fs::read(sibling_admin.join("index")).unwrap(), index);
+    fs::rename(&hidden, &sibling).unwrap();
+    assert_eq!(
+        fs::read_to_string(sibling.join("keep.txt")).unwrap(),
+        "uncommitted work"
+    );
+    let result = Command::new("git")
+        .arg("-C")
+        .arg(&sibling)
+        .args(["branch", "--show-current"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert_eq!(String::from_utf8(result.stdout).unwrap().trim(), "lane-b");
+}
