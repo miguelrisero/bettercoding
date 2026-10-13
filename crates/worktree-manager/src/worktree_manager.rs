@@ -273,10 +273,30 @@ impl WorktreeManager {
             std::fs::remove_dir_all(worktree_path).map_err(WorktreeError::Io)?;
         }
 
-        // Step 4: Good-practice to clean up any other stale admin entries
-        if let Err(e) = git_service.prune_worktrees(git_repo_path) {
-            debug!("git worktree prune non-fatal error: {}", e);
-        }
+        // Deliberately NO `git worktree prune` here.
+        //
+        // Steps 1-3 already removed THIS worktree's registration, its admin
+        // directory and its checkout, so a prune can only ever affect OTHER
+        // worktrees -- and `git worktree prune` is repo-global: it drops the
+        // admin entry of every worktree whose checkout it cannot see right now.
+        //
+        // A live lane is not always visible. It may be mid-setup, or a transient
+        // EACCES/ENOENT on its directory is enough. Pruning it frees its admin
+        // name, and the next `git worktree add` legitimately reuses that name --
+        // so two lanes end up sharing one admin entry, hence one index and one
+        // HEAD. The loser sees every git command fail with "not a git
+        // repository" (indistinguishable from its workspace being deleted), and
+        // a commit from either lane lands on the other's branch.
+        //
+        // That is a real incident, not a hypothetical: on 2026-09-28 two lanes
+        // were both bound to `.git/worktrees/patricia-monorepo`, and the one
+        // holding uncommitted work reported total workspace loss.
+        //
+        // WORKTREE_CREATION_LOCKS cannot help: it is keyed per worktree path, so
+        // it never serialises one lane's cleanup against another lane's
+        // creation. Opportunistic housekeeping is not worth destroying a live
+        // lane -- stale admin entries are inert metadata, and git's own `gc`
+        // housekeeping prunes them anyway.
 
         debug!("Comprehensive cleanup completed for worktree: {worktree_display_name}",);
         Ok(())
