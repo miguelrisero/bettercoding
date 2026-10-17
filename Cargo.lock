@@ -8843,6 +8843,7 @@ version = "0.1.44"
 dependencies = [
  "anyhow",
  "api-types",
+ "async-compression",
  "aws-lc-rs",
  "aws-lc-sys",
  "axum",

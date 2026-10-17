@@ -84,7 +84,7 @@ fn guarded_file_body(file: tokio::fs::File, guard: OwnedRwLockReadGuard<()>) -> 
         (ReaderStream::new(file), guard),
         |(mut reader, guard)| async move { reader.next().await.map(|item| (item, (reader, guard))) },
     );
-    Body::from_stream(stream)
+    Body::from_stream(stream.fuse())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -777,6 +777,75 @@ mod tests {
             .collect::<Vec<_>>();
         backups.sort();
         backups
+    }
+
+    /// Compressed downloads deliver every file byte through the production layer.
+    /// Both download_file and download_zip stream through guarded_file_body.
+    #[tokio::test]
+    async fn compressed_downloads_complete() {
+        use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder};
+        use tokio::io::AsyncReadExt;
+        use tower::ServiceExt;
+        use tower_http::compression::CompressionLayer;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("download.bin");
+        let contents = b"complete compressed workspace download\n".repeat(128);
+        fs::write(&path, &contents).unwrap();
+        let filesystem_lock = Arc::new(RwLock::new(()));
+        let handler_lock = filesystem_lock.clone();
+        let app = Router::new()
+            .route(
+                "/download",
+                get(move || {
+                    let path = path.clone();
+                    let filesystem_lock = handler_lock.clone();
+                    async move {
+                        let guard = filesystem_lock.read_owned().await;
+                        let file = tokio::fs::File::open(path).await.unwrap();
+                        let len = file.metadata().await.unwrap().len();
+                        Response::builder()
+                            .header(header::CONTENT_TYPE, "application/octet-stream")
+                            .header(header::CONTENT_LENGTH, len)
+                            .body(guarded_file_body(file, guard))
+                            .unwrap()
+                    }
+                }),
+            )
+            .layer(CompressionLayer::new());
+
+        for encoding in ["gzip", "br"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/download")
+                        .header(header::ACCEPT_ENCODING, encoding)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.headers()[header::CONTENT_ENCODING], encoding);
+            assert!(filesystem_lock.try_write().is_err());
+            let compressed = axum::body::to_bytes(response.into_body(), contents.len())
+                .await
+                .unwrap();
+            let mut decoded = Vec::new();
+            match encoding {
+                "gzip" => GzipDecoder::new(&compressed[..])
+                    .read_to_end(&mut decoded)
+                    .await
+                    .unwrap(),
+                "br" => BrotliDecoder::new(&compressed[..])
+                    .read_to_end(&mut decoded)
+                    .await
+                    .unwrap(),
+                _ => unreachable!(),
+            };
+            assert_eq!(decoded, contents, "{encoding}");
+            assert!(filesystem_lock.try_write().is_ok());
+        }
     }
 
     #[tokio::test]
