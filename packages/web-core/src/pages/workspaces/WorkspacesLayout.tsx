@@ -470,7 +470,7 @@ export function WorkspacesLayout() {
             <div
               className={cn(
                 'flex-1 min-h-0 overflow-hidden',
-                mobileTab !== 'files' && 'hidden'
+                mobileTab !== 'files' ? 'hidden' : 'flex flex-col'
               )}
             >
               {selectedWorkspace?.id && !hostId && (
