@@ -173,7 +173,9 @@ Once you have the MCP server configured, you can leverage it to streamline your 
 
 ## Share a file with the owner
 
-Call `file_link(path)` with a worktree-relative path or an absolute path inside the workspace worktree.
+Call `file_link(path)` with a path relative to the agent's current directory in the current workspace.
+Use a workspace-root-relative path when you explicitly select a different workspace with `workspace_id`.
+Absolute paths inside the selected workspace also work.
 Paste the returned URL into your message to the owner.
 The link opens a preview on the owner's computer or phone for HTML, PDF, images, video, audio, and text.
 Other file types download when opened.
@@ -183,7 +185,12 @@ Supply `workspace_id` when you call it outside a workspace.
 
 HTML pages open sandboxed.
 Keep them self-contained with inline scripts and styles, and embed images as `data:` URLs.
-Link other files with their own `file_link` URLs.
+Link other files in the same tab with their own `file_link` URLs.
+The sandbox blocks links that open new tabs.
+
+The server uses the first valid HTTP origin in `BC_ALLOWED_ORIGINS` as the public link base.
+Set this origin to the address the owner opens in their browser.
+Without a valid configured origin, links use `http://` and the request's `Host` header.
 
 ## Example Usage
 

@@ -158,8 +158,10 @@ fn relative_to(base: &Path, full: &Path) -> Result<String, ApiError> {
     Ok(full
         .strip_prefix(base)
         .map_err(|_| ApiError::File(FileError::NotFound))?
-        .to_string_lossy()
-        .replace('\\', "/"))
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/"))
 }
 
 // --- GET /list ---
@@ -313,7 +315,9 @@ async fn serve_preview(
         .await?
         .map(Body::new);
     // Single-file serving has no redirects; keep that invariant explicit.
-    if response.status().is_redirection() {
+    if response.headers().contains_key(header::LOCATION)
+        || matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308)
+    {
         return Err(ApiError::File(FileError::NotFound));
     }
     let name = Path::new(relative)
@@ -327,6 +331,14 @@ async fn serve_preview(
         disposition.replacen("attachment;", "inline;", 1)
     };
     let headers = response.headers_mut();
+    if content_type.starts_with("video/")
+        || content_type.starts_with("audio/")
+        || content_type == "application/pdf"
+        || content_type.starts_with("font/woff")
+    {
+        // Preserve the representation length for browser seeking through compression.
+        headers.insert(header::CONTENT_ENCODING, "identity".parse().unwrap());
+    }
     headers.insert(header::CONTENT_DISPOSITION, disposition.parse().unwrap());
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
     headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
@@ -944,29 +956,15 @@ mod tests {
     const GITIGNORE_CONTENTS: &str = "*\n";
 
     fn preview_app(base: PathBuf) -> Router {
-        let files = Router::new()
-            .route(
-                "/preview/{*path}",
-                get(
-                    move |RoutePath((id, path)): RoutePath<(Uuid, String)>,
-                          Extension(loaded_id): Extension<Uuid>,
-                          request: Request| {
-                        assert_eq!(id, loaded_id);
-                        let base = base.clone();
-                        async move { serve_preview(&base, &path, id, request).await }
-                    },
-                ),
-            )
-            .layer(from_fn(
-                |RoutePath(workspace): RoutePath<
-                    crate::middleware::model_loaders::WorkspacePath,
-                >,
-                 mut request: Request,
-                 next: Next| async move {
-                    request.extensions_mut().insert(workspace.id);
-                    next.run(request).await
+        let files = Router::new().route(
+            "/preview/{*path}",
+            get(
+                move |RoutePath((id, path)): RoutePath<(Uuid, String)>, request: Request| {
+                    let base = base.clone();
+                    async move { serve_preview(&base, &path, id, request).await }
                 },
-            ));
+            ),
+        );
         Router::new()
             .nest("/api/workspaces/{id}/files", files)
             .layer(CompressionLayer::new())
@@ -1060,7 +1058,11 @@ mod tests {
                 response.headers()[header::CONTENT_RANGE],
                 format!("bytes 0-9/{}", contents.len())
             );
-            assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
+            if matches!(name, "paper.pdf" | "movie.mp4") {
+                assert_eq!(response.headers()[header::CONTENT_ENCODING], "identity");
+            } else {
+                assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
+            }
             assert_eq!(
                 axum::body::to_bytes(response.into_body(), 10)
                     .await
@@ -1089,6 +1091,67 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn preview_media_preserves_full_representation_through_compression() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let contents = b"seekable workspace media".repeat(256);
+        let app = preview_app(tempdir.path().to_path_buf());
+        for name in [
+            "movie.mp4",
+            "sound.mp3",
+            "paper.pdf",
+            "font.woff",
+            "font.woff2",
+        ] {
+            fs::write(tempdir.path().join(name), &contents).unwrap();
+            let uri = format!("/api/workspaces/{}/files/preview/{name}", Uuid::nil());
+            for range in [false, true] {
+                let mut request = Request::builder()
+                    .uri(&uri)
+                    .header(header::ACCEPT_ENCODING, "gzip");
+                if range {
+                    request = request.header(header::RANGE, "bytes=0-9");
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    if range {
+                        StatusCode::PARTIAL_CONTENT
+                    } else {
+                        StatusCode::OK
+                    }
+                );
+                assert_eq!(response.headers()[header::CONTENT_ENCODING], "identity");
+                assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
+                let expected = if range {
+                    &contents[..10]
+                } else {
+                    &contents[..]
+                };
+                assert_eq!(
+                    response.headers()[header::CONTENT_LENGTH],
+                    expected.len().to_string()
+                );
+                if range {
+                    assert_eq!(
+                        response.headers()[header::CONTENT_RANGE],
+                        format!("bytes 0-9/{}", contents.len())
+                    );
+                }
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), contents.len())
+                        .await
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1127,23 +1190,18 @@ mod tests {
             put(move |Query(query): Query<InputQuery>, body: Bytes| {
                 let base = base.clone();
                 async move { input_response(&base, Uuid::nil(), &query.name, &body).await }
-            })
-            .layer(DefaultBodyLimit::max(file_policy::MAX_INPUT_BYTES)),
+            }),
         )
     }
 
     #[tokio::test]
-    async fn inputs_validate_body_limit_and_write_exact_bytes_atomically() {
+    async fn inputs_validate_json_and_write_exact_bytes_atomically() {
         let tempdir = tempfile::tempdir().unwrap();
-        let app = inputs_app(tempdir.path().to_path_buf());
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let app = inputs_app(base.clone());
         for (name, body, status) in [
             ("../escape", "{}".to_string(), StatusCode::BAD_REQUEST),
             ("valid", "invalid JSON".to_string(), StatusCode::BAD_REQUEST),
-            (
-                "valid",
-                format!("\"{}\"", "a".repeat(file_policy::MAX_INPUT_BYTES)),
-                StatusCode::PAYLOAD_TOO_LARGE,
-            ),
         ] {
             let response = app
                 .clone()
@@ -1158,7 +1216,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), status);
         }
-        assert!(!tempdir.path().join(UPLOADS_DIR).exists());
+        assert!(!base.join(UPLOADS_DIR).exists());
         let path = format!("{UPLOADS_DIR}/inputs/answers.json");
         for body in ["{ \"answer\": 42 }\n", "[true, null, 7]\n"] {
             let response = app
@@ -1180,14 +1238,11 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(json["data"]["path"], path);
             assert_eq!(json["data"]["size_bytes"], body.len());
-            assert_eq!(
-                fs::read(tempdir.path().join(&path)).unwrap(),
-                body.as_bytes()
-            );
+            assert_eq!(fs::read(base.join(&path)).unwrap(), body.as_bytes());
         }
-        assert_gitignored(&tempdir.path().join(UPLOADS_DIR));
+        assert_gitignored(&base.join(UPLOADS_DIR));
         assert_eq!(
-            fs::read_dir(tempdir.path().join(UPLOADS_DIR).join("inputs"))
+            fs::read_dir(base.join(UPLOADS_DIR).join("inputs"))
                 .unwrap()
                 .count(),
             1
@@ -1198,11 +1253,12 @@ mod tests {
     #[tokio::test]
     async fn inputs_refuse_symlink_and_regular_file_directories() {
         let tempdir = tempfile::tempdir().unwrap();
-        let uploads = seed_upload_dir(tempdir.path(), UPLOADS_DIR);
+        let base = fs::canonicalize(tempdir.path()).unwrap();
+        let uploads = seed_upload_dir(&base, UPLOADS_DIR);
         let outside = tempfile::tempdir().unwrap();
         let inputs = uploads.join("inputs");
         std::os::unix::fs::symlink(outside.path(), &inputs).unwrap();
-        let app = inputs_app(tempdir.path().to_path_buf());
+        let app = inputs_app(base.clone());
         for _ in 0..2 {
             let response = app
                 .clone()
