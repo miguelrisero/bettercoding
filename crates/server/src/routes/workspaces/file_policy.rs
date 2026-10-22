@@ -15,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 
 use services::services::file::FileError;
 use utils::path::ALWAYS_SKIP_DIRS;
+use uuid::Uuid;
 
 use crate::error::ApiError;
 
@@ -31,6 +32,8 @@ pub const MAX_UPLOAD_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_UPLOAD_REQUEST_BYTES: usize = 5 * 1024 * 1024 * 1024;
 /// Max number of files accepted in a single upload request.
 pub const MAX_UPLOAD_FILES: usize = 50;
+/// Max JSON body accepted by a workspace input write.
+pub const MAX_INPUT_BYTES: usize = 256 * 1024;
 /// Max length (bytes) of an uploaded file's basename.
 pub const MAX_FILENAME_LEN: usize = 255;
 /// Max entries included in a generated zip before the archive fails loudly.
@@ -169,11 +172,263 @@ pub fn safe_basename(raw: &str) -> Result<String, ApiError> {
     Ok(base.to_string())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewClass {
+    Html,
+    Svg,
+    Inline,
+    Attachment,
+}
+
+/// Extension-only policy: unrecognized formats always download.
+pub fn preview_type(path: &Path) -> (&'static str, PreviewClass) {
+    use PreviewClass::*;
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    let mime = match extension.to_ascii_lowercase().as_str() {
+        "html" | "htm" => return ("text/html; charset=utf-8", Html),
+        "svg" => return ("image/svg+xml", Svg),
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "pdf" => "application/pdf",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "ogv" => "video/ogg",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "wav" => "audio/wav",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "flac" => "audio/flac",
+        "aac" => "audio/aac",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "txt" | "md" | "markdown" | "csv" | "tsv" | "log" | "yaml" | "yml" | "toml" | "xml"
+        | "xhtml" | "ini" | "conf" | "rs" | "ts" | "tsx" | "jsx" | "py" | "sh" | "go" | "java"
+        | "rb" | "c" | "h" | "cpp" | "sql" => "text/plain; charset=utf-8",
+        _ => return ("application/octet-stream", Attachment),
+    };
+    (mime, Inline)
+}
+
+const PREVIEW_SANDBOX: &str = "sandbox allow-scripts allow-modals";
+
+pub fn preview_csp(class: PreviewClass, host: Option<&str>, workspace_id: Uuid) -> Option<String> {
+    if !matches!(class, PreviewClass::Html | PreviewClass::Svg) {
+        return None;
+    }
+    let scope = host.filter(|host| valid_preview_host(host));
+    let preview = scope.map_or_else(
+        || "'none'".to_string(),
+        |host| format!("{host}/api/workspaces/{workspace_id}/files/preview/"),
+    );
+    let inputs = scope.map_or_else(
+        || "'none'".to_string(),
+        |host| format!("{host}/api/workspaces/{workspace_id}/files/inputs"),
+    );
+    let script = if class == PreviewClass::Html {
+        format!(" script-src 'unsafe-inline' {preview};")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{PREVIEW_SANDBOX}; default-src 'none';{script} style-src 'unsafe-inline' {preview}; img-src {preview} data: blob:; media-src {preview} data: blob:; font-src {preview} data:; connect-src {preview} {inputs}; frame-src 'none'; worker-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'"
+    ))
+}
+
+pub fn valid_input_slug(slug: &str) -> bool {
+    (1..=64).contains(&slug.len())
+        && slug.as_bytes()[0].is_ascii_alphanumeric()
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+}
+
+/// Require a regular file, including for absolute agent-supplied link paths.
+pub fn resolve_link_path(base: &Path, path: &str) -> Result<PathBuf, ApiError> {
+    let relative = if Path::new(path).is_absolute() {
+        let canonical =
+            std::fs::canonicalize(path).map_err(|_| ApiError::File(FileError::NotFound))?;
+        canonical
+            .strip_prefix(base)
+            .map_err(|_| ApiError::BadRequest("Path is outside the workspace".to_string()))?
+            .to_str()
+            .ok_or_else(|| ApiError::BadRequest("Invalid path encoding".to_string()))?
+            .to_string()
+    } else {
+        path.to_string()
+    };
+    let resolved = resolve_existing_path(base, &relative)?;
+    if !resolved.is_file() {
+        return Err(ApiError::File(FileError::NotFound));
+    }
+    Ok(resolved)
+}
+
+pub fn valid_preview_host(host: &str) -> bool {
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b':' | b'-' | b'[' | b']'))
+        && host.parse::<http::uri::Authority>().is_ok()
+}
+
+/// Select a public HTTP origin without trusting forwarded headers.
+pub fn preview_base(allowed_origins: Option<&str>, host: Option<&str>) -> Option<String> {
+    if let Some(origins) = allowed_origins {
+        for origin in origins.split(',').map(str::trim) {
+            let Ok(url) = url::Url::parse(origin) else {
+                continue;
+            };
+            if matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none()
+            {
+                return Some(url.origin().ascii_serialization());
+            }
+        }
+    }
+    host.filter(|host| valid_preview_host(host))
+        .map(|host| format!("http://{host}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn preview_formats_are_extension_only() {
+        for (name, expected, class) in [
+            ("page.HTML", "text/html; charset=utf-8", PreviewClass::Html),
+            ("image.svg", "image/svg+xml", PreviewClass::Svg),
+            ("file.pdf", "application/pdf", PreviewClass::Inline),
+            ("video.mp4", "video/mp4", PreviewClass::Inline),
+            (
+                "data.xml",
+                "text/plain; charset=utf-8",
+                PreviewClass::Inline,
+            ),
+            (
+                "page.xhtml",
+                "text/plain; charset=utf-8",
+                PreviewClass::Inline,
+            ),
+            (
+                "unknown.bin",
+                "application/octet-stream",
+                PreviewClass::Attachment,
+            ),
+        ] {
+            assert_eq!(preview_type(Path::new(name)), (expected, class), "{name}");
+        }
+    }
+
+    #[test]
+    fn document_csp_scopes_sources_and_sandboxes_scripts() {
+        let id = Uuid::nil();
+        let csp = preview_csp(PreviewClass::Html, Some("miguel.bettercoding.io"), id).unwrap();
+        assert_eq!(
+            csp.split(';').next().unwrap(),
+            "sandbox allow-scripts allow-modals"
+        );
+        assert!(!csp.contains("allow-same-origin"));
+        let preview = format!("miguel.bettercoding.io/api/workspaces/{id}/files/preview/");
+        let inputs = format!("miguel.bettercoding.io/api/workspaces/{id}/files/inputs");
+        assert!(csp.contains(&format!("script-src 'unsafe-inline' {preview};")));
+        assert!(csp.contains(&format!("connect-src {preview} {inputs};")));
+        assert!(csp.contains("frame-ancestors 'self'"));
+        let svg = preview_csp(PreviewClass::Svg, Some("localhost:4111"), id).unwrap();
+        assert!(!svg.contains("script-src"));
+        assert!(svg.contains("default-src 'none'"));
+        assert!(preview_csp(PreviewClass::Inline, Some("localhost"), id).is_none());
+        for host in [
+            None,
+            Some("evil.com; script-src *"),
+            Some("host/path"),
+            Some(""),
+        ] {
+            let csp = preview_csp(PreviewClass::Html, host, id).unwrap();
+            assert!(csp.contains("connect-src 'none' 'none';"));
+            assert!(!csp.contains("/api/"));
+        }
+    }
+
+    #[test]
+    fn preview_link_base_selects_first_valid_origin_or_host() {
+        assert_eq!(
+            preview_base(
+                Some(" invalid, https://miguel.bettercoding.io/, https://second.example "),
+                Some("localhost:4111")
+            ),
+            Some("https://miguel.bettercoding.io".into())
+        );
+        assert_eq!(
+            preview_base(
+                Some("ftp://example.com, https://example.com/path"),
+                Some("localhost:4111")
+            ),
+            Some("http://localhost:4111".into())
+        );
+        assert_eq!(
+            preview_base(None, Some("[::1]:4111")),
+            Some("http://[::1]:4111".into())
+        );
+        assert_eq!(preview_base(None, Some("host/path")), None);
+        assert_eq!(preview_base(None, None), None);
+    }
+
+    #[test]
+    fn input_slug_has_exact_alphabet_and_length() {
+        for slug in ["a", "0", "answer_1-v2", &"a".repeat(64)] {
+            assert!(valid_input_slug(slug), "{slug}");
+        }
+        for slug in [
+            "",
+            "A",
+            "-a",
+            "_a",
+            "../a",
+            "a/b",
+            "a.b",
+            "é",
+            &"a".repeat(65),
+        ] {
+            assert!(!valid_input_slug(slug), "{slug}");
+        }
+    }
+
+    #[test]
+    fn links_require_regular_files_inside_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        fs::write(base.join("page.html"), b"hello").unwrap();
+        let absolute = base.join("page.html");
+        assert_eq!(
+            resolve_link_path(&base, absolute.to_str().unwrap()).unwrap(),
+            absolute
+        );
+        assert_eq!(resolve_link_path(&base, "page.html").unwrap(), absolute);
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        assert!(is_bad_request(
+            &resolve_link_path(&base, outside.path().to_str().unwrap()).unwrap_err()
+        ));
+        assert!(resolve_link_path(&base, "").is_err());
+    }
 
     fn is_bad_request(err: &ApiError) -> bool {
         matches!(err, ApiError::BadRequest(_))

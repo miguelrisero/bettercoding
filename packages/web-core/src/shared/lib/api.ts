@@ -922,6 +922,13 @@ export const workspaceFilesApi = {
     return handleApiResponse<WorkspaceDirListing>(response);
   },
 
+  /** Raw URL that opens a file in the browser preview. */
+  previewUrl: (workspaceId: string, path: string): string =>
+    `/api/workspaces/${workspaceId}/files/preview/${path
+      .split('/')
+      .map(encodeURIComponent)
+      .join('/')}`,
+
   /** Raw URL that streams a single file as an attachment download. */
   downloadUrl: (workspaceId: string, path: string): string =>
     `/api/workspaces/${workspaceId}/files/download?path=${encodeURIComponent(

@@ -37,6 +37,7 @@ impl ToolError {
 }
 
 mod context;
+mod files;
 mod issue_assignees;
 mod issue_relationships;
 mod issue_tags;
@@ -51,6 +52,7 @@ mod workspaces;
 impl McpServer {
     pub fn global_mode_router() -> rmcp::handler::server::tool::ToolRouter<Self> {
         Self::context_tools_router()
+            + Self::files_tools_router()
             + Self::workspaces_tools_router()
             + Self::workspace_agents_tools_router()
             + Self::organizations_tools_router()
@@ -65,6 +67,7 @@ impl McpServer {
 
     pub fn orchestrator_mode_router() -> rmcp::handler::server::tool::ToolRouter<Self> {
         let mut router = Self::context_tools_router()
+            + Self::files_tools_router()
             + Self::workspaces_tools_router()
             + Self::session_tools_router();
         router.remove_route("list_workspaces");
@@ -415,7 +418,7 @@ mod tests {
 
     static RUSTLS_PROVIDER: Once = Once::new();
 
-    fn install_rustls_provider() {
+    pub(super) fn install_rustls_provider() {
         RUSTLS_PROVIDER.call_once(|| {
             rustls::crypto::aws_lc_rs::default_provider()
                 .install_default()
@@ -436,6 +439,7 @@ mod tests {
         let actual = tool_names(McpServer::orchestrator_mode_router());
         let expected = BTreeSet::from([
             "create_session".to_string(),
+            "file_link".to_string(),
             "get_context".to_string(),
             "get_execution".to_string(),
             "list_sessions".to_string(),
