@@ -52,6 +52,7 @@ Do not manually edit shared/remote-types.ts, instead edit crates/remote/src/bin/
 - Web app: ensure `pnpm run check` and `pnpm run lint` pass. If adding runtime logic, include lightweight tests (e.g., Vitest) in the same directory.
 
 ## Security & Config Tips
+- Share workspace files with the `file_link` MCP tool rather than asking the owner to download them.
 - Use `.env` for local overrides; never commit secrets. Key envs: `FRONTEND_PORT`, `BACKEND_PORT`, `HOST` 
 - Dev ports and assets are managed by `scripts/setup-dev-environment.js`.
 

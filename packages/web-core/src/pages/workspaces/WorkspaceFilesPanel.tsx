@@ -346,15 +346,19 @@ function FileRow({ workspaceId, entry, onOpenDir }: FileRowProps) {
           )}
         </button>
       ) : (
-        <div className="flex items-center gap-half min-w-0 flex-1 text-normal">
+        <a
+          href={workspaceFilesApi.previewUrl(workspaceId, entry.path)}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex items-center gap-half min-w-0 flex-1 text-normal rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-brand focus-visible:ring-inset"
+          title={entry.name}
+        >
           <Icon className="size-icon-xs shrink-0 text-low" weight="bold" />
-          <span className="truncate" title={entry.name}>
-            {entry.name}
-          </span>
+          <span className="truncate">{entry.name}</span>
           {entry.is_symlink && (
             <LinkIcon className="size-icon-xs shrink-0 text-low" />
           )}
-        </div>
+        </a>
       )}
 
       {!entry.is_dir && (
@@ -368,7 +372,7 @@ function FileRow({ workspaceId, entry, onOpenDir }: FileRowProps) {
           href={workspaceFilesApi.downloadUrl(workspaceId, entry.path)}
           download
           onClick={(e) => e.stopPropagation()}
-          className="shrink-0 text-low opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 hover:text-normal focus-visible:text-normal"
+          className="shrink-0 text-low opacity-0 [@media(hover:none)]:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 hover:text-normal focus-visible:text-normal"
           title={`Download ${entry.name}`}
         >
           <DownloadSimpleIcon className="size-icon-xs" weight="bold" />

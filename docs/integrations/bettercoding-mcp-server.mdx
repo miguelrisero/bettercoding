@@ -171,6 +171,20 @@ Once you have the MCP server configured, you can leverage it to streamline your 
 3. **Automatic Issue Generation**: Your MCP client will use the BetterCoding MCP server to automatically create structured issues in your project
 4. **Start Workspaces**: Use `start_workspace` to programmatically begin work on issues with specific coding agents
 
+## Share a file with the owner
+
+Call `file_link(path)` with a worktree-relative path or an absolute path inside the workspace worktree.
+Paste the returned URL into your message to the owner.
+The link opens a preview on the owner's computer or phone for HTML, PDF, images, video, audio, and text.
+Other file types download when opened.
+
+The tool uses your current workspace context.
+Supply `workspace_id` when you call it outside a workspace.
+
+HTML pages open sandboxed.
+Keep them self-contained with inline scripts and styles, and embed images as `data:` URLs.
+Link other files with their own `file_link` URLs.
+
 ## Example Usage
 
 ### Planning and Issue Creation
