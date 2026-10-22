@@ -14,12 +14,12 @@ use std::{
 
 use axum::{
     Extension, Router,
-    body::Body,
-    extract::{DefaultBodyLimit, Multipart, Query, Request, State},
-    http::header,
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, Multipart, Path as RoutePath, Query, Request, State},
+    http::{HeaderMap, header},
     middleware::{Next, from_fn, from_fn_with_state},
     response::{IntoResponse, Json as ResponseJson, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use chrono::{DateTime, Utc};
 use db::models::workspace::Workspace;
@@ -32,6 +32,7 @@ use tokio::{
     sync::{OwnedRwLockReadGuard, RwLock},
 };
 use tokio_util::io::ReaderStream;
+use tower_http::services::ServeFile;
 use ts_rs::TS;
 use utils::response::ApiResponse;
 use uuid::Uuid;
@@ -228,8 +229,12 @@ pub async fn list_files(
 /// Build a header-injection-proof `Content-Disposition` with an RFC 5987 filename.
 /// Percent-encoding every non-unreserved byte makes CRLF/quote injection impossible.
 fn attachment_disposition(name: &str) -> String {
-    let mut out = String::from("attachment; filename*=UTF-8''");
-    for &b in name.as_bytes() {
+    format!("attachment; filename*=UTF-8''{}", percent_encode(name))
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut out = String::new();
+    for &b in value.as_bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
             out.push(b as char);
         } else {
@@ -279,6 +284,186 @@ pub async fn download_file(
         )
         .body(body)
         .map_err(|e| ApiError::File(FileError::ResponseBuildError(e.to_string())))
+}
+
+// --- GET /preview/{*path} ---
+
+fn request_host(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+}
+
+async fn serve_preview(
+    base: &Path,
+    relative: &str,
+    workspace_id: Uuid,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let path = file_policy::resolve_existing_path(base, relative)?;
+    if !path.is_file() {
+        return Err(ApiError::File(FileError::NotFound));
+    }
+    // Use the requested extension so relative URLs and the declared format agree.
+    let (content_type, class) = file_policy::preview_type(Path::new(relative));
+    let csp = file_policy::preview_csp(class, request_host(request.headers()), workspace_id);
+    let mime = content_type.parse().expect("static preview MIME type");
+    let mut response = ServeFile::new_with_mime(&path, &mime)
+        .try_call(request)
+        .await?
+        .map(Body::new);
+    // Single-file serving has no redirects; keep that invariant explicit.
+    if response.status().is_redirection() {
+        return Err(ApiError::File(FileError::NotFound));
+    }
+    let name = Path::new(relative)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download");
+    let disposition = attachment_disposition(name);
+    let disposition = if class == file_policy::PreviewClass::Attachment {
+        disposition
+    } else {
+        disposition.replacen("attachment;", "inline;", 1)
+    };
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_DISPOSITION, disposition.parse().unwrap());
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    if let Some(csp) = csp {
+        headers.insert(header::CONTENT_SECURITY_POLICY, csp.parse().unwrap());
+    }
+    Ok(response)
+}
+
+pub async fn preview_file(
+    Extension(workspace): Extension<Workspace>,
+    State(deployment): State<DeploymentImpl>,
+    RoutePath((_id, path)): RoutePath<(Uuid, String)>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let (base, _, filesystem_lock) = canonical_workspace(&deployment, &workspace).await?;
+    let _read_guard = filesystem_lock.read_owned().await;
+    serve_preview(&base, &path, workspace.id, request).await
+}
+
+// --- PUT /inputs ---
+
+#[derive(Debug, Deserialize)]
+pub struct InputQuery {
+    pub name: String,
+}
+
+async fn write_input(base: &Path, slug: &str, body: &[u8]) -> Result<WorkspaceFileEntry, ApiError> {
+    if !file_policy::valid_input_slug(slug) {
+        return Err(ApiError::BadRequest("Invalid input name".to_string()));
+    }
+    serde_json::from_slice::<serde_json::Value>(body)
+        .map_err(|_| ApiError::BadRequest("Input body must be JSON".to_string()))?;
+    let uploads = resolve_uploads_dir(base).await?;
+    let directory = uploads.join("inputs");
+    match tokio::fs::create_dir(&directory).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    if !is_real_directory(&directory).await? {
+        return Err(ApiError::BadRequest(
+            "Inputs must be a real directory".to_string(),
+        ));
+    }
+    let name = format!("{slug}.json");
+    let temp_name = format!(".bc-input-{}.tmp", Uuid::new_v4());
+    let temp_path = directory.join(&temp_name);
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .await?;
+    let result = async {
+        file.write_all(body).await?;
+        file.flush().await?;
+        file.metadata().await
+    }
+    .await;
+    drop(file);
+    let metadata = match result {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            cleanup_upload_temp(&temp_path).await;
+            return Err(error.into());
+        }
+    };
+    let path = publish_streamed_upload(&directory, &temp_name, &name, true).await?;
+    Ok(WorkspaceFileEntry {
+        name,
+        path: relative_to(base, &path)?,
+        is_dir: false,
+        is_symlink: false,
+        size_bytes: metadata.len() as i64,
+        modified: metadata.modified().ok().map(DateTime::<Utc>::from),
+    })
+}
+
+pub async fn save_input(
+    Extension(workspace): Extension<Workspace>,
+    State(deployment): State<DeploymentImpl>,
+    Query(query): Query<InputQuery>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let (_, canonical_base, filesystem_lock) = canonical_workspace(&deployment, &workspace).await?;
+    let _read_guard = filesystem_lock.read_owned().await;
+    input_response(&canonical_base, workspace.id, &query.name, &body).await
+}
+
+async fn input_response(
+    base: &Path,
+    workspace_id: Uuid,
+    slug: &str,
+    body: &[u8],
+) -> Result<Response, ApiError> {
+    let entry = write_input(base, slug, body).await?;
+    tracing::info!(%workspace_id, %slug, size_bytes = body.len(), "Workspace input saved");
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        ResponseJson(ApiResponse::<WorkspaceFileEntry>::success(entry)),
+    )
+        .into_response())
+}
+
+// --- GET /link ---
+
+#[derive(Debug, Serialize)]
+pub struct WorkspaceFileLink {
+    pub url: String,
+    pub path: String,
+}
+
+pub async fn file_link(
+    Extension(workspace): Extension<Workspace>,
+    State(deployment): State<DeploymentImpl>,
+    Query(query): Query<PathQuery>,
+    headers: HeaderMap,
+) -> Result<ResponseJson<ApiResponse<WorkspaceFileLink>>, ApiError> {
+    let (_, canonical_base, filesystem_lock) = canonical_workspace(&deployment, &workspace).await?;
+    let _read_guard = filesystem_lock.read_owned().await;
+    let full = file_policy::resolve_link_path(&canonical_base, &query.path)?;
+    let path = relative_to(&canonical_base, &full)?;
+    let allowed_origins = std::env::var("BC_ALLOWED_ORIGINS").ok();
+    let base = file_policy::preview_base(allowed_origins.as_deref(), request_host(&headers))
+        .ok_or_else(|| ApiError::BadRequest("A valid Host header is required".to_string()))?;
+    let encoded = path
+        .split('/')
+        .map(percent_encode)
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok(ResponseJson(ApiResponse::success(WorkspaceFileLink {
+        url: format!(
+            "{base}/api/workspaces/{}/files/preview/{encoded}",
+            workspace.id
+        ),
+        path,
+    })))
 }
 
 // --- GET /download-zip ---
@@ -728,6 +913,12 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
     Router::new()
         .route("/list", get(list_files))
         .route("/download", get(download_file))
+        .route("/preview/{*path}", get(preview_file))
+        .route("/link", get(file_link))
+        .route(
+            "/inputs",
+            put(save_input).layer(DefaultBodyLimit::max(file_policy::MAX_INPUT_BYTES)),
+        )
         .route("/download-zip", get(download_zip))
         .route(
             "/upload",
@@ -744,9 +935,298 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
 mod tests {
     use std::{fs, path::Path};
 
+    use axum::http::StatusCode;
+    use tower::ServiceExt;
+    use tower_http::compression::CompressionLayer;
+
     use super::*;
 
     const GITIGNORE_CONTENTS: &str = "*\n";
+
+    fn preview_app(base: PathBuf) -> Router {
+        let files = Router::new()
+            .route(
+                "/preview/{*path}",
+                get(
+                    move |RoutePath((id, path)): RoutePath<(Uuid, String)>,
+                          Extension(loaded_id): Extension<Uuid>,
+                          request: Request| {
+                        assert_eq!(id, loaded_id);
+                        let base = base.clone();
+                        async move { serve_preview(&base, &path, id, request).await }
+                    },
+                ),
+            )
+            .layer(from_fn(
+                |RoutePath(workspace): RoutePath<
+                    crate::middleware::model_loaders::WorkspacePath,
+                >,
+                 mut request: Request,
+                 next: Next| async move {
+                    request.extensions_mut().insert(workspace.id);
+                    next.run(request).await
+                },
+            ));
+        Router::new()
+            .nest("/api/workspaces/{id}/files", files)
+            .layer(CompressionLayer::new())
+    }
+
+    #[tokio::test]
+    async fn preview_headers_and_ranges_through_compression() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = tempdir.path();
+        let contents = b"0123456789abcdef".repeat(256);
+        for name in [
+            "page.html",
+            "drawing.svg",
+            "paper.pdf",
+            "movie.mp4",
+            "unknown.bin",
+            "data.xml",
+        ] {
+            fs::write(base.join(name), &contents).unwrap();
+        }
+        let id = Uuid::nil();
+        let prefix = format!("/api/workspaces/{id}/files/preview/");
+        let app = preview_app(base.to_path_buf());
+        for (name, content_type, disposition) in [
+            ("page.html", "text/html; charset=utf-8", "inline"),
+            ("drawing.svg", "image/svg+xml", "inline"),
+            ("paper.pdf", "application/pdf", "inline"),
+            ("movie.mp4", "video/mp4", "inline"),
+            ("unknown.bin", "application/octet-stream", "attachment"),
+            ("data.xml", "text/plain; charset=utf-8", "inline"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{prefix}{name}"))
+                        .header(header::HOST, "miguel.bettercoding.io")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{name}");
+            assert!(!response.headers().contains_key(header::LOCATION));
+            assert_eq!(response.headers()[header::CONTENT_TYPE], content_type);
+            assert_eq!(
+                response.headers()[header::CONTENT_DISPOSITION],
+                format!("{disposition}; filename*=UTF-8''{name}")
+            );
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(
+                response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+                "nosniff"
+            );
+            let csp = response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .map(|v| v.to_str().unwrap());
+            match name {
+                "page.html" => {
+                    let csp = csp.unwrap();
+                    assert!(csp.contains(&format!(
+                        "script-src 'unsafe-inline' miguel.bettercoding.io{prefix};"
+                    )));
+                    assert!(csp.contains("sandbox allow-scripts allow-modals;"));
+                    assert!(!csp.contains("allow-same-origin"));
+                }
+                "drawing.svg" => assert!(!csp.unwrap().contains("script-src")),
+                _ => assert!(csp.is_none(), "{name}"),
+            }
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), contents.len())
+                    .await
+                    .unwrap(),
+                contents
+            );
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{prefix}{name}"))
+                        .header(header::RANGE, "bytes=0-9")
+                        .header(header::ACCEPT_ENCODING, "gzip")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT, "{name}");
+            assert_eq!(
+                response.headers()[header::CONTENT_RANGE],
+                format!("bytes 0-9/{}", contents.len())
+            );
+            assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 10)
+                    .await
+                    .unwrap(),
+                &contents[..10]
+            );
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri(format!("{prefix}page.html"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_LENGTH],
+            contents.len().to_string()
+        );
+        assert!(
+            axum::body::to_bytes(response.into_body(), 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_rejects_traversal_git_and_directories_without_redirects() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::create_dir(tempdir.path().join("folder")).unwrap();
+        fs::create_dir(tempdir.path().join(".git")).unwrap();
+        fs::write(tempdir.path().join(".git/config"), "secret").unwrap();
+        let app = preview_app(tempdir.path().to_path_buf());
+        for (path, status) in [
+            ("%2e%2e/escape", StatusCode::BAD_REQUEST),
+            (".git/config", StatusCode::FORBIDDEN),
+            ("folder", StatusCode::NOT_FOUND),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/api/workspaces/{}/files/preview/{path}",
+                            Uuid::nil()
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{path}");
+            assert!(!response.headers().contains_key(header::LOCATION));
+        }
+    }
+
+    fn inputs_app(base: PathBuf) -> Router {
+        Router::new().route(
+            "/inputs",
+            put(move |Query(query): Query<InputQuery>, body: Bytes| {
+                let base = base.clone();
+                async move { input_response(&base, Uuid::nil(), &query.name, &body).await }
+            })
+            .layer(DefaultBodyLimit::max(file_policy::MAX_INPUT_BYTES)),
+        )
+    }
+
+    #[tokio::test]
+    async fn inputs_validate_body_limit_and_write_exact_bytes_atomically() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let app = inputs_app(tempdir.path().to_path_buf());
+        for (name, body, status) in [
+            ("../escape", "{}".to_string(), StatusCode::BAD_REQUEST),
+            ("valid", "invalid JSON".to_string(), StatusCode::BAD_REQUEST),
+            (
+                "valid",
+                format!("\"{}\"", "a".repeat(file_policy::MAX_INPUT_BYTES)),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/inputs?name={name}"))
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+        }
+        assert!(!tempdir.path().join(UPLOADS_DIR).exists());
+        let path = format!("{UPLOADS_DIR}/inputs/answers.json");
+        for body in ["{ \"answer\": 42 }\n", "[true, null, 7]\n"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/inputs?name=answers")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["data"]["path"], path);
+            assert_eq!(json["data"]["size_bytes"], body.len());
+            assert_eq!(
+                fs::read(tempdir.path().join(&path)).unwrap(),
+                body.as_bytes()
+            );
+        }
+        assert_gitignored(&tempdir.path().join(UPLOADS_DIR));
+        assert_eq!(
+            fs::read_dir(tempdir.path().join(UPLOADS_DIR).join("inputs"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inputs_refuse_symlink_and_regular_file_directories() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let uploads = seed_upload_dir(tempdir.path(), UPLOADS_DIR);
+        let outside = tempfile::tempdir().unwrap();
+        let inputs = uploads.join("inputs");
+        std::os::unix::fs::symlink(outside.path(), &inputs).unwrap();
+        let app = inputs_app(tempdir.path().to_path_buf());
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/inputs?name=answers")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+            fs::remove_file(&inputs).unwrap();
+            fs::write(&inputs, b"keep").unwrap();
+        }
+    }
+
+    #[test]
+    fn preview_url_segments_use_disposition_encoding() {
+        assert_eq!(percent_encode("a b#?%.html"), "a%20b%23%3F%25.html");
+        assert_eq!(percent_encode("café.html"), "caf%C3%A9.html");
+    }
 
     fn seed_upload_dir(base: &Path, name: &str) -> PathBuf {
         let path = base.join(name);

@@ -12,9 +12,14 @@ use uuid::Uuid;
 
 use crate::DeploymentImpl;
 
+#[derive(serde::Deserialize)]
+pub struct WorkspacePath {
+    pub id: Uuid,
+}
+
 pub async fn load_workspace_middleware(
     State(deployment): State<DeploymentImpl>,
-    Path(workspace_id): Path<Uuid>,
+    Path(WorkspacePath { id: workspace_id }): Path<WorkspacePath>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
