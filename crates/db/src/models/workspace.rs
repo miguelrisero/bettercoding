@@ -278,6 +278,31 @@ impl Workspace {
         sqlx::query_as!(
             Workspace,
             r#"
+            WITH cleanup_candidates AS (
+                SELECT w.*,
+                    MAX(
+                        max(
+                            datetime(w.updated_at),
+                            datetime(COALESCE(ep.completed_at, w.updated_at)),
+                            datetime(COALESCE(ca.hook_at, w.updated_at)),
+                            datetime(COALESCE(ca.updated_at, w.updated_at))
+                        )
+                    ) AS last_activity
+                FROM workspaces w
+                LEFT JOIN sessions s ON w.id = s.workspace_id
+                LEFT JOIN execution_processes ep ON s.id = ep.session_id AND ep.completed_at IS NOT NULL
+                LEFT JOIN workspace_cli_activity ca ON w.id = ca.workspace_id
+                WHERE w.container_ref IS NOT NULL
+                    AND w.worktree_deleted = FALSE
+                    AND w.pinned = FALSE
+                    AND w.id NOT IN (
+                        SELECT DISTINCT s2.workspace_id
+                        FROM sessions s2
+                        JOIN execution_processes ep2 ON s2.id = ep2.session_id
+                        WHERE ep2.completed_at IS NULL
+                    )
+                GROUP BY w.id, w.container_ref, w.updated_at
+            )
             SELECT
                 w.id as "id!: Uuid",
                 w.task_id as "task_id: Uuid",
@@ -291,44 +316,15 @@ impl Workspace {
                 w.pinned as "pinned!: bool",
                 w.name,
                 w.worktree_deleted as "worktree_deleted!: bool"
-            FROM workspaces w
-            LEFT JOIN sessions s ON w.id = s.workspace_id
-            LEFT JOIN execution_processes ep ON s.id = ep.session_id AND ep.completed_at IS NOT NULL
-            LEFT JOIN workspace_cli_activity ca ON w.id = ca.workspace_id
-            WHERE w.container_ref IS NOT NULL
-                AND w.worktree_deleted = FALSE
-                AND w.pinned = FALSE
-                AND w.id NOT IN (
-                    SELECT DISTINCT s2.workspace_id
-                    FROM sessions s2
-                    JOIN execution_processes ep2 ON s2.id = ep2.session_id
-                    WHERE ep2.completed_at IS NULL
-                )
-            GROUP BY w.id, w.container_ref, w.updated_at
-            HAVING datetime('now',
+            FROM cleanup_candidates w
+            WHERE datetime('now',
                 CASE
                     WHEN w.archived = 1
                     THEN '-1 hours'
                     ELSE '-72 hours'
                 END
-            ) > datetime(
-                MAX(
-                    max(
-                        datetime(w.updated_at),
-                        datetime(COALESCE(ep.completed_at, w.updated_at)),
-                        datetime(COALESCE(ca.hook_at, w.updated_at)),
-                        datetime(COALESCE(ca.updated_at, w.updated_at))
-                    )
-                )
-            )
-            ORDER BY MAX(
-                max(
-                    datetime(w.updated_at),
-                    datetime(COALESCE(ep.completed_at, w.updated_at)),
-                    datetime(COALESCE(ca.hook_at, w.updated_at)),
-                    datetime(COALESCE(ca.updated_at, w.updated_at))
-                )
-            ) ASC
+            ) > datetime(w.last_activity)
+            ORDER BY w.last_activity ASC
             "#
         )
         .fetch_all(pool)

@@ -357,15 +357,38 @@ impl LocalContainerService {
                     .await,
                 Err(error) if error.kind() == io::ErrorKind::NotFound
             );
-        for workspace in &expired_workspaces {
+        for candidate in &expired_workspaces {
+            let workspace_id = candidate.id;
+            let workspace = match Workspace::find_by_id(&self.db.pool, workspace_id).await {
+                Ok(Some(workspace)) => workspace,
+                Ok(None) => {
+                    tracing::info!(%workspace_id, reason = "workspace missing", "Skipping expired workspace cleanup");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%workspace_id, %error, "Skipping expired workspace cleanup: workspace reload failed");
+                    continue;
+                }
+            };
+            let skip_reason = if workspace.pinned {
+                Some("workspace pinned")
+            } else if workspace.worktree_deleted {
+                Some("worktree deleted")
+            } else {
+                None
+            };
+            if let Some(reason) = skip_reason {
+                tracing::info!(%workspace_id, reason, "Skipping expired workspace cleanup");
+                continue;
+            }
             if expired_workspace_safe_to_delete(
-                workspace.id,
+                workspace_id,
                 tmux_missing,
                 crate::cli_activity::probe_workspace_pane_busy,
             )
             .await
             {
-                self.cleanup_workspace(workspace).await;
+                self.cleanup_workspace(&workspace).await;
             }
         }
         Ok(())
