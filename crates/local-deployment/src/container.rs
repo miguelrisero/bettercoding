@@ -91,6 +91,27 @@ fn queued_action_type(
 
 const WORKSPACE_TOUCH_DEBOUNCE: Duration = Duration::from_mins(2);
 
+async fn expired_workspace_safe_to_delete<F>(
+    workspace_id: Uuid,
+    tmux_missing: bool,
+    probe: impl FnOnce(Uuid) -> F,
+) -> bool
+where
+    F: std::future::Future<Output = AgentPresence>,
+{
+    if tmux_missing {
+        return true;
+    }
+    let reason = match probe(workspace_id).await {
+        AgentPresence::Alive => "pane busy",
+        // Directory deletion is irreversible, so an unreadable pane must survive.
+        AgentPresence::Unknown => "pane state unknown",
+        AgentPresence::Absent | AgentPresence::NoSession => return true,
+    };
+    tracing::info!(%workspace_id, reason, "Skipping expired workspace cleanup");
+    false
+}
+
 #[derive(Clone)]
 pub struct LocalContainerService {
     db: DBService,
@@ -323,11 +344,29 @@ impl LocalContainerService {
             return Ok(());
         }
         tracing::info!(
-            "Found {} expired workspaces to clean up",
+            "Found {} expired workspace cleanup candidates",
             expired_workspaces.len()
         );
+        // The cached capability check also fails on probe errors; only a missing
+        // executable permits cleanup without a readable pane snapshot.
+        let tmux_missing = !crate::pty::tmux_available()
+            && matches!(
+                tokio::process::Command::new("tmux")
+                    .arg("-V")
+                    .output()
+                    .await,
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            );
         for workspace in &expired_workspaces {
-            self.cleanup_workspace(workspace).await;
+            if expired_workspace_safe_to_delete(
+                workspace.id,
+                tmux_missing,
+                crate::cli_activity::probe_workspace_pane_busy,
+            )
+            .await
+            {
+                self.cleanup_workspace(workspace).await;
+            }
         }
         Ok(())
     }
@@ -1892,6 +1931,36 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    /// Cleanup must preserve busy or unreadable panes while reclaiming confirmed idle or missing panes.
+    #[tokio::test]
+    async fn expired_cleanup_requires_safe_pane_state() {
+        let workspace_id = Uuid::new_v4();
+        for (presence, safe) in [
+            (AgentPresence::Alive, false),
+            (AgentPresence::Unknown, false),
+            (AgentPresence::Absent, true),
+            (AgentPresence::NoSession, true),
+        ] {
+            let actual = expired_workspace_safe_to_delete(workspace_id, false, |id| async move {
+                assert_eq!(id, workspace_id);
+                presence
+            })
+            .await;
+            assert_eq!(actual, safe, "{presence:?}");
+        }
+    }
+
+    /// Hosts without tmux must reclaim expired worktrees without probing nonexistent panes.
+    #[tokio::test]
+    async fn expired_cleanup_runs_without_tmux() {
+        assert!(
+            expired_workspace_safe_to_delete(Uuid::new_v4(), true, |_| async {
+                panic!("tmux-less hosts must bypass the pane probe")
+            })
+            .await
+        );
+    }
 
     #[tokio::test]
     async fn workspace_config_files_carry_hygiene_and_stay_idempotent() {

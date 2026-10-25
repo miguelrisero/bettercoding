@@ -265,23 +265,13 @@ impl Workspace {
         Ok(result.exists)
     }
 
-    /// Find workspaces that are expired and eligible for cleanup.
-    /// Uses accelerated cleanup (1 hour) for archived workspaces.
-    /// Uses standard cleanup (72 hours) for non-archived workspaces.
+    /// Find unpinned workspaces with an existing worktree and no running executions.
+    /// Expiration requires 1 hour of inactivity when archived, or 72 hours otherwise.
+    /// Freshness includes workspace updates, completed executions, CLI activity
+    /// transitions, and CLI hook reports. All timestamps are normalized to UTC.
     ///
-    /// Freshness is `max(workspace.updated_at, last completed execution)`, and
-    /// both halves must be NULL-safe. SQLite's SCALAR `max(X, Y)` returns NULL
-    /// when either argument is NULL, so comparing against a bare
-    /// `max(w.updated_at, ep.completed_at)` yields NULL — and `X > NULL` is
-    /// never true — for any workspace that has never had a completed execution
-    /// process. That silently exempted every CLI-mode workspace (the
-    /// interactive tmux agent is not an execution_process) from cleanup for the
-    /// lifetime of the install, stranding tens of GB of worktrees on disk.
-    /// `COALESCE` collapses the missing half onto `updated_at` instead.
-    ///
-    /// Timestamps are stored in UTC, so the threshold is computed in UTC too;
-    /// `datetime('now', 'localtime')` compared cleanup ages against wall-clock
-    /// local time and skewed the TTL by the host's UTC offset.
+    /// SQLite's scalar `max()` returns NULL if any argument is NULL, so missing
+    /// execution and CLI timestamps fall back to the workspace's update time.
     pub async fn find_expired_for_cleanup(
         pool: &SqlitePool,
     ) -> Result<Vec<Workspace>, sqlx::Error> {
@@ -304,8 +294,10 @@ impl Workspace {
             FROM workspaces w
             LEFT JOIN sessions s ON w.id = s.workspace_id
             LEFT JOIN execution_processes ep ON s.id = ep.session_id AND ep.completed_at IS NOT NULL
+            LEFT JOIN workspace_cli_activity ca ON w.id = ca.workspace_id
             WHERE w.container_ref IS NOT NULL
                 AND w.worktree_deleted = FALSE
+                AND w.pinned = FALSE
                 AND w.id NOT IN (
                     SELECT DISTINCT s2.workspace_id
                     FROM sessions s2
@@ -323,15 +315,19 @@ impl Workspace {
                 MAX(
                     max(
                         datetime(w.updated_at),
-                        datetime(COALESCE(ep.completed_at, w.updated_at))
+                        datetime(COALESCE(ep.completed_at, w.updated_at)),
+                        datetime(COALESCE(ca.hook_at, w.updated_at)),
+                        datetime(COALESCE(ca.updated_at, w.updated_at))
                     )
                 )
             )
             ORDER BY MAX(
-                CASE
-                    WHEN ep.completed_at IS NOT NULL THEN ep.completed_at
-                    ELSE w.updated_at
-                END
+                max(
+                    datetime(w.updated_at),
+                    datetime(COALESCE(ep.completed_at, w.updated_at)),
+                    datetime(COALESCE(ca.hook_at, w.updated_at)),
+                    datetime(COALESCE(ca.updated_at, w.updated_at))
+                )
             ) ASC
             "#
         )
@@ -975,6 +971,119 @@ mod tests {
             !expired.iter().any(|w| w.id == workspace.id),
             "a just-completed execution must keep an otherwise-stale workspace alive"
         );
+    }
+
+    /// Recent hook reports protect CLI agents whose executions have no database row.
+    #[tokio::test]
+    async fn expired_cleanup_spares_recent_cli_hook() {
+        let pool = test_pool().await;
+        let workspace = create_test_workspace(&pool).await;
+        Workspace::update_container_ref(&pool, workspace.id, "/tmp/ws/recent-hook")
+            .await
+            .unwrap();
+        add_session(&pool, workspace.id).await;
+        backdate_workspace(&pool, workspace.id, 96).await;
+        sqlx::query(
+            "INSERT INTO workspace_cli_activity (workspace_id, updated_at, hook_at)
+             VALUES (?, datetime('now', '-96 hours'), ?)",
+        )
+        .bind(workspace.id)
+        .bind(chrono::Utc::now())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            Workspace::find_expired_for_cleanup(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A poller transition protects CLI agents that send no hook reports.
+    #[tokio::test]
+    async fn expired_cleanup_spares_recent_cli_activity_transition() {
+        use crate::models::workspace_cli_activity::{CliActivityState, WorkspaceCliActivity};
+
+        let pool = test_pool().await;
+        let workspace = create_test_workspace(&pool).await;
+        Workspace::update_container_ref(&pool, workspace.id, "/tmp/ws/recent-cli-activity")
+            .await
+            .unwrap();
+        add_session(&pool, workspace.id).await;
+        backdate_workspace(&pool, workspace.id, 96).await;
+        WorkspaceCliActivity::upsert(&pool, workspace.id, CliActivityState::Idle)
+            .await
+            .unwrap();
+
+        assert!(
+            Workspace::find_expired_for_cleanup(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Owner pins protect stale worktrees under both archived and standard cleanup rules.
+    #[tokio::test]
+    async fn expired_cleanup_spares_pinned_workspaces() {
+        let pool = test_pool().await;
+        for archived in [false, true] {
+            let workspace = create_test_workspace(&pool).await;
+            Workspace::update_container_ref(&pool, workspace.id, "/tmp/ws/pinned")
+                .await
+                .unwrap();
+            add_session(&pool, workspace.id).await;
+            Workspace::set_archived(&pool, workspace.id, archived)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE workspaces SET pinned = TRUE WHERE id = ?")
+                .bind(workspace.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            backdate_workspace(&pool, workspace.id, 96).await;
+        }
+
+        assert!(
+            Workspace::find_expired_for_cleanup(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Stale CLI rows must allow idle, unpinned worktrees to expire, including nullable hook timestamps.
+    #[tokio::test]
+    async fn expired_cleanup_includes_stale_cli_activity() {
+        let pool = test_pool().await;
+        let mut expected_ids = Vec::new();
+        for has_hook in [false, true] {
+            let workspace = create_test_workspace(&pool).await;
+            Workspace::update_container_ref(&pool, workspace.id, "/tmp/ws/stale-cli-activity")
+                .await
+                .unwrap();
+            add_session(&pool, workspace.id).await;
+            backdate_workspace(&pool, workspace.id, 96).await;
+            sqlx::query(
+                "INSERT INTO workspace_cli_activity (workspace_id, state, updated_at, hook_at)
+                 VALUES (?, 'idle', datetime('now', '-96 hours'),
+                         CASE WHEN ? THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-96 hours') END)",
+            )
+            .bind(workspace.id)
+            .bind(has_hook)
+            .execute(&pool)
+            .await
+            .unwrap();
+            expected_ids.push(workspace.id);
+        }
+
+        let expired = Workspace::find_expired_for_cleanup(&pool).await.unwrap();
+        assert_eq!(expired.len(), expected_ids.len());
+        for id in expected_ids {
+            assert!(expired.iter().any(|workspace| workspace.id == id));
+        }
     }
 
     #[test]
