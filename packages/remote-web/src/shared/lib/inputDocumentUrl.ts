@@ -1,11 +1,12 @@
 import type { LocalApiRequestOptions } from "@/shared/lib/localApiTransport";
 import { buildRemoteSessionBaseUrl } from "@/shared/lib/relayBackendApi";
-import { resolveRemoteHostContext } from "@remote/shared/lib/relay/context";
-import { resolveRelayHostIdForCurrentPage } from "@remote/shared/lib/relay/routing";
 import {
-  appendSignatureToPath,
-  buildRelaySignature,
-} from "@remote/shared/lib/relay/signing";
+  invalidateRemoteSessionId,
+  resolveRemoteHostContext,
+  tryRefreshRelayHostSigningSession,
+} from "./relay/context";
+import { resolveRelayHostIdForCurrentPage } from "./relay/routing";
+import { appendSignatureToPath, buildRelaySignature } from "./relay/signing";
 
 export async function inputDocumentUrl(
   path: string,
@@ -21,7 +22,10 @@ export async function inputDocumentUrl(
     )
   )
     throw new Error("Invalid Input content route");
-  const context = await resolveRemoteHostContext(host);
+  invalidateRemoteSessionId(host);
+  const baseContext = await resolveRemoteHostContext(host);
+  const context =
+    (await tryRefreshRelayHostSigningSession(baseContext)) ?? baseContext;
   const signature = await buildRelaySignature(
     context.pairedHost,
     "GET",

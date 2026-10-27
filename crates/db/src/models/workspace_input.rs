@@ -430,6 +430,13 @@ impl WorkspaceInput {
             &json!({"input_id": id, "actor_kind":actor_kind, "actor":actor, "write":write}),
         ));
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let live_workspace: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM workspaces WHERE id=?")
+            .bind(workspace)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if live_workspace.is_none() {
+            return Err(InputError::Code("NOT_FOUND"));
+        }
         if let Some(event) = sqlx::query_as::<_, InputEvent>(
             "SELECT * FROM workspace_input_events WHERE workspace_id=? AND request_id=?",
         )
@@ -1192,6 +1199,92 @@ mod tests {
                 .is_err()
         );
     }
+    #[tokio::test]
+    async fn workspace_deletion_retains_verifiable_history_and_refuses_every_write() {
+        let (pool, workspace) = setup().await;
+        let created = seed(&pool, workspace).await;
+        let id = &created.input_id;
+        WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(id),
+            InputActorKind::OwnerUi,
+            "owner",
+            answer(1, 1),
+        )
+        .await
+        .unwrap();
+        let before = WorkspaceInput::detail(&pool, workspace, id, Some(1), true)
+            .await
+            .unwrap();
+        let events_before = WorkspaceInput::events(&pool, workspace, None, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query("DELETE FROM workspaces WHERE id=?")
+                .bind(workspace)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        let retained = WorkspaceInput::detail(&pool, workspace, id, Some(1), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(retained).unwrap()
+        );
+        let events_after = WorkspaceInput::events(&pool, workspace, None, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(events_before).unwrap(),
+            serde_json::to_value(events_after).unwrap()
+        );
+        assert!(
+            WorkspaceInput::verify(&pool, workspace, id)
+                .await
+                .unwrap()
+                .valid
+        );
+        let undo = InputWrite::Undo(InputStatusWrite {
+            request_id: "deleted-undo".into(),
+            expected_sequence: 2,
+            status: "closed".into(),
+            reason: None,
+        });
+        for write in [
+            create(),
+            publish(2),
+            answer(2, 1),
+            status(2, "closed"),
+            undo,
+        ] {
+            assert!(matches!(
+                WorkspaceInput::write(
+                    &pool,
+                    workspace,
+                    Some(id),
+                    InputActorKind::OwnerUi,
+                    "owner",
+                    write
+                )
+                .await,
+                Err(InputError::Code("NOT_FOUND"))
+            ));
+        }
+        assert!(
+            sqlx::query("UPDATE workspace_inputs SET workspace_id=? WHERE id=?")
+                .bind(Uuid::new_v4())
+                .bind(id)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn canonical_hash_ignores_object_insertion_order() {
         let a: Value = serde_json::from_str(r#"{"b":1,"a":{"y":2,"x":3}}"#).unwrap();

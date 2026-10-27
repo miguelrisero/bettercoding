@@ -245,8 +245,36 @@ async fn content(
     Ok(content_response(detail.version.html.unwrap_or_default()))
 }
 
+async fn require_live_workspace(
+    State(pool): State<SqlitePool>,
+    Path(params): Path<std::collections::HashMap<String, String>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<Response, RouteError> {
+    let workspace = params
+        .get("id")
+        .or_else(|| params.get("workspace_id"))
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .ok_or(InputError::Code("WORKSPACE_SCOPE"))?;
+    let live: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM workspaces WHERE id=?")
+        .bind(workspace)
+        .fetch_optional(&pool)
+        .await
+        .map_err(InputError::from)?;
+    if live.is_none() {
+        return Err(InputError::Code("NOT_FOUND").into());
+    }
+    Ok(next.run(request).await)
+}
+
 pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
-    input_routes().with_state(deployment.db().pool.clone())
+    let pool = deployment.db().pool.clone();
+    input_routes()
+        .layer(axum::middleware::from_fn_with_state(
+            pool.clone(),
+            require_live_workspace,
+        ))
+        .with_state(pool)
 }
 
 fn input_routes() -> Router<SqlitePool> {
@@ -293,7 +321,7 @@ mod tests {
         assert!(!INPUT_CONTENT_CSP.contains("allow-modals"));
     }
 
-    async fn test_app() -> (axum::Router, Uuid) {
+    async fn test_app() -> (axum::Router, Uuid, SqlitePool) {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -317,9 +345,16 @@ mod tests {
             .unwrap();
         (
             axum::Router::new()
-                .nest("/api/workspaces/{workspace_id}/inputs", input_routes())
-                .with_state(pool),
+                .nest(
+                    "/api/workspaces/{workspace_id}/inputs",
+                    input_routes().layer(axum::middleware::from_fn_with_state(
+                        pool.clone(),
+                        require_live_workspace,
+                    )),
+                )
+                .with_state(pool.clone()),
             workspace,
+            pool,
         )
     }
 
@@ -357,7 +392,7 @@ mod tests {
     #[tokio::test]
     async fn routes_scope_content_answers_and_server_provenance() {
         use serde_json::json;
-        let (app, workspace) = test_app().await;
+        let (app, workspace, pool) = test_app().await;
         let root = format!("/api/workspaces/{workspace}/inputs");
         let (status, _, created) = request(app.clone(), "POST", &format!("{root}/agent"), json!({
             "request_id":"create", "expected_sequence":0,"external_key":"decision",
@@ -417,9 +452,39 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{answer}");
         assert_eq!(answer["data"]["event"]["actor_kind"], "owner_ui");
         assert_eq!(answer["data"]["event"]["payload"]["answer"]["text"], "yes");
-        let (_, _, verified) =
-            request(app, "GET", &format!("{root}/{id}/verify"), json!(null)).await;
+        let (_, _, verified) = request(
+            app.clone(),
+            "GET",
+            &format!("{root}/{id}/verify"),
+            json!(null),
+        )
+        .await;
         assert_eq!(verified["data"]["valid"], true);
+        sqlx::query("DELETE FROM workspaces WHERE id=?")
+            .bind(workspace)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for suffix in [
+            String::new(),
+            "/events".into(),
+            format!("/{id}"),
+            format!("/{id}/verify"),
+            format!("/{id}/versions/1/content"),
+        ] {
+            assert_eq!(
+                request(app.clone(), "GET", &format!("{root}{suffix}"), json!(null))
+                    .await
+                    .0,
+                StatusCode::NOT_FOUND
+            );
+        }
+        assert!(
+            WorkspaceInput::verify(&pool, workspace, id)
+                .await
+                .unwrap()
+                .valid
+        );
     }
 
     #[test]

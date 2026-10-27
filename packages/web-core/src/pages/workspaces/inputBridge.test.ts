@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   inputEmbeddingDocument,
   inputFrameLoaded,
+  createInputBridge,
   readInputProposal,
   validateInputAnswer,
   type InputBridge,
@@ -29,6 +30,21 @@ const message = {
 };
 
 describe('Input proposal bridge', () => {
+  it('issues a new bridge for a trusted retry and rejects the prior page', () => {
+    const first = createInputBridge('input', 1);
+    const retry = createInputBridge('input', 1);
+    expect(retry.id).not.toBe(first.id);
+    expect(retry.loads).toBe(0);
+    const source = {} as Window;
+    expect(
+      readInputProposal(
+        { source, data: { ...message, bridge_id: first.id } },
+        source,
+        retry,
+        contract
+      )
+    ).toBeNull();
+  });
   it('rejects a forged source even with the correct bridge id', () => {
     const source = {} as Window;
     expect(

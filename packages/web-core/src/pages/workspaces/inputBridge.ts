@@ -8,6 +8,13 @@ export type InputBridge = {
   valid: boolean;
 };
 
+export function createInputBridge(
+  inputId: string,
+  version: number
+): InputBridge {
+  return { id: crypto.randomUUID(), inputId, version, loads: 0, valid: true };
+}
+
 export function inputFrameLoaded(bridge: InputBridge): boolean {
   bridge.loads += 1;
   if (bridge.loads > 1) bridge.valid = false;

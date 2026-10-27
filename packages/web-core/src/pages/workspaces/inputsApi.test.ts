@@ -1,10 +1,44 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { setLocalApiTransport } from '@/shared/lib/localApiTransport';
-import { inputsApi } from './inputsApi';
+import { inputsApi, refreshInputAfterConflict } from './inputsApi';
 
 afterEach(() => setLocalApiTransport(null));
 
 describe('Input status actions', () => {
+  it.each(['VERSION_CONFLICT', 'SEQUENCE_CONFLICT: current_sequence=9'])(
+    'refetches current metadata after %s without another write',
+    async (code) => {
+      const request = vi.fn(
+        async () =>
+          new Response(JSON.stringify({ success: false, message: code }), {
+            status: 409,
+          })
+      );
+      setLocalApiTransport({ request, openWebSocket: vi.fn() });
+      const refresh = vi.fn(async () => {});
+      const body = {
+        request_id: 'answer',
+        expected_sequence: 3,
+        version: 2,
+        answer: { choice_id: 'ship', text: 'Saved draft' },
+      };
+      try {
+        await inputsApi.answer('workspace', null, 'input', body);
+      } catch (error) {
+        expect(await refreshInputAfterConflict(error, refresh)).toBe(true);
+      }
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(request).toHaveBeenCalledTimes(1);
+      expect(body.answer.text).toBe('Saved draft');
+    }
+  );
+  it('keeps network failures retryable without replacing their idempotency key', async () => {
+    const refresh = vi.fn(async () => {});
+    expect(
+      await refreshInputAfterConflict(new Error('network unavailable'), refresh)
+    ).toBe(false);
+    expect(refresh).not.toHaveBeenCalled();
+  });
   it('closes in one request and appends Undo with the receipt sequence', async () => {
     const request = vi.fn(
       async () =>

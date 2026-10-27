@@ -10,6 +10,19 @@ import {
   makeLocalApiRequest,
 } from '@/shared/lib/localApiTransport';
 
+export async function refreshInputAfterConflict(
+  error: unknown,
+  refresh: () => Promise<void>
+): Promise<boolean> {
+  if (
+    !(error instanceof Error) ||
+    !/^(VERSION_CONFLICT|SEQUENCE_CONFLICT)(:|$)/.test(error.message)
+  )
+    return false;
+  await refresh();
+  return true;
+}
+
 export async function inputRequest<T>(
   workspace: string,
   hostId: string | null,

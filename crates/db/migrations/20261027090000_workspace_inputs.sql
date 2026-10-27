@@ -1,6 +1,9 @@
+-- The ledger retains its workspace UUID after workspace deletion. Active routes
+-- require a live workspace; retained history has no workspace UI. Retention has
+-- no automatic expiry. Safe garbage collection requires a separate policy.
 CREATE TABLE workspace_inputs (
     id TEXT PRIMARY KEY,
-    workspace_id BLOB NOT NULL REFERENCES workspaces(id),
+    workspace_id BLOB NOT NULL,
     external_key TEXT NOT NULL,
     creator TEXT NOT NULL,
     current_version INTEGER NOT NULL,
@@ -42,6 +45,12 @@ CREATE TABLE workspace_input_events (
     UNIQUE(workspace_id, request_id),
     FOREIGN KEY(workspace_id, input_id) REFERENCES workspace_inputs(workspace_id, id)
 );
+CREATE TRIGGER workspace_inputs_live_workspace BEFORE INSERT ON workspace_inputs
+WHEN NOT EXISTS (SELECT 1 FROM workspaces WHERE id=NEW.workspace_id)
+BEGIN SELECT RAISE(ABORT, 'input requires live workspace'); END;
+CREATE TRIGGER workspace_inputs_identity_immutable BEFORE UPDATE OF id, workspace_id ON workspace_inputs
+WHEN OLD.id != NEW.id OR OLD.workspace_id != NEW.workspace_id
+BEGIN SELECT RAISE(ABORT, 'immutable input identity'); END;
 CREATE INDEX workspace_inputs_scope ON workspace_inputs(workspace_id, id);
 CREATE INDEX workspace_input_events_scope ON workspace_input_events(workspace_id, cursor);
 CREATE TRIGGER workspace_input_versions_no_update BEFORE UPDATE ON workspace_input_versions BEGIN SELECT RAISE(ABORT, 'immutable input version'); END;

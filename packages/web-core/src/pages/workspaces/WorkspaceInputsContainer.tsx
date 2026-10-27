@@ -9,11 +9,12 @@ import { useIsMobile } from '@/shared/hooks/useIsMobile';
 import {
   inputEmbeddingDocument,
   inputFrameLoaded,
+  createInputBridge,
   readInputProposal,
   validateInputAnswer,
   type InputBridge,
 } from './inputBridge';
-import { inputsApi } from './inputsApi';
+import { inputsApi, refreshInputAfterConflict } from './inputsApi';
 
 const button =
   'min-h-11 px-base rounded border text-high focus-visible:ring-2 focus-visible:ring-brand disabled:opacity-50';
@@ -130,6 +131,7 @@ function InputViewer({
   const queryClient = useQueryClient();
   const isMobile = useIsMobile();
   const viewport = useVisualViewportGeometry();
+  const [reviewMessage, setReviewMessage] = useState<string | null>(null);
   const detail = useQuery({
     queryKey: ['input', host, workspaceId, inputId],
     queryFn: () => inputsApi.get(workspaceId, host, inputId),
@@ -158,6 +160,19 @@ function InputViewer({
         >
           <header className="flex items-center gap-base border-b p-base shrink-0">
             <Dialog.Close className={button}>Back</Dialog.Close>
+            <button
+              className={button}
+              disabled={detail.isFetching}
+              onClick={async () => {
+                const result = await detail.refetch();
+                if (!result.error)
+                  setReviewMessage(
+                    'Review the current version and your saved draft before you submit again.'
+                  );
+              }}
+            >
+              Refresh
+            </button>
             <Dialog.Title className="text-xl font-medium min-w-0 truncate">
               {detail.data?.version.title ?? 'Input'}
             </Dialog.Title>
@@ -166,6 +181,11 @@ function InputViewer({
             The page can propose an answer. Only Submit records your answer.
             Keep secrets outside Inputs.
           </Dialog.Description>
+          {reviewMessage && (
+            <p role="status" className="px-base py-half">
+              {reviewMessage}
+            </p>
+          )}
           {detail.error && (
             <p role="alert" className="p-base">
               {detail.error.message}
@@ -181,6 +201,13 @@ function InputViewer({
               key={detail.data.version.version}
               workspaceId={workspaceId}
               detail={detail.data}
+              refreshAfterConflict={async () => {
+                const result = await detail.refetch();
+                if (result.error) throw result.error;
+                setReviewMessage(
+                  'The Input changed. Review the current version and your saved draft before you submit again.'
+                );
+              }}
               refresh={async () => {
                 await queryClient.invalidateQueries({
                   queryKey: ['input', host, workspaceId, inputId],
@@ -202,20 +229,18 @@ function InputBody({
   workspaceId,
   detail,
   refresh,
+  refreshAfterConflict,
 }: {
   workspaceId: string;
   detail: InputDetail;
   refresh: () => Promise<void>;
+  refreshAfterConflict: () => Promise<void>;
 }) {
   const host = useHostId();
   const frame = useRef<HTMLIFrameElement>(null);
-  const bridge = useRef<InputBridge>({
-    id: crypto.randomUUID(),
-    inputId: detail.input.id,
-    version: detail.version.version,
-    loads: 0,
-    valid: true,
-  });
+  const bridge = useRef<InputBridge>(
+    createInputBridge(detail.input.id, detail.version.version)
+  );
   const key = `bc.input.draft:${host ?? 'local'}:${detail.input.id}:${detail.version.version}`;
   const [draft, setDraft] = useState<InputAnswer>(() => {
     try {
@@ -232,6 +257,7 @@ function InputBody({
   const [proposal, setProposal] = useState(false);
   const [priorDraft, setPriorDraft] = useState<InputAnswer | null>(null);
   const [document, setDocument] = useState('');
+  const [pageAttempt, setPageAttempt] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [navigated, setNavigated] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -281,6 +307,7 @@ function InputBody({
     detail.input.id,
     detail.version.version,
     detail.version.content_hash,
+    pageAttempt,
   ]);
   useEffect(() => {
     try {
@@ -347,8 +374,14 @@ function InputBody({
       answerRequest.current = null;
       await refresh();
     } catch (e) {
+      try {
+        if (await refreshInputAfterConflict(e, refreshAfterConflict))
+          answerRequest.current = null;
+      } catch (refreshError) {
+        setError(String(refreshError));
+      }
       setError(
-        `${String(e)}. Your draft stays saved. Refresh to read the current version.`
+        `${String(e)}. Your draft stays saved. Review the current version before you submit again.`
       );
     } finally {
       setBusy(false);
@@ -376,10 +409,22 @@ function InputBody({
       statusRequest.current = null;
       await refresh();
     } catch (e) {
+      try {
+        if (await refreshInputAfterConflict(e, refreshAfterConflict))
+          statusRequest.current = null;
+      } catch (refreshError) {
+        setError(String(refreshError));
+      }
       setError(String(e));
     } finally {
       setBusy(false);
     }
+  };
+  const retryPage = () => {
+    bridge.current = createInputBridge(detail.input.id, detail.version.version);
+    setDocument('');
+    setNavigated(false);
+    setPageAttempt((attempt) => attempt + 1);
   };
   return (
     <>
@@ -387,6 +432,12 @@ function InputBody({
         <span>
           Version {detail.version.version} · {detail.input.status} · From{' '}
           {detail.input.creator}
+        </span>
+        <button className={button} onClick={retryPage}>
+          Retry page
+        </button>
+        <span className="text-low">
+          If the page fails to load, retry to renew its connection.
         </span>
         {['open', 'answered'].includes(detail.input.status) && (
           <button
