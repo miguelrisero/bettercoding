@@ -27,7 +27,8 @@ export type MobileTab =
   | 'logs'
   | 'preview'
   | 'git'
-  | 'files';
+  | 'files'
+  | 'inputs';
 
 export type MobileFontScale = 'default' | 'small' | 'smaller';
 export const DEFAULT_CREATE_DRAFT_WORKSPACE_BY_DEFAULT = false;
@@ -285,6 +286,7 @@ export const PERSIST_KEYS = {
   notesSection: 'notes-section',
   // Files panel section
   filesSection: 'files-section',
+  inputsSection: 'inputs-section',
   // GitHub comments toggle
   showGitHubComments: 'show-github-comments',
   // Panel sizes
@@ -318,6 +320,7 @@ export type PersistKey =
   | typeof PERSIST_KEYS.terminalSection
   | typeof PERSIST_KEYS.notesSection
   | typeof PERSIST_KEYS.filesSection
+  | typeof PERSIST_KEYS.inputsSection
   | typeof PERSIST_KEYS.showGitHubComments
   | typeof PERSIST_KEYS.rightMainPanel
   | typeof PERSIST_KEYS.rightPanelprocesses

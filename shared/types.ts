@@ -4,6 +4,38 @@
 
 // If you are an AI, and you absolutely have to edit this file, please confirm with the user first.
 
+export type InputChoice = { id: string, label: string, };
+
+export type InputContract = { choices: Array<InputChoice>, allow_text: boolean, allow_no_answer_yet: boolean, };
+
+export type InputAnswer = { choice_id: string | null, text: string | null, };
+
+export type InputContent = { title: string, html: string, contract: InputContract, };
+
+export type CreateInput = { external_key: string, request_id: string, expected_sequence: number, content: InputContent, };
+
+export type PublishInput = { request_id: string, expected_sequence: number, content: InputContent, request_answer: boolean, };
+
+export type AnswerInput = { request_id: string, expected_sequence: number, version: number, answer: InputAnswer, };
+
+export type InputStatusWrite = { request_id: string, expected_sequence: number, status: string, reason: string | null, };
+
+export type WorkspaceInput = { id: string, workspace_id: string, external_key: string, creator: string, current_version: number, status: string, sequence: number, created_at: string, updated_at: string, };
+
+export type InputVersion = { version: number, title: string, html: string | null, contract: InputContract, content_hash: string, };
+
+export type InputDetail = { input: WorkspaceInput, version: InputVersion, answers: Array<InputEvent>, };
+
+export type InputEvent = { cursor: number, id: string, workspace_id: string, input_id: string, sequence: number, actor_kind: string, actor: string, event_type: string, version: number, payload: JsonValue, request_id: string, request_hash: string, created_at: string, prev_hash: string, hash: string, };
+
+export type InputReceipt = { input_id: string, version: number, sequence: number, status: string, event: InputEvent, owner_url: string, };
+
+export type InputPage = { inputs: Array<InputDetail>, next_cursor: string | null, pending_count: number, };
+
+export type InputEventPage = { events: Array<InputEvent>, next_cursor: number, };
+
+export type InputVerification = { valid: boolean, checked: number, first_break: number | null, };
+
 export type Repo = { id: string, path: string, name: string, display_name: string, setup_script: string | null, cleanup_script: string | null, archive_script: string | null, copy_files: string | null, parallel_setup_script: boolean, dev_server_script: string | null, default_target_branch: string | null, default_working_dir: string | null, created_at: Date, updated_at: Date, };
 
 export type Project = { id: string, name: string, default_agent_working_dir: string | null, remote_project_id: string | null, created_at: Date, updated_at: Date, };
