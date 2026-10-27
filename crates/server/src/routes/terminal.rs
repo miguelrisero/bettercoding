@@ -468,12 +468,29 @@ async fn spawn_cli_terminal(
         .lock_owned()
         .await;
     let pool = &deployment.db().pool;
-    let reservation =
-        WorkspaceSpawnReservation::acquire(pool, workspace.id, SpawnReservationHolder::Cli)
-            .await?
-            .ok_or_else(|| {
-                ApiError::Conflict("Another writer is starting for this workspace".into())
-            })?;
+    let reservation = if cli_tmux_available()
+        && cli_tmux_session_exists_checked(workspace.id).await?
+    {
+        None
+    } else {
+        let mut acquired = None;
+        for attempt in 0..10 {
+            acquired =
+                WorkspaceSpawnReservation::acquire(pool, workspace.id, SpawnReservationHolder::Cli)
+                    .await?;
+            if acquired.is_some() {
+                break;
+            }
+            if attempt < 9 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+        Some(acquired.ok_or_else(|| {
+            ApiError::Conflict(
+                "Another writer is starting for this workspace; retry the terminal attach".into(),
+            )
+        })?)
+    };
     let result = async {
         let attach = prepare_cli_attach(
             deployment,
@@ -481,6 +498,7 @@ async fn spawn_cli_terminal(
             base_dir,
             requested_session_id,
             connect_hidden,
+            reservation.is_none(),
         )
         .await?;
         let spawned = spawn_terminal(
@@ -505,7 +523,15 @@ async fn spawn_cli_terminal(
         Ok(spawned)
     }
     .await;
-    WorkspaceSpawnReservation::release(pool, workspace.id, &reservation.fence).await?;
+    if let Some(reservation) = reservation
+        && let Err(error) =
+            WorkspaceSpawnReservation::release(pool, workspace.id, &reservation.fence).await
+    {
+        if let Ok(spawned) = &result {
+            let _ = deployment.pty().close_session(spawned.session_id).await;
+        }
+        return Err(error.into());
+    }
     result
 }
 
@@ -515,6 +541,7 @@ async fn prepare_cli_attach(
     base_dir: &Path,
     requested_session_id: Option<Uuid>,
     connect_hidden: bool,
+    attach_only: bool,
 ) -> Result<CliAttach, ApiError> {
     let mut prompt_delivery: Option<PromptDelivery> = None;
     let mut cli_launch_registration: Option<CliLaunchRegistration> = None;
@@ -572,7 +599,7 @@ async fn prepare_cli_attach(
     } else {
         false
     };
-    if tmux_available && !cli_session_exists {
+    if tmux_available && !attach_only && !cli_session_exists {
         let launch_session = session.as_ref().ok_or_else(|| {
             ApiError::BadRequest(
                 "CLI mode requires a BetterCoding session for this workspace".to_string(),
@@ -747,6 +774,7 @@ async fn prepare_cli_attach(
         working_dir: dir,
         command: PtyCommand::TmuxCli {
             workspace_id: workspace.id,
+            attach_only,
             resume_session_id,
             busy_wait_for_resume: executor_active,
             initial_prompt: baked_prompt,

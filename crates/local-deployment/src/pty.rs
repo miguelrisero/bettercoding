@@ -34,6 +34,8 @@ pub enum PtyCommand {
         /// staged prompt-file path are both derived from it
         /// ([`cli_tmux_session_name`], [`write_cli_prompt_file`]).
         workspace_id: Uuid,
+        /// An existing-pane attach must never create a replacement without a reservation.
+        attach_only: bool,
         /// claude's own session UUID to resume (the workspace's selected uix
         /// chat). When set, the bootstrap runs `claude --resume <id>` so CLI
         /// mode joins the *exact* conversation the chat UI is showing, and
@@ -1276,6 +1278,7 @@ fn owned_cli_tmux_target_on(workspace_id: Uuid, socket: &str) -> CliTmuxTarget {
 /// directory and bootstrap for a session that does not exist yet.
 struct CliTmuxArgv<'a> {
     workspace_id: Uuid,
+    attach_only: bool,
     socket: &'a str,
     conf: Option<&'a Path>,
     connect_hidden: bool,
@@ -1286,6 +1289,7 @@ struct CliTmuxArgv<'a> {
 fn cli_tmux_argv_on(input: CliTmuxArgv<'_>) -> Vec<std::ffi::OsString> {
     let CliTmuxArgv {
         workspace_id,
+        attach_only,
         socket,
         conf,
         connect_hidden,
@@ -1296,6 +1300,17 @@ fn cli_tmux_argv_on(input: CliTmuxArgv<'_>) -> Vec<std::ffi::OsString> {
     if let Some(conf) = conf {
         args.push("-f".into());
         args.push(conf.as_os_str().to_owned());
+    }
+    if attach_only {
+        args.push("attach-session".into());
+        if connect_hidden {
+            args.extend(["-f".into(), "ignore-size".into()]);
+        }
+        args.extend([
+            "-t".into(),
+            format!("={}", cli_tmux_session_name(workspace_id)).into(),
+        ]);
+        return args;
     }
     args.push("new-session".into());
     if connect_hidden {
@@ -2714,6 +2729,13 @@ impl PtyService {
     ) -> Result<(Uuid, mpsc::Receiver<Vec<u8>>), PtyError> {
         // An unreadable tmux state fails closed before any client is spawned.
         tmux_probe_result.transpose()?;
+        let attach_only = matches!(
+            &command,
+            PtyCommand::TmuxCli {
+                attach_only: true,
+                ..
+            }
+        );
         let session_id = Uuid::new_v4();
         let (output_tx, output_rx) = mpsc::channel(OUTPUT_CHANNEL_CAPACITY);
         let shell = get_interactive_shell().await;
@@ -2758,6 +2780,7 @@ impl PtyService {
                     deferred_prompt_pending,
                     connect_hidden,
                     spec,
+                    ..
                 } if tmux_available() => (
                     Some(*workspace_id),
                     resume_session_id.clone(),
@@ -2842,6 +2865,7 @@ impl PtyService {
 
                 let argv = cli_tmux_argv_on(CliTmuxArgv {
                     workspace_id,
+                    attach_only,
                     socket,
                     conf: conf.as_deref(),
                     connect_hidden: tmux_connect_hidden,
@@ -3597,10 +3621,37 @@ mod tests {
     }
 
     #[test]
+    fn attach_only_argv_cannot_create_a_session() {
+        let workspace = Uuid::new_v4();
+        let args = argv_strings(cli_tmux_argv_on(CliTmuxArgv {
+            workspace_id: workspace,
+            attach_only: true,
+            socket: "bc-attach-only-test",
+            conf: None,
+            connect_hidden: true,
+            working_dir: Path::new("/"),
+            bootstrap: "must-not-execute",
+        }));
+        assert_eq!(
+            args,
+            [
+                "-L",
+                "bc-attach-only-test",
+                "attach-session",
+                "-f",
+                "ignore-size",
+                "-t",
+                &format!("={}", cli_tmux_session_name(workspace))
+            ]
+        );
+    }
+
+    #[test]
     fn argv_uses_socket_conf_and_attach_or_create() {
         let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
         let args = argv_strings(cli_tmux_argv_on(CliTmuxArgv {
             workspace_id: id,
+            attach_only: false,
             socket: "bc-b2-test-current",
             conf: Some(Path::new("/tmp/bc-cli.conf")),
             connect_hidden: true,
@@ -4665,6 +4716,7 @@ mod tests {
         let workspace_id = Uuid::new_v4();
         let command = PtyCommand::TmuxCli {
             workspace_id,
+            attach_only: false,
             resume_session_id: None,
             busy_wait_for_resume: false,
             initial_prompt: None,

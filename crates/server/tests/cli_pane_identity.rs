@@ -132,6 +132,8 @@ async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switc
         .await
         .unwrap();
     let prefix = format!("/api/workspaces/{}/cli", workspace.id);
+    existing_pane_reattaches_while_executor_holds_reservation(&app, pool, workspace.id, &prefix)
+        .await;
     let response = app
         .clone()
         .oneshot(
@@ -419,6 +421,7 @@ async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switc
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let response = app
+        .clone()
         .oneshot(
             Request::post(format!("{prefix}/launch"))
                 .body(Body::empty())
@@ -436,6 +439,16 @@ async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switc
         "{args}"
     );
     local_deployment::pty::kill_cli_tmux_session(workspace.id, "test:fresh_cleanup").await;
+    spawn_retries_executor_reservation_contention(&app, pool, workspace.id, &prefix).await;
+    local_deployment::pty::kill_cli_tmux_session(workspace.id, "test:retry_cleanup").await;
+    reservation_release_failure_closes_spawned_tmux_client(
+        &app,
+        pool,
+        workspace.id,
+        &prefix,
+        &socket.0,
+    )
+    .await;
     shutdown.cancel();
 }
 
@@ -592,4 +605,129 @@ async fn delay_existing_attach(
         task.await.unwrap();
     });
     (release_tx, keeper)
+}
+
+async fn existing_pane_reattaches_while_executor_holds_reservation(
+    app: &axum::Router,
+    pool: &sqlx::SqlitePool,
+    workspace: Uuid,
+    prefix: &str,
+) {
+    use db::models::workspace_spawn_reservation::{
+        SpawnReservationHolder, WorkspaceSpawnReservation,
+    };
+    let reservation =
+        WorkspaceSpawnReservation::acquire(pool, workspace, SpawnReservationHolder::Executor)
+            .await
+            .unwrap()
+            .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("{prefix}/launch"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "an existing pane must remain attachable while an executor owns the spawn reservation"
+    );
+    assert_eq!(
+        WorkspaceSpawnReservation::find(pool, workspace)
+            .await
+            .unwrap()
+            .unwrap()
+            .fence,
+        reservation.fence
+    );
+    WorkspaceSpawnReservation::release(pool, workspace, &reservation.fence)
+        .await
+        .unwrap();
+}
+
+async fn reservation_release_failure_closes_spawned_tmux_client(
+    app: &axum::Router,
+    pool: &sqlx::SqlitePool,
+    workspace: Uuid,
+    prefix: &str,
+    socket: &str,
+) {
+    let before = tmux_client_count(socket);
+    sqlx::query("CREATE TRIGGER fail_cli_reservation_release BEFORE DELETE ON workspace_spawn_reservations BEGIN SELECT RAISE(FAIL, 'injected reservation release failure'); END")
+        .execute(pool).await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("{prefix}/launch"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_server_error());
+    for _ in 0..100 {
+        if tmux_client_count(socket) == before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        tmux_client_count(socket),
+        before,
+        "failed release must close the PTY's tmux client"
+    );
+    sqlx::query("DROP TRIGGER fail_cli_reservation_release")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM workspace_spawn_reservations WHERE workspace_id = ?")
+        .bind(workspace)
+        .execute(pool)
+        .await
+        .unwrap();
+    local_deployment::pty::kill_cli_tmux_session(workspace, "test:release_failure_cleanup").await;
+}
+
+fn tmux_client_count(socket: &str) -> usize {
+    let output = Command::new("tmux")
+        .args(["-L", socket, "list-clients", "-F", "#{client_pid}"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).lines().count()
+}
+
+async fn spawn_retries_executor_reservation_contention(
+    app: &axum::Router,
+    pool: &sqlx::SqlitePool,
+    workspace: Uuid,
+    prefix: &str,
+) {
+    use db::models::workspace_spawn_reservation::{
+        SpawnReservationHolder, WorkspaceSpawnReservation,
+    };
+    let reservation =
+        WorkspaceSpawnReservation::acquire(pool, workspace, SpawnReservationHolder::Executor)
+            .await
+            .unwrap()
+            .unwrap();
+    let app = app.clone();
+    let url = format!("{prefix}/launch");
+    let mut request = tokio::spawn(async move {
+        app.oneshot(Request::post(url).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut request)
+            .await
+            .is_err(),
+        "reservation contention must wait for the next acquisition attempt"
+    );
+    WorkspaceSpawnReservation::release(pool, workspace, &reservation.fence)
+        .await
+        .unwrap();
+    assert_eq!(request.await.unwrap().status(), StatusCode::OK);
 }
