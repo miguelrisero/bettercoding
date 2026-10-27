@@ -467,22 +467,7 @@ async fn prepare_cli_attach(
     let mut cli_launch_registration: Option<CliLaunchRegistration> = None;
     let pool = &deployment.db().pool;
 
-    // Resolve the uix session driving the handover. A mid-switch
-    // frontend can briefly send the PREVIOUS workspace's session id;
-    // honoring it would resume a foreign conversation (observed live
-    // as "No conversation found with session ID …" and the pane
-    // dropping to a bare shell), so any session that doesn't belong
-    // to this workspace is discarded in favor of the workspace's
-    // latest session.
-    let mut session = match requested_session_id {
-        Some(session_id) => Session::find_by_id(pool, session_id)
-            .await?
-            .filter(|s| s.workspace_id == workspace.id),
-        None => None,
-    };
-    if session.is_none() {
-        session = Session::find_latest_by_workspace_id(pool, workspace.id).await?;
-    }
+    let session = Session::find_for_cli(pool, workspace.id, requested_session_id).await?;
 
     // Run claude exactly where the coding agent runs: the workspace
     // root plus the session's relative agent_working_dir (mirrors
@@ -918,7 +903,11 @@ async fn spawn_terminal(
         )
         .await;
         if let Err(error) = registered {
-            kill_cli_tmux_session(registration.workspace_id).await;
+            kill_cli_tmux_session(
+                registration.workspace_id,
+                "spawn_terminal:registration_failed",
+            )
+            .await;
             if let Some(delivery) = &prompt_delivery {
                 remove_cli_prompt_file(delivery.workspace_id);
             }
@@ -1398,7 +1387,7 @@ async fn send_cli_text(
         .await?
         .ok_or_else(|| ApiError::BadRequest("Workspace not found".to_string()))?;
     let dir = PathBuf::from(workspace.container_ref.unwrap_or_default());
-    let session = Session::find_latest_by_workspace_id(pool, workspace_id).await?;
+    let session = Session::find_for_cli(pool, workspace_id, None).await?;
 
     // The program the attach path launches comes first; the other known
     // agents follow because the pane keeps whichever agent launched it even

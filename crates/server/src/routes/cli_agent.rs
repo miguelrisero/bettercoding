@@ -110,7 +110,7 @@ async fn cli_context(
         ));
     }
 
-    let session = Session::find_latest_by_workspace_id(pool, workspace_id).await?;
+    let session = Session::find_for_cli(pool, workspace_id, None).await?;
 
     // Mirrors the attach path: the agent must run where the coding agent runs,
     // because agents key conversation storage by cwd and a resume started from

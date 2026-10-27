@@ -580,14 +580,32 @@ async fn respawn_cli_tmux_pane_on(
     working_dir: &Path,
     bootstrap: &str,
 ) -> Result<(), PtyError> {
+    let workspace_id = workspace_id_from_cli_session_name(session_name);
+    tracing::info!(
+        ?workspace_id,
+        session_name,
+        socket,
+        caller = "restart_agent",
+        reason = "agent_absent",
+        "respawning CLI agent pane"
+    );
     let pane_id = resolve_cli_pane_id_on(socket, session_name).await?;
     let args = cli_respawn_argv_on(socket, &pane_id, working_dir, bootstrap);
 
     let output = run_cli_tmux_output_os(&args)
         .await
         .map_err(PtyError::CreateFailed)?;
+    tracing::info!(
+        ?workspace_id,
+        session_name,
+        pane_id,
+        socket,
+        caller = "restart_agent",
+        reason = "agent_absent",
+        success = output.status.success(),
+        "respawned CLI agent pane"
+    );
     if output.status.success() {
-        tracing::info!(session_name, pane_id, "respawned CLI agent pane");
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1713,33 +1731,36 @@ pub(crate) fn workspace_id_from_cli_session_name(name: &str) -> Option<Uuid> {
     Uuid::parse_str(hex).ok()
 }
 
-async fn kill_cli_tmux_sessions_on(workspace_id: Uuid, socket: &str) {
+async fn kill_cli_tmux_sessions_on(workspace_id: Uuid, socket: &str, reason: &str) -> bool {
+    tracing::info!(%workspace_id, socket, reason, "killing CLI tmux session");
     let session_name = cli_tmux_session_name(workspace_id);
-    match tokio::process::Command::new("tmux")
-        .args([
-            "-L",
-            socket,
-            "kill-session",
-            "-t",
-            &format!("={session_name}"),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
+    match run_cli_tmux_output(&[
+        "-L",
+        socket,
+        "kill-session",
+        "-t",
+        &format!("={session_name}"),
+    ])
+    .await
     {
-        // Non-success simply means no such session — the common case.
-        Ok(_) => {}
-        Err(e) => tracing::debug!("Failed to run tmux kill-session for {session_name}: {e}"),
+        Ok(output) => {
+            let status = output.status;
+            tracing::info!(%workspace_id, socket, reason, success = status.success(), "CLI tmux session kill completed");
+            status.success()
+        }
+        Err(error) => {
+            tracing::warn!(%workspace_id, socket, reason, %error, "CLI tmux session kill failed");
+            false
+        }
     }
 }
 
 /// Best-effort kill of a workspace's CLI tmux session so it cannot outlive
 /// its worktree. `=` forces exact-name matching; tmux `-t` is otherwise a
 /// prefix match.
-pub async fn kill_cli_tmux_session(workspace_id: Uuid) {
+pub async fn kill_cli_tmux_session(workspace_id: Uuid, reason: &str) {
     if tmux_available() {
-        kill_cli_tmux_sessions_on(workspace_id, cli_tmux_socket()).await;
+        kill_cli_tmux_sessions_on(workspace_id, cli_tmux_socket(), reason).await;
     }
     // Drop any transient prompt file AFTER the session is dead (covers the
     // never-attached case where the bootstrap never ran to self-delete it).
@@ -2296,18 +2317,6 @@ pub(crate) async fn cli_tmux_session_liveness(workspace_id: Uuid) -> CliTmuxHome
     cli_tmux_session_liveness_on(workspace_id, cli_tmux_socket()).await
 }
 
-async fn kill_cli_tmux_home_on(workspace_id: Uuid, socket: &str) -> bool {
-    run_cli_tmux(&[
-        "-L",
-        socket,
-        "kill-session",
-        "-t",
-        &format!("={}", cli_tmux_session_name(workspace_id)),
-    ])
-    .await
-    .is_ok()
-}
-
 /// How idle a CLI tmux home must be before a guarded kill may touch it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReapThresholds {
@@ -2352,15 +2361,17 @@ async fn reap_cli_tmux_session_with_liveness_on(
             attached,
             idle_secs,
         } if thresholds.permits(attached, idle_secs) => {
-            if !kill_cli_tmux_home_on(workspace_id, socket).await {
+            tracing::info!(
+                %workspace_id,
+                socket,
+                attached,
+                idle_secs,
+                caller = "reap_cli_tmux_session_with_liveness_on",
+                reason = "idle_threshold_reached",
+                "Reaper: killing an idle CLI tmux session"
+            );
+            if !kill_cli_tmux_sessions_on(workspace_id, socket, "idle_reaper").await {
                 return 0;
-            }
-            if attached {
-                tracing::info!(
-                    workspace_id = %workspace_id,
-                    idle_secs,
-                    "Reaper: killing an ATTACHED but long-silent CLI tmux session"
-                );
             }
             1
         }
@@ -4824,7 +4835,7 @@ mod tests {
             CliTmuxSessionProbe::Present
         );
 
-        kill_cli_tmux_sessions_on(workspace_id, &server.socket).await;
+        kill_cli_tmux_sessions_on(workspace_id, &server.socket, "test_explicit_cleanup").await;
 
         assert_eq!(
             probe_tmux_session_on(&server.socket, &session_name).await,

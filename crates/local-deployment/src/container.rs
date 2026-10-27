@@ -273,7 +273,7 @@ impl LocalContainerService {
     async fn cleanup_workspace(&self, workspace: &Workspace) {
         // The workspace's CLI tmux session (if any) must not outlive its
         // worktree. Best-effort.
-        crate::pty::kill_cli_tmux_session(workspace.id).await;
+        crate::pty::kill_cli_tmux_session(workspace.id, "cleanup_workspace:worktree_cleanup").await;
 
         let Some(container_ref) = &workspace.container_ref else {
             return;
@@ -1365,7 +1365,7 @@ impl ContainerService for LocalContainerService {
     }
 
     async fn kill_cli_session(&self, workspace_id: Uuid) {
-        crate::pty::kill_cli_tmux_session(workspace_id).await;
+        crate::pty::kill_cli_tmux_session(workspace_id, "kill_cli_session:explicit_cleanup").await;
     }
 
     fn db(&self) -> &DBService {
