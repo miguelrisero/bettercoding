@@ -29,6 +29,8 @@ pub mod remote;
 pub mod repo;
 pub mod scratch;
 pub mod search;
+pub mod session_adoption;
+pub mod session_handover;
 pub mod sessions;
 pub mod ssh_session;
 pub mod tags;
@@ -57,6 +59,8 @@ pub fn router(deployment: DeploymentImpl) -> IntoMakeService<Router> {
         .merge(sessions::router(&deployment))
         .merge(terminal::router())
         .merge(cli_agent::router())
+        .merge(session_handover::router())
+        .merge(session_adoption::router())
         .merge(loop_automation::router())
         .merge(native_transcripts::router())
         .route("/ssh-session", get(ssh_session::ssh_session_ws))

@@ -151,6 +151,7 @@ async fn main() -> Result<(), BetterCodingError> {
         .set_preview_proxy_port(actual_proxy_port)
         .expect("client preview proxy port already set");
 
+    routes::session_handover::start_monitor(deployment.clone(), shutdown_token.clone());
     let app_router = routes::router(deployment.clone());
 
     // Production only: open browser

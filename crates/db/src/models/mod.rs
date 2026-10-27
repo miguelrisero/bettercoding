@@ -18,6 +18,7 @@ pub mod repo;
 pub mod requests;
 pub mod scratch;
 pub mod session;
+pub mod session_handover;
 pub mod session_queued_message;
 pub mod tag;
 pub mod task;

@@ -109,18 +109,18 @@ pub struct SwitchCliSessionRequest {
 }
 
 /// Everything the two handlers need about a workspace's CLI launch.
-struct CliContext {
-    program: String,
-    working_dir: std::path::PathBuf,
+pub(super) struct CliContext {
+    pub(super) program: String,
+    pub(super) working_dir: std::path::PathBuf,
     resume_session_id: Option<String>,
     executor_active: bool,
-    spec: executors::executors::cli::CliLaunchSpec,
+    pub(super) spec: executors::executors::cli::CliLaunchSpec,
 }
 
 /// Resolve a workspace's CLI launch parameters the same way the terminal attach
 /// does, so a restart lands on the same agent, model, effort and directory as
 /// the launch it is replacing.
-async fn cli_context(
+pub(super) async fn cli_context(
     deployment: &DeploymentImpl,
     workspace_id: Uuid,
 ) -> Result<CliContext, ApiError> {

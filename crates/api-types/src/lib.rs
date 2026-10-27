@@ -11,6 +11,7 @@ pub mod attachment;
 pub mod auth;
 pub mod blob;
 pub mod export;
+pub mod handover;
 pub mod issue;
 pub mod issue_assignee;
 pub mod issue_comment;
