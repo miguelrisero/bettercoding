@@ -215,16 +215,20 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
   const { closeTerminalConnection } = useTerminal();
   const handleOpenInCli = useCallback(async () => {
     if (!sessionId || !workspaceId) return;
-    const result = await ConfirmDialog.show({
-      title: t('common:cliMode.openConversation'),
-      message: t('common:cliMode.switchConversationWarning'),
-      confirmText: t('common:cliMode.openConversation'),
-      cancelText: t('conversation.actions.cancel'),
-      variant: 'destructive',
-    });
-    if (result !== 'confirmed') return;
     try {
-      await cliAgentApi.switchSession(workspaceId, sessionId);
+      const status = await cliAgentApi.status(workspaceId);
+      const result = await ConfirmDialog.show({
+        title: t('common:cliMode.openConversation'),
+        message: t('common:cliMode.switchConversationWarning'),
+        confirmText: t('common:cliMode.openConversation'),
+        cancelText: t('conversation.actions.cancel'),
+        variant: 'destructive',
+      });
+      if (result !== 'confirmed') return;
+      await cliAgentApi.switchSession(workspaceId, sessionId, {
+        acknowledge_agent_shutdown: true,
+        expected_binding_id: status.binding_id,
+      });
       closeTerminalConnection(cliTabId(workspaceId));
       setMainPaneMode('cli');
     } catch (error) {

@@ -14,8 +14,13 @@
 //! two states are indistinguishable from the outside. Restarting automatically
 //! would yank a shell out from under someone mid-command.
 
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
+
 use axum::{
-    Router,
+    Json, Router,
     extract::{Path, State},
     response::Json as ResponseJson,
     routing::{get, post},
@@ -74,6 +79,7 @@ pub struct CliAgentStatus {
     pub blocker: Option<CliRestartBlocker>,
     /// The agent binary the liveness probe looked for, for diagnostics.
     pub program: String,
+    pub binding_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, Deserialize, TS)]
@@ -84,6 +90,22 @@ pub struct CliRestartResponse {
     /// Whether the restart resumed a known conversation. When false the agent
     /// falls back to its own continue/fresh behaviour.
     pub resumed: bool,
+}
+
+pub(super) fn cli_lifecycle_lock(workspace_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    locks.entry(workspace_id).or_default().clone()
+}
+
+#[derive(Debug, Deserialize, TS)]
+pub struct SwitchCliSessionRequest {
+    pub acknowledge_agent_shutdown: bool,
+    pub expected_binding_id: Option<Uuid>,
 }
 
 /// Everything the two handlers need about a workspace's CLI launch.
@@ -173,7 +195,11 @@ async fn get_agent_status(
     State(deployment): State<DeploymentImpl>,
     Path(workspace_id): Path<Uuid>,
 ) -> Result<ResponseJson<ApiResponse<CliAgentStatus>>, ApiError> {
+    let _guard = cli_lifecycle_lock(workspace_id).lock_owned().await;
     let context = cli_context(&deployment, workspace_id).await?;
+    let binding_id = CliPaneBinding::find_active_for_workspace(&deployment.db().pool, workspace_id)
+        .await?
+        .map(|binding| binding.id);
 
     if !cli_tmux_available() {
         return Ok(ResponseJson(ApiResponse::success(CliAgentStatus {
@@ -182,6 +208,7 @@ async fn get_agent_status(
             restartable: false,
             blocker: Some(CliRestartBlocker::Unknown),
             program: context.program,
+            binding_id,
         })));
     }
 
@@ -210,6 +237,7 @@ async fn get_agent_status(
         restartable: agent_alive == Some(false) && blocker.is_none(),
         blocker,
         program: context.program,
+        binding_id,
     })))
 }
 
@@ -217,6 +245,7 @@ async fn restart_agent(
     State(deployment): State<DeploymentImpl>,
     Path(workspace_id): Path<Uuid>,
 ) -> Result<ResponseJson<ApiResponse<CliRestartResponse>>, ApiError> {
+    let _guard = cli_lifecycle_lock(workspace_id).lock_owned().await;
     let context = cli_context(&deployment, workspace_id).await?;
 
     if context.executor_active {
@@ -275,6 +304,18 @@ async fn restart_agent(
     )
     .await
     .map_err(|error| ApiError::BadGateway(error.to_string()))?;
+    if let Some(binding) =
+        CliPaneBinding::find_active_for_workspace(&deployment.db().pool, workspace_id).await?
+    {
+        CliPaneBinding::record_launch(
+            &deployment.db().pool,
+            workspace_id,
+            binding.session_id,
+            context.resume_session_id.as_deref(),
+            binding.bound_via,
+        )
+        .await?;
+    }
     terminal::forget_ended_session(&deployment.db().pool, workspace_id).await;
 
     Ok(ResponseJson(ApiResponse::success(CliRestartResponse {
@@ -287,7 +328,14 @@ async fn restart_agent(
 async fn switch_agent_session(
     State(deployment): State<DeploymentImpl>,
     Path((workspace_id, session_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<SwitchCliSessionRequest>,
 ) -> Result<ResponseJson<ApiResponse<()>>, ApiError> {
+    if !request.acknowledge_agent_shutdown {
+        return Err(ApiError::BadRequest(
+            "Confirm the current CLI agent shutdown before switching".into(),
+        ));
+    }
+    let _guard = cli_lifecycle_lock(workspace_id).lock_owned().await;
     let pool = &deployment.db().pool;
     let session = Session::find_by_id(pool, session_id)
         .await?
@@ -300,6 +348,10 @@ async fn switch_agent_session(
                 ApiError::Conflict("Another writer is starting for this workspace".into())
             })?;
     let result = async {
+        let binding_id = CliPaneBinding::find_active_for_workspace(pool, workspace_id).await?.map(|binding| binding.id);
+        if binding_id != request.expected_binding_id {
+            return Err(ApiError::Conflict("The CLI agent changed. Confirm the conversation switch again".into()));
+        }
         if ExecutionProcess::has_running_coding_agent_for_session(pool, session.id).await? {
             return Err(ApiError::Conflict(
                 "Wait for the headless run to finish before opening this conversation in the CLI pane".into(),

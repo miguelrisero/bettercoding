@@ -25,6 +25,7 @@ import {
   UserSystemInfo,
   CliAgentStatus,
   CliRestartResponse,
+  SwitchCliSessionRequest,
   McpServerQuery,
   UpdateMcpServersBody,
   GetMcpServerResponse,
@@ -1181,11 +1182,12 @@ export const configApi = {
 export const cliAgentApi = {
   switchSession: async (
     workspaceId: string,
-    sessionId: string
+    sessionId: string,
+    acknowledgement: SwitchCliSessionRequest
   ): Promise<void> => {
     const response = await makeRequest(
       `/api/workspaces/${workspaceId}/cli/session/${sessionId}`,
-      { method: 'POST' }
+      { method: 'POST', body: JSON.stringify(acknowledgement) }
     );
     await handleApiResponse<void>(response);
     const launch = await makeRequest(

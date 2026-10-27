@@ -456,6 +456,59 @@ struct CliAttach {
 /// Resolve a CLI attach: the session, directory and agent launch, whether this
 /// attach launches a fresh pane, and the parked prompt it carries. Shared by
 /// the terminal WebSocket and the headless launch.
+async fn spawn_cli_terminal(
+    deployment: &DeploymentImpl,
+    workspace: &Workspace,
+    base_dir: &Path,
+    requested_session_id: Option<Uuid>,
+    connect_hidden: bool,
+    dimensions: (u16, u16),
+) -> Result<SpawnedTerminal, ApiError> {
+    let _guard = super::cli_agent::cli_lifecycle_lock(workspace.id)
+        .lock_owned()
+        .await;
+    let pool = &deployment.db().pool;
+    let reservation =
+        WorkspaceSpawnReservation::acquire(pool, workspace.id, SpawnReservationHolder::Cli)
+            .await?
+            .ok_or_else(|| {
+                ApiError::Conflict("Another writer is starting for this workspace".into())
+            })?;
+    let result = async {
+        let attach = prepare_cli_attach(
+            deployment,
+            workspace,
+            base_dir,
+            requested_session_id,
+            connect_hidden,
+        )
+        .await?;
+        let spawned = spawn_terminal(
+            deployment,
+            attach.working_dir,
+            dimensions,
+            attach.command,
+            attach.prompt_delivery,
+            attach.registration,
+        )
+        .await
+        .map_err(ApiError::Conflict)?;
+        if cli_tmux_available()
+            && let Err(error) = deployment
+                .pty()
+                .wait_for_cli_attach(spawned.session_id)
+                .await
+        {
+            let _ = deployment.pty().close_session(spawned.session_id).await;
+            return Err(ApiError::Pty(error));
+        }
+        Ok(spawned)
+    }
+    .await;
+    WorkspaceSpawnReservation::release(pool, workspace.id, &reservation.fence).await?;
+    result
+}
+
 async fn prepare_cli_attach(
     deployment: &DeploymentImpl,
     workspace: &Workspace,
@@ -525,15 +578,6 @@ async fn prepare_cli_attach(
                 "CLI mode requires a BetterCoding session for this workspace".to_string(),
             )
         })?;
-        let reservation =
-            WorkspaceSpawnReservation::acquire(pool, workspace.id, SpawnReservationHolder::Cli)
-                .await?
-                .ok_or_else(|| {
-                    ApiError::Conflict(
-                        "Another writer is starting for this workspace; retry the terminal attach"
-                            .to_string(),
-                    )
-                })?;
         if executor_active {
             remove_cli_resume_ready_file(workspace.id);
         }
@@ -547,7 +591,6 @@ async fn prepare_cli_attach(
                 CliPaneBoundVia::CliFresh
             },
             cwd: dir.to_string_lossy().into_owned(),
-            fence: reservation.fence,
         });
     }
 
@@ -727,12 +770,11 @@ async fn terminal_ws(
 
     let base_dir = workspace_dir(&attempt)?;
 
-    // Set inside the Cli arm when this attach carries the workspace's parked
-    // prompt; consumed by handle_terminal_ws to confirm delivery and clear it.
-    let mut prompt_delivery: Option<PromptDelivery> = None;
-    let mut cli_launch_registration: Option<CliLaunchRegistration> = None;
-
-    let (working_dir, command) = match query.mode {
+    let dimensions = (
+        query.cols.unwrap_or(DEFAULT_COLS),
+        query.rows.unwrap_or(DEFAULT_ROWS),
+    );
+    let shell_dir = match query.mode {
         TerminalMode::Cli => {
             // Regression tripwire for the stray-newline bug: a CLI attach must
             // always carry the pane's real fitted grid. Absent cols/rows mean
@@ -751,17 +793,7 @@ async fn terminal_ws(
                 );
             }
 
-            let attach = prepare_cli_attach(
-                &deployment,
-                &attempt,
-                &base_dir,
-                query.session_id,
-                query.hidden,
-            )
-            .await?;
-            prompt_delivery = attach.prompt_delivery;
-            cli_launch_registration = attach.registration;
-            (attach.working_dir, attach.command)
+            None
         }
         // Side terminals open in the repo for single-repo workspaces — the
         // most useful default for running project commands by hand.
@@ -785,23 +817,35 @@ async fn terminal_ws(
                     );
                 }
             }
-            (dir, PtyCommand::Shell)
+            Some(dir)
         }
     };
 
-    Ok(ws.on_upgrade(move |socket| {
-        handle_terminal_ws(
-            socket,
-            deployment,
-            working_dir,
-            (
-                query.cols.unwrap_or(DEFAULT_COLS),
-                query.rows.unwrap_or(DEFAULT_ROWS),
-            ),
-            command,
-            prompt_delivery,
-            cli_launch_registration,
-        )
+    Ok(ws.on_upgrade(move |mut socket| async move {
+        let spawned = match shell_dir {
+            Some(dir) => {
+                spawn_terminal(&deployment, dir, dimensions, PtyCommand::Shell, None, None)
+                    .await
+                    .map_err(ApiError::Conflict)
+            }
+            None => {
+                spawn_cli_terminal(
+                    &deployment,
+                    &attempt,
+                    &base_dir,
+                    query.session_id,
+                    query.hidden,
+                    dimensions,
+                )
+                .await
+            }
+        };
+        match spawned {
+            Ok(spawned) => handle_terminal_ws(socket, deployment, spawned).await,
+            Err(error) => {
+                let _ = send_error(&mut socket, &error.to_string()).await;
+            }
+        }
     }))
 }
 
@@ -836,7 +880,6 @@ struct CliLaunchRegistration {
     claude_session_id: Option<String>,
     bound_via: CliPaneBoundVia,
     cwd: String,
-    fence: String,
 }
 
 /// A spawned terminal: its PTY session and output stream.
@@ -880,14 +923,6 @@ async fn spawn_terminal(
             if let Some(delivery) = &prompt_delivery {
                 remove_cli_prompt_file(delivery.workspace_id);
             }
-            if let Some(registration) = &cli_launch_registration {
-                let _ = WorkspaceSpawnReservation::release(
-                    &deployment.db().pool,
-                    registration.workspace_id,
-                    &registration.fence,
-                )
-                .await;
-            }
             return Err(e.to_string());
         }
     };
@@ -900,12 +935,6 @@ async fn spawn_terminal(
             )),
             Err(error) => Err(ApiError::Pty(error)),
         };
-        let _ = WorkspaceSpawnReservation::release(
-            &deployment.db().pool,
-            registration.workspace_id,
-            &registration.fence,
-        )
-        .await;
         if let Err(error) = registered {
             kill_cli_tmux_session(
                 registration.workspace_id,
@@ -1003,32 +1032,13 @@ async fn spawn_terminal(
 async fn handle_terminal_ws(
     mut socket: MaybeSignedWebSocket,
     deployment: DeploymentImpl,
-    working_dir: PathBuf,
-    dimensions: (u16, u16),
-    command: PtyCommand,
-    prompt_delivery: Option<PromptDelivery>,
-    cli_launch_registration: Option<CliLaunchRegistration>,
+    spawned: SpawnedTerminal,
 ) {
     let SpawnedTerminal {
         session_id,
         mut output_rx,
         tripwire_session,
-    } = match spawn_terminal(
-        &deployment,
-        working_dir,
-        dimensions,
-        command,
-        prompt_delivery,
-        cli_launch_registration,
-    )
-    .await
-    {
-        Ok(spawned) => spawned,
-        Err(message) => {
-            let _ = send_error(&mut socket, &message).await;
-            return;
-        }
-    };
+    } = spawned;
 
     // FIX 4 input tripwire — bounds and rationale live on `AttachInputTripwire`.
     let mut tripwire = AttachInputTripwire::new(tripwire_session, session_id);
@@ -1444,17 +1454,15 @@ async fn launch_cli_agent(
     let base_dir = workspace_dir(&workspace)?;
     let already_up = cli_tmux_session_exists_checked(workspace_id).await?;
 
-    let attach = prepare_cli_attach(&deployment, &workspace, &base_dir, None, false).await?;
-    let spawned = spawn_terminal(
+    let spawned = spawn_cli_terminal(
         &deployment,
-        attach.working_dir,
+        &workspace,
+        &base_dir,
+        None,
+        false,
         (HEADLESS_COLS, HEADLESS_ROWS),
-        attach.command,
-        attach.prompt_delivery,
-        attach.registration,
     )
-    .await
-    .map_err(ApiError::Conflict)?;
+    .await?;
     let _ = deployment.pty().close_session(spawned.session_id).await;
 
     Ok(Json(ApiResponse::success(LaunchCliAgentResponse {

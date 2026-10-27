@@ -2996,6 +2996,31 @@ impl PtyService {
         Ok((session_id, output_rx))
     }
 
+    /// Confirm tmux accepted this attach before its lifecycle reservation is released.
+    pub async fn wait_for_cli_attach(&self, session_id: Uuid) -> Result<(), PtyError> {
+        let pid = self
+            .sessions
+            .lock()
+            .map_err(|e| PtyError::CreateFailed(e.to_string()))?
+            .get(&session_id)
+            .and_then(|session| session.tmux_client.as_ref().map(|client| client.pid))
+            .ok_or_else(|| PtyError::CreateFailed("CLI tmux client is missing".into()))?;
+        tokio::time::timeout(CLI_TMUX_COMMAND_TIMEOUT, async {
+            loop {
+                if cli_tmux_client_name_on(cli_tmux_socket(), pid)
+                    .await
+                    .map_err(PtyError::CreateFailed)?
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| PtyError::CreateFailed("CLI tmux attach was not confirmed".into()))?
+    }
+
     pub async fn write(&self, session_id: Uuid, data: &[u8]) -> Result<(), PtyError> {
         // Clone the per-session writer handle under the registry lock, then
         // do the PTY write OUTSIDE it. A PTY whose consumer stalls can block
@@ -3422,6 +3447,66 @@ mod tests {
             before, after,
             "respawn must replace the pane's process, giving it a fresh pty"
         );
+    }
+
+    #[tokio::test]
+    async fn respawn_failures_record_workspace_caller_and_outcome() {
+        use tracing::instrument::WithSubscriber;
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Writer {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self {
+                self.clone()
+            }
+        }
+        let server = scratch_tmux_server();
+        let workspace = Uuid::new_v4();
+        let session = cli_tmux_session_name(workspace);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(Writer(bytes.clone()))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        assert!(
+            respawn_cli_tmux_pane_on(&server.socket, &session, Path::new("/"), "true")
+                .with_subscriber(dispatch.clone())
+                .await
+                .is_err()
+        );
+        server.start_session(&session);
+        assert!(
+            respawn_cli_tmux_pane_on(&server.socket, &session, Path::new("/"), "invalid\0command")
+                .with_subscriber(dispatch)
+                .await
+                .is_err()
+        );
+        let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let failures: Vec<serde_json::Value> = logs
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["fields"]["success"] == false)
+            .collect();
+        assert_eq!(failures.len(), 2, "{logs}");
+        for failure in failures {
+            assert_eq!(failure["fields"]["caller"], "restart_agent");
+            assert!(
+                failure["fields"]["workspace_id"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&workspace.to_string())
+            );
+        }
     }
 
     /// A session that does not exist must be reported as such, not as a

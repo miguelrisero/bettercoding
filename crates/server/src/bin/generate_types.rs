@@ -136,6 +136,7 @@ fn generate_types_content() -> String {
         services::services::claude_transcript_ingest::UnassignedCliSession::decl(),
         server::routes::native_transcripts::AssignNativeCliSessionRequest::decl(),
         server::routes::cli_agent::CliAgentStatus::decl(),
+        server::routes::cli_agent::SwitchCliSessionRequest::decl(),
         server::routes::cli_agent::CliRestartBlocker::decl(),
         server::routes::cli_agent::CliRestartResponse::decl(),
         relay_types::StartSpake2EnrollmentRequest::decl(),

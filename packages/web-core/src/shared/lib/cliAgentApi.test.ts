@@ -20,13 +20,22 @@ describe('explicit CLI conversation handover', () => {
       request: async (path, options) => {
         expect(options?.method).toBe('POST');
         paths.push(path);
+        if (path.includes('/session/')) {
+          expect(JSON.parse(options?.body as string)).toEqual({
+            acknowledge_agent_shutdown: true,
+            expected_binding_id: 'binding-shown-before-confirmation',
+          });
+        }
         return Response.json({ success: true, data: null });
       },
       openWebSocket: () => {
         throw new Error('unexpected WebSocket');
       },
     });
-    await cliAgentApi.switchSession('workspace', 'selected-session');
+    await cliAgentApi.switchSession('workspace', 'selected-session', {
+      acknowledge_agent_shutdown: true,
+      expected_binding_id: 'binding-shown-before-confirmation',
+    });
     expect(paths).toEqual([
       '/api/workspaces/workspace/cli/session/selected-session',
       '/api/workspaces/workspace/cli/launch',
@@ -45,7 +54,10 @@ describe('explicit CLI conversation handover', () => {
       },
     });
     await expect(
-      cliAgentApi.switchSession('workspace', 'selected-session')
+      cliAgentApi.switchSession('workspace', 'selected-session', {
+        acknowledge_agent_shutdown: true,
+        expected_binding_id: null,
+      })
     ).rejects.toThrow('writer busy');
     expect(request).toHaveBeenCalledTimes(1);
   });
