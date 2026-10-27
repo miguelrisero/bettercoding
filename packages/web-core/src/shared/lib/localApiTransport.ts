@@ -15,6 +15,10 @@ export interface LocalApiWebSocketOptions {
 }
 
 export interface LocalApiTransport {
+  documentUrl?: (
+    path: string,
+    options?: LocalApiRequestOptions
+  ) => Promise<string>;
   request: (
     pathOrUrl: string,
     init?: LocalApiRequestOptions
@@ -96,10 +100,12 @@ const defaultTransport: LocalApiTransport = {
       relayHostId: _relayHostId,
       ...requestInit
     } = init;
+    void _hostScope;
+    void _hostId;
+    void _relayHostId;
     return fetch(pathOrUrl, requestInit);
   },
-  openWebSocket: (pathOrUrl, _options = {}) =>
-    new WebSocket(toAbsoluteWsUrl(pathOrUrl)),
+  openWebSocket: (pathOrUrl) => new WebSocket(toAbsoluteWsUrl(pathOrUrl)),
 };
 
 let transport: LocalApiTransport = defaultTransport;
@@ -113,6 +119,16 @@ export async function makeLocalApiRequest(
   init: LocalApiRequestOptions = {}
 ): Promise<Response> {
   return transport.request(resolveScopedPath(pathOrUrl, init), init);
+}
+
+export async function localApiDocumentUrl(
+  path: string,
+  options: LocalApiRequestOptions = {}
+): Promise<string> {
+  const scoped = resolveScopedPath(path, options);
+  return transport.documentUrl
+    ? transport.documentUrl(scoped, options)
+    : scoped;
 }
 
 export async function openLocalApiWebSocket(
