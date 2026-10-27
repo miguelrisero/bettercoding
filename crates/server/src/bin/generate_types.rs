@@ -11,6 +11,22 @@ fn generate_types_content() -> String {
 // If you are an AI, and you absolutely have to edit this file, please confirm with the user first.";
 
     let decls: Vec<String> = vec![
+        db::models::workspace_input::InputChoice::decl(),
+        db::models::workspace_input::InputContract::decl(),
+        db::models::workspace_input::InputAnswer::decl(),
+        db::models::workspace_input::InputContent::decl(),
+        db::models::workspace_input::CreateInput::decl(),
+        db::models::workspace_input::PublishInput::decl(),
+        db::models::workspace_input::AnswerInput::decl(),
+        db::models::workspace_input::InputStatusWrite::decl(),
+        db::models::workspace_input::WorkspaceInput::decl(),
+        db::models::workspace_input::InputVersion::decl(),
+        db::models::workspace_input::InputDetail::decl(),
+        db::models::workspace_input::InputEvent::decl(),
+        db::models::workspace_input::InputReceipt::decl(),
+        db::models::workspace_input::InputPage::decl(),
+        db::models::workspace_input::InputEventPage::decl(),
+        db::models::workspace_input::InputVerification::decl(),
         db::models::repo::Repo::decl(),
         db::models::project::Project::decl(),
         db::models::repo::UpdateRepo::decl(),

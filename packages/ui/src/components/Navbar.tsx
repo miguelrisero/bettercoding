@@ -101,7 +101,8 @@ export type MobileTabId =
   | 'logs'
   | 'preview'
   | 'git'
-  | 'files';
+  | 'files'
+  | 'inputs';
 
 export const MOBILE_TABS: { id: MobileTabId; icon: Icon; label: string }[] = [
   { id: 'workspaces', icon: LayoutIcon, label: 'Wksps' },
@@ -111,6 +112,7 @@ export const MOBILE_TABS: { id: MobileTabId; icon: Icon; label: string }[] = [
   { id: 'preview', icon: DesktopIcon, label: 'Preview' },
   { id: 'git', icon: GitForkIcon, label: 'Git' },
   { id: 'files', icon: FolderIcon, label: 'Files' },
+  { id: 'inputs', icon: ChatsTeardropIcon, label: 'Inputs' },
 ];
 
 export interface NavbarBreadcrumbItem {

@@ -6,6 +6,7 @@ import { PostHogProvider } from "posthog-js/react";
 import { AppRouter } from "@remote/app/entry/App";
 import { RemoteAuthProvider } from "@remote/app/providers/RemoteAuthProvider";
 import { getIdentity } from "@remote/shared/lib/api";
+import { inputDocumentUrl } from "@remote/shared/lib/inputDocumentUrl";
 import { getToken, triggerRefresh } from "@remote/shared/lib/auth/tokenManager";
 import "@remote/app/styles/index.css";
 import "@/i18n";
@@ -33,6 +34,7 @@ setRelayApiBase(
     window.location.origin,
 );
 setLocalApiTransport({
+  documentUrl: inputDocumentUrl,
   request: requestLocalApiViaWebRtc,
   openWebSocket: openLocalApiWebSocketViaWebRtc,
 });

@@ -24,5 +24,6 @@ pub mod tag;
 pub mod task;
 pub mod workspace;
 pub mod workspace_cli_activity;
+pub mod workspace_input;
 pub mod workspace_repo;
 pub mod workspace_spawn_reservation;

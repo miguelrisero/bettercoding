@@ -10,6 +10,7 @@ pub mod file_policy;
 pub mod files;
 pub mod gh_cli_setup;
 pub mod git;
+pub mod inputs;
 pub mod integration;
 pub mod links;
 pub mod pr;
@@ -39,6 +40,7 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
         .nest("/execution", execution::router())
         .nest("/integration", integration::router())
         .nest("/repos", repos::router())
+        .nest("/inputs", inputs::router(deployment))
         .nest("/pull-requests", pr::router())
         .layer(from_fn_with_state(
             deployment.clone(),

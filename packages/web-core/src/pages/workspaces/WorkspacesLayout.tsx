@@ -31,6 +31,10 @@ import {
   type WorkspacesMainContainerHandle,
 } from './WorkspacesMainContainer';
 import { RightSidebar } from './RightSidebar';
+import {
+  WorkspaceInputsContainer,
+  WorkspaceInputViewer,
+} from './WorkspaceInputsContainer';
 import { WorkspaceFilesContainer } from './WorkspaceFilesContainer';
 import { ChangesPanelContainer } from './ChangesPanelContainer';
 import { CreateChatBoxContainer } from '@/shared/components/CreateChatBoxContainer';
@@ -477,6 +481,19 @@ export function WorkspacesLayout() {
                 <WorkspaceFilesContainer workspaceId={selectedWorkspace.id} />
               )}
             </div>
+            <div
+              className={cn(
+                'flex-1 min-h-0 overflow-auto',
+                mobileTab !== 'inputs' && 'hidden'
+              )}
+            >
+              {selectedWorkspace && (
+                <WorkspaceInputsContainer
+                  key={selectedWorkspace.id}
+                  workspaceId={selectedWorkspace.id}
+                />
+              )}
+            </div>
           </div>
         </ChangesViewProvider>
       </ReviewProvider>
@@ -484,6 +501,12 @@ export function WorkspacesLayout() {
 
     return (
       <div className="flex flex-1 min-h-0 h-full">
+        {selectedWorkspace && (
+          <WorkspaceInputViewer
+            key={selectedWorkspace.id}
+            workspaceId={selectedWorkspace.id}
+          />
+        )}
         <div className="flex-1 min-w-0 h-full">
           {isCreateMode ? (
             <CreateModeProvider
@@ -570,6 +593,12 @@ export function WorkspacesLayout() {
 
   return (
     <div className="flex flex-1 min-h-0 h-full">
+      {selectedWorkspace && (
+        <WorkspaceInputViewer
+          key={selectedWorkspace.id}
+          workspaceId={selectedWorkspace.id}
+        />
+      )}
       {isLeftSidebarVisible && (
         <div className="w-[300px] shrink-0 h-full overflow-hidden">
           <WorkspacesSidebarContainer onScrollToBottom={handleScrollToBottom} />

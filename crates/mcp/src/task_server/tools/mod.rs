@@ -39,6 +39,7 @@ impl ToolError {
 mod context;
 mod files;
 mod handovers;
+mod inputs;
 mod issue_assignees;
 mod issue_relationships;
 mod issue_tags;
@@ -55,6 +56,7 @@ impl McpServer {
         Self::context_tools_router()
             + Self::files_tools_router()
             + Self::handover_tools_router()
+            + Self::inputs_tools_router()
             + Self::workspaces_tools_router()
             + Self::workspace_agents_tools_router()
             + Self::organizations_tools_router()
@@ -70,6 +72,7 @@ impl McpServer {
     pub fn orchestrator_mode_router() -> rmcp::handler::server::tool::ToolRouter<Self> {
         let mut router = Self::context_tools_router()
             + Self::files_tools_router()
+            + Self::inputs_tools_router()
             + Self::workspaces_tools_router()
             + Self::session_tools_router();
         router.remove_route("list_workspaces");
@@ -442,6 +445,12 @@ mod tests {
         let expected = BTreeSet::from([
             "create_session".to_string(),
             "file_link".to_string(),
+            "create_input".to_string(),
+            "update_input".to_string(),
+            "list_inputs".to_string(),
+            "get_input".to_string(),
+            "get_input_events".to_string(),
+            "set_input_status".to_string(),
             "get_context".to_string(),
             "get_execution".to_string(),
             "list_sessions".to_string(),
