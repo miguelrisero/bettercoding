@@ -204,6 +204,18 @@ export type CliPaneBoundVia = "cli-resume" | "cli-fresh";
 
 export type CliPaneBinding = { id: string, workspace_id: string, session_id: string, claude_session_id: string | null, bound_via: CliPaneBoundVia, created_at: string, released_at: string | null, };
 
+export type AdoptWorkspaceSessionRequest = { workspace_id: string, expected_binding_id: string, expected_session_id: string, expected_native_session_id: string | null, session_id: string, native_session_id: string, expected_pane_id: string, expected_pid: number, expected_start_time: bigint, };
+
+export type AdoptWorkspaceSessionResponse = { workspace_id: string, binding_id: string, session_id: string, native_session_id: string, pane_id: string, pid: number, start_time: bigint, };
+
+export type HandoverWorkspaceSessionRequest = { workspace_id: string, expected_binding_id: string, successor_session_id: string, initial_prompt: string, fallback_session_id: string, confirm_deadline_secs: number, request_id: string, };
+
+export type HandoverPhase = "starting" | "awaiting_confirmation" | "confirmed" | "rolled_back" | "failed";
+
+export type HandoverResponse = { operation_id: string, workspace_id: string, predecessor_session_id: string, successor_session_id: string, successor_native_session_id: string, phase: HandoverPhase, deadline_at: string, binding_id: string, fallback_session_id: string, confirmed_at: string | null, failure: string | null, };
+
+export type ConfirmHandoverResponse = { operation_id: string, phase: HandoverPhase, confirmed_at: string, successor_session_id: string, successor_native_session_id: string, binding_id: string, };
+
 export type SpawnReservationHolder = "executor" | "cli";
 
 export type WorkspaceSpawnReservation = { workspace_id: string, holder: SpawnReservationHolder, fence: string, created_at: string, expires_at: string, };
