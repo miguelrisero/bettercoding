@@ -1,5 +1,7 @@
 {
   "cliMode": {
+    "openConversation": "Open this conversation in CLI",
+    "switchConversationWarning": "This closes the current CLI agent, including any work in progress. Continue with the selected conversation?",
     "agentRestart": "Restart agent",
     "agentRestarting": "Restarting…",
     "agentRunningBody": "The coding agent is running this task in chat. The terminal will take over with the same conversation as soon as it finishes — no need to repeat the prompt here.",

@@ -34,6 +34,8 @@ pub enum PtyCommand {
         /// staged prompt-file path are both derived from it
         /// ([`cli_tmux_session_name`], [`write_cli_prompt_file`]).
         workspace_id: Uuid,
+        /// An existing-pane attach must never create a replacement without a reservation.
+        attach_only: bool,
         /// claude's own session UUID to resume (the workspace's selected uix
         /// chat). When set, the bootstrap runs `claude --resume <id>` so CLI
         /// mode joins the *exact* conversation the chat UI is showing, and
@@ -560,6 +562,7 @@ pub async fn respawn_cli_tmux_pane(
     bootstrap: &str,
 ) -> Result<(), PtyError> {
     if !tmux_available() {
+        tracing::warn!(%workspace_id, caller = "restart_agent", success = false, error = "tmux unavailable", "CLI pane respawn failed");
         return Err(PtyError::CreateFailed("tmux is not available".to_string()));
     }
     // A restart launches the agent exactly like a fresh attach does, so it
@@ -580,14 +583,38 @@ async fn respawn_cli_tmux_pane_on(
     working_dir: &Path,
     bootstrap: &str,
 ) -> Result<(), PtyError> {
-    let pane_id = resolve_cli_pane_id_on(socket, session_name).await?;
+    let workspace_id = workspace_id_from_cli_session_name(session_name);
+    tracing::info!(
+        ?workspace_id,
+        session_name,
+        socket,
+        caller = "restart_agent",
+        reason = "agent_absent",
+        "respawning CLI agent pane"
+    );
+    let pane_id = resolve_cli_pane_id_on(socket, session_name).await.map_err(|error| {
+        tracing::warn!(?workspace_id, session_name, socket, caller = "restart_agent", success = false, %error, "CLI pane resolution failed");
+        error
+    })?;
     let args = cli_respawn_argv_on(socket, &pane_id, working_dir, bootstrap);
 
     let output = run_cli_tmux_output_os(&args)
         .await
-        .map_err(PtyError::CreateFailed)?;
+        .map_err(|error| {
+            tracing::warn!(?workspace_id, session_name, socket, caller = "restart_agent", success = false, %error, "CLI pane respawn command failed");
+            PtyError::CreateFailed(error)
+        })?;
+    tracing::info!(
+        ?workspace_id,
+        session_name,
+        pane_id,
+        socket,
+        caller = "restart_agent",
+        reason = "agent_absent",
+        success = output.status.success(),
+        "respawned CLI agent pane"
+    );
     if output.status.success() {
-        tracing::info!(session_name, pane_id, "respawned CLI agent pane");
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1251,6 +1278,7 @@ fn owned_cli_tmux_target_on(workspace_id: Uuid, socket: &str) -> CliTmuxTarget {
 /// directory and bootstrap for a session that does not exist yet.
 struct CliTmuxArgv<'a> {
     workspace_id: Uuid,
+    attach_only: bool,
     socket: &'a str,
     conf: Option<&'a Path>,
     connect_hidden: bool,
@@ -1261,6 +1289,7 @@ struct CliTmuxArgv<'a> {
 fn cli_tmux_argv_on(input: CliTmuxArgv<'_>) -> Vec<std::ffi::OsString> {
     let CliTmuxArgv {
         workspace_id,
+        attach_only,
         socket,
         conf,
         connect_hidden,
@@ -1271,6 +1300,17 @@ fn cli_tmux_argv_on(input: CliTmuxArgv<'_>) -> Vec<std::ffi::OsString> {
     if let Some(conf) = conf {
         args.push("-f".into());
         args.push(conf.as_os_str().to_owned());
+    }
+    if attach_only {
+        args.push("attach-session".into());
+        if connect_hidden {
+            args.extend(["-f".into(), "ignore-size".into()]);
+        }
+        args.extend([
+            "-t".into(),
+            format!("={}", cli_tmux_session_name(workspace_id)).into(),
+        ]);
+        return args;
     }
     args.push("new-session".into());
     if connect_hidden {
@@ -1713,33 +1753,36 @@ pub(crate) fn workspace_id_from_cli_session_name(name: &str) -> Option<Uuid> {
     Uuid::parse_str(hex).ok()
 }
 
-async fn kill_cli_tmux_sessions_on(workspace_id: Uuid, socket: &str) {
+async fn kill_cli_tmux_sessions_on(workspace_id: Uuid, socket: &str, reason: &str) -> bool {
+    tracing::info!(%workspace_id, socket, reason, "killing CLI tmux session");
     let session_name = cli_tmux_session_name(workspace_id);
-    match tokio::process::Command::new("tmux")
-        .args([
-            "-L",
-            socket,
-            "kill-session",
-            "-t",
-            &format!("={session_name}"),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
+    match run_cli_tmux_output(&[
+        "-L",
+        socket,
+        "kill-session",
+        "-t",
+        &format!("={session_name}"),
+    ])
+    .await
     {
-        // Non-success simply means no such session — the common case.
-        Ok(_) => {}
-        Err(e) => tracing::debug!("Failed to run tmux kill-session for {session_name}: {e}"),
+        Ok(output) => {
+            let status = output.status;
+            tracing::info!(%workspace_id, socket, reason, success = status.success(), "CLI tmux session kill completed");
+            status.success()
+        }
+        Err(error) => {
+            tracing::warn!(%workspace_id, socket, reason, %error, "CLI tmux session kill failed");
+            false
+        }
     }
 }
 
 /// Best-effort kill of a workspace's CLI tmux session so it cannot outlive
 /// its worktree. `=` forces exact-name matching; tmux `-t` is otherwise a
 /// prefix match.
-pub async fn kill_cli_tmux_session(workspace_id: Uuid) {
+pub async fn kill_cli_tmux_session(workspace_id: Uuid, reason: &str) {
     if tmux_available() {
-        kill_cli_tmux_sessions_on(workspace_id, cli_tmux_socket()).await;
+        kill_cli_tmux_sessions_on(workspace_id, cli_tmux_socket(), reason).await;
     }
     // Drop any transient prompt file AFTER the session is dead (covers the
     // never-attached case where the bootstrap never ran to self-delete it).
@@ -2296,18 +2339,6 @@ pub(crate) async fn cli_tmux_session_liveness(workspace_id: Uuid) -> CliTmuxHome
     cli_tmux_session_liveness_on(workspace_id, cli_tmux_socket()).await
 }
 
-async fn kill_cli_tmux_home_on(workspace_id: Uuid, socket: &str) -> bool {
-    run_cli_tmux(&[
-        "-L",
-        socket,
-        "kill-session",
-        "-t",
-        &format!("={}", cli_tmux_session_name(workspace_id)),
-    ])
-    .await
-    .is_ok()
-}
-
 /// How idle a CLI tmux home must be before a guarded kill may touch it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReapThresholds {
@@ -2352,15 +2383,17 @@ async fn reap_cli_tmux_session_with_liveness_on(
             attached,
             idle_secs,
         } if thresholds.permits(attached, idle_secs) => {
-            if !kill_cli_tmux_home_on(workspace_id, socket).await {
+            tracing::info!(
+                %workspace_id,
+                socket,
+                attached,
+                idle_secs,
+                caller = "reap_cli_tmux_session_with_liveness_on",
+                reason = "idle_threshold_reached",
+                "Reaper: killing an idle CLI tmux session"
+            );
+            if !kill_cli_tmux_sessions_on(workspace_id, socket, "idle_reaper").await {
                 return 0;
-            }
-            if attached {
-                tracing::info!(
-                    workspace_id = %workspace_id,
-                    idle_secs,
-                    "Reaper: killing an ATTACHED but long-silent CLI tmux session"
-                );
             }
             1
         }
@@ -2696,6 +2729,13 @@ impl PtyService {
     ) -> Result<(Uuid, mpsc::Receiver<Vec<u8>>), PtyError> {
         // An unreadable tmux state fails closed before any client is spawned.
         tmux_probe_result.transpose()?;
+        let attach_only = matches!(
+            &command,
+            PtyCommand::TmuxCli {
+                attach_only: true,
+                ..
+            }
+        );
         let session_id = Uuid::new_v4();
         let (output_tx, output_rx) = mpsc::channel(OUTPUT_CHANNEL_CAPACITY);
         let shell = get_interactive_shell().await;
@@ -2740,6 +2780,7 @@ impl PtyService {
                     deferred_prompt_pending,
                     connect_hidden,
                     spec,
+                    ..
                 } if tmux_available() => (
                     Some(*workspace_id),
                     resume_session_id.clone(),
@@ -2824,6 +2865,7 @@ impl PtyService {
 
                 let argv = cli_tmux_argv_on(CliTmuxArgv {
                     workspace_id,
+                    attach_only,
                     socket,
                     conf: conf.as_deref(),
                     connect_hidden: tmux_connect_hidden,
@@ -2976,6 +3018,31 @@ impl PtyService {
             .insert(session_id, result);
 
         Ok((session_id, output_rx))
+    }
+
+    /// Confirm tmux accepted this attach before its lifecycle reservation is released.
+    pub async fn wait_for_cli_attach(&self, session_id: Uuid) -> Result<(), PtyError> {
+        let pid = self
+            .sessions
+            .lock()
+            .map_err(|e| PtyError::CreateFailed(e.to_string()))?
+            .get(&session_id)
+            .and_then(|session| session.tmux_client.as_ref().map(|client| client.pid))
+            .ok_or_else(|| PtyError::CreateFailed("CLI tmux client is missing".into()))?;
+        tokio::time::timeout(CLI_TMUX_COMMAND_TIMEOUT, async {
+            loop {
+                if cli_tmux_client_name_on(cli_tmux_socket(), pid)
+                    .await
+                    .map_err(PtyError::CreateFailed)?
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| PtyError::CreateFailed("CLI tmux attach was not confirmed".into()))?
     }
 
     pub async fn write(&self, session_id: Uuid, data: &[u8]) -> Result<(), PtyError> {
@@ -3406,6 +3473,66 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn respawn_failures_record_workspace_caller_and_outcome() {
+        use tracing::instrument::WithSubscriber;
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Writer {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self {
+                self.clone()
+            }
+        }
+        let server = scratch_tmux_server();
+        let workspace = Uuid::new_v4();
+        let session = cli_tmux_session_name(workspace);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(Writer(bytes.clone()))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        assert!(
+            respawn_cli_tmux_pane_on(&server.socket, &session, Path::new("/"), "true")
+                .with_subscriber(dispatch.clone())
+                .await
+                .is_err()
+        );
+        server.start_session(&session);
+        assert!(
+            respawn_cli_tmux_pane_on(&server.socket, &session, Path::new("/"), "invalid\0command")
+                .with_subscriber(dispatch)
+                .await
+                .is_err()
+        );
+        let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let failures: Vec<serde_json::Value> = logs
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["fields"]["success"] == false)
+            .collect();
+        assert_eq!(failures.len(), 2, "{logs}");
+        for failure in failures {
+            assert_eq!(failure["fields"]["caller"], "restart_agent");
+            assert!(
+                failure["fields"]["workspace_id"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&workspace.to_string())
+            );
+        }
+    }
+
     /// A session that does not exist must be reported as such, not as a
     /// successful no-op.
     #[tokio::test]
@@ -3494,10 +3621,37 @@ mod tests {
     }
 
     #[test]
+    fn attach_only_argv_cannot_create_a_session() {
+        let workspace = Uuid::new_v4();
+        let args = argv_strings(cli_tmux_argv_on(CliTmuxArgv {
+            workspace_id: workspace,
+            attach_only: true,
+            socket: "bc-attach-only-test",
+            conf: None,
+            connect_hidden: true,
+            working_dir: Path::new("/"),
+            bootstrap: "must-not-execute",
+        }));
+        assert_eq!(
+            args,
+            [
+                "-L",
+                "bc-attach-only-test",
+                "attach-session",
+                "-f",
+                "ignore-size",
+                "-t",
+                &format!("={}", cli_tmux_session_name(workspace))
+            ]
+        );
+    }
+
+    #[test]
     fn argv_uses_socket_conf_and_attach_or_create() {
         let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
         let args = argv_strings(cli_tmux_argv_on(CliTmuxArgv {
             workspace_id: id,
+            attach_only: false,
             socket: "bc-b2-test-current",
             conf: Some(Path::new("/tmp/bc-cli.conf")),
             connect_hidden: true,
@@ -4562,6 +4716,7 @@ mod tests {
         let workspace_id = Uuid::new_v4();
         let command = PtyCommand::TmuxCli {
             workspace_id,
+            attach_only: false,
             resume_session_id: None,
             busy_wait_for_resume: false,
             initial_prompt: None,
@@ -4824,7 +4979,7 @@ mod tests {
             CliTmuxSessionProbe::Present
         );
 
-        kill_cli_tmux_sessions_on(workspace_id, &server.socket).await;
+        kill_cli_tmux_sessions_on(workspace_id, &server.socket, "test_explicit_cleanup").await;
 
         assert_eq!(
             probe_tmux_session_on(&server.socket, &session_name).await,

@@ -94,7 +94,7 @@ pub fn spawn_rename_propagation(pool: SqlitePool, workspace_id: Uuid, name: Stri
 }
 
 async fn propagate_rename(pool: &SqlitePool, workspace_id: Uuid, name: &str) -> Result<(), String> {
-    let Some(session) = Session::find_latest_by_workspace_id(pool, workspace_id)
+    let Some(session) = Session::find_for_cli(pool, workspace_id, None)
         .await
         .map_err(|e| e.to_string())?
     else {

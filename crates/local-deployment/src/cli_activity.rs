@@ -15,8 +15,8 @@
 //! A CLI-mode claude also reports its own phase through its hooks. Where a
 //! workspace has a fresh report, that phase decides the bucket and the pane
 //! heuristics above are not consulted: the agent knows whether it is working,
-//! and a user typing into the pane does not. Everything else (codex, a claude
-//! too old for the hooks) keeps the guess.
+//! and a user typing into the pane does not. Agents without a fresh report
+//! keep the guess.
 //!
 //! States are written to the DB only on transitions; the SQLite update hook
 //! then re-broadcasts the owning workspace's status patch, so the sidebar
@@ -38,7 +38,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::pty::{
-    CliClientPresence, PtyService, cli_tmux_socket, now_unix_secs,
+    CLI_AGENT_PROGRAMS, CliClientPresence, PtyService, cli_tmux_socket, now_unix_secs,
     refresh_cli_tmux_client_ignore_size, run_cli_tmux, run_cli_tmux_output, tmux_available,
     tmux_client_flags_supported, workspace_id_from_cli_session_name,
 };
@@ -187,47 +187,9 @@ fn parse_cli_client_line(line: &str) -> Option<TmuxClientRow> {
 /// Snapshot of the process table: pid → (parent pid, "is a claude process").
 type ProcSnapshot = HashMap<u32, (u32, bool)>;
 
-/// Scan /proc once per tick. A process counts as claude when its comm is
-/// `claude` (native binary) or it's a `node` process whose cmdline mentions
-/// claude (npm-shim installs).
+/// Scan /proc once per tick for every supported interactive agent.
 fn snapshot_processes() -> ProcSnapshot {
-    let mut map = ProcSnapshot::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return map;
-    };
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|n| n.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        // /proc/<pid>/stat: `pid (comm) state ppid ...` — comm may contain
-        // spaces or parens, so split around the LAST ')'.
-        let Some(open) = stat.find('(') else { continue };
-        let Some(close) = stat.rfind(')') else {
-            continue;
-        };
-        let comm = &stat[open + 1..close];
-        let mut rest = stat[close + 1..].split_whitespace();
-        let _state = rest.next();
-        let Some(ppid) = rest.next().and_then(|p| p.parse::<u32>().ok()) else {
-            continue;
-        };
-
-        let is_claude = comm == "claude"
-            || (comm == "node"
-                && std::fs::read_to_string(entry.path().join("cmdline"))
-                    .map(|c| c.contains("claude"))
-                    .unwrap_or(false));
-
-        map.insert(pid, (ppid, is_claude));
-    }
-    map
+    snapshot_processes_for(CLI_AGENT_PROGRAMS)
 }
 
 /// Whether `root` or any of its descendants is a claude process. Pure over
@@ -263,15 +225,14 @@ fn subtree_has_agent(root: u32, procs: &ProcSnapshot) -> bool {
     false
 }
 
-/// Same scan as [`snapshot_processes`], but matching an arbitrary agent binary
-/// instead of hard-coding claude.
+/// Scan the process table for the requested agent binaries.
 ///
 /// The interpreter case is the reason this cannot just compare `comm`: an
 /// npm-shim install runs as `node`, and a uv/pipx install as `python*`, with
 /// the real program name only visible in the cmdline. `cmdline` is read only
 /// for those interpreter processes, so the common case still costs one
 /// `stat` read per pid.
-fn snapshot_processes_for(program: &str) -> ProcSnapshot {
+fn snapshot_processes_for(programs: &[&str]) -> ProcSnapshot {
     const INTERPRETERS: [&str; 4] = ["node", "python", "python3", "bun"];
 
     let mut map = ProcSnapshot::new();
@@ -300,10 +261,10 @@ fn snapshot_processes_for(program: &str) -> ProcSnapshot {
             continue;
         };
 
-        let is_agent = comm == program
+        let is_agent = programs.contains(&comm)
             || (INTERPRETERS.contains(&comm)
                 && std::fs::read_to_string(entry.path().join("cmdline"))
-                    .map(|c| c.contains(program))
+                    .map(|c| programs.iter().any(|program| c.contains(program)))
                     .unwrap_or(false));
 
         map.insert(pid, (ppid, is_agent));
@@ -483,7 +444,7 @@ pub async fn probe_workspace_agent(workspace_id: Uuid, program: &str) -> AgentPr
         return AgentPresence::NoSession;
     }
 
-    let procs = snapshot_processes_for(program);
+    let procs = snapshot_processes_for(&[program]);
     if procs.is_empty() {
         // /proc was unreadable; every subtree would falsely look empty.
         return AgentPresence::Unknown;
@@ -1096,6 +1057,25 @@ mod tests {
             .iter()
             .map(|(pid, ppid, claude)| (*pid, (*ppid, *claude)))
             .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn poller_detects_live_codex_without_a_hook_report() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let program = temp.path().join("codex");
+        symlink("/bin/sleep", &program).unwrap();
+        let mut child = std::process::Command::new(program)
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let snapshot = snapshot_processes();
+        let alive = subtree_has_agent(child.id(), &snapshot);
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert!(alive, "the poller must see a live Codex process");
     }
 
     #[test]

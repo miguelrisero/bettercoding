@@ -1,5 +1,7 @@
 {
   "cliMode": {
+    "openConversation": "이 대화를 CLI에서 열기",
+    "switchConversationWarning": "현재 CLI 에이전트를 종료하며 진행 중인 작업도 중단됩니다. 선택한 대화로 계속하시겠습니까?",
     "agentRestart": "에이전트 다시 시작",
     "agentRestarting": "다시 시작 중…",
     "agentRunningBody": "코딩 에이전트가 채팅에서 이 작업을 실행 중입니다. 완료되면 터미널이 같은 대화를 이어받습니다 — 여기서 프롬프트를 반복할 필요가 없습니다.",

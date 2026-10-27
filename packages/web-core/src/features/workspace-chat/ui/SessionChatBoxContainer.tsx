@@ -67,7 +67,7 @@ import { useActionVisibilityContext } from '@/shared/hooks/useActionVisibilityCo
 import { PrCommentsDialog } from '@/shared/dialogs/tasks/PrCommentsDialog';
 import type { NormalizedComment } from '@bettercoding/ui/components/pr-comment-node';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
-import { sessionsApi } from '@/shared/lib/api';
+import { cliAgentApi, sessionsApi } from '@/shared/lib/api';
 import { RenameSessionDialog } from '@bettercoding/ui/components/RenameSessionDialog';
 import type { TurnNavigationItem } from '@bettercoding/ui/components/TurnNavigationPopup';
 import { ConfirmDialog } from '@bettercoding/ui/components/ConfirmDialog';
@@ -79,6 +79,8 @@ import {
   type DispatchNoticeKind,
 } from '../model/collaborationUiState';
 import { useTransientToast } from '@/shared/hooks/useTransientToast';
+import { cliTabId, useTerminal } from '@/shared/hooks/useTerminal';
+import { TerminalIcon } from '@phosphor-icons/react';
 import { DispatchConflictError } from '@/shared/lib/dispatchWithConflictResolution';
 
 /** Compute execution status from boolean flags */
@@ -208,8 +210,41 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
 
   const { executeAction } = useActions();
   const actionCtx = useActionVisibilityContext();
-  const { rightMainPanelMode, setRightMainPanelMode } =
+  const { rightMainPanelMode, setRightMainPanelMode, setMainPaneMode } =
     useWorkspacePanelState(workspaceId);
+  const { closeTerminalConnection } = useTerminal();
+  const handleOpenInCli = useCallback(async () => {
+    if (!sessionId || !workspaceId) return;
+    try {
+      const status = await cliAgentApi.status(workspaceId);
+      const result = await ConfirmDialog.show({
+        title: t('common:cliMode.openConversation'),
+        message: t('common:cliMode.switchConversationWarning'),
+        confirmText: t('common:cliMode.openConversation'),
+        cancelText: t('conversation.actions.cancel'),
+        variant: 'destructive',
+      });
+      if (result !== 'confirmed') return;
+      await cliAgentApi.switchSession(workspaceId, sessionId, {
+        acknowledge_agent_shutdown: true,
+        expected_binding_id: status.binding_id,
+      });
+      closeTerminalConnection(cliTabId(workspaceId));
+      setMainPaneMode('cli');
+    } catch (error) {
+      showToast(
+        error instanceof Error ? error.message : String(error),
+        'error'
+      );
+    }
+  }, [
+    sessionId,
+    workspaceId,
+    t,
+    closeTerminalConnection,
+    setMainPaneMode,
+    showToast,
+  ]);
 
   const handleViewCode = useCallback(() => {
     setRightMainPanelMode(
@@ -1243,7 +1278,19 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
         onRenameSession: handleRenameSession,
       }}
       toolbarActions={{
-        items: toolbarActionItems,
+        items: [
+          ...toolbarActionItems,
+          {
+            id: 'open-conversation-in-cli',
+            icon: TerminalIcon,
+            label: t('common:cliMode.openConversation'),
+            tooltip: t('common:cliMode.openConversation'),
+            disabled: !sessionId,
+            onClick: () => {
+              void handleOpenInCli();
+            },
+          },
+        ],
       }}
       onPrCommentClick={
         actionCtx.hasOpenPR ? handleInsertPrComments : undefined

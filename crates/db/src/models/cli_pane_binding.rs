@@ -149,13 +149,21 @@ impl CliPaneBinding {
     /// A pane that switches threads inside the Codex TUI (`/new`, `/resume`,
     /// `/fork`) records the thread it runs now, so this names the
     /// conversation the user last saw in the pane, which can be newer than
-    /// the executor's latest thread. Only Codex thread ids (UUIDv7) are
-    /// returned; a Claude pane keeps the executor-first resume order.
+    /// the executor's latest thread. Only Codex thread ids (UUIDv7) are returned.
     pub async fn latest_codex_pane_thread(
         pool: &SqlitePool,
         session_id: Uuid,
     ) -> Result<Option<String>, sqlx::Error> {
-        let sid: Option<String> = sqlx::query_scalar(
+        Ok(Self::latest_pane_session_id(pool, session_id)
+            .await?
+            .filter(|sid| is_codex_thread_id(sid)))
+    }
+
+    async fn latest_pane_session_id(
+        pool: &SqlitePool,
+        session_id: Uuid,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar(
             "SELECT b.claude_session_id FROM cli_pane_bindings b \
              WHERE b.session_id = ?1 AND b.claude_session_id IS NOT NULL \
                AND NOT EXISTS ( \
@@ -163,23 +171,22 @@ impl CliPaneBinding {
                    WHERE ep.session_id = ?1 AND ep.run_reason = 'codingagent' \
                      AND ep.dropped = FALSE \
                      AND julianday(ep.created_at) > julianday(b.created_at)) \
-             ORDER BY b.created_at DESC LIMIT 1",
+             ORDER BY b.created_at DESC, b.rowid DESC LIMIT 1",
         )
         .bind(session_id)
         .fetch_optional(pool)
-        .await?;
-        Ok(sid.filter(|sid| is_codex_thread_id(sid)))
+        .await
     }
 
-    /// The native session a CLI launch of `session_id` resumes: the Codex
-    /// thread its pane ran last, then the executor's latest turn, then the
+    /// The native session a CLI launch of `session_id` resumes: the
+    /// conversation its pane ran last, then the executor's latest turn, then the
     /// session's latest CLI link.
     pub async fn resume_session_id(
         pool: &SqlitePool,
         session_id: Uuid,
     ) -> Result<Option<String>, sqlx::Error> {
-        if let Some(thread) = Self::latest_codex_pane_thread(pool, session_id).await? {
-            return Ok(Some(thread));
+        if let Some(sid) = Self::latest_pane_session_id(pool, session_id).await? {
+            return Ok(Some(sid));
         }
         if let Some(info) = CodingAgentTurn::find_latest_session_info(pool, session_id).await? {
             return Ok(Some(info.session_id));

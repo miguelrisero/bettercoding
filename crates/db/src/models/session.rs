@@ -140,6 +140,35 @@ impl Session {
         .await
     }
 
+    /// Resolve the pane's session independently of headless side-task sessions.
+    /// Released bindings retain the conversation after a tmux session exits.
+    pub async fn find_for_cli(
+        pool: &SqlitePool,
+        workspace_id: Uuid,
+        requested_session_id: Option<Uuid>,
+    ) -> Result<Option<Self>, sqlx::Error> {
+        let bound = sqlx::query_as::<_, Self>(
+            "SELECT s.id, s.workspace_id, s.name, s.executor, s.agent_working_dir, \
+                    s.created_at, s.updated_at \
+             FROM cli_pane_bindings b JOIN sessions s ON s.id = b.session_id \
+             WHERE b.workspace_id = ?1 AND s.workspace_id = ?1 \
+             ORDER BY (b.released_at IS NULL) DESC, b.created_at DESC, b.rowid DESC LIMIT 1",
+        )
+        .bind(workspace_id)
+        .fetch_optional(pool)
+        .await?;
+        if bound.is_some() {
+            return Ok(bound);
+        }
+        if let Some(id) = requested_session_id
+            && let Some(session) = Self::find_by_id(pool, id).await?
+            && session.workspace_id == workspace_id
+        {
+            return Ok(Some(session));
+        }
+        Self::find_latest_by_workspace_id(pool, workspace_id).await
+    }
+
     /// Find the first-created session for a workspace.
     /// This is a temporary policy for orchestrator MCP session discovery.
     pub async fn find_first_by_workspace_id(
@@ -417,6 +446,173 @@ mod tests {
             agent_working_dir: agent_working_dir.map(str::to_string),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_selection_keeps_bound_agent_and_conversation_after_side_tasks_and_exit() {
+        use super::super::{
+            cli_pane_binding::{CliPaneBinding, CliPaneBoundVia},
+            workspace::{CreateWorkspace, Workspace},
+        };
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::run_migrations_for_tests(&pool).await.unwrap();
+        let workspace_id = Uuid::new_v4();
+        Workspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "main".into(),
+                name: None,
+            },
+            workspace_id,
+        )
+        .await
+        .unwrap();
+        let claude = Session::create(
+            &pool,
+            &CreateSession {
+                executor: Some("CLAUDE_CODE".into()),
+                name: None,
+            },
+            Uuid::new_v4(),
+            workspace_id,
+        )
+        .await
+        .unwrap();
+        let native_id = Uuid::new_v4().to_string();
+        let binding = CliPaneBinding::record_launch(
+            &pool,
+            workspace_id,
+            claude.id,
+            Some(&native_id),
+            CliPaneBoundVia::CliResume,
+        )
+        .await
+        .unwrap();
+        let codex = Session::create(
+            &pool,
+            &CreateSession {
+                executor: Some("CODEX".into()),
+                name: None,
+            },
+            Uuid::new_v4(),
+            workspace_id,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE sessions SET created_at = '2099-01-01 00:00:00' WHERE id = ?")
+            .bind(codex.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            Session::find_latest_by_workspace_id(&pool, workspace_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            codex.id
+        );
+        for requested in [None, Some(codex.id), Some(Uuid::new_v4())] {
+            let selected = Session::find_for_cli(&pool, workspace_id, requested)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(selected.id, claude.id);
+            assert_eq!(selected.executor.as_deref(), Some("CLAUDE_CODE"));
+            assert_eq!(
+                CliPaneBinding::resume_session_id(&pool, selected.id)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(native_id.as_str())
+            );
+        }
+        CliPaneBinding::release(&pool, binding.id).await.unwrap();
+        let selected = Session::find_for_cli(&pool, workspace_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.id, claude.id);
+        assert_eq!(
+            CliPaneBinding::resume_session_id(&pool, selected.id)
+                .await
+                .unwrap(),
+            Some(native_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_handover_discards_foreign_session_and_honors_local_session_without_binding() {
+        use super::super::workspace::{CreateWorkspace, Workspace};
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::run_migrations_for_tests(&pool).await.unwrap();
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            let workspace = Uuid::new_v4();
+            Workspace::create(
+                &pool,
+                &CreateWorkspace {
+                    branch: "main".into(),
+                    name: None,
+                },
+                workspace,
+            )
+            .await
+            .unwrap();
+            sessions.push(
+                Session::create(
+                    &pool,
+                    &CreateSession {
+                        executor: Some("CLAUDE_CODE".into()),
+                        name: None,
+                    },
+                    Uuid::new_v4(),
+                    workspace,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let local = &sessions[0];
+        let newer = Session::create(
+            &pool,
+            &CreateSession {
+                executor: Some("CODEX".into()),
+                name: None,
+            },
+            Uuid::new_v4(),
+            local.workspace_id,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE sessions SET created_at = '2099-01-01 00:00:00' WHERE id = ?")
+            .bind(newer.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (requested, expected) in [
+            (None, newer.id),
+            (Some(local.id), local.id),
+            (Some(sessions[1].id), newer.id),
+        ] {
+            assert_eq!(
+                Session::find_for_cli(&pool, local.workspace_id, requested)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                expected
+            );
         }
     }
 

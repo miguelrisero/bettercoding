@@ -435,7 +435,9 @@ blocker: CliRestartBlocker | null,
 /**
  * The agent binary the liveness probe looked for, for diagnostics.
  */
-program: string, };
+program: string, binding_id: string | null, };
+
+export type SwitchCliSessionRequest = { acknowledge_agent_shutdown: boolean, expected_binding_id: string | null, };
 
 export type CliRestartBlocker = "no_session" | "executor_running" | "unknown";
 

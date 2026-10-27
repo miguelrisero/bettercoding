@@ -783,6 +783,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       getTerminalInstance,
       unregisterTerminalInstance,
       createTerminalConnection,
+      closeTerminalConnection,
       getTerminalConnection,
       broadcastTerminalPresence,
     }),
@@ -798,6 +799,7 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
       getTerminalInstance,
       unregisterTerminalInstance,
       createTerminalConnection,
+      closeTerminalConnection,
       getTerminalConnection,
       broadcastTerminalPresence,
     ]

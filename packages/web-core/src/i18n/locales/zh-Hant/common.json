@@ -1,5 +1,7 @@
 {
   "cliMode": {
+    "openConversation": "在 CLI 中開啟此對話",
+    "switchConversationWarning": "這將關閉目前的 CLI 代理，包括所有進行中的工作。是否繼續使用所選對話？",
     "agentRestart": "重新啟動代理",
     "agentRestarting": "正在重新啟動…",
     "agentRunningBody": "編碼代理正在聊天中執行此任務。完成後終端將接管同一會話 — 無需在此重複提示。",

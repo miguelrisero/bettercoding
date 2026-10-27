@@ -70,6 +70,7 @@ export interface TerminalContextType {
     send: (data: string) => void;
     resize: (cols: number, rows: number) => void;
   };
+  closeTerminalConnection: (tabId: string) => void;
   getTerminalConnection: (tabId: string) => TerminalConnection | null;
   broadcastTerminalPresence: (tabId: string) => void;
 }
