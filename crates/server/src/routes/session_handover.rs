@@ -98,6 +98,13 @@ async fn begin(
             receipt(&op).map_err(json_error)?,
         )));
     }
+    let reservation =
+        WorkspaceSpawnReservation::acquire(pool, request.workspace_id, SpawnReservationHolder::Cli)
+            .await?
+            .ok_or_else(|| {
+                ApiError::Conflict("Another writer is starting for this workspace".into())
+            })?;
+    let result = async {
     if request.request_id.is_empty()
         || request.initial_prompt.trim().is_empty()
         || request.confirm_deadline_secs == 0
@@ -209,7 +216,7 @@ async fn begin(
         None,
         &fallback_exit,
         &[
-            ("BC_HANDOVER_CAPABILITY", ""),
+            ("BC_HANDOVER_CAPABILITY", &format!("{capability}-fallback")),
             ("BC_HANDOVER_OPERATION_ID", ""),
         ],
     )?;
@@ -223,29 +230,26 @@ async fn begin(
     let op = SessionHandover {
         operation_id,
         workspace_id: request.workspace_id,
-        request_id: request.request_id,
+        request_id: request.request_id.clone(),
         request_json,
         predecessor_session_id: binding.session_id,
         successor_session_id: successor.id,
         predecessor_binding_id: binding.id,
         binding_id: Uuid::new_v4(),
         successor_native_session_id: native_id,
-        fallback_session_id: request.fallback_session_id,
+        fallback_session_id: request.fallback_session_id.clone(),
         capability,
         phase: "starting".into(),
         deadline_at: Utc::now() + Duration::seconds(i64::from(request.confirm_deadline_secs)),
         confirmed_at: None,
         failure: None,
         rollback_started: false,
+        fallback_started_at: None,
+        fallback_ready_at: None,
+        fallback_pid: None,
+        fallback_start_time: None,
         launch_json: serde_json::to_string(&launch).map_err(json_error)?,
     };
-    let reservation =
-        WorkspaceSpawnReservation::acquire(pool, op.workspace_id, SpawnReservationHolder::Cli)
-            .await?
-            .ok_or_else(|| {
-                ApiError::Conflict("Another writer is starting for this workspace".into())
-            })?;
-    let result = async {
         op.insert(pool).await?;
         match respawn(
             &deployment,
@@ -271,7 +275,7 @@ async fn begin(
         )))
     }
     .await;
-    WorkspaceSpawnReservation::release(pool, op.workspace_id, &reservation.fence).await?;
+    WorkspaceSpawnReservation::release(pool, request.workspace_id, &reservation.fence).await?;
     result
 }
 
@@ -348,14 +352,23 @@ async fn rollback(
         .await?;
         return Ok(());
     }
-    let launch: Launch = serde_json::from_str(&op.launch_json).map_err(json_error)?;
-    if !op.rollback_started {
-        // Persist the rollback intent before respawn, so a restart repeats only the exact fallback.
-        sqlx::query("UPDATE session_handovers SET rollback_started = 1 WHERE operation_id = ?")
-            .bind(op.operation_id)
-            .execute(pool)
+    for session_id in [op.predecessor_session_id, op.successor_session_id] {
+        if ExecutionProcess::has_running_coding_agent_for_session(pool, session_id).await? {
+            op.set_phase(
+                pool,
+                "failed",
+                Some("Fallback refused: a headless writer owns a handover session"),
+            )
             .await?;
+            return Ok(());
+        }
     }
+    let launch: Launch = serde_json::from_str(&op.launch_json).map_err(json_error)?;
+    if op.fallback_started_at.is_some() {
+        return finish_fallback(deployment, op, Utc::now()).await;
+    }
+    sqlx::query("UPDATE session_handovers SET rollback_started = 1, fallback_started_at = ?, failure = ? WHERE operation_id = ?")
+        .bind(Utc::now()).bind(reason).bind(op.operation_id).execute(pool).await?;
     match respawn(
         deployment,
         op,
@@ -366,12 +379,9 @@ async fn rollback(
     .await
     {
         Ok(()) => {
-            // Keep the operation's fence until the fallback launch has been checked.
             let mut tx = pool.begin().await?;
             sqlx::query("UPDATE cli_pane_bindings SET session_id = ?, claude_session_id = ?, bound_via = 'cli-resume' WHERE id = ? AND released_at IS NULL")
                 .bind(op.predecessor_session_id).bind(&op.fallback_session_id).bind(op.binding_id).execute(&mut *tx).await?;
-            sqlx::query("UPDATE session_handovers SET phase = 'rolled_back', failure = ? WHERE operation_id = ?")
-                .bind(reason).bind(op.operation_id).execute(&mut *tx).await?;
             tx.commit().await?;
         }
         Err(error) => {
@@ -381,6 +391,85 @@ async fn rollback(
                 Some(&format!("{reason}; fallback failed: {error}")),
             )
             .await?
+        }
+    }
+    Ok(())
+}
+
+async fn finish_fallback(
+    deployment: &DeploymentImpl,
+    op: &SessionHandover,
+    now: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    let launch: Launch = serde_json::from_str(&op.launch_json).map_err(json_error)?;
+    let alive = native_agent_alive(op.workspace_id, "--resume", &op.fallback_session_id).await;
+    if launch.fallback_exit.exists() {
+        op.set_phase(
+            &deployment.db().pool,
+            "failed",
+            Some("Fallback failed during initialization: process exited"),
+        )
+        .await?;
+    } else if op.fallback_ready_at.is_some()
+        && alive
+        && op
+            .fallback_pid
+            .zip(op.fallback_start_time.as_deref())
+            .is_some_and(|(pid, start)| {
+                process_start_identity(pid as u32).as_deref() == Some(start)
+            })
+    {
+        op.set_phase(&deployment.db().pool, "rolled_back", op.failure.as_deref())
+            .await?;
+    } else {
+        let request: HandoverWorkspaceSessionRequest =
+            serde_json::from_str(&op.request_json).map_err(json_error)?;
+        if op.fallback_started_at.is_some_and(|at| {
+            now >= at + Duration::seconds(i64::from(request.confirm_deadline_secs))
+        }) {
+            op.set_phase(&deployment.db().pool, "failed", Some("Fallback needs recovery: initialization receipt deadline expired; process preserved")).await?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn process_start_identity(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    Some(
+        stat.rsplit_once(") ")?
+            .1
+            .split_whitespace()
+            .nth(19)?
+            .to_string(),
+    )
+}
+
+pub(super) async fn fallback_ready(
+    deployment: &DeploymentImpl,
+    workspace_id: Uuid,
+    native_id: &str,
+    capability: &str,
+) -> Result<(), ApiError> {
+    let Some((Some("claude"), processes)) =
+        cli_pane_agent_processes(workspace_id, &["claude"]).await
+    else {
+        return Ok(());
+    };
+    for process in processes {
+        if process.argv.as_ref().is_some_and(|argv| {
+            argv.windows(2)
+                .any(|pair| pair[0] == "--resume" && pair[1] == native_id)
+        }) && let Some(start) = process_start_identity(process.pid)
+        {
+            SessionHandover::record_fallback_ready(
+                &deployment.db().pool,
+                workspace_id,
+                native_id,
+                capability,
+                process.pid,
+                &start,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -465,6 +554,10 @@ pub async fn reconcile(deployment: &DeploymentImpl, now: DateTime<Utc>) -> Resul
                 Some("Handover binding was superseded; newer pane preserved"),
             )
             .await?;
+            continue;
+        }
+        if op.fallback_started_at.is_some() {
+            finish_fallback(deployment, &op, now).await?;
             continue;
         }
         let dead = matches!(

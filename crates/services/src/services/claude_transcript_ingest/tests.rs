@@ -3079,3 +3079,126 @@ async fn measure_backfill_on_copied_database() {
         );
     }
 }
+
+#[derive(Clone)]
+struct PausedFreshProbe {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+#[async_trait]
+impl CliWriterProbe for PausedFreshProbe {
+    async fn probe(
+        &self,
+        _: Uuid,
+        _: &Path,
+        _: Option<&str>,
+        _: Option<&CliPaneBinding>,
+        _: bool,
+    ) -> ProbeReport {
+        self.entered.notify_one();
+        self.release.notified().await;
+        writer_report(true, Some(true), SidEvidence::NoResumeArg, Some(true))
+    }
+}
+
+#[tokio::test]
+async fn cli_fresh_ingestion_cannot_retake_a_native_session_after_adoption() {
+    let temp = TempDir::new().unwrap();
+    let db = test_db().await;
+    let (workspace, old) = create_workspace_and_session(&db, temp.path()).await;
+    let target = Session::create(
+        &db.pool,
+        &CreateSession {
+            executor: Some("CLAUDE_CODE".into()),
+            name: None,
+        },
+        Uuid::new_v4(),
+        workspace.id,
+    )
+    .await
+    .unwrap();
+    let native = Uuid::new_v4().to_string();
+    let binding = CliPaneBinding::record_launch(
+        &db.pool,
+        workspace.id,
+        old.id,
+        Some(&native),
+        CliPaneBoundVia::CliFresh,
+    )
+    .await
+    .unwrap();
+    CliNativeFile::register(
+        &db.pool,
+        &RegisterCliNativeFile {
+            claude_session_id: &native,
+            dir_path: temp.path().to_str().unwrap(),
+            file_name: &format!("{native}.jsonl"),
+            discovered_workspace_id: Some(workspace.id),
+            dev: 1,
+            inode: 1,
+            observed_size: 0,
+            observed_mtime_ms: None,
+        },
+    )
+    .await
+    .unwrap();
+    let probe = PausedFreshProbe {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let service = Arc::new(ClaudeTranscriptIngest::new_with_probe(
+        db.clone(),
+        temp.path().join("projects"),
+        Arc::new(probe.clone()),
+    ));
+    let task = {
+        let service = service.clone();
+        let native = native.clone();
+        let cwd = temp.path().to_path_buf();
+        tokio::spawn(async move {
+            service
+                .try_auto_bind_cli_fresh(
+                    &native,
+                    &DirectoryContext {
+                        workspace_id: workspace.id,
+                        cwd,
+                    },
+                )
+                .await
+        })
+    };
+    probe.entered.notified().await;
+    assert!(
+        CliPaneBinding::adopt_session(
+            &db.pool,
+            binding.id,
+            old.id,
+            Some(&native),
+            &native,
+            target.id,
+            workspace.id,
+            temp.path().to_str().unwrap()
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+    probe.release.notify_one();
+    assert!(task.await.unwrap().unwrap().is_none());
+    assert_eq!(
+        ClaudeSessionLink::find(&db.pool, &native)
+            .await
+            .unwrap()
+            .unwrap()
+            .session_id,
+        target.id
+    );
+    assert_eq!(
+        CliPaneBinding::find_active_for_workspace(&db.pool, workspace.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .session_id,
+        target.id
+    );
+}

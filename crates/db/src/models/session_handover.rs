@@ -21,6 +21,10 @@ pub struct SessionHandover {
     pub confirmed_at: Option<DateTime<Utc>>,
     pub failure: Option<String>,
     pub rollback_started: bool,
+    pub fallback_started_at: Option<DateTime<Utc>>,
+    pub fallback_ready_at: Option<DateTime<Utc>>,
+    pub fallback_pid: Option<i64>,
+    pub fallback_start_time: Option<String>,
     pub launch_json: String,
 }
 
@@ -52,6 +56,20 @@ impl SessionHandover {
         .await
     }
 
+    /// SessionStart is the CLI initialization receipt; the active generation fences delayed hooks.
+    pub async fn record_fallback_ready(
+        pool: &SqlitePool,
+        workspace_id: Uuid,
+        native_id: &str,
+        capability: &str,
+        pid: u32,
+        start_time: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE session_handovers SET fallback_ready_at = ?, fallback_pid = ?, fallback_start_time = ? WHERE workspace_id = ? AND fallback_session_id = ? AND capability || '-fallback' = ? AND rollback_started = 1 AND fallback_started_at IS NOT NULL AND phase IN ('starting', 'awaiting_confirmation') AND EXISTS (SELECT 1 FROM cli_pane_bindings b WHERE b.id = session_handovers.binding_id AND b.released_at IS NULL)")
+            .bind(Utc::now()).bind(i64::from(pid)).bind(start_time).bind(workspace_id).bind(native_id).bind(capability).execute(pool).await?;
+        Ok(())
+    }
+
     /// Persist the recovery record and the successor binding before touching tmux.
     pub async fn insert(&self, pool: &SqlitePool) -> Result<(), sqlx::Error> {
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -62,6 +80,13 @@ impl SessionHandover {
         }
         sqlx::query("INSERT INTO cli_pane_bindings (id, workspace_id, session_id, claude_session_id, bound_via) VALUES (?, ?, ?, ?, 'cli-fresh')")
             .bind(self.binding_id).bind(self.workspace_id).bind(self.successor_session_id).bind(&self.successor_native_session_id).execute(&mut *tx).await?;
+        let launch: serde_json::Value = serde_json::from_str(&self.launch_json)
+            .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+        let cwd = launch["cwd"]
+            .as_str()
+            .ok_or_else(|| sqlx::Error::Protocol("Handover launch cwd missing".into()))?;
+        sqlx::query("INSERT INTO claude_session_links (claude_session_id, session_id, workspace_id, cwd, bound_via) VALUES (?, ?, ?, ?, 'cli-fresh')")
+            .bind(&self.successor_native_session_id).bind(self.successor_session_id).bind(self.workspace_id).bind(cwd).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO session_handovers (operation_id, workspace_id, request_id, request_json, predecessor_session_id, successor_session_id, predecessor_binding_id, binding_id, successor_native_session_id, fallback_session_id, capability, phase, deadline_at, launch_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?)")
             .bind(self.operation_id).bind(self.workspace_id).bind(&self.request_id).bind(&self.request_json)
             .bind(self.predecessor_session_id).bind(self.successor_session_id).bind(self.predecessor_binding_id).bind(self.binding_id)

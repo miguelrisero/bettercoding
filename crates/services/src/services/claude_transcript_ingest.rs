@@ -1785,22 +1785,17 @@ impl ClaudeTranscriptIngest {
         {
             return Ok(None);
         }
-        if binding.claude_session_id.is_none()
-            && !CliPaneBinding::bind_discovered_sid(&self.db.pool, binding.id, claude_session_id)
-                .await?
-        {
-            return Ok(None);
-        }
-        let mutation = ClaudeSessionLink::assign_cli(
+        CliPaneBinding::assign_discovered_session(
             &self.db.pool,
+            binding.id,
+            binding.claude_session_id.as_deref(),
             claude_session_id,
             binding.session_id,
             binding.workspace_id,
             &context.cwd.to_string_lossy(),
-            db::models::claude_session_link::ClaudeSessionBoundVia::CliFresh,
         )
-        .await?;
-        Ok(Some(mutation))
+        .await
+        .map_err(Into::into)
     }
 
     async fn apply_link_mutation(&self, mutation: &ClaudeSessionLinkMutation) {

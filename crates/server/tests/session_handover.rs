@@ -42,7 +42,14 @@ async fn request(
         .unwrap();
     let status = response.status();
     let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap())
+    (
+        status,
+        if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        },
+    )
 }
 
 struct Socket(String);
@@ -65,9 +72,13 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
     let fake = root.join("bin/claude");
     fs::write(&fake, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PWD/args\"\nprintf '%s' \"$BC_HANDOVER_CAPABILITY\" > \"$PWD/token\"\nprintf '%s' \"$$\" > \"$PWD/agent-pid\"\nwhile :; do /bin/sleep 1; done\n").unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let original_fake = fs::read(&fake).unwrap();
     unsafe {
         std::env::set_var("HOME", root.join("home"));
         std::env::set_var("SHELL", "/bin/sh");
+        std::env::set_var("ENABLE_CLI_HANDOVER", "1");
+        std::env::remove_var("DISABLE_CLI_COLLAB_ROUTING");
+        std::env::remove_var("DISABLE_CLI_TRANSCRIPT_INGEST");
         std::env::set_var(
             "PATH",
             format!(
@@ -96,8 +107,12 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
         "deadline",
         "restart",
         "newer",
+        "fallback_deadline",
+        "stale_fallback_identity",
+        "delayed_fallback_failure",
         "fallback_failure",
     ] {
+        fs::write(&fake, &original_fake).unwrap();
         let workspace = Workspace::create(
             pool,
             &CreateWorkspace {
@@ -113,6 +128,50 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
         Workspace::update_container_ref(pool, workspace.id, cwd.to_str().unwrap())
             .await
             .unwrap();
+        if scenario == "success" {
+            let repo_path = root.join("fixture-repo");
+            fs::create_dir(&repo_path).unwrap();
+            assert!(
+                Command::new("git")
+                    .args(["-C"])
+                    .arg(&repo_path)
+                    .args(["init", "-b", "main"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&repo_path)
+                    .args([
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "commit",
+                        "--allow-empty",
+                        "-m",
+                        "fixture"
+                    ])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let repo = db::models::repo::Repo::find_or_create(pool, &repo_path, "fixture")
+                .await
+                .unwrap();
+            db::models::workspace_repo::WorkspaceRepo::create_many(
+                pool,
+                workspace.id,
+                &[db::models::workspace_repo::CreateWorkspaceRepo {
+                    repo_id: repo.id,
+                    target_branch: "main".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        }
         let mut sessions = Vec::new();
         for _ in 0..3 {
             sessions.push(
@@ -196,6 +255,16 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
             StatusCode::CONFLICT
         );
         if scenario == "success" {
+            let (status, delivered) = request(
+                &app,
+                "POST",
+                &format!("/api/sessions/{}/follow-up", sessions[1].id),
+                json!({"prompt":"dashboard message", "executor_config":{"executor":"CLAUDE_CODE"}}),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{delivered}");
+            assert_eq!(delivered["data"]["outcome"], "routed_to_cli", "{delivered}");
             let (status, confirmed) =
                 request(&app, "POST", &confirm_url, json!({}), Some(&token)).await;
             assert_eq!(status, StatusCode::OK, "{confirmed}");
@@ -218,6 +287,32 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
                     .unwrap()
                     .phase,
                 "confirmed"
+            );
+            let (status, deleted) = request(
+                &app,
+                "DELETE",
+                &format!("/api/workspaces/{}", workspace.id),
+                json!({}),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{deleted}");
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while Workspace::find_by_id(pool, workspace.id)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                db::models::session_handover::SessionHandover::find(pool, operation_id)
+                    .await
+                    .unwrap()
+                    .is_none()
             );
             continue;
         }
@@ -320,6 +415,9 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
         if scenario == "fallback_failure" {
             fs::write(&fake, "#!/bin/sh\nexit 23\n").unwrap();
         }
+        if scenario == "delayed_fallback_failure" {
+            fs::write(&fake, "#!/bin/sh\nprintf '%s' \"$$\" > \"$PWD/agent-pid\"\nwhile :; do /bin/sleep 1; done\n").unwrap();
+        }
         if scenario == "deadline" {
             sqlx::query("UPDATE session_handovers SET deadline_at = ? WHERE operation_id = ?")
                 .bind(Utc::now() - Duration::seconds(1))
@@ -334,7 +432,7 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
                 StatusCode::CONFLICT
             );
         }
-        let now = if scenario == "crash" {
+        let now = if matches!(scenario, "crash" | "restart") {
             Utc::now()
         } else {
             Utc::now() + Duration::hours(1)
@@ -342,6 +440,92 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
         server::routes::session_handover::reconcile(&deployment, now)
             .await
             .unwrap();
+        if !matches!(scenario, "success" | "newer" | "fallback_failure") {
+            let pending = db::models::session_handover::SessionHandover::find(pool, operation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(pending.phase, "rolled_back");
+            if scenario == "delayed_fallback_failure" {
+                let pid = fs::read_to_string(cwd.join("agent-pid")).unwrap();
+                assert!(
+                    Command::new("kill")
+                        .args(["-KILL", &pid])
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                let launch: Value = serde_json::from_str(&pending.launch_json).unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while !std::path::Path::new(launch["fallback_exit"].as_str().unwrap()).exists()
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            } else if scenario == "fallback_deadline" {
+                let pid = fs::read_to_string(cwd.join("agent-pid")).unwrap();
+                server::routes::session_handover::reconcile(
+                    &deployment,
+                    pending.fallback_started_at.unwrap() + Duration::seconds(901),
+                )
+                .await
+                .unwrap();
+                assert!(std::path::Path::new(&format!("/proc/{}", pid.trim())).exists());
+            } else {
+                let (status, _) = request(
+                    &app,
+                    "POST",
+                    &format!("/api/workspaces/{}/cli-activity", workspace.id),
+                    json!({"hook_event_name":"SessionStart","session_id":native}),
+                    Some("stale-operation"),
+                )
+                .await;
+                assert_eq!(status, StatusCode::NO_CONTENT);
+                assert!(
+                    db::models::session_handover::SessionHandover::find(pool, operation_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .fallback_ready_at
+                        .is_none()
+                );
+                let (status, _) = request(
+                    &app,
+                    "POST",
+                    &format!("/api/workspaces/{}/cli-activity", workspace.id),
+                    json!({"hook_event_name":"SessionStart", "session_id":native}),
+                    Some(&format!("{token}-fallback")),
+                )
+                .await;
+                assert_eq!(status, StatusCode::NO_CONTENT);
+            }
+            if scenario == "stale_fallback_identity" {
+                sqlx::query("UPDATE session_handovers SET fallback_start_time = 'stale-process' WHERE operation_id = ?").bind(operation_id).execute(pool).await.unwrap();
+                server::routes::session_handover::reconcile(&deployment, Utc::now())
+                    .await
+                    .unwrap();
+                assert_ne!(
+                    db::models::session_handover::SessionHandover::find(pool, operation_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .phase,
+                    "rolled_back"
+                );
+                server::routes::session_handover::reconcile(
+                    &deployment,
+                    pending.fallback_started_at.unwrap() + Duration::seconds(901),
+                )
+                .await
+                .unwrap();
+            } else {
+                server::routes::session_handover::reconcile(&deployment, Utc::now())
+                    .await
+                    .unwrap();
+            }
+        }
         let saved = db::models::session_handover::SessionHandover::find(pool, operation_id)
             .await
             .unwrap()
@@ -360,13 +544,24 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
                 fs::read_to_string(cwd.join("args")).unwrap(),
                 "newer-pane-marker"
             );
-        } else if scenario == "fallback_failure" {
+        } else if matches!(scenario, "fallback_deadline" | "stale_fallback_identity") {
             assert_eq!(saved.phase, "failed");
-            assert!(saved.failure.unwrap().contains("fallback failed"));
+            assert!(saved.failure.unwrap().contains("needs recovery"));
+        } else if matches!(scenario, "fallback_failure" | "delayed_fallback_failure") {
+            assert_eq!(saved.phase, "failed");
+            assert!(
+                saved
+                    .failure
+                    .unwrap()
+                    .to_lowercase()
+                    .contains("fallback failed")
+            );
         } else {
             assert_eq!(saved.phase, "rolled_back", "{:?}", saved.failure);
             let args = fs::read_to_string(cwd.join("args")).unwrap();
-            assert!(args.contains(&format!("--resume\n{native}\n")), "{args}");
+            if scenario != "delayed_fallback_failure" {
+                assert!(args.contains(&format!("--resume\n{native}\n")), "{args}");
+            }
             let active = CliPaneBinding::find_active_for_workspace(pool, workspace.id)
                 .await
                 .unwrap()
@@ -380,6 +575,7 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
                 .0,
             StatusCode::CONFLICT
         );
+        fs::write(&fake, &original_fake).unwrap();
     }
     shutdown.cancel();
 }

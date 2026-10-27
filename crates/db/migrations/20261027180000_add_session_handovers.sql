@@ -1,10 +1,10 @@
 CREATE TABLE session_handovers (
     operation_id BLOB PRIMARY KEY NOT NULL,
-    workspace_id BLOB NOT NULL REFERENCES workspaces(id),
+    workspace_id BLOB NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     request_id TEXT NOT NULL,
     request_json TEXT NOT NULL,
-    predecessor_session_id BLOB NOT NULL REFERENCES sessions(id),
-    successor_session_id BLOB NOT NULL REFERENCES sessions(id),
+    predecessor_session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    successor_session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     predecessor_binding_id BLOB NOT NULL,
     binding_id BLOB NOT NULL,
     successor_native_session_id TEXT NOT NULL,
@@ -15,6 +15,10 @@ CREATE TABLE session_handovers (
     confirmed_at TEXT,
     failure TEXT,
     rollback_started INTEGER NOT NULL DEFAULT 0,
+    fallback_started_at TEXT,
+    fallback_ready_at TEXT,
+    fallback_pid INTEGER,
+    fallback_start_time TEXT,
     launch_json TEXT NOT NULL,
     UNIQUE(workspace_id, request_id)
 );

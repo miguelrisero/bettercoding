@@ -48,6 +48,13 @@ Startup reconciliation reads unfinished operations from SQLite.
 An interrupted launch triggers fallback recovery.
 A newer binding makes an older operation fail while preserving the current pane.
 The receipt reports fallback launch failures through `phase=failed` and `failure`.
+Fallback initialization requires a matching native `SessionStart` hook and a live process.
+Recovery retains its unfinished phase while it waits for that receipt.
+An exit before the initialization receipt makes recovery fail.
+The requested `confirm_deadline_secs` also bounds fallback initialization, counted from the persisted fallback launch time.
+An expired initialization deadline records failure and preserves the live process and operation journal.
+Recovery requires the matching native UUID, launch capability, PID and process start identity.
+The monitor commits `rolled_back` after initialization succeeds.
 
 ## Local identity boundary
 
