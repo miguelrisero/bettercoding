@@ -560,6 +560,7 @@ pub async fn respawn_cli_tmux_pane(
     bootstrap: &str,
 ) -> Result<(), PtyError> {
     if !tmux_available() {
+        tracing::warn!(%workspace_id, caller = "restart_agent", success = false, error = "tmux unavailable", "CLI pane respawn failed");
         return Err(PtyError::CreateFailed("tmux is not available".to_string()));
     }
     // A restart launches the agent exactly like a fresh attach does, so it
@@ -589,12 +590,18 @@ async fn respawn_cli_tmux_pane_on(
         reason = "agent_absent",
         "respawning CLI agent pane"
     );
-    let pane_id = resolve_cli_pane_id_on(socket, session_name).await?;
+    let pane_id = resolve_cli_pane_id_on(socket, session_name).await.map_err(|error| {
+        tracing::warn!(?workspace_id, session_name, socket, caller = "restart_agent", success = false, %error, "CLI pane resolution failed");
+        error
+    })?;
     let args = cli_respawn_argv_on(socket, &pane_id, working_dir, bootstrap);
 
     let output = run_cli_tmux_output_os(&args)
         .await
-        .map_err(PtyError::CreateFailed)?;
+        .map_err(|error| {
+            tracing::warn!(?workspace_id, session_name, socket, caller = "restart_agent", success = false, %error, "CLI pane respawn command failed");
+            PtyError::CreateFailed(error)
+        })?;
     tracing::info!(
         ?workspace_id,
         session_name,

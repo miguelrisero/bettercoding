@@ -584,14 +584,34 @@ mod tests {
             );
         }
         let local = &sessions[0];
-        for requested in [None, Some(local.id), Some(sessions[1].id)] {
+        let newer = Session::create(
+            &pool,
+            &CreateSession {
+                executor: Some("CODEX".into()),
+                name: None,
+            },
+            Uuid::new_v4(),
+            local.workspace_id,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE sessions SET created_at = '2099-01-01 00:00:00' WHERE id = ?")
+            .bind(newer.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (requested, expected) in [
+            (None, newer.id),
+            (Some(local.id), local.id),
+            (Some(sessions[1].id), newer.id),
+        ] {
             assert_eq!(
                 Session::find_for_cli(&pool, local.workspace_id, requested)
                     .await
                     .unwrap()
                     .unwrap()
                     .id,
-                local.id
+                expected
             );
         }
     }

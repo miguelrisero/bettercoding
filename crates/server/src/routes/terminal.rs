@@ -631,7 +631,11 @@ async fn prepare_cli_attach(
     // Either way the parked prompt is cleared only after delivery is
     // confirmed.
     let mut baked_prompt = None;
-    let mut deferred_prompt_pending = false;
+    let mut deferred_prompt_pending = CliPaneBinding::find_active_for_workspace(pool, workspace.id)
+        .await?
+        .is_some_and(|binding| {
+            binding.bound_via == CliPaneBoundVia::CliFresh && binding.claude_session_id.is_none()
+        });
     if let Some((peeked, claim, clear_session_id)) = carried {
         // Match the bootstrap's resume predicate EXACTLY (it filters the
         // id through is_uuid before resuming): a non-UUID resume id is

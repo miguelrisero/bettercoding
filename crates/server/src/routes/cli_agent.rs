@@ -21,13 +21,19 @@ use axum::{
     routing::{get, post},
 };
 use db::models::{
-    cli_pane_binding::CliPaneBinding, execution_process::ExecutionProcess, session::Session,
+    cli_pane_binding::{CliPaneBinding, CliPaneBoundVia},
+    execution_process::ExecutionProcess,
+    session::Session,
     workspace::Workspace,
+    workspace_spawn_reservation::{SpawnReservationHolder, WorkspaceSpawnReservation},
 };
 use deployment::Deployment;
 use local_deployment::{
     cli_activity::{AgentPresence, probe_workspace_agent},
-    pty::{CliRespawnClaim, cli_restart_bootstrap, cli_tmux_available, respawn_cli_tmux_pane},
+    pty::{
+        CliRespawnClaim, cli_restart_bootstrap, cli_tmux_available,
+        cli_tmux_session_exists_checked, kill_cli_tmux_session, respawn_cli_tmux_pane,
+    },
 };
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -277,8 +283,57 @@ async fn restart_agent(
     })))
 }
 
+/// Explicit chat-to-pane handover. Passive terminal attaches never call this route.
+async fn switch_agent_session(
+    State(deployment): State<DeploymentImpl>,
+    Path((workspace_id, session_id)): Path<(Uuid, Uuid)>,
+) -> Result<ResponseJson<ApiResponse<()>>, ApiError> {
+    let pool = &deployment.db().pool;
+    let session = Session::find_by_id(pool, session_id)
+        .await?
+        .filter(|session| session.workspace_id == workspace_id)
+        .ok_or_else(|| ApiError::BadRequest("Session does not belong to this workspace".into()))?;
+    let reservation =
+        WorkspaceSpawnReservation::acquire(pool, workspace_id, SpawnReservationHolder::Cli)
+            .await?
+            .ok_or_else(|| {
+                ApiError::Conflict("Another writer is starting for this workspace".into())
+            })?;
+    let result = async {
+        if ExecutionProcess::has_running_coding_agent_for_session(pool, session.id).await? {
+            return Err(ApiError::Conflict(
+                "Wait for the headless run to finish before opening this conversation in the CLI pane".into(),
+            ));
+        }
+        let native_id = CliPaneBinding::resume_session_id(pool, session.id).await?;
+        if cli_tmux_session_exists_checked(workspace_id).await? {
+            kill_cli_tmux_session(workspace_id, "switch_agent_session:explicit_handover").await;
+            if cli_tmux_session_exists_checked(workspace_id).await? {
+                return Err(ApiError::BadGateway(
+                    "The CLI pane could not close for the conversation switch".into(),
+                ));
+            }
+        }
+        CliPaneBinding::record_launch(
+            pool, workspace_id, session.id, native_id.as_deref(),
+            if native_id.is_some() {
+                CliPaneBoundVia::CliResume
+            } else {
+                CliPaneBoundVia::CliFresh
+            },
+        ).await?;
+        Ok(ResponseJson(ApiResponse::success(())))
+    }.await;
+    WorkspaceSpawnReservation::release(pool, workspace_id, &reservation.fence).await?;
+    result
+}
+
 pub(super) fn router() -> Router<DeploymentImpl> {
     Router::new()
+        .route(
+            "/workspaces/{workspace_id}/cli/session/{session_id}",
+            post(switch_agent_session),
+        )
         .route(
             "/workspaces/{workspace_id}/cli/agent-status",
             get(get_agent_status),

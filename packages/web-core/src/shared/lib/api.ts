@@ -1179,6 +1179,24 @@ export const configApi = {
  * respawns it in place.
  */
 export const cliAgentApi = {
+  switchSession: async (
+    workspaceId: string,
+    sessionId: string
+  ): Promise<void> => {
+    const response = await makeRequest(
+      `/api/workspaces/${workspaceId}/cli/session/${sessionId}`,
+      { method: 'POST' }
+    );
+    await handleApiResponse<void>(response);
+    const launch = await makeRequest(
+      `/api/workspaces/${workspaceId}/cli/launch`,
+      {
+        method: 'POST',
+      }
+    );
+    await handleApiResponse(launch);
+  },
+
   status: async (workspaceId: string): Promise<CliAgentStatus> => {
     const response = await makeRequest(
       `/api/workspaces/${workspaceId}/cli/agent-status`
