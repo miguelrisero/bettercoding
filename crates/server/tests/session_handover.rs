@@ -106,6 +106,8 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
         "crash",
         "deadline",
         "restart",
+        "fallback_intent_restart",
+        "fallback_launch_restart",
         "newer",
         "fallback_deadline",
         "stale_fallback_identity",
@@ -117,7 +119,7 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
             pool,
             &CreateWorkspace {
                 branch: scenario.into(),
-                name: None,
+                name: Some("Named lifecycle workspace".into()),
             },
             Uuid::new_v4(),
         )
@@ -128,8 +130,8 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
         Workspace::update_container_ref(pool, workspace.id, cwd.to_str().unwrap())
             .await
             .unwrap();
-        if scenario == "success" {
-            let repo_path = root.join("fixture-repo");
+        if matches!(scenario, "success" | "crash") {
+            let repo_path = root.join(format!("fixture-repo-{scenario}"));
             fs::create_dir(&repo_path).unwrap();
             assert!(
                 Command::new("git")
@@ -432,6 +434,9 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
                 StatusCode::CONFLICT
             );
         }
+        if scenario == "fallback_intent_restart" {
+            sqlx::query("UPDATE session_handovers SET rollback_started = 1, fallback_started_at = ? WHERE operation_id = ?").bind(Utc::now()).bind(operation_id).execute(pool).await.unwrap();
+        }
         let now = if matches!(scenario, "crash" | "restart") {
             Utc::now()
         } else {
@@ -446,6 +451,23 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
                 .unwrap()
                 .unwrap();
             assert_ne!(pending.phase, "rolled_back");
+            if matches!(
+                scenario,
+                "fallback_intent_restart" | "fallback_launch_restart"
+            ) {
+                if scenario == "fallback_launch_restart" {
+                    sqlx::query("UPDATE cli_pane_bindings SET session_id = ?, claude_session_id = ?, bound_via = 'cli-fresh' WHERE id = ?")
+                        .bind(sessions[1].id).bind(&pending.successor_native_session_id).bind(pending.binding_id).execute(pool).await.unwrap();
+                    sqlx::query("UPDATE session_handovers SET fallback_pid = NULL, fallback_start_time = NULL WHERE operation_id = ?").bind(operation_id).execute(pool).await.unwrap();
+                }
+                let pid = fs::read_to_string(cwd.join("agent-pid")).unwrap();
+                let recovered = LocalDeployment::new(shutdown.child_token()).await.unwrap();
+                server::routes::session_handover::reconcile(&recovered, Utc::now())
+                    .await
+                    .unwrap();
+                assert_eq!(fs::read_to_string(cwd.join("agent-pid")).unwrap(), pid);
+            }
+
             if scenario == "delayed_fallback_failure" {
                 let pid = fs::read_to_string(cwd.join("agent-pid")).unwrap();
                 assert!(
@@ -568,6 +590,11 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
                 .unwrap();
             assert_eq!(active.session_id, sessions[0].id);
             assert_eq!(active.claude_session_id.as_deref(), Some(native.as_str()));
+            if scenario == "crash" {
+                let (status,delivered)=request(&app,"POST",&format!("/api/sessions/{}/follow-up",sessions[0].id),json!({"prompt":"named fallback dashboard message","executor_config":{"executor":"CLAUDE_CODE"}}),None).await;
+                assert_eq!(status, StatusCode::OK, "{delivered}");
+                assert_eq!(delivered["data"]["outcome"], "routed_to_cli", "{delivered}");
+            }
         }
         assert_eq!(
             request(&app, "POST", &confirm_url, json!({}), Some(&token))

@@ -769,6 +769,26 @@ impl CliCollabService {
             }
         };
 
+        // The reservation can follow a newer CLI launch than the caller's Free lease.
+        if !matches!(self.derive_lease_locked(session).await, WriterLease::Free) {
+            WorkspaceSpawnReservation::release(
+                &self.db.pool,
+                session.workspace_id,
+                &reservation.fence,
+            )
+            .await?;
+            return self
+                .queue_or_status(
+                    session.id,
+                    prompt,
+                    executor_config,
+                    dispatch_context,
+                    source,
+                    existing,
+                )
+                .await;
+        }
+
         let claimed = if let Some(row) = existing {
             match SessionQueuedMessage::claim_for_executor(
                 &self.db.pool,
@@ -1871,6 +1891,91 @@ mod tests {
             probe_failed: false,
             only_active_claude_in_cwd: None,
         }
+    }
+
+    struct PausedFreeProbe {
+        captured: Arc<Notify>,
+        release: Arc<Notify>,
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl CliWriterProbe for PausedFreeProbe {
+        async fn probe(
+            &self,
+            _: Uuid,
+            _: &Path,
+            _: Option<&str>,
+            _: Option<&CliPaneBinding>,
+            _: bool,
+        ) -> ProbeReport {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.captured.notify_one();
+                self.release.notified().await;
+                report(true, Some(false), SidEvidence::Unknown)
+            } else {
+                report(
+                    true,
+                    Some(true),
+                    SidEvidence::ConfirmedResume("11111111-1111-4111-8111-111111111111".into()),
+                )
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_rechecks_a_free_lease_after_a_new_cli_generation_launches() {
+        let (db, workspace, session) = fixture().await;
+        let (mut service, _) = service(db.clone(), report(true, Some(false), SidEvidence::Unknown));
+        let probe = Arc::new(PausedFreeProbe {
+            captured: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            calls: AtomicUsize::new(0),
+        });
+        service.probe = probe.clone();
+        let service = Arc::new(service);
+        let task = {
+            let service = service.clone();
+            let session = session.clone();
+            tokio::spawn(async move {
+                service
+                    .dispatch_gate(
+                        &session,
+                        "racing request".into(),
+                        executor_config(),
+                        QueuedMessageSource::Ui,
+                        false,
+                    )
+                    .await
+            })
+        };
+        probe.captured.notified().await;
+        let reservation =
+            WorkspaceSpawnReservation::acquire(&db.pool, workspace.id, SpawnReservationHolder::Cli)
+                .await
+                .unwrap()
+                .unwrap();
+        CliPaneBinding::record_launch(
+            &db.pool,
+            workspace.id,
+            session.id,
+            Some("11111111-1111-4111-8111-111111111111"),
+            CliPaneBoundVia::CliResume,
+        )
+        .await
+        .unwrap();
+        WorkspaceSpawnReservation::release(&db.pool, workspace.id, &reservation.fence)
+            .await
+            .unwrap();
+        probe.release.notify_one();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            DispatchOutcome::Queued { .. }
+        ));
+        assert!(
+            !ExecutionProcess::has_running_coding_agent_for_session(&db.pool, session.id)
+                .await
+                .unwrap()
+        );
     }
 
     fn executor_config() -> ExecutorConfig {

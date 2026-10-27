@@ -69,6 +69,7 @@ fn resume_evidence(argvs: &[Option<Vec<String>>]) -> SidEvidence {
                 if matches!(
                     arg,
                     "--model"
+                        | "--name"
                         | "--effort"
                         | "--settings"
                         | "--permission-mode"

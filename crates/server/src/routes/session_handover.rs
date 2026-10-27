@@ -365,10 +365,26 @@ async fn rollback(
     }
     let launch: Launch = serde_json::from_str(&op.launch_json).map_err(json_error)?;
     if op.fallback_started_at.is_some() {
-        return finish_fallback(deployment, op, Utc::now()).await;
+        if fallback_process_identity(op).await.is_some()
+            || op.fallback_pid.is_some()
+            || launch.fallback_exit.exists()
+        {
+            return finish_fallback(deployment, op, Utc::now()).await;
+        }
+        let request: HandoverWorkspaceSessionRequest =
+            serde_json::from_str(&op.request_json).map_err(json_error)?;
+        if op.fallback_started_at.is_some_and(|at| {
+            Utc::now() >= at + Duration::seconds(i64::from(request.confirm_deadline_secs))
+        }) {
+            return finish_fallback(deployment, op, Utc::now()).await;
+        }
+        if probe_workspace_agent(op.workspace_id, "claude").await == AgentPresence::Unknown {
+            return Ok(());
+        }
+    } else {
+        sqlx::query("UPDATE session_handovers SET rollback_started = 1, fallback_started_at = ?, failure = ? WHERE operation_id = ?")
+            .bind(Utc::now()).bind(reason).bind(op.operation_id).execute(pool).await?;
     }
-    sqlx::query("UPDATE session_handovers SET rollback_started = 1, fallback_started_at = ?, failure = ? WHERE operation_id = ?")
-        .bind(Utc::now()).bind(reason).bind(op.operation_id).execute(pool).await?;
     match respawn(
         deployment,
         op,
@@ -379,10 +395,10 @@ async fn rollback(
     .await
     {
         Ok(()) => {
-            let mut tx = pool.begin().await?;
-            sqlx::query("UPDATE cli_pane_bindings SET session_id = ?, claude_session_id = ?, bound_via = 'cli-resume' WHERE id = ? AND released_at IS NULL")
-                .bind(op.predecessor_session_id).bind(&op.fallback_session_id).bind(op.binding_id).execute(&mut *tx).await?;
-            tx.commit().await?;
+            if let Some((pid, start)) = fallback_process_identity(op).await {
+                sqlx::query("UPDATE session_handovers SET fallback_pid = ?, fallback_start_time = ? WHERE operation_id = ?")
+                    .bind(i64::from(pid)).bind(start).bind(op.operation_id).execute(pool).await?;
+            }
         }
         Err(error) => {
             op.set_phase(
@@ -402,7 +418,7 @@ async fn finish_fallback(
     now: DateTime<Utc>,
 ) -> Result<(), ApiError> {
     let launch: Launch = serde_json::from_str(&op.launch_json).map_err(json_error)?;
-    let alive = native_agent_alive(op.workspace_id, "--resume", &op.fallback_session_id).await;
+    let identity = fallback_process_identity(op).await;
     if launch.fallback_exit.exists() {
         op.set_phase(
             &deployment.db().pool,
@@ -411,16 +427,38 @@ async fn finish_fallback(
         )
         .await?;
     } else if op.fallback_ready_at.is_some()
-        && alive
-        && op
-            .fallback_pid
-            .zip(op.fallback_start_time.as_deref())
-            .is_some_and(|(pid, start)| {
-                process_start_identity(pid as u32).as_deref() == Some(start)
-            })
+        && identity.as_ref().is_some_and(|(pid, start)| {
+            op.fallback_pid == Some(i64::from(*pid))
+                && op.fallback_start_time.as_ref() == Some(start)
+        })
     {
-        op.set_phase(&deployment.db().pool, "rolled_back", op.failure.as_deref())
+        let pool = &deployment.db().pool;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let owner: Option<Uuid> = sqlx::query_scalar(
+            "SELECT session_id FROM claude_session_links WHERE claude_session_id = ?",
+        )
+        .bind(&op.fallback_session_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if owner.is_some_and(|owner| owner != op.predecessor_session_id) {
+            drop(tx);
+            op.set_phase(
+                pool,
+                "failed",
+                Some("Fallback ownership changed; current transcript owner preserved"),
+            )
             .await?;
+            return Ok(());
+        }
+        sqlx::query("INSERT INTO claude_session_links (claude_session_id, session_id, workspace_id, cwd, bound_via) VALUES (?, ?, ?, ?, 'cli-resume') ON CONFLICT(claude_session_id) DO NOTHING")
+            .bind(&op.fallback_session_id).bind(op.predecessor_session_id).bind(op.workspace_id).bind(launch.cwd.to_string_lossy().as_ref()).execute(&mut *tx).await?;
+        let changed=sqlx::query("UPDATE cli_pane_bindings SET session_id = ?, claude_session_id = ?, bound_via = 'cli-resume' WHERE id = ? AND released_at IS NULL")
+            .bind(op.predecessor_session_id).bind(&op.fallback_session_id).bind(op.binding_id).execute(&mut *tx).await?.rows_affected();
+        if changed == 1 {
+            sqlx::query("UPDATE session_handovers SET phase = 'rolled_back' WHERE operation_id = ? AND phase IN ('starting','awaiting_confirmation')")
+                .bind(op.operation_id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
     } else {
         let request: HandoverWorkspaceSessionRequest =
             serde_json::from_str(&op.request_json).map_err(json_error)?;
@@ -431,6 +469,29 @@ async fn finish_fallback(
         }
     }
     Ok(())
+}
+
+async fn fallback_process_identity(op: &SessionHandover) -> Option<(u32, String)> {
+    let (_, processes) = cli_pane_agent_processes(op.workspace_id, &["claude"]).await?;
+    let capability = format!("BC_HANDOVER_CAPABILITY={}-fallback", op.capability);
+    for process in processes {
+        if !process.argv.as_ref().is_some_and(|argv| {
+            argv.windows(2)
+                .any(|pair| pair[0] == "--resume" && pair[1] == op.fallback_session_id)
+        }) {
+            continue;
+        }
+        let start = process_start_identity(process.pid)?;
+        let env = std::fs::read(format!("/proc/{}/environ", process.pid)).ok()?;
+        if env
+            .split(|b| *b == 0)
+            .any(|entry| entry == capability.as_bytes())
+            && process_start_identity(process.pid).as_ref() == Some(&start)
+        {
+            return Some((process.pid, start));
+        }
+    }
+    None
 }
 
 pub(super) fn process_start_identity(pid: u32) -> Option<String> {
@@ -556,7 +617,11 @@ pub async fn reconcile(deployment: &DeploymentImpl, now: DateTime<Utc>) -> Resul
             .await?;
             continue;
         }
-        if op.fallback_started_at.is_some() {
+        if op.fallback_started_at.is_some()
+            && (fallback_process_identity(&op).await.is_some()
+                || op.fallback_pid.is_some()
+                || launch.fallback_exit.exists())
+        {
             finish_fallback(deployment, &op, now).await?;
             continue;
         }
