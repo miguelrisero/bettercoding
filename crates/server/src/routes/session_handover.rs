@@ -419,6 +419,19 @@ async fn finish_fallback(
 ) -> Result<(), ApiError> {
     let launch: Launch = serde_json::from_str(&op.launch_json).map_err(json_error)?;
     let identity = fallback_process_identity(op).await;
+    let request: HandoverWorkspaceSessionRequest =
+        serde_json::from_str(&op.request_json).map_err(json_error)?;
+    let deadline = op
+        .fallback_started_at
+        .map(|at| at + Duration::seconds(i64::from(request.confirm_deadline_secs)));
+    if op
+        .fallback_ready_at
+        .zip(deadline)
+        .is_some_and(|(ready, deadline)| ready >= deadline)
+    {
+        op.set_phase(&deployment.db().pool,"failed",Some("Fallback needs recovery: initialization receipt arrived after its deadline; process preserved")).await?;
+        return Ok(());
+    }
     if launch.fallback_exit.exists() {
         op.set_phase(
             &deployment.db().pool,

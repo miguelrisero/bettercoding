@@ -111,6 +111,7 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
         "newer",
         "fallback_deadline",
         "stale_fallback_identity",
+        "late_fallback_receipt",
         "delayed_fallback_failure",
         "fallback_failure",
     ] {
@@ -523,6 +524,10 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
                 .await;
                 assert_eq!(status, StatusCode::NO_CONTENT);
             }
+            if scenario == "late_fallback_receipt" {
+                sqlx::query("UPDATE session_handovers SET fallback_started_at = ?, fallback_ready_at = ? WHERE operation_id = ?")
+                    .bind(Utc::now()-Duration::seconds(901)).bind(Utc::now()).bind(operation_id).execute(pool).await.unwrap();
+            }
             if scenario == "stale_fallback_identity" {
                 sqlx::query("UPDATE session_handovers SET fallback_start_time = 'stale-process' WHERE operation_id = ?").bind(operation_id).execute(pool).await.unwrap();
                 server::routes::session_handover::reconcile(&deployment, Utc::now())
@@ -566,7 +571,10 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
                 fs::read_to_string(cwd.join("args")).unwrap(),
                 "newer-pane-marker"
             );
-        } else if matches!(scenario, "fallback_deadline" | "stale_fallback_identity") {
+        } else if matches!(
+            scenario,
+            "fallback_deadline" | "stale_fallback_identity" | "late_fallback_receipt"
+        ) {
             assert_eq!(saved.phase, "failed");
             assert!(saved.failure.unwrap().contains("needs recovery"));
         } else if matches!(scenario, "fallback_failure" | "delayed_fallback_failure") {
