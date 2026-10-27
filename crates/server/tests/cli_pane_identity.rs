@@ -36,14 +36,22 @@ impl Drop for ScratchSocket {
 #[tokio::test]
 async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switch() {
     let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("fixture");
+    fs::create_dir(&root).unwrap();
+    let neighbor = temp.path().join("neighbor");
+    fs::create_dir(&neighbor).unwrap();
+    fs::write(neighbor.join("keep"), "another test's workspace").unwrap();
     let socket = ScratchSocket(format!("bc-identity-test-{}", std::process::id()));
-    let claude = temp.path().join("claude");
+    let claude = root.join("claude");
     symlink("/bin/sleep", &claude).unwrap();
-    let data = temp.path().join("data");
+    let data = root.join("data");
     fs::create_dir(&data).unwrap();
-    let home = temp.path().join("home");
+    let worktrees = root.join("worktrees");
+    fs::create_dir(&worktrees).unwrap();
+    let pane_dir = worktrees.join("pane");
+    let home = root.join("home");
     fs::create_dir(&home).unwrap();
-    let fake_bin = temp.path().join("bin");
+    let fake_bin = root.join("bin");
     fs::create_dir(&fake_bin).unwrap();
     for program in ["claude", "codex"] {
         let path = fake_bin.join(program);
@@ -59,7 +67,7 @@ async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switc
             format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
         );
         std::env::set_var("BC_DATA_DIR", &data);
-        std::env::set_var("BC_WORKTREE_BASE", temp.path().join("worktrees"));
+        std::env::set_var("BC_WORKTREE_BASE", &worktrees);
         std::env::set_var("BC_CLI_TMUX_SOCKET", &socket.0);
         std::env::remove_var("BC_SHARED_API_BASE");
         std::env::remove_var("BC_SHARED_RELAY_API_BASE");
@@ -77,9 +85,19 @@ async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switc
     )
     .await
     .unwrap();
-    Workspace::update_container_ref(pool, workspace.id, temp.path().to_str().unwrap())
+    Workspace::update_container_ref(pool, workspace.id, pane_dir.to_str().unwrap())
         .await
         .unwrap();
+    fs::create_dir(&pane_dir).unwrap();
+    deployment
+        .workspace_manager()
+        .cleanup_orphan_workspaces()
+        .await;
+    assert!(pane_dir.is_dir());
+    assert_eq!(
+        fs::read_to_string(neighbor.join("keep")).unwrap(),
+        "another test's workspace"
+    );
     let session = Session::create(
         pool,
         &CreateSession {
@@ -235,7 +253,7 @@ async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switc
                 &native,
                 chosen.id,
                 workspace.id,
-                temp.path().to_str().unwrap(),
+                pane_dir.to_str().unwrap(),
                 db::models::claude_session_link::ClaudeSessionBoundVia::CliResume,
             )
             .await
