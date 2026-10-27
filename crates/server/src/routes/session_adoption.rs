@@ -122,10 +122,10 @@ async fn adopt_checked(
         .join(&request.native_session_id);
     let mut native_proof = false;
     for fd in std::fs::read_dir(format!("/proc/{}/fd", request.expected_pid))? {
-        if let Ok(path) = std::fs::read_link(fd?.path()) {
-            if transcript_paths.contains(&path) || path == tasks {
-                native_proof = true;
-            }
+        if let Ok(path) = std::fs::read_link(fd?.path())
+            && (transcript_paths.contains(&path) || path == tasks)
+        {
+            native_proof = true;
         }
     }
     // An open session-specific transcript or task directory ties a fresh CLI process to its native UUID.

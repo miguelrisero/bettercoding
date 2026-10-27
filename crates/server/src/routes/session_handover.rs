@@ -48,15 +48,14 @@ fn json_error(error: serde_json::Error) -> ApiError {
     ApiError::BadGateway(format!("Invalid durable handover data: {error}"))
 }
 
-fn receipt(op: &SessionHandover) -> Result<HandoverResponse, ApiError> {
+fn receipt(op: &SessionHandover) -> Result<HandoverResponse, serde_json::Error> {
     Ok(HandoverResponse {
         operation_id: op.operation_id,
         workspace_id: op.workspace_id,
         predecessor_session_id: op.predecessor_session_id,
         successor_session_id: op.successor_session_id,
         successor_native_session_id: op.successor_native_session_id.clone(),
-        phase: serde_json::from_value(serde_json::Value::String(op.phase.clone()))
-            .map_err(json_error)?,
+        phase: serde_json::from_value(serde_json::Value::String(op.phase.clone()))?,
         deadline_at: op.deadline_at,
         binding_id: op.binding_id,
         fallback_session_id: op.fallback_session_id.clone(),
@@ -75,9 +74,9 @@ async fn get_operation(
     State(deployment): State<DeploymentImpl>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<HandoverResponse>>, ApiError> {
-    Ok(Json(ApiResponse::success(receipt(
-        &load(&deployment, id).await?,
-    )?)))
+    Ok(Json(ApiResponse::success(
+        receipt(&load(&deployment, id).await?).map_err(json_error)?,
+    )))
 }
 
 async fn begin(
@@ -95,7 +94,9 @@ async fn begin(
                 "request_id already names a different handover".into(),
             ));
         }
-        return Ok(Json(ApiResponse::success(receipt(&op)?)));
+        return Ok(Json(ApiResponse::success(
+            receipt(&op).map_err(json_error)?,
+        )));
     }
     if request.request_id.is_empty()
         || request.initial_prompt.trim().is_empty()
@@ -265,9 +266,9 @@ async fn begin(
                 .await?
             }
         }
-        Ok(Json(ApiResponse::success(receipt(
-            &load(&deployment, operation_id).await?,
-        )?)))
+        Ok(Json(ApiResponse::success(
+            receipt(&load(&deployment, operation_id).await?).map_err(json_error)?,
+        )))
     }
     .await;
     WorkspaceSpawnReservation::release(pool, op.workspace_id, &reservation.fence).await?;
