@@ -1,5 +1,7 @@
 {
   "cliMode": {
+    "openConversation": "Abrir esta conversación en la CLI",
+    "switchConversationWarning": "Esto cierra el agente actual de la CLI, incluido cualquier trabajo en curso. ¿Quieres continuar con la conversación seleccionada?",
     "agentRestart": "Reiniciar agente",
     "agentRestarting": "Reiniciando…",
     "agentRunningBody": "El agente de código está ejecutando esta tarea en el chat. La terminal continuará con la misma conversación en cuanto termine — no hace falta repetir el prompt aquí.",

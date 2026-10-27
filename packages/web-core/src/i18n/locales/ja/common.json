@@ -1,5 +1,7 @@
 {
   "cliMode": {
+    "openConversation": "この会話を CLI で開く",
+    "switchConversationWarning": "現在の CLI エージェントを終了します。進行中の作業も停止します。選択した会話で続行しますか？",
     "agentRestart": "エージェントを再起動",
     "agentRestarting": "再起動中…",
     "agentRunningBody": "コーディングエージェントがチャットでこのタスクを実行中です。完了するとターミナルが同じ会話を引き継ぎます — ここでプロンプトを繰り返す必要はありません。",
