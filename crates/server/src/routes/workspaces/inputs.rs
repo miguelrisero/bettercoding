@@ -1,3 +1,4 @@
+use api_types::SendCliTextResponse;
 use axum::{
     Json, Router,
     body::Body,
@@ -13,7 +14,7 @@ use sqlx::SqlitePool;
 use utils::response::ApiResponse;
 use uuid::Uuid;
 
-use crate::DeploymentImpl;
+use crate::{DeploymentImpl, error::ApiError, routes::terminal::send_text_to_cli_agent};
 
 pub const INPUT_CONTENT_CSP: &str = "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'; navigate-to 'none'; frame-ancestors *";
 
@@ -122,17 +123,105 @@ async fn answer(
     Path((workspace, id)): Path<(Uuid, String)>,
     Json(body): Json<AnswerInput>,
 ) -> RouteResult<InputReceipt> {
-    Ok(Json(ApiResponse::success(
-        WorkspaceInput::write(
-            &pool,
-            workspace,
-            Some(&id),
-            InputActorKind::OwnerUi,
-            "owner",
-            InputWrite::Answer(body),
-        )
-        .await?,
-    )))
+    let receipt = WorkspaceInput::write(
+        &pool,
+        workspace,
+        Some(&id),
+        InputActorKind::OwnerUi,
+        "owner",
+        InputWrite::Answer(body),
+    )
+    .await?;
+    let event = receipt.event.clone();
+    tokio::spawn(async move {
+        let send_pool = pool.clone();
+        notify_answer(&pool, &event, |text| async move {
+            send_text_to_cli_agent(&send_pool, workspace, &text).await
+        })
+        .await
+    });
+    Ok(Json(ApiResponse::success(receipt)))
+}
+
+/// Longest owner text, in characters, that the answer notice carries.
+const NOTICE_TEXT_CHARS: usize = 2000;
+
+#[derive(Debug, PartialEq)]
+enum AnswerDelivery {
+    Skipped,
+    Delivered,
+    NoSession,
+    Failed,
+}
+
+/// The line typed into the agent's prompt when the owner answers an Input.
+/// Control characters other than newline and tab become spaces, because the
+/// CLI send path refuses them.
+fn answer_notice(input_id: &str, title: &str, answer: &InputAnswer) -> String {
+    let text: String = answer
+        .text
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(NOTICE_TEXT_CHARS)
+        .collect();
+    let choice = answer.choice_id.as_deref().unwrap_or("none");
+    format!("[BetterCoding Input answered] {input_id} \"{title}\" choice={choice} text={text}")
+        .chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Push an owner answer into the workspace's running agent session. The
+/// answer is already stored, so every outcome is only logged: with no
+/// running agent the agent reads the event from the Input log later.
+async fn notify_answer<F, Fut>(pool: &SqlitePool, event: &InputEvent, send: F) -> AnswerDelivery
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<SendCliTextResponse, ApiError>>,
+{
+    // "No answer yet" is not a decision, so it does not wake the agent.
+    if event.payload["no_answer_yet"] == true {
+        return AnswerDelivery::Skipped;
+    }
+    let title = WorkspaceInput::detail(
+        pool,
+        event.workspace_id,
+        &event.input_id,
+        Some(event.version),
+        false,
+    )
+    .await
+    .map(|detail| detail.version.title)
+    .unwrap_or_else(|error| {
+        tracing::warn!(input_id = %event.input_id, %error, "Input title lookup failed for the answer notice");
+        String::new()
+    });
+    let answer: InputAnswer =
+        serde_json::from_value(event.payload["answer"].clone()).unwrap_or_default();
+    let notice = answer_notice(&event.input_id, &title, &answer);
+    let (workspace_id, input_id) = (event.workspace_id, &event.input_id);
+    match send(notice).await {
+        Ok(SendCliTextResponse { submitted }) => {
+            tracing::info!(%workspace_id, %input_id, submitted, "Delivered the Input answer to the workspace agent");
+            AnswerDelivery::Delivered
+        }
+        Err(ApiError::Conflict(_)) => {
+            tracing::info!(%workspace_id, %input_id, "No running agent for the Input answer; it stays in the event log");
+            AnswerDelivery::NoSession
+        }
+        Err(error) => {
+            tracing::warn!(%workspace_id, %input_id, %error, "Input answer delivery to the workspace agent failed");
+            AnswerDelivery::Failed
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -576,6 +665,112 @@ mod tests {
                 .unwrap()
                 .valid
         );
+    }
+
+    #[test]
+    fn answer_notice_formats_trims_and_strips_control_characters() {
+        let answer = InputAnswer {
+            choice_id: Some("a".into()),
+            text: Some(format!("  ok\x1b[201~{}  ", "x".repeat(3000))),
+        };
+        let notice = answer_notice("in-1", "Pick\none", &answer);
+        let expected = format!(
+            "[BetterCoding Input answered] in-1 \"Pick\none\" choice=a text=ok [201~{}",
+            "x".repeat(NOTICE_TEXT_CHARS - 8)
+        );
+        assert_eq!(notice, expected);
+        assert_eq!(
+            answer_notice("in-2", "T", &InputAnswer::default()),
+            "[BetterCoding Input answered] in-2 \"T\" choice=none text="
+        );
+    }
+
+    async fn answered_event() -> (SqlitePool, InputEvent) {
+        answer_event(serde_json::json!({"choice_id":"yes","text":"go"})).await
+    }
+
+    async fn answer_event(answer: serde_json::Value) -> (SqlitePool, InputEvent) {
+        use serde_json::json;
+        let (app, workspace, pool) = test_app().await;
+        let root = format!("/api/workspaces/{workspace}/inputs");
+        let (_, _, created) = request(app.clone(), "POST", &format!("{root}/agent"), json!({
+            "request_id":"create", "expected_sequence":0,"external_key":"decision",
+            "content":{"title":"Ship it?","html":"<p>Choose</p>","contract":{"choices":[{"id":"yes","label":"Yes"}],"allow_text":true,"allow_no_answer_yet":true}}
+        })).await;
+        let id = created["data"]["input_id"].as_str().unwrap().to_string();
+        let (status, _, answer) = request(
+            app,
+            "POST",
+            &format!("{root}/{id}/answer"),
+            json!({"request_id":"answer","expected_sequence":1,"version":1,"answer":answer}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        (
+            pool,
+            serde_json::from_value(answer["data"]["event"].clone()).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn answer_notice_reaches_a_running_agent() {
+        let (pool, event) = answered_event().await;
+        let sent = std::sync::Mutex::new(None);
+        let outcome = notify_answer(&pool, &event, |text| {
+            *sent.lock().unwrap() = Some(text);
+            async { Ok(SendCliTextResponse { submitted: true }) }
+        })
+        .await;
+        assert_eq!(outcome, AnswerDelivery::Delivered);
+        assert_eq!(
+            sent.into_inner().unwrap().unwrap(),
+            format!(
+                "[BetterCoding Input answered] {} \"Ship it?\" choice=yes text=go",
+                event.input_id
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn no_answer_yet_does_not_wake_the_agent() {
+        let (pool, event) = answer_event(serde_json::json!({})).await;
+        let outcome = notify_answer(&pool, &event, |_| async {
+            panic!("no answer yet must not be sent")
+        })
+        .await;
+        assert_eq!(outcome, AnswerDelivery::Skipped);
+    }
+
+    #[tokio::test]
+    async fn answer_notice_without_a_running_agent_keeps_the_answer() {
+        let (pool, event) = answered_event().await;
+        let outcome = notify_answer(&pool, &event, |_| async {
+            Err(ApiError::Conflict("no agent".into()))
+        })
+        .await;
+        assert_eq!(outcome, AnswerDelivery::NoSession);
+        let detail =
+            WorkspaceInput::detail(&pool, event.workspace_id, &event.input_id, None, false)
+                .await
+                .unwrap();
+        assert_eq!(detail.input.status, "answered");
+        assert_eq!(detail.answers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn answer_notice_delivery_error_keeps_the_answer() {
+        let (pool, event) = answered_event().await;
+        let outcome = notify_answer(&pool, &event, |_| async {
+            Err(ApiError::BadGateway("tmux did not confirm".into()))
+        })
+        .await;
+        assert_eq!(outcome, AnswerDelivery::Failed);
+        let detail =
+            WorkspaceInput::detail(&pool, event.workspace_id, &event.input_id, None, false)
+                .await
+                .unwrap();
+        assert_eq!(detail.input.status, "answered");
+        assert_eq!(detail.answers.len(), 1);
     }
 
     #[test]
