@@ -109,11 +109,31 @@ struct UpdateSessionRequest {
     session_id: Uuid,
     #[schemars(description = "Set session display name (empty string clears it)")]
     name: Option<String>,
+    #[schemars(
+        description = "Set the model the session's next CLI launch uses, e.g. `claude-opus-5-5` (empty string clears it). A running agent keeps its model until it is relaunched."
+    )]
+    cli_model_id: Option<String>,
+    #[schemars(
+        description = "Set the reasoning effort the session's next CLI launch uses (empty string clears it)"
+    )]
+    cli_reasoning_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct UpdateSessionPayload {
     name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cli_model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cli_reasoning_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdatedSession {
+    #[serde(flatten)]
+    session: Session,
+    cli_model_id: Option<String>,
+    cli_reasoning_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -121,6 +141,8 @@ struct UpdateSessionResponse {
     success: bool,
     session_id: String,
     name: Option<String>,
+    cli_model_id: Option<String>,
+    cli_reasoning_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -221,10 +243,17 @@ impl McpServer {
         })
     }
 
-    #[tool(description = "Update a session's name. `session_id` is required.")]
+    #[tool(
+        description = "Update a session's name and the model and reasoning effort of its next CLI launch. `session_id` is required. The response reads the stored launch values back."
+    )]
     async fn update_session(
         &self,
-        Parameters(UpdateSessionRequest { session_id, name }): Parameters<UpdateSessionRequest>,
+        Parameters(UpdateSessionRequest {
+            session_id,
+            name,
+            cli_model_id,
+            cli_reasoning_id,
+        }): Parameters<UpdateSessionRequest>,
     ) -> Result<CallToolResult, ErrorData> {
         // Verify session exists and check scope
         let session_url = self.url(&format!("/api/sessions/{session_id}"));
@@ -238,17 +267,22 @@ impl McpServer {
 
         let payload = UpdateSessionPayload {
             name: name.map(|value| value.trim().to_string()),
+            cli_model_id,
+            cli_reasoning_id,
         };
         let url = self.url(&format!("/api/sessions/{session_id}"));
-        let updated: Session = match self.send_json(self.client.put(&url).json(&payload)).await {
-            Ok(value) => value,
-            Err(error_result) => return Ok(Self::tool_error(error_result)),
-        };
+        let updated: UpdatedSession =
+            match self.send_json(self.client.put(&url).json(&payload)).await {
+                Ok(value) => value,
+                Err(error_result) => return Ok(Self::tool_error(error_result)),
+            };
 
         Self::success(&UpdateSessionResponse {
             success: true,
-            session_id: updated.id.to_string(),
-            name: updated.name,
+            session_id: updated.session.id.to_string(),
+            name: updated.session.name,
+            cli_model_id: updated.cli_model_id,
+            cli_reasoning_id: updated.cli_reasoning_id,
         })
     }
 

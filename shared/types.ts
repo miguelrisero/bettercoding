@@ -669,7 +669,15 @@ export type RepoBranchStatus = { repo_id: string, repo_name: string, commits_beh
 
 export type UpdateWorkspace = { archived: boolean | null, pinned: boolean | null, name: string | null, };
 
-export type UpdateSession = { name: string | null, };
+export type UpdateSession = { name: string | null, 
+/**
+ * Model for the next CLI launch of this session; an empty string clears it.
+ */
+cli_model_id?: string | null, 
+/**
+ * Reasoning effort for the next CLI launch; an empty string clears it.
+ */
+cli_reasoning_id?: string | null, };
 
 export type WorkspaceSummaryRequest = { archived: boolean, };
 
