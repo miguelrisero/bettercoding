@@ -1422,9 +1422,20 @@ async fn send_cli_text(
     axum::extract::Path(workspace_id): axum::extract::Path<Uuid>,
     Json(request): Json<SendCliTextRequest>,
 ) -> Result<Json<ApiResponse<SendCliTextResponse>>, ApiError> {
-    let text = validate_cli_send_text(&request.text).map_err(ApiError::BadRequest)?;
+    send_text_to_cli_agent(&deployment.db().pool, workspace_id, &request.text)
+        .await
+        .map(|response| Json(ApiResponse::success(response)))
+}
 
-    let pool = &deployment.db().pool;
+/// Type `text` into the workspace's live CLI agent pane and submit it.
+/// `ApiError::Conflict` means no Claude/Codex agent is running there.
+pub(crate) async fn send_text_to_cli_agent(
+    pool: &SqlitePool,
+    workspace_id: Uuid,
+    text: &str,
+) -> Result<SendCliTextResponse, ApiError> {
+    let text = validate_cli_send_text(text).map_err(ApiError::BadRequest)?;
+
     let workspace = Workspace::find_by_id(pool, workspace_id)
         .await?
         .ok_or_else(|| ApiError::BadRequest("Workspace not found".to_string()))?;
@@ -1452,9 +1463,9 @@ async fn send_cli_text(
         Some(CliSendResult::NotDelivered) => Err(ApiError::BadGateway(
             "tmux did not confirm the paste; check the CLI pane before sending again".to_string(),
         )),
-        Some(result) => Ok(Json(ApiResponse::success(SendCliTextResponse {
+        Some(result) => Ok(SendCliTextResponse {
             submitted: result == CliSendResult::Submitted,
-        }))),
+        }),
     }
 }
 
