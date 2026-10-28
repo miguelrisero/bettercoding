@@ -72,11 +72,11 @@ export function WorkspaceInputsContainer({
   workspaceId: string;
 }) {
   const host = useHostId();
-  const [all, setAll] = useState(false);
+  const [done, setDone] = useState(false);
   const [cursor, setCursor] = useState('');
   const list = useQuery({
-    queryKey: ['inputs', host, workspaceId, all, cursor],
-    queryFn: () => inputsApi.list(workspaceId, host, all, cursor),
+    queryKey: ['inputs', host, workspaceId, done, cursor],
+    queryFn: () => inputsApi.list(workspaceId, host, done, cursor),
     refetchInterval: 10000,
   });
   return (
@@ -88,15 +88,24 @@ export function WorkspaceInputsContainer({
           </strong>{' '}
           pending
         </span>
-        <button
-          className={quietButton}
-          onClick={() => {
-            setAll(!all);
-            setCursor('');
-          }}
-        >
-          {all ? 'Show pending' : 'Show all'}
-        </button>
+        <div className="flex gap-base" role="group" aria-label="Input view">
+          {[false, true].map((isDone) => (
+            <button
+              key={String(isDone)}
+              className={cn(
+                quietButton,
+                done === isDone && 'text-high underline'
+              )}
+              aria-pressed={done === isDone}
+              onClick={() => {
+                setDone(isDone);
+                setCursor('');
+              }}
+            >
+              {isDone ? 'Done' : 'Pending'}
+            </button>
+          ))}
+        </div>
       </div>
       {list.isLoading && (
         <p role="status" className="text-sm text-low">
@@ -127,10 +136,7 @@ export function WorkspaceInputsContainer({
               </span>
               <span className="mt-1 flex items-center gap-half text-xs text-low [&>time]:ml-half">
                 <StatusDot status={detail.input.status} />
-                {detail.input.status === 'answered'
-                  ? 'Needs completion'
-                  : (inputStatusLabel[detail.input.status] ??
-                    detail.input.status)}
+                {inputStatusLabel[detail.input.status] ?? detail.input.status}
                 <Age date={detail.input.created_at} />
               </span>
             </button>

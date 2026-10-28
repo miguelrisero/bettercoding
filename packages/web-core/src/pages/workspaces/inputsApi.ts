@@ -48,11 +48,11 @@ export async function inputRequest<T>(
 }
 
 export const inputsApi = {
-  list: (workspace: string, host: string | null, all: boolean, cursor = '') =>
+  list: (workspace: string, host: string | null, done: boolean, cursor = '') =>
     inputRequest<InputPage>(
       workspace,
       host,
-      `?limit=50${all ? '' : '&status=open,answered'}&cursor=${encodeURIComponent(cursor)}`
+      `?limit=50&status=${done ? 'answered,closed,cancelled' : 'open'}&cursor=${encodeURIComponent(cursor)}`
     ),
   get: (workspace: string, host: string | null, id: string) =>
     inputRequest<InputDetail>(workspace, host, `/${id}`),
