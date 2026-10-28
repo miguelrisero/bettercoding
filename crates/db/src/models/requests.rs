@@ -56,4 +56,12 @@ pub struct UpdateWorkspace {
 #[derive(Debug, Serialize, Deserialize, TS)]
 pub struct UpdateSession {
     pub name: Option<String>,
+    /// Model for the next CLI launch of this session; an empty string clears it.
+    #[serde(default)]
+    #[ts(optional, type = "string | null")]
+    pub cli_model_id: Option<String>,
+    /// Reasoning effort for the next CLI launch; an empty string clears it.
+    #[serde(default)]
+    #[ts(optional, type = "string | null")]
+    pub cli_reasoning_id: Option<String>,
 }

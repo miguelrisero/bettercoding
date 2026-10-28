@@ -27,7 +27,7 @@ use executors::{
     executors::{BaseCodingAgent, claude::native::adapt_native_claude_line},
     profile::ExecutorConfig,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use services::services::{
     cli_collab::{DispatchOutcome, RetryDispatchContext},
     container::ContainerService,
@@ -95,20 +95,63 @@ pub async fn create_session(
     Ok(ResponseJson(ApiResponse::success(session)))
 }
 
+/// A session plus the model and effort its next CLI launch uses.
+#[derive(Debug, Serialize)]
+pub struct UpdatedSession {
+    #[serde(flatten)]
+    pub session: Session,
+    pub cli_model_id: Option<String>,
+    pub cli_reasoning_id: Option<String>,
+}
+
+/// A CLI launch value goes into the agent argv: allow model-id characters only.
+/// An empty value clears the setting.
+fn cli_launch_value(value: &str) -> Result<Option<String>, ApiError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let allowed = |c: char| c.is_ascii_alphanumeric() || "-._:/[]".contains(c);
+    if value.len() > 128 || !value.chars().all(allowed) {
+        return Err(ApiError::BadRequest(format!(
+            "invalid CLI launch value: {value:?}"
+        )));
+    }
+    Ok(Some(value.to_string()))
+}
+
 pub async fn update_session(
     Extension(session): Extension<Session>,
     State(deployment): State<DeploymentImpl>,
     Json(request): Json<UpdateSession>,
-) -> Result<ResponseJson<ApiResponse<Session>>, ApiError> {
+) -> Result<ResponseJson<ApiResponse<UpdatedSession>>, ApiError> {
     let pool = &deployment.db().pool;
 
+    let (mut model, mut reasoning) = Session::get_cli_model_effort(pool, session.id).await?;
+    let launch_changed = request.cli_model_id.is_some() || request.cli_reasoning_id.is_some();
+    if let Some(value) = request.cli_model_id.as_deref() {
+        model = cli_launch_value(value)?;
+    }
+    if let Some(value) = request.cli_reasoning_id.as_deref() {
+        reasoning = cli_launch_value(value)?;
+    }
+
     Session::update(pool, session.id, request.name.as_deref()).await?;
+    if launch_changed {
+        Session::set_cli_model_effort(pool, session.id, model.as_deref(), reasoning.as_deref())
+            .await?;
+    }
 
     let updated = Session::find_by_id(pool, session.id)
         .await?
         .ok_or(ApiError::Session(SessionError::NotFound))?;
+    let (cli_model_id, cli_reasoning_id) = Session::get_cli_model_effort(pool, session.id).await?;
 
-    Ok(ResponseJson(ApiResponse::success(updated)))
+    Ok(ResponseJson(ApiResponse::success(UpdatedSession {
+        session: updated,
+        cli_model_id,
+        cli_reasoning_id,
+    })))
 }
 
 #[derive(Debug, Deserialize, TS)]
@@ -449,4 +492,31 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
         .nest("/{session_id}/queue", queue::router(deployment));
 
     Router::new().nest("/sessions", sessions_router)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cli_launch_value;
+
+    #[test]
+    fn cli_launch_value_accepts_model_ids_and_clears_on_empty() {
+        assert_eq!(
+            cli_launch_value(" claude-opus-5-5 ").unwrap().as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(
+            cli_launch_value("claude-opus-5-5[1m]").unwrap().as_deref(),
+            Some("claude-opus-5-5[1m]")
+        );
+        assert_eq!(cli_launch_value("").unwrap(), None);
+        for bad in [
+            "opus; rm -rf /",
+            "a b",
+            "$(id)",
+            "--x\nfoo",
+            &"x".repeat(129),
+        ] {
+            assert!(cli_launch_value(bad).is_err(), "{bad}");
+        }
+    }
 }
