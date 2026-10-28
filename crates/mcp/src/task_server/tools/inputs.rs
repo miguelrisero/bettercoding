@@ -88,7 +88,7 @@ impl McpServer {
 #[tool_router(router = inputs_tools_router, vis = "pub")]
 impl McpServer {
     #[tool(
-        description = "Create one independently answerable workspace Input with self-contained HTML and a fixed answer contract. expected_sequence must be 0. Returns input_id, version, sequence, status, owner_url and event. Answers come only from the owner's UI. Application-enforced history includes a per-event hash chain; same-user processes can edit SQLite directly. Use bc.input.init and bc.input.propose protocol version 1 for page proposals; the owner must submit in trusted chrome. Optional priority P0 through P4 defaults to P2. Never collect secrets."
+        description = "Create one independently answerable workspace Input with self-contained HTML and a fixed answer contract. expected_sequence must be 0. Returns input_id, version, sequence, status, owner_url and event. Answers come only from the owner's UI. Application-enforced history includes a per-event hash chain; same-user processes can edit SQLite directly. Use bc.input.init and bc.input.propose protocol version 1 for page proposals; the owner must submit in trusted chrome. Optional priority P0 through P4; when omitted, a leading \"P<n> · \" in the title sets it, else P2. Never collect secrets."
     )]
     async fn create_input(&self, Parameters(request): Parameters<CreateRequest>) -> ToolCallResult {
         let workspace = match self.input_scope(request.workspace_id) {
@@ -103,7 +103,7 @@ impl McpServer {
         .await
     }
     #[tool(
-        description = "Publish an immutable Input version. Requires requester ownership, request_id and expected_sequence. request_answer=true returns an answered Input to open. Optional priority P0 through P4 keeps its current value when omitted. Closed or cancelled Inputs cannot be reopened."
+        description = "Publish an immutable Input version. Requires requester ownership, request_id and expected_sequence. request_answer=true returns an answered Input to open. Optional priority P0 through P4; when omitted, a leading \"P<n> · \" in the title sets it, else the current value stays. Closed or cancelled Inputs cannot be reopened."
     )]
     async fn update_input(&self, Parameters(request): Parameters<UpdateRequest>) -> ToolCallResult {
         let workspace = match self.input_scope(request.workspace_id) {

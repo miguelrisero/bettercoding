@@ -317,6 +317,13 @@ fn validate_priority(priority: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reads a leading "P<n> · " title prefix, the level agents wrote into titles before priority existed.
+fn title_priority(title: &str) -> Option<String> {
+    let rest = title.strip_prefix('P')?;
+    let level = rest.chars().next().filter(|c| ('0'..='4').contains(c))?;
+    rest[1..].starts_with(" · ").then(|| format!("P{level}"))
+}
+
 impl WorkspaceInput {
     pub async fn set_priority(
         pool: &SqlitePool,
@@ -517,7 +524,11 @@ impl WorkspaceInput {
                     return Err(InputError::Code("IDEMPOTENCY_CONFLICT"));
                 }
                 let input = Self {
-                    priority: request.priority.clone().unwrap_or_else(|| "P2".into()),
+                    priority: request
+                        .priority
+                        .clone()
+                        .or_else(|| title_priority(&request.content.title))
+                        .unwrap_or_else(|| "P2".into()),
                     id: Uuid::new_v4().to_string(),
                     workspace_id: workspace,
                     external_key: request.external_key.clone(),
@@ -561,9 +572,13 @@ impl WorkspaceInput {
                             return Err(InputError::Code("INVALID_TRANSITION"));
                         }
                         request.content.validate()?;
-                        if let Some(priority) = &request.priority {
-                            validate_priority(priority)?;
-                            input.priority = priority.clone();
+                        if let Some(priority) = request
+                            .priority
+                            .clone()
+                            .or_else(|| title_priority(&request.content.title))
+                        {
+                            validate_priority(&priority)?;
+                            input.priority = priority;
                         }
                         input.current_version += 1;
                         if request.request_answer {
@@ -741,6 +756,92 @@ mod tests {
             .await
             .unwrap();
         (pool, workspace)
+    }
+    #[tokio::test]
+    async fn title_prefix_sets_priority_and_backfills_open_inputs() {
+        assert_eq!(title_priority("P3 · Ship"), Some("P3".into()));
+        assert_eq!(title_priority("P5 · Ship"), None);
+        assert_eq!(title_priority("P1: Ship"), None);
+        let (pool, workspace) = setup().await;
+        let make = |key: &str, title: &str, priority: Option<&str>| {
+            let mut content = content();
+            content.title = title.into();
+            InputWrite::Create(CreateInput {
+                priority: priority.map(Into::into),
+                external_key: key.into(),
+                request_id: key.into(),
+                expected_sequence: 0,
+                content,
+            })
+        };
+        let write = |write| {
+            WorkspaceInput::write(
+                &pool,
+                workspace,
+                None,
+                InputActorKind::AgentMcp,
+                "requester",
+                write,
+            )
+        };
+        let priority = |id: String| {
+            let pool = pool.clone();
+            async move {
+                WorkspaceInput::get(&pool, workspace, &id)
+                    .await
+                    .unwrap()
+                    .priority
+            }
+        };
+        let derived = write(make("derived", "P3 · Ship", None)).await.unwrap();
+        assert_eq!(priority(derived.input_id.clone()).await, "P3");
+        let explicit = write(make("explicit", "P3 · Ship", Some("P1")))
+            .await
+            .unwrap();
+        assert_eq!(priority(explicit.input_id).await, "P1");
+        let mut content = content();
+        content.title = "P0 · Ship now".into();
+        WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&derived.input_id),
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Publish(PublishInput {
+                priority: None,
+                request_id: "republish".into(),
+                expected_sequence: 1,
+                content,
+                request_answer: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(priority(derived.input_id).await, "P0");
+
+        // Inputs written before the fallback existed: stored P2 under a prefixed title.
+        let open = write(make("open", "P4 · Later", Some("P2"))).await.unwrap();
+        let closed = write(make("closed", "P0 · Done", Some("P2")))
+            .await
+            .unwrap();
+        WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&closed.input_id),
+            InputActorKind::AgentMcp,
+            "requester",
+            status(1, "closed"),
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20261028130000_workspace_input_priority_from_title.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(priority(open.input_id).await, "P4");
+        assert_eq!(priority(closed.input_id).await, "P2");
     }
     #[tokio::test]
     async fn workspace_input_priority_defaults_updates_and_legacy_retry() {
