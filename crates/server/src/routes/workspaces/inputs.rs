@@ -132,17 +132,14 @@ async fn answer(
         InputWrite::Answer(body),
     )
     .await?;
-    // "No answer yet" is not a decision, so it does not wake the agent.
-    if receipt.event.payload["no_answer_yet"] != true {
-        let event = receipt.event.clone();
-        tokio::spawn(async move {
-            let send_pool = pool.clone();
-            notify_answer(&pool, &event, |text| async move {
-                send_text_to_cli_agent(&send_pool, workspace, &text).await
-            })
-            .await
-        });
-    }
+    let event = receipt.event.clone();
+    tokio::spawn(async move {
+        let send_pool = pool.clone();
+        notify_answer(&pool, &event, |text| async move {
+            send_text_to_cli_agent(&send_pool, workspace, &text).await
+        })
+        .await
+    });
     Ok(Json(ApiResponse::success(receipt)))
 }
 
@@ -151,6 +148,7 @@ const NOTICE_TEXT_CHARS: usize = 2000;
 
 #[derive(Debug, PartialEq)]
 enum AnswerDelivery {
+    Skipped,
     Delivered,
     NoSession,
     Failed,
@@ -189,6 +187,10 @@ where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<SendCliTextResponse, ApiError>>,
 {
+    // "No answer yet" is not a decision, so it does not wake the agent.
+    if event.payload["no_answer_yet"] == true {
+        return AnswerDelivery::Skipped;
+    }
     let title = WorkspaceInput::detail(
         pool,
         event.workspace_id,
@@ -207,8 +209,8 @@ where
     let notice = answer_notice(&event.input_id, &title, &answer);
     let (workspace_id, input_id) = (event.workspace_id, &event.input_id);
     match send(notice).await {
-        Ok(_) => {
-            tracing::info!(%workspace_id, %input_id, "Delivered the Input answer to the workspace agent");
+        Ok(SendCliTextResponse { submitted }) => {
+            tracing::info!(%workspace_id, %input_id, submitted, "Delivered the Input answer to the workspace agent");
             AnswerDelivery::Delivered
         }
         Err(ApiError::Conflict(_)) => {
@@ -610,6 +612,10 @@ mod tests {
     }
 
     async fn answered_event() -> (SqlitePool, InputEvent) {
+        answer_event(serde_json::json!({"choice_id":"yes","text":"go"})).await
+    }
+
+    async fn answer_event(answer: serde_json::Value) -> (SqlitePool, InputEvent) {
         use serde_json::json;
         let (app, workspace, pool) = test_app().await;
         let root = format!("/api/workspaces/{workspace}/inputs");
@@ -622,7 +628,7 @@ mod tests {
             app,
             "POST",
             &format!("{root}/{id}/answer"),
-            json!({"request_id":"answer","expected_sequence":1,"version":1,"answer":{"choice_id":"yes","text":"go"}}),
+            json!({"request_id":"answer","expected_sequence":1,"version":1,"answer":answer}),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{answer}");
@@ -649,6 +655,16 @@ mod tests {
                 event.input_id
             )
         );
+    }
+
+    #[tokio::test]
+    async fn no_answer_yet_does_not_wake_the_agent() {
+        let (pool, event) = answer_event(serde_json::json!({})).await;
+        let outcome = notify_answer(&pool, &event, |_| async {
+            panic!("no answer yet must not be sent")
+        })
+        .await;
+        assert_eq!(outcome, AnswerDelivery::Skipped);
     }
 
     #[tokio::test]
