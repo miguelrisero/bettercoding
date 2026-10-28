@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::HashSet,
     path::{Path, PathBuf},
 };
 
@@ -446,14 +446,10 @@ impl WorkspaceManager {
         WorktreeManager::batch_cleanup_worktrees(&cleanup_data).await?;
 
         // Remove the workspace directory itself
-        if workspace_dir.exists()
-            && let Err(e) = tokio::fs::remove_dir_all(workspace_dir).await
-        {
-            debug!(
-                "Could not remove workspace directory {}: {}",
-                workspace_dir.display(),
-                e
-            );
+        if workspace_dir.exists() {
+            tokio::fs::remove_dir_all(workspace_dir)
+                .await
+                .map_err(WorkspaceError::Io)?;
         }
 
         Ok(())
@@ -547,27 +543,33 @@ impl WorkspaceManager {
             return;
         }
 
-        // The default and the current roots, plus every root a workspace still
-        // lives in: a workspace keeps its absolute path when the root changes.
-        let mut roots = BTreeSet::from([
-            WorktreeManager::get_default_worktree_base_dir(),
-            Self::get_workspace_base_dir(),
-        ]);
-        match DbWorkspace::fetch_all(&self.db.pool).await {
-            Ok(workspaces) => roots.extend(
-                workspaces
-                    .iter()
-                    .filter_map(|w| Path::new(w.container_ref.as_deref()?).parent())
-                    .map(Path::to_path_buf),
-            ),
-            Err(e) => warn!("Failed to list workspace roots for orphan cleanup: {}", e),
-        }
-        for root in roots {
-            self.cleanup_orphans_in_directory(&root).await;
-        }
+        // Only the root new workspaces are created in. A former root (the
+        // default dir after a workspace-dir override, or a legacy root older
+        // workspaces still live in) can hold anything, such as another tool's
+        // files or live lock files, so it is never swept.
+        let registered: HashSet<PathBuf> = match DbWorkspace::fetch_all(&self.db.pool).await {
+            Ok(workspaces) => workspaces
+                .iter()
+                .filter_map(|w| w.container_ref.as_deref())
+                .map(canonical)
+                .collect(),
+            Err(e) => {
+                warn!(
+                    "Skipping orphan workspace cleanup: failed to list workspaces: {}",
+                    e
+                );
+                return;
+            }
+        };
+        self.cleanup_orphans_in_directory(&Self::get_workspace_base_dir(), &registered)
+            .await;
     }
 
-    async fn cleanup_orphans_in_directory(&self, workspace_base_dir: &Path) {
+    async fn cleanup_orphans_in_directory(
+        &self,
+        workspace_base_dir: &Path,
+        registered: &HashSet<PathBuf>,
+    ) {
         if !workspace_base_dir.exists() {
             debug!(
                 "Workspace base directory {} does not exist, skipping orphan cleanup",
@@ -603,18 +605,20 @@ impl WorkspaceManager {
             }
 
             let workspace_path_str = path.to_string_lossy().to_string();
-            if let Ok(false) =
-                DbWorkspace::container_ref_exists(&self.db.pool, &workspace_path_str).await
-            {
-                info!("Found orphaned workspace: {}", workspace_path_str);
+            // Canonical paths, so a symlinked root cannot hide a registered workspace.
+            if !registered.contains(&canonical(&path)) {
+                warn!(
+                    "Removing orphaned workspace directory {}",
+                    workspace_path_str
+                );
                 if let Err(e) = Self::cleanup_workspace_without_repos(&path).await {
                     error!(
                         "Failed to remove orphaned workspace {}: {}",
                         workspace_path_str, e
                     );
                 } else {
-                    info!(
-                        "Successfully removed orphaned workspace: {}",
+                    warn!(
+                        "Removed orphaned workspace directory {}",
                         workspace_path_str
                     );
                 }
@@ -647,20 +651,108 @@ impl WorkspaceManager {
             if path.is_dir()
                 && let Err(e) = WorktreeManager::cleanup_suspected_worktree(&path).await
             {
-                warn!("Failed to cleanup suspected worktree: {}", e);
+                warn!(
+                    "Failed to cleanup suspected worktree {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
 
-        if workspace_dir.exists()
-            && let Err(e) = tokio::fs::remove_dir_all(workspace_dir).await
-        {
-            debug!(
-                "Could not remove workspace directory {}: {}",
-                workspace_dir.display(),
-                e
-            );
+        if workspace_dir.exists() {
+            tokio::fs::remove_dir_all(workspace_dir)
+                .await
+                .map_err(WorkspaceError::Io)?;
         }
 
         Ok(())
+    }
+}
+
+fn canonical(path: impl AsRef<Path>) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or_else(|_| path.as_ref().to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use db::models::workspace::CreateWorkspace;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orphan_sweep_only_removes_unregistered_dirs_in_the_base_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("worktrees");
+        let outside = temp.path().join("outside");
+        let registered = outside.join("registered");
+        let sibling_lock = outside.join("sibling/.scratch/slot-2.lock");
+        let orphan = base.join("orphan");
+        // A workspace registered through a symlinked alias of the base dir.
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&base, &alias).unwrap();
+        let aliased = base.join("aliased");
+        fs::create_dir_all(&aliased).unwrap();
+        fs::create_dir_all(&registered).unwrap();
+        fs::create_dir_all(sibling_lock.parent().unwrap()).unwrap();
+        fs::write(&sibling_lock, "live gate lock").unwrap();
+        fs::create_dir_all(&orphan).unwrap();
+        // This crate's only test owns the environment; the base dir is cached on first use.
+        unsafe { std::env::set_var("BC_WORKTREE_BASE", &base) };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations_for_tests(&pool).await.unwrap();
+        let workspace = DbWorkspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "sweep-scope".into(),
+                name: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        DbWorkspace::update_container_ref(&pool, workspace.id, registered.to_str().unwrap())
+            .await
+            .unwrap();
+        let aliased_workspace = DbWorkspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "sweep-alias".into(),
+                name: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        DbWorkspace::update_container_ref(
+            &pool,
+            aliased_workspace.id,
+            alias.join("aliased").to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        WorkspaceManager::new(DBService { pool })
+            .cleanup_orphan_workspaces()
+            .await;
+
+        assert!(registered.is_dir());
+        assert!(
+            aliased.is_dir(),
+            "a registered workspace survives a symlinked root"
+        );
+        assert_eq!(fs::read_to_string(&sibling_lock).unwrap(), "live gate lock");
+        assert!(
+            !orphan.exists(),
+            "orphans inside the base dir are still removed"
+        );
     }
 }
