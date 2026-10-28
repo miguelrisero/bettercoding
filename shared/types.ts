@@ -12,15 +12,15 @@ export type InputAnswer = { choice_id: string | null, text: string | null, };
 
 export type InputContent = { title: string, html: string, contract: InputContract, };
 
-export type CreateInput = { external_key: string, request_id: string, expected_sequence: number, content: InputContent, };
+export type CreateInput = { priority?: string | null, external_key: string, request_id: string, expected_sequence: number, content: InputContent, };
 
-export type PublishInput = { request_id: string, expected_sequence: number, content: InputContent, request_answer: boolean, };
+export type PublishInput = { priority?: string | null, request_id: string, expected_sequence: number, content: InputContent, request_answer: boolean, };
 
 export type AnswerInput = { request_id: string, expected_sequence: number, version: number, answer: InputAnswer, };
 
 export type InputStatusWrite = { request_id: string, expected_sequence: number, status: string, reason: string | null, };
 
-export type WorkspaceInput = { id: string, workspace_id: string, external_key: string, creator: string, current_version: number, status: string, sequence: number, created_at: string, updated_at: string, };
+export type WorkspaceInput = { priority: string, id: string, workspace_id: string, external_key: string, creator: string, current_version: number, status: string, sequence: number, created_at: string, updated_at: string, };
 
 export type InputVersion = { version: number, title: string, html: string | null, contract: InputContract, content_hash: string, };
 

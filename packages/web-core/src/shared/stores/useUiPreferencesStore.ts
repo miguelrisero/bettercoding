@@ -33,6 +33,17 @@ export type MobileTab =
 export type MobileFontScale = 'default' | 'small' | 'smaller';
 export const DEFAULT_CREATE_DRAFT_WORKSPACE_BY_DEFAULT = false;
 
+const INPUT_SORT_KEY = 'bc-input-sort';
+const loadInputSort = (): 'priority' | 'newest' => {
+  try {
+    return localStorage.getItem(INPUT_SORT_KEY) === 'newest'
+      ? 'newest'
+      : 'priority';
+  } catch {
+    return 'priority';
+  }
+};
+
 const MOBILE_FONT_SCALE_KEY = 'vk-mobile-font-scale';
 
 const loadMobileFontScale = (): MobileFontScale => {
@@ -343,6 +354,8 @@ export type PersistKey =
   | `list-section-${string}`;
 
 type State = {
+  inputSort: 'priority' | 'newest';
+  setInputSort: (sort: 'priority' | 'newest') => void;
   // UI preferences
   repoActions: Record<string, RepoAction>;
   expanded: Record<string, boolean>;
@@ -487,6 +500,15 @@ type State = {
 };
 
 export const useUiPreferencesStore = create<State>()((set, get) => ({
+  inputSort: loadInputSort(),
+  setInputSort: (inputSort) => {
+    try {
+      localStorage.setItem(INPUT_SORT_KEY, inputSort);
+    } catch {
+      // localStorage may be unavailable.
+    }
+    set({ inputSort });
+  },
   // UI preferences state
   repoActions: {},
   expanded: {},

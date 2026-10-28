@@ -88,7 +88,7 @@ impl McpServer {
 #[tool_router(router = inputs_tools_router, vis = "pub")]
 impl McpServer {
     #[tool(
-        description = "Create one independently answerable workspace Input with self-contained HTML and a fixed answer contract. expected_sequence must be 0. Returns input_id, version, sequence, status, owner_url and event. Answers come only from the owner's UI. Application-enforced history includes a per-event hash chain; same-user processes can edit SQLite directly. Use bc.input.init and bc.input.propose protocol version 1 for page proposals; the owner must submit in trusted chrome. Never collect secrets."
+        description = "Create one independently answerable workspace Input with self-contained HTML and a fixed answer contract. expected_sequence must be 0. Returns input_id, version, sequence, status, owner_url and event. Answers come only from the owner's UI. Application-enforced history includes a per-event hash chain; same-user processes can edit SQLite directly. Use bc.input.init and bc.input.propose protocol version 1 for page proposals; the owner must submit in trusted chrome. Optional priority P0 through P4 defaults to P2. Never collect secrets."
     )]
     async fn create_input(&self, Parameters(request): Parameters<CreateRequest>) -> ToolCallResult {
         let workspace = match self.input_scope(request.workspace_id) {
@@ -103,7 +103,7 @@ impl McpServer {
         .await
     }
     #[tool(
-        description = "Publish an immutable Input version. Requires requester ownership, request_id and expected_sequence. request_answer=true returns an answered Input to open. Closed or cancelled Inputs cannot be reopened."
+        description = "Publish an immutable Input version. Requires requester ownership, request_id and expected_sequence. request_answer=true returns an answered Input to open. Optional priority P0 through P4 keeps its current value when omitted. Closed or cancelled Inputs cannot be reopened."
     )]
     async fn update_input(&self, Parameters(request): Parameters<UpdateRequest>) -> ToolCallResult {
         let workspace = match self.input_scope(request.workspace_id) {
@@ -251,6 +251,26 @@ mod tests {
     #[test]
     fn input_tool_create_decodes_flat_contract() {
         let request = serde_json::json!({"expected_sequence":0,"request_id":"r","external_key":"k","content":{"title":"t","html":"<p>yes</p>","contract":{"choices":[],"allow_text":true,"allow_no_answer_yet":false}}});
-        assert!(serde_json::from_value::<CreateRequest>(request).is_ok());
+        let mut request = request;
+        assert!(
+            serde_json::from_value::<CreateRequest>(request.clone())
+                .unwrap()
+                .input
+                .priority
+                .is_none()
+        );
+        request["priority"] = serde_json::json!("P1");
+        assert_eq!(
+            serde_json::from_value::<CreateRequest>(request)
+                .unwrap()
+                .input
+                .priority
+                .as_deref(),
+            Some("P1")
+        );
+        let schema = serde_json::to_value(schemars::schema_for!(CreateRequest)).unwrap();
+        assert!(schema["properties"].get("priority").is_some());
+        let schema = serde_json::to_value(schemars::schema_for!(UpdateRequest)).unwrap();
+        assert!(schema["properties"].get("priority").is_some());
     }
 }

@@ -10,6 +10,7 @@ import {
   XIcon,
 } from '@phosphor-icons/react';
 import type { AnswerInput, InputAnswer, InputDetail } from 'shared/types';
+import { useUiPreferencesStore } from '@/shared/stores/useUiPreferencesStore';
 import { useHostId } from '@/shared/providers/HostIdProvider';
 import { useVisualViewportGeometry } from '@/shared/hooks/useVisualViewportGeometry';
 import { useIsMobile } from '@/shared/hooks/useIsMobile';
@@ -23,8 +24,17 @@ import {
   validateInputAnswer,
   type InputBridge,
 } from './inputBridge';
-import { inputsApi, refreshInputAfterConflict } from './inputsApi';
-import { inputStatusLabel, nextOpenInput, splitRecommended } from './inputFlow';
+import {
+  inputsApi,
+  loadPendingInputs,
+  refreshInputAfterConflict,
+} from './inputsApi';
+import {
+  compareInputs,
+  inputStatusLabel,
+  nextOpenInput,
+  splitRecommended,
+} from './inputFlow';
 
 const focusRing =
   'focus:outline-none focus-visible:ring-2 focus-visible:ring-brand';
@@ -58,6 +68,43 @@ function StatusDot({ status }: { status: string }) {
   );
 }
 
+function PriorityBadge({ priority }: { priority: string }) {
+  return (
+    <span
+      className={cn(
+        'rounded border px-1.5 py-0.5 text-xs font-semibold',
+        priority === 'P0'
+          ? 'text-error bg-error/10'
+          : priority === 'P1'
+            ? 'text-brand bg-brand/10'
+            : 'text-low'
+      )}
+    >
+      {priority}
+    </span>
+  );
+}
+
+function InputSortControl() {
+  const sort = useUiPreferencesStore((s) => s.inputSort);
+  const setSort = useUiPreferencesStore((s) => s.setInputSort);
+  return (
+    <label className="flex items-center gap-half text-sm text-low">
+      Sort
+      <select
+        className={`min-h-9 rounded border bg-primary px-half text-high ${focusRing}`}
+        value={sort}
+        onChange={(e) =>
+          setSort(e.target.value === 'newest' ? 'newest' : 'priority')
+        }
+      >
+        <option value="priority">Priority</option>
+        <option value="newest">Newest</option>
+      </select>
+    </label>
+  );
+}
+
 function Age({ date }: { date: string }) {
   return (
     <time dateTime={date} title={formatDateShortWithTime(date)}>
@@ -72,11 +119,15 @@ export function WorkspaceInputsContainer({
   workspaceId: string;
 }) {
   const host = useHostId();
+  const sort = useUiPreferencesStore((s) => s.inputSort);
   const [showDone, setShowDone] = useState(false);
   const [cursor, setCursor] = useState('');
   const list = useQuery({
     queryKey: ['inputs', host, workspaceId, showDone, cursor],
-    queryFn: () => inputsApi.list(workspaceId, host, showDone, cursor),
+    queryFn: () =>
+      showDone
+        ? inputsApi.list(workspaceId, host, true, cursor)
+        : loadPendingInputs(workspaceId, host),
     refetchInterval: 10000,
   });
   return (
@@ -107,6 +158,7 @@ export function WorkspaceInputsContainer({
           ))}
         </div>
       </div>
+      <InputSortControl />
       {list.isLoading && (
         <p role="status" className="text-sm text-low">
           Loading Inputs…
@@ -123,7 +175,10 @@ export function WorkspaceInputsContainer({
         </p>
       )}
       <ul className="-mx-half">
-        {list.data?.inputs.map((detail) => (
+        {(list.data
+          ? [...list.data.inputs].sort((a, b) => compareInputs(a, b, sort))
+          : []
+        ).map((detail) => (
           <li key={detail.input.id}>
             <button
               className={`w-full text-left rounded-md px-half py-base hover:bg-secondary ${focusRing}`}
@@ -135,6 +190,7 @@ export function WorkspaceInputsContainer({
                 {detail.version.title}
               </span>
               <span className="mt-1 flex items-center gap-half text-xs text-low [&>time]:ml-half">
+                <PriorityBadge priority={detail.input.priority} />
                 <StatusDot status={detail.input.status} />
                 {inputStatusLabel[detail.input.status] ?? detail.input.status}
                 <Age date={detail.input.created_at} />
@@ -167,6 +223,7 @@ export function WorkspaceInputsContainer({
 export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
   const host = useHostId();
   const queryClient = useQueryClient();
+  const sort = useUiPreferencesStore((s) => s.inputSort);
   const isMobile = useIsMobile();
   const viewport = useVisualViewportGeometry();
   const [selected, setSelected] = useState(selectedInput);
@@ -193,7 +250,7 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
   // Shares the cache entry of the pending list in the Inputs panel.
   const listQuery = {
     queryKey: ['inputs', host, workspaceId, false, ''],
-    queryFn: () => inputsApi.list(workspaceId, host, false),
+    queryFn: () => loadPendingInputs(workspaceId, host),
   };
   const list = useQuery({ ...listQuery, enabled: selected !== null });
   if (!selected && !done) return null;
@@ -206,26 +263,27 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
     setSelected(null);
     setDone(false);
   };
-  const advance = async (fromId: string) => {
+  const advance = async (from: InputDetail) => {
+    const fromId = from.input.id;
     const started = session.current;
     let inputs: InputDetail[];
     try {
-      const first = await queryClient.fetchQuery({
-        ...listQuery,
-        staleTime: 0,
-      });
-      inputs = [...first.inputs];
-      // ponytail: reads every pending page; fine while pending Inputs stay few.
-      for (let cursor = first.next_cursor; cursor; ) {
-        const page = await inputsApi.list(workspaceId, host, false, cursor);
-        inputs.push(...page.inputs);
-        cursor = page.next_cursor;
-      }
+      const page = await queryClient.fetchQuery({ ...listQuery, staleTime: 0 });
+      inputs = page.inputs;
     } catch {
       return; // Stay on the answered Input; its receipt is already shown.
     }
     if (session.current !== started || selectedInput() !== fromId) return;
-    const next = nextOpenInput(inputs, fromId);
+    const next = nextOpenInput(
+      inputs,
+      queryClient.getQueryData<InputDetail>([
+        'input',
+        host,
+        workspaceId,
+        fromId,
+      ]) ?? from,
+      useUiPreferencesStore.getState().inputSort
+    );
     const stillOpen = inputs.some((d) => d.input.id === fromId);
     if (!next && stillOpen) {
       setNotice('Saved');
@@ -240,7 +298,9 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
       setDone(true);
     }
   };
-  const openInputs = list.data?.inputs ?? [];
+  const openInputs = [...(list.data?.inputs ?? [])].sort((a, b) =>
+    compareInputs(a, b, sort)
+  );
   const position = openInputs.findIndex((d) => d.input.id === selected);
   return createPortal(
     <Dialog.Root
@@ -293,7 +353,7 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
                         ),
                     }
               }
-              onAnswered={() => advance(selected)}
+              onAnswered={advance}
             />
           ) : (
             <InputsDone />
@@ -358,10 +418,12 @@ function InputViewer({
     total: number;
     step: (delta: number) => void;
   } | null;
-  onAnswered: () => Promise<void>;
+  onAnswered: (detail: InputDetail) => Promise<void>;
 }) {
   const host = useHostId();
   const queryClient = useQueryClient();
+  const [priorityBusy, setPriorityBusy] = useState(false);
+  const [priorityError, setPriorityError] = useState<string | null>(null);
   const [reviewMessage, setReviewMessage] = useState<string | null>(null);
   const detail = useQuery({
     queryKey: ['input', host, workspaceId, inputId],
@@ -388,6 +450,52 @@ function InputViewer({
                 <StatusDot status={input.status} />
                 {inputStatusLabel[input.status] ?? input.status}
               </span>
+              <PriorityBadge priority={input.priority} />
+              {['open', 'answered'].includes(input.status) && (
+                <label className="inline-flex items-center gap-half">
+                  Priority
+                  <select
+                    aria-label="Input priority"
+                    className={`min-h-9 rounded border bg-primary px-half text-high ${focusRing}`}
+                    value={input.priority}
+                    disabled={priorityBusy}
+                    onChange={async (e) => {
+                      const priority = e.target.value;
+                      setPriorityBusy(true);
+                      setPriorityError(null);
+                      try {
+                        const result = await inputsApi.priority(
+                          workspaceId,
+                          host,
+                          inputId,
+                          priority
+                        );
+                        queryClient.setQueryData<InputDetail>(
+                          ['input', host, workspaceId, inputId],
+                          (data) => (data ? { ...data, input: result } : data)
+                        );
+                        await queryClient.invalidateQueries({
+                          queryKey: ['inputs', host, workspaceId],
+                        });
+                      } catch (error) {
+                        setPriorityError(
+                          error instanceof Error
+                            ? error.message
+                            : 'Could not save priority'
+                        );
+                      } finally {
+                        setPriorityBusy(false);
+                      }
+                    }}
+                  >
+                    {['P0', 'P1', 'P2', 'P3', 'P4'].map((priority) => (
+                      <option key={priority} value={priority}>
+                        {priority}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
               <Age date={input.created_at} />
               {position && (
                 <span className="md:hidden tabular-nums">
@@ -458,6 +566,11 @@ function InputViewer({
         The page can propose an answer. Only Submit records your answer. Keep
         secrets outside Inputs.
       </Dialog.Description>
+      {priorityError && (
+        <p role="alert" className="px-base py-half text-error">
+          {priorityError}
+        </p>
+      )}
       {reviewMessage && (
         <p
           role="status"
@@ -514,7 +627,7 @@ function InputBody({
   detail: InputDetail;
   refresh: () => Promise<void>;
   refreshAfterConflict: () => Promise<void>;
-  onAnswered: () => Promise<void>;
+  onAnswered: (detail: InputDetail) => Promise<void>;
 }) {
   const host = useHostId();
   const frame = useRef<HTMLIFrameElement>(null);
@@ -676,7 +789,7 @@ function InputBody({
     } finally {
       setBusy(false);
     }
-    if (answered && mounted.current) await onAnswered();
+    if (answered && mounted.current) await onAnswered(detail);
   };
   const status = async (undo: boolean) => {
     setBusy(true);

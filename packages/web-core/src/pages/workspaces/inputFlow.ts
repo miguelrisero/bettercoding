@@ -11,22 +11,36 @@ export function splitRecommended(label: string): {
     : { label, recommended: false };
 }
 
-// The next open Input after the current one in list order, wrapping around.
+export type InputSort = 'priority' | 'newest';
+
+export function compareInputs(
+  a: InputDetail,
+  b: InputDetail,
+  sort: InputSort
+): number {
+  const age = Date.parse(a.input.created_at) - Date.parse(b.input.created_at);
+  return (
+    (sort === 'priority'
+      ? a.input.priority.localeCompare(b.input.priority) || age
+      : -age) || a.input.id.localeCompare(b.input.id)
+  );
+}
+
+// Place the current detail in the selected order even after it leaves Pending.
 export function nextOpenInput(
   inputs: InputDetail[],
-  currentId: string
+  current: InputDetail,
+  sort: InputSort
 ): string | null {
-  const index = inputs.findIndex((d) => d.input.id === currentId);
-  if (index < 0) {
-    return (
-      inputs.find((d) => d.input.status === 'open' && d.input.id > currentId)
-        ?.input.id ??
-      inputs.find((d) => d.input.status === 'open')?.input.id ??
-      null
-    );
-  }
-  const order = [...inputs.slice(index + 1), ...inputs.slice(0, index)];
-  return order.find((d) => d.input.status === 'open')?.input.id ?? null;
+  current = inputs.find((d) => d.input.id === current.input.id) ?? current;
+  const open = inputs
+    .filter((d) => d.input.status === 'open' && d.input.id !== current.input.id)
+    .sort((a, b) => compareInputs(a, b, sort));
+  return (
+    open.find((d) => compareInputs(d, current, sort) > 0)?.input.id ??
+    open[0]?.input.id ??
+    null
+  );
 }
 
 export const inputStatusLabel: Record<string, string> = {
