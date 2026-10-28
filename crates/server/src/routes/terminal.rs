@@ -182,7 +182,10 @@ pub(super) async fn resolve_cli_launch_spec(
             None
         };
         if let Some(settings) = write_cli_hook_settings(workspace_id).await {
-            if let Some(mcp_config) = mcp_config {
+            if let Some((mcp_config, strict)) = mcp_config {
+                if strict {
+                    spec.base_args.push("--strict-mcp-config".to_string());
+                }
                 spec.base_args.push("--mcp-config".to_string());
                 spec.base_args
                     .push(mcp_config.to_string_lossy().into_owned());
@@ -325,35 +328,113 @@ async fn mcp_server_launch() -> Option<(String, String)> {
     Some((exe, format!("http://127.0.0.1:{port}")))
 }
 
+/// The user's own MCP servers a workspace agent starts with, next to
+/// BetterCoding's. Every other server in `~/.claude.json` and every plugin
+/// server stays off: a stdio server is one or more processes per agent, and
+/// dozens of agents each starting all of them overload the host.
+const LEAN_MCP_SERVERS: &[&str] = &[
+    "slack",
+    "linear-server",
+    "render",
+    "Neon",
+    "posthog",
+    "grafana",
+    "patricia",
+    "context7",
+    "fff",
+];
+
 /// Write the per-workspace MCP config that gives claude the BetterCoding tools
-/// (create, update, archive and delete workspaces, sessions, repos), and return
-/// its path for `claude --mcp-config`. Like `--settings`, it adds to the
-/// user's own MCP servers without editing their config.
-async fn write_cli_mcp_config(workspace_id: Uuid) -> Option<PathBuf> {
+/// (create, update, archive and delete workspaces, sessions, repos) plus the
+/// lean set of the user's servers, and return its path for
+/// `claude --mcp-config` with whether to pass `--strict-mcp-config`.
+///
+/// `cli-mcp/<workspace_id>.servers.json` overrides the set per workspace: a
+/// JSON array of extra server names from `~/.claude.json` (e.g.
+/// `["playwright"]`), or `"all"` to keep every server the user configured.
+/// The user's config is only read, never edited.
+async fn write_cli_mcp_config(workspace_id: Uuid) -> Option<(PathBuf, bool)> {
     let (exe, url) = mcp_server_launch().await?;
-    let config = serde_json::json!({
-        "mcpServers": {
-            MCP_SERVER_NAME: {
-                "type": "stdio",
-                "command": exe,
-                "args": ["mcp"],
-                "env": { "BC_BACKEND_URL": url },
-            }
-        }
-    });
     let dir = utils::assets::asset_dir().join("cli-mcp");
     if let Err(error) = tokio::fs::create_dir_all(&dir).await {
         tracing::debug!(?error, "could not create the CLI MCP config directory");
         return None;
     }
+    let read_json = |path: PathBuf| async move {
+        let text = tokio::fs::read_to_string(path).await.ok()?;
+        serde_json::from_str::<serde_json::Value>(&text).ok()
+    };
+    let workspace_override = read_json(dir.join(format!("{workspace_id}.servers.json"))).await;
+    let user_config = match dirs::home_dir() {
+        Some(home) => read_json(home.join(".claude.json")).await,
+        None => None,
+    };
+    let lean = cli_mcp_servers(user_config.as_ref(), workspace_override.as_ref());
+    let strict = lean.is_some();
+    let mut servers = lean.unwrap_or_default();
+    servers.insert(
+        MCP_SERVER_NAME.to_string(),
+        serde_json::json!({
+            "type": "stdio",
+            "command": exe,
+            "args": ["mcp"],
+            "env": { "BC_BACKEND_URL": url },
+        }),
+    );
+    let config = serde_json::json!({ "mcpServers": servers });
     let path = dir.join(format!("{workspace_id}.json"));
-    match tokio::fs::write(&path, config.to_string()).await {
-        Ok(()) => Some(path),
+    // The copied server entries can carry the user's API keys.
+    match write_private(&path, config.to_string().as_bytes()).await {
+        Ok(()) => Some((path, strict)),
         Err(error) => {
             tracing::debug!(?error, "could not write the CLI MCP config file");
             None
         }
     }
+}
+
+/// The user's servers for a strict launch, or `None` to keep all of them: the
+/// override says `"all"`, or the user's config cannot be read (a strict launch
+/// then would silently drop every server).
+fn cli_mcp_servers(
+    user_config: Option<&serde_json::Value>,
+    workspace_override: Option<&serde_json::Value>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    if workspace_override.and_then(|v| v.as_str()) == Some("all") {
+        return None;
+    }
+    let configured = user_config?.get("mcpServers")?.as_object()?;
+    let extra = workspace_override
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|name| name.as_str());
+    Some(
+        LEAN_MCP_SERVERS
+            .iter()
+            .copied()
+            .chain(extra)
+            .filter_map(|name| Some((name.to_string(), configured.get(name)?.clone())))
+            .collect(),
+    )
+}
+
+async fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        options.mode(0o600);
+        // An older launch created the file with the default mode.
+        if tokio::fs::metadata(path).await.is_ok() {
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+        }
+    }
+    let mut file = options.open(path).await?;
+    file.write_all(contents).await?;
+    file.flush().await
 }
 
 /// The inline `-c mcp_servers.<name>.*` overrides that give codex the same MCP
@@ -1536,7 +1617,32 @@ mod tests {
     use sqlx::SqlitePool;
     use uuid::Uuid;
 
-    use super::{MAX_CLI_SEND_BYTES, validate_cli_send_text};
+    use super::{MAX_CLI_SEND_BYTES, cli_mcp_servers, validate_cli_send_text};
+
+    #[test]
+    fn cli_mcp_servers_keep_the_lean_set_plus_the_workspace_override() {
+        let user = serde_json::json!({"mcpServers": {
+            "slack": {"type": "http", "url": "https://mcp.slack.com/mcp"},
+            "fff": {"command": "fff-mcp"},
+            "gmail": {"command": "npx"},
+            "playwright": {"command": "npx"},
+        }});
+        let names = |servers: serde_json::Map<String, serde_json::Value>| {
+            let mut names: Vec<_> = servers.keys().cloned().collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(cli_mcp_servers(Some(&user), None).unwrap()),
+            ["fff", "slack"]
+        );
+        let extra = serde_json::json!(["playwright", "missing"]);
+        let servers = cli_mcp_servers(Some(&user), Some(&extra)).unwrap();
+        assert_eq!(servers["slack"], user["mcpServers"]["slack"]);
+        assert_eq!(names(servers), ["fff", "playwright", "slack"]);
+        assert!(cli_mcp_servers(Some(&user), Some(&serde_json::json!("all"))).is_none());
+        assert!(cli_mcp_servers(None, None).is_none());
+    }
 
     #[test]
     fn cli_send_rejects_empty_and_whitespace_text() {
