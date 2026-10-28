@@ -17,10 +17,15 @@ export function nextOpenInput(
   currentId: string
 ): string | null {
   const index = inputs.findIndex((d) => d.input.id === currentId);
-  const order =
-    index < 0
-      ? inputs
-      : [...inputs.slice(index + 1), ...inputs.slice(0, index)];
+  if (index < 0) {
+    return (
+      inputs.find((d) => d.input.status === 'open' && d.input.id > currentId)
+        ?.input.id ??
+      inputs.find((d) => d.input.status === 'open')?.input.id ??
+      null
+    );
+  }
+  const order = [...inputs.slice(index + 1), ...inputs.slice(0, index)];
   return order.find((d) => d.input.status === 'open')?.input.id ?? null;
 }
 

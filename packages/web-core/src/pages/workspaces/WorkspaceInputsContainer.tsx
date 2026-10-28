@@ -72,11 +72,11 @@ export function WorkspaceInputsContainer({
   workspaceId: string;
 }) {
   const host = useHostId();
-  const [done, setDone] = useState(false);
+  const [showDone, setShowDone] = useState(false);
   const [cursor, setCursor] = useState('');
   const list = useQuery({
-    queryKey: ['inputs', host, workspaceId, done, cursor],
-    queryFn: () => inputsApi.list(workspaceId, host, done, cursor),
+    queryKey: ['inputs', host, workspaceId, showDone, cursor],
+    queryFn: () => inputsApi.list(workspaceId, host, showDone, cursor),
     refetchInterval: 10000,
   });
   return (
@@ -94,11 +94,11 @@ export function WorkspaceInputsContainer({
               key={String(isDone)}
               className={cn(
                 quietButton,
-                done === isDone && 'text-high underline'
+                showDone === isDone && 'text-high underline'
               )}
-              aria-pressed={done === isDone}
+              aria-pressed={showDone === isDone}
               onClick={() => {
-                setDone(isDone);
+                setShowDone(isDone);
                 setCursor('');
               }}
             >
@@ -226,9 +226,7 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
     }
     if (session.current !== started || selectedInput() !== fromId) return;
     const next = nextOpenInput(inputs, fromId);
-    const stillOpen = inputs.some(
-      (d) => d.input.id === fromId && d.input.status === 'open'
-    );
+    const stillOpen = inputs.some((d) => d.input.id === fromId);
     if (!next && stillOpen) {
       setNotice('Saved');
       return; // "No answer yet" keeps the only open Input in view.
@@ -242,8 +240,7 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
       setDone(true);
     }
   };
-  const openInputs =
-    list.data?.inputs.filter((d) => d.input.status === 'open') ?? [];
+  const openInputs = list.data?.inputs ?? [];
   const position = openInputs.findIndex((d) => d.input.id === selected);
   return createPortal(
     <Dialog.Root
