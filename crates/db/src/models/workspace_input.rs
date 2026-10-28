@@ -43,6 +43,8 @@ pub struct InputContent {
 #[derive(Debug, Clone, Serialize, Deserialize, TS, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
     pub external_key: String,
     pub request_id: String,
     #[ts(type = "number")]
@@ -53,6 +55,8 @@ pub struct CreateInput {
 #[derive(Debug, Clone, Serialize, Deserialize, TS, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublishInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
     pub request_id: String,
     #[ts(type = "number")]
     pub expected_sequence: i64,
@@ -83,6 +87,7 @@ pub struct InputStatusWrite {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 pub struct WorkspaceInput {
+    pub priority: String,
     pub id: String,
     pub workspace_id: Uuid,
     pub external_key: String,
@@ -305,7 +310,32 @@ impl InputContent {
     }
 }
 
+fn validate_priority(priority: &str) -> Result<()> {
+    if !["P0", "P1", "P2", "P3", "P4"].contains(&priority) {
+        return Err(InputError::Code("SCHEMA_INVALID"));
+    }
+    Ok(())
+}
+
 impl WorkspaceInput {
+    pub async fn set_priority(
+        pool: &SqlitePool,
+        workspace: Uuid,
+        id: &str,
+        priority: &str,
+    ) -> Result<Self> {
+        validate_priority(priority)?;
+        let input = sqlx::query_as("UPDATE workspace_inputs SET priority=? WHERE workspace_id=? AND id=? AND status IN ('open','answered') RETURNING *")
+            .bind(priority).bind(workspace).bind(id).fetch_optional(pool).await?;
+        match input {
+            Some(input) => Ok(input),
+            None => {
+                Self::get(pool, workspace, id).await?;
+                Err(InputError::Code("INVALID_TRANSITION"))
+            }
+        }
+    }
+
     pub async fn get(pool: &SqlitePool, workspace: Uuid, id: &str) -> Result<Self> {
         sqlx::query_as("SELECT * FROM workspace_inputs WHERE workspace_id=? AND id=?")
             .bind(workspace)
@@ -473,6 +503,9 @@ impl WorkspaceInput {
                     return Err(InputError::Code("SCHEMA_INVALID"));
                 }
                 request.content.validate()?;
+                if let Some(priority) = &request.priority {
+                    validate_priority(priority)?;
+                }
                 let exists: Option<(String,)> = sqlx::query_as(
                     "SELECT id FROM workspace_inputs WHERE workspace_id=? AND external_key=?",
                 )
@@ -484,6 +517,7 @@ impl WorkspaceInput {
                     return Err(InputError::Code("IDEMPOTENCY_CONFLICT"));
                 }
                 let input = Self {
+                    priority: request.priority.clone().unwrap_or_else(|| "P2".into()),
                     id: Uuid::new_v4().to_string(),
                     workspace_id: workspace,
                     external_key: request.external_key.clone(),
@@ -494,8 +528,8 @@ impl WorkspaceInput {
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 };
-                sqlx::query("INSERT INTO workspace_inputs (id,workspace_id,external_key,creator,current_version,status,sequence,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)")
-                    .bind(&input.id).bind(workspace).bind(&input.external_key).bind(actor).bind(1).bind("open").bind(0).bind(&now).bind(&now).execute(&mut *tx).await?;
+                sqlx::query("INSERT INTO workspace_inputs (id,workspace_id,external_key,creator,current_version,status,sequence,created_at,updated_at,priority) VALUES (?,?,?,?,?,?,?,?,?,?)")
+                    .bind(&input.id).bind(workspace).bind(&input.external_key).bind(actor).bind(1).bind("open").bind(0).bind(&now).bind(&now).bind(&input.priority).execute(&mut *tx).await?;
                 content = Some(request.content.clone());
                 (
                     input,
@@ -527,6 +561,10 @@ impl WorkspaceInput {
                             return Err(InputError::Code("INVALID_TRANSITION"));
                         }
                         request.content.validate()?;
+                        if let Some(priority) = &request.priority {
+                            validate_priority(priority)?;
+                            input.priority = priority.clone();
+                        }
                         input.current_version += 1;
                         if request.request_answer {
                             input.status = "open".into();
@@ -646,8 +684,8 @@ impl WorkspaceInput {
         event.hash = event_hash(&event);
         event.cursor = sqlx::query("INSERT INTO workspace_input_events (id,workspace_id,input_id,sequence,actor_kind,actor,event_type,version,payload,request_id,request_hash,created_at,prev_hash,hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&event.id).bind(workspace).bind(&input.id).bind(event.sequence).bind(&event.actor_kind).bind(actor).bind(event_type).bind(event.version).bind(canonical(&event.payload)).bind(request_id).bind(&event.request_hash).bind(&now).bind(&event.prev_hash).bind(&event.hash).execute(&mut *tx).await?.last_insert_rowid();
-        sqlx::query("UPDATE workspace_inputs SET current_version=?,status=?,sequence=?,updated_at=? WHERE workspace_id=? AND id=?")
-            .bind(input.current_version).bind(&input.status).bind(input.sequence).bind(&now).bind(workspace).bind(&input.id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE workspace_inputs SET current_version=?,status=?,sequence=?,updated_at=?,priority=? WHERE workspace_id=? AND id=?")
+            .bind(input.current_version).bind(&input.status).bind(input.sequence).bind(&now).bind(&input.priority).bind(workspace).bind(&input.id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(receipt(event, input.status))
     }
@@ -690,6 +728,12 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20261028120000_workspace_input_priority.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         let workspace = Uuid::new_v4();
         sqlx::query("INSERT INTO workspaces (id) VALUES (?)")
             .bind(workspace)
@@ -698,6 +742,153 @@ mod tests {
             .unwrap();
         (pool, workspace)
     }
+    #[tokio::test]
+    async fn workspace_input_priority_defaults_updates_and_legacy_retry() {
+        let (pool, workspace) = setup().await;
+        let legacy = json!({"external_key":"legacy","request_id":"legacy-create","expected_sequence":0,"content":content()});
+        let request: CreateInput = serde_json::from_value(legacy.clone()).unwrap();
+        let created = WorkspaceInput::write(
+            &pool,
+            workspace,
+            None,
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Create(request.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            WorkspaceInput::get(&pool, workspace, &created.input_id)
+                .await
+                .unwrap()
+                .priority,
+            "P2"
+        );
+        let old_hash = digest(&canonical(
+            &json!({"input_id":null,"actor_kind":"agent_mcp","actor":"requester","write":{"operation":"create","body":legacy}}),
+        ));
+        assert_eq!(created.event.request_hash, old_hash);
+        let retry = WorkspaceInput::write(
+            &pool,
+            workspace,
+            None,
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Create(request),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry.event.id, created.event.id);
+
+        let mut request = match create() {
+            InputWrite::Create(request) => request,
+            _ => unreachable!(),
+        };
+        request.priority = Some("P1".into());
+        let created = WorkspaceInput::write(
+            &pool,
+            workspace,
+            None,
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Create(request.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            WorkspaceInput::get(&pool, workspace, &created.input_id)
+                .await
+                .unwrap()
+                .priority,
+            "P1"
+        );
+        let legacy_publish = json!({"request_id":"publish-1","expected_sequence":1,"content":content(),"request_answer":true});
+        let published = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::AgentMcp,
+            "requester",
+            publish(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            WorkspaceInput::get(&pool, workspace, &created.input_id)
+                .await
+                .unwrap()
+                .priority,
+            "P1"
+        );
+        assert_eq!(
+            published.event.request_hash,
+            digest(&canonical(
+                &json!({"input_id":created.input_id,"actor_kind":"agent_mcp","actor":"requester","write":{"operation":"publish","body":legacy_publish}})
+            ))
+        );
+        let retry = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::AgentMcp,
+            "requester",
+            publish(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry.event.id, published.event.id);
+        let mut update = match publish(2) {
+            InputWrite::Publish(request) => request,
+            _ => unreachable!(),
+        };
+        update.priority = Some("invalid".into());
+        assert!(matches!(
+            WorkspaceInput::write(
+                &pool,
+                workspace,
+                Some(&created.input_id),
+                InputActorKind::AgentMcp,
+                "requester",
+                InputWrite::Publish(update.clone())
+            )
+            .await,
+            Err(InputError::Code("SCHEMA_INVALID"))
+        ));
+        update.priority = Some("P0".into());
+        WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Publish(update),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            WorkspaceInput::get(&pool, workspace, &created.input_id)
+                .await
+                .unwrap()
+                .priority,
+            "P0"
+        );
+        request.external_key = "invalid".into();
+        request.request_id = "invalid".into();
+        request.priority = Some("P5".into());
+        assert!(matches!(
+            WorkspaceInput::write(
+                &pool,
+                workspace,
+                None,
+                InputActorKind::AgentMcp,
+                "requester",
+                InputWrite::Create(request)
+            )
+            .await,
+            Err(InputError::Code("SCHEMA_INVALID"))
+        ));
+    }
+
     fn content() -> InputContent {
         InputContent {
             title: "Choose the rollout".into(),
@@ -714,6 +905,7 @@ mod tests {
     }
     fn create() -> InputWrite {
         InputWrite::Create(CreateInput {
+            priority: None,
             external_key: "rollout".into(),
             request_id: "create".into(),
             expected_sequence: 0,
@@ -753,6 +945,7 @@ mod tests {
     }
     fn publish(sequence: i64) -> InputWrite {
         InputWrite::Publish(PublishInput {
+            priority: None,
             request_id: format!("publish-{sequence}"),
             expected_sequence: sequence,
             content: content(),

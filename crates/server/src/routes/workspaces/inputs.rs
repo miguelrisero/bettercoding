@@ -223,6 +223,21 @@ where
         }
     }
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PriorityWrite {
+    priority: String,
+}
+async fn priority(
+    State(pool): State<SqlitePool>,
+    Path((workspace, id)): Path<(Uuid, String)>,
+    Json(body): Json<PriorityWrite>,
+) -> RouteResult<WorkspaceInput> {
+    Ok(Json(ApiResponse::success(
+        WorkspaceInput::set_priority(&pool, workspace, &id, &body.priority).await?,
+    )))
+}
+
 async fn close(
     State(pool): State<SqlitePool>,
     Path((workspace, id)): Path<(Uuid, String)>,
@@ -383,6 +398,7 @@ fn input_routes() -> Router<SqlitePool> {
             "/{input_id}/answer",
             post(answer).layer(DefaultBodyLimit::max(super::file_policy::MAX_INPUT_BYTES)),
         )
+        .route("/{input_id}/priority", post(priority))
         .route("/{input_id}/close", post(close))
         .route("/{input_id}/undo-close", post(undo))
         .route("/{input_id}/verify", get(verify))
@@ -439,6 +455,12 @@ mod tests {
             .unwrap();
         sqlx::raw_sql(include_str!(
             "../../../../db/migrations/20261027090000_workspace_inputs.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../../db/migrations/20261028120000_workspace_input_priority.sql"
         ))
         .execute(&pool)
         .await
@@ -507,6 +529,30 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{created}");
         let id = created["data"]["input_id"].as_str().unwrap();
         assert_eq!(created["data"]["event"]["actor_kind"], "agent_mcp");
+        let priority_url = format!("{root}/{id}/priority");
+        let (status, _, result) =
+            request(app.clone(), "POST", &priority_url, json!({"priority":"P0"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result["data"]["priority"], "P0");
+        assert_eq!(result["data"]["sequence"], 1);
+        assert_eq!(
+            request(app.clone(), "POST", &priority_url, json!({"priority":"P5"}))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            request(
+                app.clone(),
+                "POST",
+                &priority_url,
+                json!({"priority":"P1", "actor_kind":"agent_mcp"})
+            )
+            .await
+            .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
         let (status, headers, _) = request(
             app.clone(),
             "GET",
@@ -558,6 +604,34 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{answer}");
         assert_eq!(answer["data"]["event"]["actor_kind"], "owner_ui");
         assert_eq!(answer["data"]["event"]["payload"]["answer"]["text"], "yes");
+        let (status, _, result) =
+            request(app.clone(), "POST", &priority_url, json!({"priority":"P1"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result["data"]["priority"], "P1");
+        assert_eq!(result["data"]["sequence"], 2);
+        assert_eq!(
+            request(
+                app.clone(),
+                "POST",
+                &format!("{root}/{id}/close"),
+                json!({"request_id":"close", "expected_sequence":2, "status":"closed"})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let (status, _, result) =
+            request(app.clone(), "POST", &priority_url, json!({"priority":"P3"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(result["message"], "INVALID_TRANSITION");
+        assert_eq!(
+            WorkspaceInput::get(&pool, workspace, id)
+                .await
+                .unwrap()
+                .priority,
+            "P1"
+        );
+
         let (_, _, verified) = request(
             app.clone(),
             "GET",

@@ -1,7 +1,9 @@
+import type { QueryClient } from '@tanstack/react-query';
 import type {
   AnswerInput,
   InputDetail,
   InputPage,
+  WorkspaceInput,
   InputReceipt,
   InputStatusWrite,
 } from 'shared/types';
@@ -27,7 +29,7 @@ export async function inputRequest<T>(
   workspace: string,
   hostId: string | null,
   suffix = '',
-  body?: AnswerInput | InputStatusWrite
+  body?: AnswerInput | InputStatusWrite | { priority: string }
 ): Promise<T> {
   const response = await makeLocalApiRequest(
     `/api/workspaces/${workspace}/inputs${suffix}`,
@@ -61,6 +63,15 @@ export const inputsApi = {
     ),
   get: (workspace: string, host: string | null, id: string) =>
     inputRequest<InputDetail>(workspace, host, `/${id}`),
+  priority: (
+    workspace: string,
+    host: string | null,
+    id: string,
+    priority: string
+  ) =>
+    inputRequest<WorkspaceInput>(workspace, host, `/${id}/priority`, {
+      priority,
+    }),
   contentUrl: (
     workspace: string,
     host: string | null,
@@ -96,3 +107,35 @@ export const inputsApi = {
       }
     ),
 };
+
+// ponytail: pending queues are small; load every page, use server sorting if queues grow large.
+export async function loadPendingInputs(
+  workspace: string,
+  host: string | null
+): Promise<InputPage> {
+  const first = await inputsApi.list(workspace, host, false);
+  const inputs = [...first.inputs];
+  for (let cursor = first.next_cursor; cursor; ) {
+    const page = await inputsApi.list(workspace, host, false, cursor);
+    inputs.push(...page.inputs);
+    cursor = page.next_cursor;
+  }
+  return { ...first, inputs, next_cursor: null };
+}
+
+export async function setInputPriority(
+  queryClient: QueryClient,
+  workspace: string,
+  host: string | null,
+  inputId: string,
+  priority: string
+): Promise<void> {
+  await inputsApi.priority(workspace, host, inputId, priority);
+  await Promise.all([
+    queryClient.invalidateQueries({
+      queryKey: ['input', host, workspace, inputId],
+      exact: true,
+    }),
+    queryClient.invalidateQueries({ queryKey: ['inputs', host, workspace] }),
+  ]);
+}
