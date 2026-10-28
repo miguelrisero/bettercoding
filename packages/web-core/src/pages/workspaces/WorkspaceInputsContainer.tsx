@@ -2,10 +2,19 @@ import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import * as Dialog from '@radix-ui/react-dialog';
+import {
+  ArrowClockwiseIcon,
+  CaretLeftIcon,
+  CaretRightIcon,
+  CheckIcon,
+  XIcon,
+} from '@phosphor-icons/react';
 import type { AnswerInput, InputAnswer, InputDetail } from 'shared/types';
 import { useHostId } from '@/shared/providers/HostIdProvider';
 import { useVisualViewportGeometry } from '@/shared/hooks/useVisualViewportGeometry';
 import { useIsMobile } from '@/shared/hooks/useIsMobile';
+import { cn } from '@/shared/lib/utils';
+import { formatDateShortWithTime, formatRelativeTime } from '@/shared/lib/date';
 import {
   inputEmbeddingDocument,
   inputFrameLoaded,
@@ -15,13 +24,46 @@ import {
   type InputBridge,
 } from './inputBridge';
 import { inputsApi, refreshInputAfterConflict } from './inputsApi';
+import { inputStatusLabel, nextOpenInput, splitRecommended } from './inputFlow';
 
-const button =
-  'min-h-11 px-base rounded border text-high focus-visible:ring-2 focus-visible:ring-brand disabled:opacity-50';
+const focusRing =
+  'focus:outline-none focus-visible:ring-2 focus-visible:ring-brand';
+const iconButton = `inline-flex items-center justify-center size-9 shrink-0 rounded-md text-low hover:text-high hover:bg-secondary disabled:opacity-40 disabled:pointer-events-none ${focusRing}`;
+const quietButton = `text-sm text-low hover:text-high underline-offset-2 hover:underline disabled:opacity-50 ${focusRing}`;
 
 function selectedInput(): string | null {
   const value = new URLSearchParams(window.location.hash.slice(1)).get('input');
   return value && /^[0-9a-f-]{36}$/i.test(value) ? value : null;
+}
+
+function clearInputHash() {
+  const url = new URL(window.location.href);
+  url.hash = '';
+  window.history.replaceState(null, '', url);
+}
+
+function StatusDot({ status }: { status: string }) {
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        'size-1.5 rounded-full shrink-0',
+        status === 'open'
+          ? 'bg-brand'
+          : status === 'answered'
+            ? 'bg-success'
+            : 'bg-low'
+      )}
+    />
+  );
+}
+
+function Age({ date }: { date: string }) {
+  return (
+    <time dateTime={date} title={formatDateShortWithTime(date)}>
+      {formatRelativeTime(date)}
+    </time>
+  );
 }
 
 export function WorkspaceInputsContainer({
@@ -40,9 +82,14 @@ export function WorkspaceInputsContainer({
   return (
     <section className="w-full p-base space-y-base" aria-label="Inputs">
       <div className="flex items-center justify-between gap-base">
-        <strong>{list.data?.pending_count ?? 0} pending</strong>
+        <span className="text-sm text-low">
+          <strong className="font-medium text-high tabular-nums">
+            {list.data?.pending_count ?? 0}
+          </strong>{' '}
+          pending
+        </span>
         <button
-          className={button}
+          className={quietButton}
           onClick={() => {
             setAll(!all);
             setCursor('');
@@ -51,44 +98,61 @@ export function WorkspaceInputsContainer({
           {all ? 'Show pending' : 'Show all'}
         </button>
       </div>
-      {list.isLoading && <p role="status">Loading Inputs…</p>}
-      {list.error && <p role="alert">{list.error.message}</p>}
-      {list.data?.inputs.length === 0 && (
-        <p className="text-low">Your decision pages will appear here.</p>
+      {list.isLoading && (
+        <p role="status" className="text-sm text-low">
+          Loading Inputs…
+        </p>
       )}
-      <ul className="space-y-half">
+      {list.error && (
+        <p role="alert" className="text-sm text-error">
+          {list.error.message}
+        </p>
+      )}
+      {list.data?.inputs.length === 0 && (
+        <p className="text-sm text-low">
+          Your decision pages will appear here.
+        </p>
+      )}
+      <ul className="-mx-half">
         {list.data?.inputs.map((detail) => (
           <li key={detail.input.id}>
             <button
-              className={`${button} w-full text-left py-base`}
+              className={`w-full text-left rounded-md px-half py-base hover:bg-secondary ${focusRing}`}
               onClick={() => {
                 window.location.hash = `input=${detail.input.id}`;
               }}
             >
-              <span className="block font-medium">{detail.version.title}</span>
-              <span className="block text-low">
-                {detail.input.status === 'open'
-                  ? 'Needs answer'
-                  : detail.input.status === 'answered'
-                    ? 'Needs completion'
-                    : detail.input.status}
+              <span className="block text-sm text-high leading-snug line-clamp-2">
+                {detail.version.title}
+              </span>
+              <span className="mt-1 flex items-center gap-half text-xs text-low [&>time]:ml-half">
+                <StatusDot status={detail.input.status} />
+                {detail.input.status === 'answered'
+                  ? 'Needs completion'
+                  : (inputStatusLabel[detail.input.status] ??
+                    detail.input.status)}
+                <Age date={detail.input.created_at} />
               </span>
             </button>
           </li>
         ))}
       </ul>
-      {list.data?.next_cursor && (
-        <button
-          className={button}
-          onClick={() => setCursor(list.data!.next_cursor!)}
-        >
-          Next page
-        </button>
-      )}
-      {cursor && (
-        <button className={button} onClick={() => setCursor('')}>
-          First page
-        </button>
+      {(list.data?.next_cursor || cursor) && (
+        <div className="flex gap-base">
+          {cursor && (
+            <button className={quietButton} onClick={() => setCursor('')}>
+              First page
+            </button>
+          )}
+          {list.data?.next_cursor && (
+            <button
+              className={quietButton}
+              onClick={() => setCursor(list.data!.next_cursor!)}
+            >
+              Next page
+            </button>
+          )}
+        </div>
       )}
     </section>
   );
@@ -96,57 +160,101 @@ export function WorkspaceInputsContainer({
 
 export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
   const host = useHostId();
-  const [selected, setSelected] = useState(selectedInput);
-  useEffect(() => {
-    const listener = () => setSelected(selectedInput());
-    window.addEventListener('hashchange', listener);
-    return () => window.removeEventListener('hashchange', listener);
-  }, []);
-  if (!selected) return null;
-  return (
-    <InputViewer
-      key={`${host}:${workspaceId}:${selected}`}
-      workspaceId={workspaceId}
-      inputId={selected}
-      onClose={() => {
-        const url = new URL(window.location.href);
-        url.hash = '';
-        window.history.replaceState(null, '', url);
-        setSelected(null);
-      }}
-    />
-  );
-}
-
-function InputViewer({
-  workspaceId,
-  inputId,
-  onClose,
-}: {
-  workspaceId: string;
-  inputId: string;
-  onClose: () => void;
-}) {
-  const host = useHostId();
   const queryClient = useQueryClient();
   const isMobile = useIsMobile();
   const viewport = useVisualViewportGeometry();
-  const [reviewMessage, setReviewMessage] = useState<string | null>(null);
-  const detail = useQuery({
-    queryKey: ['input', host, workspaceId, inputId],
-    queryFn: () => inputsApi.get(workspaceId, host, inputId),
-    refetchOnWindowFocus: false,
-  });
+  const [selected, setSelected] = useState(selectedInput);
+  const [done, setDone] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const content = useRef<HTMLDivElement>(null);
+  // Bumped whenever the owner closes or moves, so a late answer cannot advance.
+  const session = useRef(0);
+  useEffect(() => {
+    const listener = () => {
+      session.current += 1;
+      const next = selectedInput();
+      setSelected(next);
+      if (next) setDone(false);
+    };
+    window.addEventListener('hashchange', listener);
+    return () => window.removeEventListener('hashchange', listener);
+  }, []);
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(null), 3000);
+    return () => clearTimeout(timer);
+  }, [notice]);
+  // Shares the cache entry of the pending list in the Inputs panel.
+  const listQuery = {
+    queryKey: ['inputs', host, workspaceId, false, ''],
+    queryFn: () => inputsApi.list(workspaceId, host, false),
+  };
+  const list = useQuery({ ...listQuery, enabled: selected !== null });
+  if (!selected && !done) return null;
+  const open = (id: string) => {
+    window.location.hash = `input=${id}`;
+  };
+  const close = () => {
+    session.current += 1;
+    clearInputHash();
+    setSelected(null);
+    setDone(false);
+  };
+  const advance = async (fromId: string) => {
+    const started = session.current;
+    let inputs: InputDetail[];
+    try {
+      const first = await queryClient.fetchQuery({
+        ...listQuery,
+        staleTime: 0,
+      });
+      inputs = [...first.inputs];
+      // ponytail: reads every pending page; fine while pending Inputs stay few.
+      for (let cursor = first.next_cursor; cursor; ) {
+        const page = await inputsApi.list(workspaceId, host, false, cursor);
+        inputs.push(...page.inputs);
+        cursor = page.next_cursor;
+      }
+    } catch {
+      return; // Stay on the answered Input; its receipt is already shown.
+    }
+    if (session.current !== started || selectedInput() !== fromId) return;
+    const next = nextOpenInput(inputs, fromId);
+    const stillOpen = inputs.some(
+      (d) => d.input.id === fromId && d.input.status === 'open'
+    );
+    if (!next && stillOpen) {
+      setNotice('Saved');
+      return; // "No answer yet" keeps the only open Input in view.
+    }
+    setNotice('Answer saved');
+    if (next) {
+      open(next);
+    } else {
+      clearInputHash();
+      setSelected(null);
+      setDone(true);
+    }
+  };
+  const openInputs =
+    list.data?.inputs.filter((d) => d.input.status === 'open') ?? [];
+  const position = openInputs.findIndex((d) => d.input.id === selected);
   return createPortal(
     <Dialog.Root
       open
-      onOpenChange={(open) => {
-        if (!open) onClose();
+      onOpenChange={(isOpen) => {
+        if (!isOpen) close();
       }}
     >
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/60 z-50" />
         <Dialog.Content
+          ref={content}
+          // Focus the dialog itself so the close button shows no ring on open.
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            content.current?.focus();
+          }}
           style={
             isMobile && viewport.height !== null
               ? {
@@ -156,67 +264,36 @@ function InputViewer({
                 }
               : undefined
           }
-          className="new-design fixed inset-0 md:inset-6 z-50 bg-primary text-normal flex flex-col min-h-0 border shadow-xl focus:outline-none"
+          className="new-design fixed inset-0 md:inset-6 z-50 bg-primary text-normal flex flex-col min-h-0 md:rounded-lg md:border shadow-xl overflow-hidden focus:outline-none"
         >
-          <header className="flex items-center gap-base border-b p-base shrink-0">
-            <Dialog.Close className={button}>Back</Dialog.Close>
-            <button
-              className={button}
-              disabled={detail.isFetching}
-              onClick={async () => {
-                const result = await detail.refetch();
-                if (!result.error)
-                  setReviewMessage(
-                    'Review the current version and your saved draft before you submit again.'
-                  );
-              }}
-            >
-              Refresh
-            </button>
-            <Dialog.Title className="text-xl font-medium min-w-0 truncate">
-              {detail.data?.version.title ?? 'Input'}
-            </Dialog.Title>
-          </header>
-          <Dialog.Description className="px-base py-half text-low shrink-0">
-            The page can propose an answer. Only Submit records your answer.
-            Keep secrets outside Inputs.
-          </Dialog.Description>
-          {reviewMessage && (
-            <p role="status" className="px-base py-half">
-              {reviewMessage}
-            </p>
-          )}
-          {detail.error && (
-            <p role="alert" className="p-base">
-              {detail.error.message}
-            </p>
-          )}
-          {detail.isLoading && (
-            <p role="status" className="p-base">
-              Loading Input…
-            </p>
-          )}
-          {detail.data && (
-            <InputBody
-              key={detail.data.version.version}
+          <p role="status" className="sr-only">
+            {notice}
+          </p>
+          {selected ? (
+            <InputViewer
+              key={`${host}:${workspaceId}:${selected}`}
               workspaceId={workspaceId}
-              detail={detail.data}
-              refreshAfterConflict={async () => {
-                const result = await detail.refetch();
-                if (result.error) throw result.error;
-                setReviewMessage(
-                  'The Input changed. Review the current version and your saved draft before you submit again.'
-                );
-              }}
-              refresh={async () => {
-                await queryClient.invalidateQueries({
-                  queryKey: ['input', host, workspaceId, inputId],
-                });
-                await queryClient.invalidateQueries({
-                  queryKey: ['inputs', host, workspaceId],
-                });
-              }}
+              inputId={selected}
+              notice={notice}
+              position={
+                position < 0
+                  ? null
+                  : {
+                      index: position,
+                      total: openInputs.length,
+                      step: (delta: number) =>
+                        open(
+                          openInputs[
+                            (position + delta + openInputs.length) %
+                              openInputs.length
+                          ].input.id
+                        ),
+                    }
+              }
+              onAnswered={() => advance(selected)}
             />
+          ) : (
+            <InputsDone />
           )}
         </Dialog.Content>
       </Dialog.Portal>
@@ -225,16 +302,216 @@ function InputViewer({
   );
 }
 
+const BURST = Array.from({ length: 12 }, (_, i) => i * 30);
+
+function InputsDone() {
+  return (
+    <div className="flex-1 grid place-items-center p-double">
+      <div className="text-center max-w-sm">
+        <div className="relative mx-auto mb-double size-20">
+          {BURST.map((angle, i) => (
+            <span
+              key={angle}
+              aria-hidden
+              style={{ ['--angle' as string]: `${angle}deg` }}
+              className={cn(
+                'input-done-spark absolute left-1/2 top-1/2 size-2 -ml-1 -mt-1 rounded-full',
+                i % 2 ? 'bg-success' : 'bg-brand'
+              )}
+            />
+          ))}
+          <div className="input-done-check absolute inset-0 grid place-items-center rounded-full bg-success text-white">
+            <CheckIcon className="size-9" weight="bold" />
+          </div>
+        </div>
+        <Dialog.Title className="text-xl font-semibold text-high">
+          All caught up
+        </Dialog.Title>
+        <Dialog.Description className="mt-half text-low">
+          You answered every open Input. New ones show up in the Inputs panel.
+        </Dialog.Description>
+        <Dialog.Close
+          className={`mt-double min-h-11 px-double rounded-md border text-high hover:bg-secondary ${focusRing}`}
+        >
+          Done
+        </Dialog.Close>
+      </div>
+    </div>
+  );
+}
+
+function InputViewer({
+  workspaceId,
+  inputId,
+  notice,
+  position,
+  onAnswered,
+}: {
+  workspaceId: string;
+  inputId: string;
+  notice: string | null;
+  position: {
+    index: number;
+    total: number;
+    step: (delta: number) => void;
+  } | null;
+  onAnswered: () => Promise<void>;
+}) {
+  const host = useHostId();
+  const queryClient = useQueryClient();
+  const [reviewMessage, setReviewMessage] = useState<string | null>(null);
+  const detail = useQuery({
+    queryKey: ['input', host, workspaceId, inputId],
+    queryFn: () => inputsApi.get(workspaceId, host, inputId),
+    refetchOnWindowFocus: false,
+  });
+  const input = detail.data?.input;
+  return (
+    <>
+      <header className="flex items-start gap-base px-base md:px-double pt-base md:pt-double pb-base border-b shrink-0">
+        <Dialog.Close aria-label="Close" className={cn(iconButton, '-ml-1')}>
+          <XIcon className="size-5" />
+        </Dialog.Close>
+        <div className="min-w-0 flex-1 pt-1">
+          <Dialog.Title
+            className="text-xl font-semibold text-high leading-snug line-clamp-2 [text-wrap:balance]"
+            title={detail.data?.version.title}
+          >
+            {detail.data?.version.title ?? 'Input'}
+          </Dialog.Title>
+          {input && (
+            <div className="mt-1 flex flex-wrap items-center gap-x-base gap-y-half text-sm text-low">
+              <span className="inline-flex items-center gap-half text-normal">
+                <StatusDot status={input.status} />
+                {inputStatusLabel[input.status] ?? input.status}
+              </span>
+              <Age date={input.created_at} />
+              {position && (
+                <span className="md:hidden tabular-nums">
+                  {position.index + 1} of {position.total}
+                </span>
+              )}
+              {input.current_version > 1 && (
+                <span>Version {detail.data?.version.version}</span>
+              )}
+              {notice && (
+                <span className="inline-flex items-center gap-1 text-success">
+                  <CheckIcon className="size-3.5" weight="bold" />
+                  {notice}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+        <div className="flex items-center shrink-0">
+          {position && (
+            <nav
+              aria-label="Open Inputs"
+              className="hidden md:flex items-center"
+            >
+              {position.total > 1 && (
+                <button
+                  aria-label="Previous open Input"
+                  className={iconButton}
+                  onClick={() => position.step(-1)}
+                >
+                  <CaretLeftIcon className="size-4" />
+                </button>
+              )}
+              <span className="px-half text-sm text-low tabular-nums whitespace-nowrap">
+                {position.index + 1} of {position.total}
+              </span>
+              {position.total > 1 && (
+                <button
+                  aria-label="Next open Input"
+                  className={iconButton}
+                  onClick={() => position.step(1)}
+                >
+                  <CaretRightIcon className="size-4" />
+                </button>
+              )}
+            </nav>
+          )}
+          <button
+            aria-label="Refresh Input"
+            title="Refresh Input"
+            className={iconButton}
+            disabled={detail.isFetching}
+            onClick={async () => {
+              const result = await detail.refetch();
+              if (!result.error)
+                setReviewMessage(
+                  'Review the current version and your saved draft before you submit again.'
+                );
+            }}
+          >
+            <ArrowClockwiseIcon
+              className={cn('size-4', detail.isFetching && 'animate-spin')}
+            />
+          </button>
+        </div>
+      </header>
+      <Dialog.Description className="sr-only">
+        The page can propose an answer. Only Submit records your answer. Keep
+        secrets outside Inputs.
+      </Dialog.Description>
+      {reviewMessage && (
+        <p
+          role="status"
+          className="px-base md:px-double py-half text-sm bg-secondary border-b shrink-0"
+        >
+          {reviewMessage}
+        </p>
+      )}
+      {detail.error && (
+        <p role="alert" className="p-double text-error">
+          {detail.error.message}
+        </p>
+      )}
+      {detail.isLoading && (
+        <p role="status" className="p-double text-low">
+          Loading Input…
+        </p>
+      )}
+      {detail.data && (
+        <InputBody
+          key={detail.data.version.version}
+          workspaceId={workspaceId}
+          detail={detail.data}
+          onAnswered={onAnswered}
+          refreshAfterConflict={async () => {
+            const result = await detail.refetch();
+            if (result.error) throw result.error;
+            setReviewMessage(
+              'The Input changed. Review the current version and your saved draft before you submit again.'
+            );
+          }}
+          refresh={async () => {
+            await queryClient.invalidateQueries({
+              queryKey: ['input', host, workspaceId, inputId],
+            });
+            await queryClient.invalidateQueries({
+              queryKey: ['inputs', host, workspaceId],
+            });
+          }}
+        />
+      )}
+    </>
+  );
+}
+
 function InputBody({
   workspaceId,
   detail,
   refresh,
   refreshAfterConflict,
+  onAnswered,
 }: {
   workspaceId: string;
   detail: InputDetail;
   refresh: () => Promise<void>;
   refreshAfterConflict: () => Promise<void>;
+  onAnswered: () => Promise<void>;
 }) {
   const host = useHostId();
   const frame = useRef<HTMLIFrameElement>(null);
@@ -263,6 +540,14 @@ function InputBody({
   const [busy, setBusy] = useState(false);
   const [undoSequence, setUndoSequence] = useState<number | null>(null);
   const answerRequest = useRef<AnswerInput | null>(null);
+  // A closed or moved dialog unmounts this body; its late answer must not advance.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const statusRequest = useRef<{
     undo: boolean;
     sequence: number;
@@ -364,6 +649,7 @@ function InputBody({
       answer: draft,
     };
     answerRequest.current = request;
+    let answered = false;
     try {
       await inputsApi.answer(workspaceId, host, detail.input.id, request);
       try {
@@ -373,6 +659,7 @@ function InputBody({
       }
       answerRequest.current = null;
       await refresh();
+      answered = true;
     } catch (e) {
       try {
         if (await refreshInputAfterConflict(e, refreshAfterConflict))
@@ -386,6 +673,7 @@ function InputBody({
     } finally {
       setBusy(false);
     }
+    if (answered && mounted.current) await onAnswered();
   };
   const status = async (undo: boolean) => {
     setBusy(true);
@@ -426,41 +714,14 @@ function InputBody({
     setNavigated(false);
     setPageAttempt((attempt) => attempt + 1);
   };
+  const canSubmit =
+    !busy && validateInputAnswer(draft, detail.version.contract);
+  const choices = detail.version.contract.choices;
   return (
-    <>
-      <div className="flex items-center flex-wrap gap-base px-base pb-base shrink-0">
-        <span>
-          Version {detail.version.version} · {detail.input.status} · From{' '}
-          {detail.input.creator}
-        </span>
-        <button className={button} onClick={retryPage}>
-          Retry page
-        </button>
-        <span className="text-low">
-          If the page fails to load, retry to renew its connection.
-        </span>
-        {['open', 'answered'].includes(detail.input.status) && (
-          <button
-            className={button}
-            disabled={busy}
-            onClick={() => status(false)}
-          >
-            Close
-          </button>
-        )}
-        {undoSequence !== null && (
-          <button
-            className={button}
-            disabled={busy}
-            onClick={() => status(true)}
-          >
-            Undo close
-          </button>
-        )}
-      </div>
-      <div className="flex-1 min-h-24 overflow-hidden bg-white">
+    <div className="flex-1 min-h-0 flex flex-col md:flex-row">
+      <div className="relative flex-1 min-h-24 bg-white">
         {navigated ? (
-          <p role="alert" className="p-base text-black">
+          <p role="alert" className="p-double text-black">
             Page navigated away. Close and open the Input to load it safely.
           </p>
         ) : (
@@ -469,7 +730,7 @@ function InputBody({
               ref={frame}
               title={`${detail.version.title} sandbox viewer`}
               srcDoc={document}
-              className="w-full h-full border-0"
+              className="absolute inset-0 w-full h-full border-0"
               onLoad={() => {
                 if (!inputFrameLoaded(bridge.current)) setNavigated(true);
               }}
@@ -477,93 +738,171 @@ function InputBody({
           )
         )}
       </div>
-      <footer className="sticky bottom-0 bg-primary border-t p-base space-y-half shrink-0 max-h-[50dvh] overflow-y-auto text-xl md:text-base pb-[max(12px,env(safe-area-inset-bottom))]">
-        {error && (
-          <p role="alert" className="text-error">
-            {error}
-          </p>
-        )}
-        {priorDraft && (
-          <div className="border rounded p-base">
-            <p>
-              A saved draft from an earlier version is available. Read this
-              version before you use it.
-            </p>
-            <p className="whitespace-pre-wrap break-words">{priorDraft.text}</p>
-            <button
-              className={button}
-              onClick={() => {
-                setDraft({
-                  choice_id: detail.version.contract.choices.some(
-                    (c) => c.id === priorDraft.choice_id
-                  )
-                    ? priorDraft.choice_id
-                    : null,
-                  text: detail.version.contract.allow_text
-                    ? priorDraft.text
-                    : null,
-                });
-                setPriorDraft(null);
-                answerRequest.current = null;
-              }}
-            >
-              Use saved draft
-            </button>
-          </div>
-        )}
-        {detail.input.status === 'open' && (
-          <>
-            {proposal && (
-              <p className="font-medium">
-                Proposed by the page. Review before you submit.
+      <aside
+        aria-label="Your answer"
+        className="md:w-96 shrink-0 flex flex-col max-h-[55dvh] md:max-h-none overflow-y-auto border-t md:border-t-0 md:border-l bg-primary"
+        onKeyDown={(e) => {
+          if (
+            e.key === 'Enter' &&
+            (e.metaKey || e.ctrlKey) &&
+            detail.input.status === 'open' &&
+            canSubmit
+          ) {
+            e.preventDefault();
+            void submit();
+          }
+        }}
+      >
+        <div className="flex-1 p-base md:p-double space-y-double">
+          {priorDraft && (
+            <div className="rounded-md border p-base space-y-half text-sm">
+              <p className="text-high">
+                A saved draft from an earlier version is available. Read this
+                version before you use it.
               </p>
-            )}
-            <label className="block">
-              Your choice
-              <select
-                className={`${button} bg-secondary w-full`}
-                value={draft.choice_id ?? ''}
-                onChange={(e) => {
-                  setDraft({ ...draft, choice_id: e.target.value || null });
-                  setProposal(false);
+              {priorDraft.text && (
+                <p className="whitespace-pre-wrap break-words text-low">
+                  {priorDraft.text}
+                </p>
+              )}
+              <button
+                className={quietButton}
+                onClick={() => {
+                  setDraft({
+                    choice_id: detail.version.contract.choices.some(
+                      (c) => c.id === priorDraft.choice_id
+                    )
+                      ? priorDraft.choice_id
+                      : null,
+                    text: detail.version.contract.allow_text
+                      ? priorDraft.text
+                      : null,
+                  });
+                  setPriorDraft(null);
                   answerRequest.current = null;
                 }}
               >
-                <option value="">Select a choice</option>
-                {detail.version.contract.choices.map((choice) => (
-                  <option key={choice.id} value={choice.id}>
-                    {choice.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {detail.version.contract.allow_text && (
-              <label className="block">
-                Your answer
-                <textarea
-                  className="border rounded bg-secondary w-full p-base focus-visible:ring-2 focus-visible:ring-brand min-h-16"
-                  value={draft.text ?? ''}
-                  onChange={(e) => {
-                    setDraft({ ...draft, text: e.target.value });
-                    setProposal(false);
-                    answerRequest.current = null;
-                  }}
-                />
-              </label>
-            )}
-            {proposal && (
-              <p className="whitespace-pre-wrap break-words">
-                {detail.version.contract.choices.find(
-                  (c) => c.id === draft.choice_id
-                )?.label ?? ''}
-                {draft.text ? `\n${draft.text}` : ''}
-              </p>
-            )}
+                Use saved draft
+              </button>
+            </div>
+          )}
+          {detail.input.status === 'open' && (
+            <>
+              {proposal && (
+                <div className="rounded-md border border-brand p-base space-y-half text-sm">
+                  <p className="font-medium text-high">
+                    Proposed by the page. Review before you submit.
+                  </p>
+                  <p className="whitespace-pre-wrap break-words">
+                    {detail.version.contract.choices.find(
+                      (c) => c.id === draft.choice_id
+                    )?.label ?? ''}
+                    {draft.text ? `\n${draft.text}` : ''}
+                  </p>
+                </div>
+              )}
+              {choices.length > 0 && (
+                <fieldset className="space-y-half">
+                  <legend className="mb-base text-sm font-medium text-high">
+                    Your choice
+                  </legend>
+                  {choices.map((choice) => {
+                    const { label, recommended } = splitRecommended(
+                      choice.label
+                    );
+                    const checked = draft.choice_id === choice.id;
+                    return (
+                      <label
+                        key={choice.id}
+                        className={cn(
+                          'flex items-start gap-base rounded-md border p-base cursor-pointer transition-colors has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-brand',
+                          checked
+                            ? 'border-brand bg-secondary'
+                            : 'hover:bg-secondary'
+                        )}
+                      >
+                        <input
+                          type="radio"
+                          name={`input-choice-${detail.input.id}`}
+                          value={choice.id}
+                          checked={checked}
+                          className="mt-1 size-4 shrink-0 accent-brand focus:outline-none"
+                          onChange={() => {
+                            setDraft({ ...draft, choice_id: choice.id });
+                            setProposal(false);
+                            answerRequest.current = null;
+                          }}
+                        />
+                        <span className="min-w-0 flex-1 text-high leading-snug">
+                          {label}
+                          {recommended && (
+                            <span className="mt-1 flex w-fit items-center gap-1 rounded-full bg-brand px-2 py-px text-xs font-medium text-on-brand">
+                              Recommended
+                            </span>
+                          )}
+                        </span>
+                      </label>
+                    );
+                  })}
+                  {draft.choice_id && (
+                    <button
+                      className={quietButton}
+                      onClick={() => {
+                        setDraft({ ...draft, choice_id: null });
+                        setProposal(false);
+                        answerRequest.current = null;
+                      }}
+                    >
+                      Clear choice
+                    </button>
+                  )}
+                </fieldset>
+              )}
+              {detail.version.contract.allow_text && (
+                <label className="block space-y-half">
+                  <span className="block text-sm font-medium text-high">
+                    {choices.length > 0 ? 'Add a note' : 'Your answer'}
+                  </span>
+                  <textarea
+                    className={`block w-full min-h-28 rounded-md border bg-secondary p-base text-base text-high placeholder:text-low resize-y ${focusRing}`}
+                    placeholder={
+                      choices.length > 0
+                        ? 'Optional context for the agent'
+                        : 'Write your answer'
+                    }
+                    value={draft.text ?? ''}
+                    onChange={(e) => {
+                      setDraft({ ...draft, text: e.target.value });
+                      setProposal(false);
+                      answerRequest.current = null;
+                    }}
+                  />
+                </label>
+              )}
+            </>
+          )}
+          {detail.input.status === 'answered' && (
+            <p className="text-high">
+              Answer recorded. Close this Input when the work is complete.
+            </p>
+          )}
+          {['closed', 'cancelled'].includes(detail.input.status) && (
+            <p className="text-high">
+              This Input is {detail.input.status}. Your answer stays in the
+              ledger.
+            </p>
+          )}
+        </div>
+        <div className="sticky bottom-0 bg-primary border-t p-base md:px-double space-y-base pb-[max(12px,env(safe-area-inset-bottom))]">
+          {error && (
+            <p role="alert" className="text-sm text-error break-words">
+              {error}
+            </p>
+          )}
+          {detail.input.status === 'open' && (
             <button
-              className={`${button} bg-brand text-white w-full`}
-              disabled={
-                busy || !validateInputAnswer(draft, detail.version.contract)
-              }
+              className={`w-full min-h-11 rounded-md bg-brand hover:bg-brand-hover text-on-brand font-medium disabled:opacity-50 ${focusRing} focus-visible:ring-offset-2`}
+              disabled={!canSubmit}
               onClick={submit}
             >
               {busy
@@ -574,18 +913,40 @@ function InputBody({
                   ? 'Submit: no answer yet'
                   : 'Submit answer'}
             </button>
-          </>
-        )}
-        {detail.input.status === 'answered' && (
-          <p>Answer recorded. Close this Input when the work is complete.</p>
-        )}
-        {['closed', 'cancelled'].includes(detail.input.status) && (
-          <p>
-            This Input is {detail.input.status}. Your answer stays in the
-            ledger.
+          )}
+          <p className="text-xs text-low">
+            The page can propose an answer. Only Submit records your answer.
+            Keep secrets outside Inputs.
           </p>
-        )}
-      </footer>
-    </>
+          <div className="flex flex-wrap gap-x-double gap-y-half">
+            <button
+              className={quietButton}
+              title="If the page fails to load, reload it to renew its connection."
+              onClick={retryPage}
+            >
+              Reload page
+            </button>
+            {['open', 'answered'].includes(detail.input.status) && (
+              <button
+                className={quietButton}
+                disabled={busy}
+                onClick={() => status(false)}
+              >
+                Close Input
+              </button>
+            )}
+            {undoSequence !== null && (
+              <button
+                className={quietButton}
+                disabled={busy}
+                onClick={() => status(true)}
+              >
+                Undo close
+              </button>
+            )}
+          </div>
+        </div>
+      </aside>
+    </div>
   );
 }
