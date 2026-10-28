@@ -540,6 +540,14 @@ function InputBody({
   const [busy, setBusy] = useState(false);
   const [undoSequence, setUndoSequence] = useState<number | null>(null);
   const answerRequest = useRef<AnswerInput | null>(null);
+  // A closed or moved dialog unmounts this body; its late answer must not advance.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const statusRequest = useRef<{
     undo: boolean;
     sequence: number;
@@ -665,7 +673,7 @@ function InputBody({
     } finally {
       setBusy(false);
     }
-    if (answered) await onAnswered();
+    if (answered && mounted.current) await onAnswered();
   };
   const status = async (undo: boolean) => {
     setBusy(true);
