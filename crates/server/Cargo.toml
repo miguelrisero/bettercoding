@@ -41,6 +41,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = "0.8"
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -80,7 +81,6 @@ dotenv = "0.15"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] }
-toml = "0.8"
 tower = { version = "0.5", features = ["util"] }
 
 [features]
