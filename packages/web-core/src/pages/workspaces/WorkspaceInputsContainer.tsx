@@ -167,8 +167,11 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
   const [done, setDone] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const content = useRef<HTMLDivElement>(null);
+  // Bumped whenever the owner closes or moves, so a late answer cannot advance.
+  const session = useRef(0);
   useEffect(() => {
     const listener = () => {
+      session.current += 1;
       const next = selectedInput();
       setSelected(next);
       if (next) setDone(false);
@@ -192,21 +195,38 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
     window.location.hash = `input=${id}`;
   };
   const close = () => {
+    session.current += 1;
     clearInputHash();
     setSelected(null);
     setDone(false);
   };
   const advance = async (fromId: string) => {
-    let next: string | null;
+    const started = session.current;
+    let inputs: InputDetail[];
     try {
-      next = nextOpenInput(
-        (await queryClient.fetchQuery({ ...listQuery, staleTime: 0 })).inputs,
-        fromId
-      );
+      const first = await queryClient.fetchQuery({
+        ...listQuery,
+        staleTime: 0,
+      });
+      inputs = [...first.inputs];
+      // ponytail: reads every pending page; fine while pending Inputs stay few.
+      for (let cursor = first.next_cursor; cursor; ) {
+        const page = await inputsApi.list(workspaceId, host, false, cursor);
+        inputs.push(...page.inputs);
+        cursor = page.next_cursor;
+      }
     } catch {
       return; // Stay on the answered Input; its receipt is already shown.
     }
-    if (selectedInput() !== fromId) return; // The owner moved on already.
+    if (session.current !== started || selectedInput() !== fromId) return;
+    const next = nextOpenInput(inputs, fromId);
+    const stillOpen = inputs.some(
+      (d) => d.input.id === fromId && d.input.status === 'open'
+    );
+    if (!next && stillOpen) {
+      setNotice('Saved');
+      return; // "No answer yet" keeps the only open Input in view.
+    }
     setNotice('Answer saved');
     if (next) {
       open(next);
@@ -775,23 +795,9 @@ function InputBody({
               )}
               {choices.length > 0 && (
                 <fieldset className="space-y-half">
-                  <div className="flex items-baseline justify-between gap-base mb-base">
-                    <legend className="text-sm font-medium text-high">
-                      Your choice
-                    </legend>
-                    {draft.choice_id && (
-                      <button
-                        className={quietButton}
-                        onClick={() => {
-                          setDraft({ ...draft, choice_id: null });
-                          setProposal(false);
-                          answerRequest.current = null;
-                        }}
-                      >
-                        Clear
-                      </button>
-                    )}
-                  </div>
+                  <legend className="mb-base text-sm font-medium text-high">
+                    Your choice
+                  </legend>
                   {choices.map((choice) => {
                     const { label, recommended } = splitRecommended(
                       choice.label
@@ -830,6 +836,18 @@ function InputBody({
                       </label>
                     );
                   })}
+                  {draft.choice_id && (
+                    <button
+                      className={quietButton}
+                      onClick={() => {
+                        setDraft({ ...draft, choice_id: null });
+                        setProposal(false);
+                        answerRequest.current = null;
+                      }}
+                    >
+                      Clear choice
+                    </button>
+                  )}
                 </fieldset>
               )}
               {detail.version.contract.allow_text && (
