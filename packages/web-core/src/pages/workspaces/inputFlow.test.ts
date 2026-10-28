@@ -25,8 +25,10 @@ describe('Input flow', () => {
     ).toBeNull();
     expect(nextOpenInput([], 'a')).toBeNull();
   });
-  it('starts from the top when the current Input is not listed', () => {
-    expect(nextOpenInput(list, 'z')).toBe('a');
+  it('keeps server order after the answered Input leaves the pending list', () => {
+    const pending = [item('a', 'open'), item('c', 'open')];
+    expect(nextOpenInput(pending, 'b')).toBe('c');
+    expect(nextOpenInput(pending, 'z')).toBe('a');
   });
   it('marks a recommended choice and strips the suffix', () => {
     expect(splitRecommended('Ship it (recommended)')).toEqual({

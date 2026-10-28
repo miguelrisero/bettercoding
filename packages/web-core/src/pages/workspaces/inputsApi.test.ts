@@ -5,6 +5,22 @@ import { inputsApi, refreshInputAfterConflict } from './inputsApi';
 afterEach(() => setLocalApiTransport(null));
 
 describe('Input status actions', () => {
+  it('requests only open Inputs for Pending and keeps answered Inputs in Done', async () => {
+    const request = vi.fn(
+      async () => new Response(JSON.stringify({ success: true, data: {} }))
+    );
+    setLocalApiTransport({ request, openWebSocket: vi.fn() });
+    await inputsApi.list('workspace', null, false);
+    expect(request).toHaveBeenLastCalledWith(
+      '/api/workspaces/workspace/inputs?limit=50&status=open&cursor=',
+      expect.anything()
+    );
+    await inputsApi.list('workspace', null, true, 'next');
+    expect(request).toHaveBeenLastCalledWith(
+      '/api/workspaces/workspace/inputs?limit=50&status=answered,closed,cancelled&cursor=next',
+      expect.anything()
+    );
+  });
   it.each(['VERSION_CONFLICT', 'SEQUENCE_CONFLICT: current_sequence=9'])(
     'refetches current metadata after %s without another write',
     async (code) => {

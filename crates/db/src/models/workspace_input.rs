@@ -364,7 +364,12 @@ impl WorkspaceInput {
             inputs.push(Self::detail(pool, workspace, &row.id, None, false).await?);
         }
         let next_cursor = more.then(|| inputs.last().unwrap().input.id.clone());
-        let (pending_count,): (i64,) = sqlx::query_as("SELECT count(*) FROM workspace_inputs WHERE workspace_id=? AND status IN ('open','answered')").bind(workspace).fetch_one(pool).await?;
+        let (pending_count,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM workspace_inputs WHERE workspace_id=? AND status='open'",
+        )
+        .bind(workspace)
+        .fetch_one(pool)
+        .await?;
         Ok(InputPage {
             inputs,
             next_cursor,
@@ -1155,6 +1160,39 @@ mod tests {
         assert!(second.next_cursor > first.next_cursor);
     }
     #[tokio::test]
+    async fn answered_inputs_leave_pending_and_remain_in_answered_history() {
+        let (pool, workspace) = setup().await;
+        let created = seed(&pool, workspace).await;
+        let before = WorkspaceInput::list(&pool, workspace, Some("open"), "", 50)
+            .await
+            .unwrap();
+        assert_eq!(before.pending_count, 1);
+        assert_eq!(before.inputs.len(), 1);
+        WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::OwnerUi,
+            "owner",
+            answer(1, 1),
+        )
+        .await
+        .unwrap();
+        let pending = WorkspaceInput::list(&pool, workspace, Some("open"), "", 50)
+            .await
+            .unwrap();
+        assert_eq!(pending.pending_count, before.pending_count - 1);
+        assert!(pending.inputs.is_empty());
+        let answered = WorkspaceInput::list(&pool, workspace, Some("answered"), "", 50)
+            .await
+            .unwrap();
+        assert_eq!(answered.pending_count, 0);
+        assert_eq!(answered.inputs.len(), 1);
+        assert_eq!(answered.inputs[0].input.id, created.input_id);
+        assert_eq!(answered.inputs[0].input.status, "answered");
+        assert_eq!(answered.inputs[0].answers.len(), 1);
+    }
+    #[tokio::test]
     async fn no_answer_yet_stays_open_and_invalid_contract_answers_fail() {
         let (pool, workspace) = setup().await;
         let created = seed(&pool, workspace).await;
@@ -1176,6 +1214,12 @@ mod tests {
         .unwrap();
         assert_eq!(result.status, "open");
         assert_eq!(result.event.payload["no_answer_yet"], true);
+        let pending = WorkspaceInput::list(&pool, workspace, Some("open"), "", 50)
+            .await
+            .unwrap();
+        assert_eq!(pending.pending_count, 1);
+        assert_eq!(pending.inputs.len(), 1);
+        assert_eq!(pending.inputs[0].input.id, created.input_id);
         let contract = InputContract {
             choices: vec![],
             allow_text: false,

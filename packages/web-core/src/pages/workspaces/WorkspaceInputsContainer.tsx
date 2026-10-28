@@ -72,11 +72,11 @@ export function WorkspaceInputsContainer({
   workspaceId: string;
 }) {
   const host = useHostId();
-  const [all, setAll] = useState(false);
+  const [showDone, setShowDone] = useState(false);
   const [cursor, setCursor] = useState('');
   const list = useQuery({
-    queryKey: ['inputs', host, workspaceId, all, cursor],
-    queryFn: () => inputsApi.list(workspaceId, host, all, cursor),
+    queryKey: ['inputs', host, workspaceId, showDone, cursor],
+    queryFn: () => inputsApi.list(workspaceId, host, showDone, cursor),
     refetchInterval: 10000,
   });
   return (
@@ -88,15 +88,24 @@ export function WorkspaceInputsContainer({
           </strong>{' '}
           pending
         </span>
-        <button
-          className={quietButton}
-          onClick={() => {
-            setAll(!all);
-            setCursor('');
-          }}
-        >
-          {all ? 'Show pending' : 'Show all'}
-        </button>
+        <div className="flex gap-base" role="group" aria-label="Input view">
+          {[false, true].map((isDone) => (
+            <button
+              key={String(isDone)}
+              className={cn(
+                quietButton,
+                showDone === isDone && 'text-high underline'
+              )}
+              aria-pressed={showDone === isDone}
+              onClick={() => {
+                setShowDone(isDone);
+                setCursor('');
+              }}
+            >
+              {isDone ? 'Done' : 'Pending'}
+            </button>
+          ))}
+        </div>
       </div>
       {list.isLoading && (
         <p role="status" className="text-sm text-low">
@@ -127,10 +136,7 @@ export function WorkspaceInputsContainer({
               </span>
               <span className="mt-1 flex items-center gap-half text-xs text-low [&>time]:ml-half">
                 <StatusDot status={detail.input.status} />
-                {detail.input.status === 'answered'
-                  ? 'Needs completion'
-                  : (inputStatusLabel[detail.input.status] ??
-                    detail.input.status)}
+                {inputStatusLabel[detail.input.status] ?? detail.input.status}
                 <Age date={detail.input.created_at} />
               </span>
             </button>
@@ -220,9 +226,7 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
     }
     if (session.current !== started || selectedInput() !== fromId) return;
     const next = nextOpenInput(inputs, fromId);
-    const stillOpen = inputs.some(
-      (d) => d.input.id === fromId && d.input.status === 'open'
-    );
+    const stillOpen = inputs.some((d) => d.input.id === fromId);
     if (!next && stillOpen) {
       setNotice('Saved');
       return; // "No answer yet" keeps the only open Input in view.
@@ -236,8 +240,7 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
       setDone(true);
     }
   };
-  const openInputs =
-    list.data?.inputs.filter((d) => d.input.status === 'open') ?? [];
+  const openInputs = list.data?.inputs ?? [];
   const position = openInputs.findIndex((d) => d.input.id === selected);
   return createPortal(
     <Dialog.Root
