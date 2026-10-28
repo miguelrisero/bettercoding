@@ -599,10 +599,11 @@ impl WorkspaceManager {
                 }
             };
 
-            let path = entry.path();
-            if !path.is_dir() {
+            // `file_type` does not follow symlinks: a link is never walked into.
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
+            let path = entry.path();
 
             let workspace_path_str = path.to_string_lossy().to_string();
             // Canonical paths, so a symlinked root cannot hide a registered workspace.
@@ -700,6 +701,7 @@ mod tests {
         fs::create_dir_all(sibling_lock.parent().unwrap()).unwrap();
         fs::write(&sibling_lock, "live gate lock").unwrap();
         fs::create_dir_all(&orphan).unwrap();
+        std::os::unix::fs::symlink(outside.join("sibling"), base.join("link-out")).unwrap();
         // This crate's only test owns the environment; the base dir is cached on first use.
         unsafe { std::env::set_var("BC_WORKTREE_BASE", &base) };
 
