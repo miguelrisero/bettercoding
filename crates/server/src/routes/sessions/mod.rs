@@ -106,16 +106,14 @@ pub struct UpdatedSession {
 
 /// A CLI launch value goes into the agent argv: allow model-id characters only.
 /// An empty value clears the setting.
-fn cli_launch_value(value: &str) -> Result<Option<String>, ApiError> {
+fn cli_launch_value(value: &str) -> Result<Option<String>, String> {
     let value = value.trim();
     if value.is_empty() {
         return Ok(None);
     }
     let allowed = |c: char| c.is_ascii_alphanumeric() || "-._:/[]".contains(c);
     if value.len() > 128 || !value.chars().all(allowed) {
-        return Err(ApiError::BadRequest(format!(
-            "invalid CLI launch value: {value:?}"
-        )));
+        return Err(format!("invalid CLI launch value: {value:?}"));
     }
     Ok(Some(value.to_string()))
 }
@@ -130,10 +128,10 @@ pub async fn update_session(
     let (mut model, mut reasoning) = Session::get_cli_model_effort(pool, session.id).await?;
     let launch_changed = request.cli_model_id.is_some() || request.cli_reasoning_id.is_some();
     if let Some(value) = request.cli_model_id.as_deref() {
-        model = cli_launch_value(value)?;
+        model = cli_launch_value(value).map_err(ApiError::BadRequest)?;
     }
     if let Some(value) = request.cli_reasoning_id.as_deref() {
-        reasoning = cli_launch_value(value)?;
+        reasoning = cli_launch_value(value).map_err(ApiError::BadRequest)?;
     }
 
     Session::update(pool, session.id, request.name.as_deref()).await?;
