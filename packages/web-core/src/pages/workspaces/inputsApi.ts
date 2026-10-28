@@ -1,3 +1,4 @@
+import type { QueryClient } from '@tanstack/react-query';
 import type {
   AnswerInput,
   InputDetail,
@@ -120,4 +121,21 @@ export async function loadPendingInputs(
     cursor = page.next_cursor;
   }
   return { ...first, inputs, next_cursor: null };
+}
+
+export async function setInputPriority(
+  queryClient: QueryClient,
+  workspace: string,
+  host: string | null,
+  inputId: string,
+  priority: string
+): Promise<void> {
+  await inputsApi.priority(workspace, host, inputId, priority);
+  await Promise.all([
+    queryClient.invalidateQueries({
+      queryKey: ['input', host, workspace, inputId],
+      exact: true,
+    }),
+    queryClient.invalidateQueries({ queryKey: ['inputs', host, workspace] }),
+  ]);
 }

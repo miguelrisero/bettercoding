@@ -1,4 +1,5 @@
 import type { InputDetail } from 'shared/types';
+import type { InputSort } from '@/shared/stores/useUiPreferencesStore';
 
 const RECOMMENDED = /\s*\(recommended\)\s*$/i;
 
@@ -10,8 +11,6 @@ export function splitRecommended(label: string): {
     ? { label: label.replace(RECOMMENDED, ''), recommended: true }
     : { label, recommended: false };
 }
-
-export type InputSort = 'priority' | 'newest';
 
 export function compareInputs(
   a: InputDetail,

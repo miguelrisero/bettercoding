@@ -1,14 +1,51 @@
+import { QueryClient } from '@tanstack/react-query';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { setLocalApiTransport } from '@/shared/lib/localApiTransport';
 import {
   inputsApi,
   loadPendingInputs,
   refreshInputAfterConflict,
+  setInputPriority,
 } from './inputsApi';
 
 afterEach(() => setLocalApiTransport(null));
 
 describe('Input status actions', () => {
+  it('refreshes caches without replacing a close with a late priority response', async () => {
+    let respond!: (response: Response) => void;
+    const request = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          respond = resolve;
+        })
+    );
+    setLocalApiTransport({ request, openWebSocket: vi.fn() });
+    const client = new QueryClient();
+    const detailKey = ['input', null, 'workspace', 'input'];
+    const listKey = ['inputs', null, 'workspace', false, ''];
+    client.setQueryData(detailKey, { input: { status: 'open', sequence: 1 } });
+    client.setQueryData(listKey, { inputs: [] });
+    const save = setInputPriority(client, 'workspace', null, 'input', 'P1');
+    client.setQueryData(detailKey, {
+      input: { status: 'closed', sequence: 2 },
+    });
+    respond(
+      new Response(
+        JSON.stringify({
+          success: true,
+          data: { status: 'open', sequence: 1, priority: 'P1' },
+        })
+      )
+    );
+    await save;
+    expect(client.getQueryData(detailKey)).toEqual({
+      input: { status: 'closed', sequence: 2 },
+    });
+    expect(client.getQueryState(detailKey)?.isInvalidated).toBe(true);
+    expect(client.getQueryState(listKey)?.isInvalidated).toBe(true);
+    client.clear();
+  });
+
   it('sets priority through the owner route with host routing', async () => {
     const request = vi.fn(
       async () => new Response(JSON.stringify({ success: true, data: {} }))

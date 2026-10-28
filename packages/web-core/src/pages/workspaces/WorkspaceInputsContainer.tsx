@@ -28,6 +28,7 @@ import {
   inputsApi,
   loadPendingInputs,
   refreshInputAfterConflict,
+  setInputPriority,
 } from './inputsApi';
 import {
   compareInputs,
@@ -39,6 +40,7 @@ import {
 const focusRing =
   'focus:outline-none focus-visible:ring-2 focus-visible:ring-brand';
 const iconButton = `inline-flex items-center justify-center size-9 shrink-0 rounded-md text-low hover:text-high hover:bg-secondary disabled:opacity-40 disabled:pointer-events-none ${focusRing}`;
+const selectControl = `min-h-9 rounded border bg-primary px-half text-high ${focusRing}`;
 const quietButton = `text-sm text-low hover:text-high underline-offset-2 hover:underline disabled:opacity-50 ${focusRing}`;
 
 function selectedInput(): string | null {
@@ -92,7 +94,7 @@ function InputSortControl() {
     <label className="flex items-center gap-half text-sm text-low">
       Sort
       <select
-        className={`min-h-9 rounded border bg-primary px-half text-high ${focusRing}`}
+        className={selectControl}
         value={sort}
         onChange={(e) =>
           setSort(e.target.value === 'newest' ? 'newest' : 'priority')
@@ -158,7 +160,7 @@ export function WorkspaceInputsContainer({
           ))}
         </div>
       </div>
-      <InputSortControl />
+      {!showDone && <InputSortControl />}
       {list.isLoading && (
         <p role="status" className="text-sm text-low">
           Loading Inputs…
@@ -176,7 +178,9 @@ export function WorkspaceInputsContainer({
       )}
       <ul className="-mx-half">
         {(list.data
-          ? [...list.data.inputs].sort((a, b) => compareInputs(a, b, sort))
+          ? showDone
+            ? list.data.inputs
+            : [...list.data.inputs].sort((a, b) => compareInputs(a, b, sort))
           : []
         ).map((detail) => (
           <li key={detail.input.id}>
@@ -263,8 +267,7 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
     setSelected(null);
     setDone(false);
   };
-  const advance = async (from: InputDetail) => {
-    const fromId = from.input.id;
+  const advance = async (fromId: string) => {
     const started = session.current;
     let inputs: InputDetail[];
     try {
@@ -274,14 +277,16 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
       return; // Stay on the answered Input; its receipt is already shown.
     }
     if (session.current !== started || selectedInput() !== fromId) return;
+    const current = queryClient.getQueryData<InputDetail>([
+      'input',
+      host,
+      workspaceId,
+      fromId,
+    ]);
+    if (!current) return;
     const next = nextOpenInput(
       inputs,
-      queryClient.getQueryData<InputDetail>([
-        'input',
-        host,
-        workspaceId,
-        fromId,
-      ]) ?? from,
+      current,
       useUiPreferencesStore.getState().inputSort
     );
     const stillOpen = inputs.some((d) => d.input.id === fromId);
@@ -353,7 +358,7 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
                         ),
                     }
               }
-              onAnswered={advance}
+              onAnswered={() => advance(selected)}
             />
           ) : (
             <InputsDone />
@@ -418,7 +423,7 @@ function InputViewer({
     total: number;
     step: (delta: number) => void;
   } | null;
-  onAnswered: (detail: InputDetail) => Promise<void>;
+  onAnswered: () => Promise<void>;
 }) {
   const host = useHostId();
   const queryClient = useQueryClient();
@@ -450,13 +455,17 @@ function InputViewer({
                 <StatusDot status={input.status} />
                 {inputStatusLabel[input.status] ?? input.status}
               </span>
-              <PriorityBadge priority={input.priority} />
-              {['open', 'answered'].includes(input.status) && (
+              {['open', 'answered'].includes(input.status) ? (
                 <label className="inline-flex items-center gap-half">
                   Priority
                   <select
-                    aria-label="Input priority"
-                    className={`min-h-9 rounded border bg-primary px-half text-high ${focusRing}`}
+                    className={cn(
+                      selectControl,
+                      input.priority === 'P0'
+                        ? 'text-error bg-error/10 font-semibold'
+                        : input.priority === 'P1' &&
+                            'text-brand bg-brand/10 font-semibold'
+                    )}
                     value={input.priority}
                     disabled={priorityBusy}
                     onChange={async (e) => {
@@ -464,19 +473,13 @@ function InputViewer({
                       setPriorityBusy(true);
                       setPriorityError(null);
                       try {
-                        const result = await inputsApi.priority(
+                        await setInputPriority(
+                          queryClient,
                           workspaceId,
                           host,
                           inputId,
                           priority
                         );
-                        queryClient.setQueryData<InputDetail>(
-                          ['input', host, workspaceId, inputId],
-                          (data) => (data ? { ...data, input: result } : data)
-                        );
-                        await queryClient.invalidateQueries({
-                          queryKey: ['inputs', host, workspaceId],
-                        });
                       } catch (error) {
                         setPriorityError(
                           error instanceof Error
@@ -495,6 +498,8 @@ function InputViewer({
                     ))}
                   </select>
                 </label>
+              ) : (
+                <PriorityBadge priority={input.priority} />
               )}
               <Age date={input.created_at} />
               {position && (
@@ -627,7 +632,7 @@ function InputBody({
   detail: InputDetail;
   refresh: () => Promise<void>;
   refreshAfterConflict: () => Promise<void>;
-  onAnswered: (detail: InputDetail) => Promise<void>;
+  onAnswered: () => Promise<void>;
 }) {
   const host = useHostId();
   const frame = useRef<HTMLIFrameElement>(null);
@@ -789,7 +794,7 @@ function InputBody({
     } finally {
       setBusy(false);
     }
-    if (answered && mounted.current) await onAnswered(detail);
+    if (answered && mounted.current) await onAnswered();
   };
   const status = async (undo: boolean) => {
     setBusy(true);

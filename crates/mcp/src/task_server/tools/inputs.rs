@@ -249,9 +249,8 @@ mod tests {
         }
     }
     #[test]
-    fn input_tool_create_decodes_flat_contract() {
-        let request = serde_json::json!({"expected_sequence":0,"request_id":"r","external_key":"k","content":{"title":"t","html":"<p>yes</p>","contract":{"choices":[],"allow_text":true,"allow_no_answer_yet":false}}});
-        let mut request = request;
+    fn input_tools_accept_optional_priority() {
+        let mut request = serde_json::json!({"expected_sequence":0,"request_id":"r","external_key":"k","content":{"title":"t","html":"<p>yes</p>","contract":{"choices":[],"allow_text":true,"allow_no_answer_yet":false}}});
         assert!(
             serde_json::from_value::<CreateRequest>(request.clone())
                 .unwrap()

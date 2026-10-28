@@ -30,11 +30,12 @@ export type MobileTab =
   | 'files'
   | 'inputs';
 
+export type InputSort = 'priority' | 'newest';
 export type MobileFontScale = 'default' | 'small' | 'smaller';
 export const DEFAULT_CREATE_DRAFT_WORKSPACE_BY_DEFAULT = false;
 
 const INPUT_SORT_KEY = 'bc-input-sort';
-const loadInputSort = (): 'priority' | 'newest' => {
+const loadInputSort = (): InputSort => {
   try {
     return localStorage.getItem(INPUT_SORT_KEY) === 'newest'
       ? 'newest'
@@ -354,8 +355,8 @@ export type PersistKey =
   | `list-section-${string}`;
 
 type State = {
-  inputSort: 'priority' | 'newest';
-  setInputSort: (sort: 'priority' | 'newest') => void;
+  inputSort: InputSort;
+  setInputSort: (sort: InputSort) => void;
   // UI preferences
   repoActions: Record<string, RepoAction>;
   expanded: Record<string, boolean>;
