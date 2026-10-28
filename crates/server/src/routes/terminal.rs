@@ -245,7 +245,7 @@ fn resolve_cli_agent_spec(
 /// them by receipt.
 fn hook_report_command(port: u16, workspace_id: Uuid) -> String {
     format!(
-        "curl -s -m 2 -o /dev/null -X POST -H 'Content-Type: application/json' \
+        "curl -s -m 2 -o /dev/null -X POST -H 'Content-Type: application/json' -H \"x-bc-handover-capability: $BC_HANDOVER_CAPABILITY\" \
          --data-binary @- \
          \"http://127.0.0.1:{port}/api/workspaces/{workspace_id}/cli-activity?seq=$(date +%s%N)\" \
          || true"

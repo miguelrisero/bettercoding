@@ -38,6 +38,7 @@ impl ToolError {
 
 mod context;
 mod files;
+mod handovers;
 mod inputs;
 mod issue_assignees;
 mod issue_relationships;
@@ -54,6 +55,7 @@ impl McpServer {
     pub fn global_mode_router() -> rmcp::handler::server::tool::ToolRouter<Self> {
         Self::context_tools_router()
             + Self::files_tools_router()
+            + Self::handover_tools_router()
             + Self::inputs_tools_router()
             + Self::workspaces_tools_router()
             + Self::workspace_agents_tools_router()

@@ -21,31 +21,81 @@ impl LocalCliWriterProbe {
     }
 }
 
-fn resume_evidence(cmdlines: &[String]) -> SidEvidence {
+fn resume_evidence(argvs: &[Option<Vec<String>>]) -> SidEvidence {
     let mut ids = HashSet::new();
-    let mut saw_resume = false;
     let mut invalid = false;
-    for cmdline in cmdlines {
-        let words: Vec<_> = cmdline.split_whitespace().collect();
-        for (index, word) in words.iter().enumerate() {
-            let candidate = if *word == "--resume" {
-                saw_resume = true;
-                words.get(index + 1).copied()
-            } else if let Some(value) = word.strip_prefix("--resume=") {
-                saw_resume = true;
-                Some(value)
+    for argv in argvs {
+        let Some(argv) = argv else {
+            invalid = true;
+            continue;
+        };
+        let is_claude = |arg: &str| {
+            Path::new(arg)
+                .file_name()
+                .is_some_and(|name| name == "claude" || name == "claude.exe")
+        };
+        let program = if argv.first().is_some_and(|arg| is_claude(arg)) {
+            0
+        } else if argv
+            .first()
+            .and_then(|arg| Path::new(arg).file_name())
+            .is_some_and(|name| {
+                matches!(
+                    name.to_str(),
+                    Some("sh" | "bash" | "dash" | "zsh" | "node" | "nodejs")
+                )
+            })
+            && argv.get(1).is_some_and(|arg| is_claude(arg))
+        {
+            1
+        } else {
+            invalid = true;
+            continue;
+        };
+        let mut args = argv.iter().skip(program + 1).map(String::as_str);
+        while let Some(arg) = args.next() {
+            if arg == "--" || !arg.starts_with('-') {
+                break;
+            }
+            let value = if matches!(arg, "--resume" | "--session-id") {
+                Some(args.next())
+            } else if let Some(value) = arg
+                .strip_prefix("--resume=")
+                .or_else(|| arg.strip_prefix("--session-id="))
+            {
+                Some(Some(value))
             } else {
+                // Claude's positional prompt ends option parsing; value flags must consume their own argument.
+                if matches!(
+                    arg,
+                    "--model"
+                        | "--name"
+                        | "--effort"
+                        | "--settings"
+                        | "--permission-mode"
+                        | "--mcp-config"
+                        | "--allowedTools"
+                        | "--disallowedTools"
+                        | "--append-system-prompt"
+                        | "--system-prompt"
+                        | "--output-format"
+                        | "--input-format"
+                        | "--agent"
+                        | "--agents"
+                        | "--add-dir"
+                        | "--plugin-dir"
+                        | "--tools"
+                ) {
+                    args.next();
+                }
                 None
             };
-            if let Some(candidate) = candidate {
-                match Uuid::parse_str(candidate) {
-                    Ok(id) => {
-                        ids.insert(id.to_string());
-                    }
-                    Err(_) => invalid = true,
+            if let Some(value) = value {
+                if let Some(id) = value.and_then(|value| Uuid::parse_str(value).ok()) {
+                    ids.insert(id.to_string());
+                } else {
+                    invalid = true;
                 }
-            } else if *word == "--resume" {
-                invalid = true;
             }
         }
     }
@@ -53,8 +103,6 @@ fn resume_evidence(cmdlines: &[String]) -> SidEvidence {
         SidEvidence::Ambiguous
     } else if let Some(id) = ids.into_iter().next() {
         SidEvidence::ConfirmedResume(id)
-    } else if saw_resume {
-        SidEvidence::Ambiguous
     } else {
         SidEvidence::NoResumeArg
     }
@@ -168,7 +216,7 @@ fn live_process_report(
         Some(_) => resume_evidence(
             &processes
                 .iter()
-                .map(|process| process.cmdline.clone())
+                .map(|process| process.argv.clone())
                 .collect::<Vec<_>>(),
         ),
     };
@@ -321,20 +369,60 @@ mod tests {
     #[test]
     fn resume_cmdline_evidence_is_exact_and_ambiguous_on_disagreement() {
         assert_eq!(
-            resume_evidence(&["claude --resume 11111111-1111-4111-8111-111111111111".into()]),
+            resume_evidence(&[Some(vec![
+                "claude".into(),
+                "--resume".into(),
+                "11111111-1111-4111-8111-111111111111".into()
+            ])]),
             SidEvidence::ConfirmedResume("11111111-1111-4111-8111-111111111111".into())
         );
         assert_eq!(
             resume_evidence(&[
-                "claude --resume 11111111-1111-4111-8111-111111111111".into(),
-                "claude --resume 22222222-2222-4222-8222-222222222222".into(),
+                Some(vec![
+                    "claude".into(),
+                    "--resume".into(),
+                    "11111111-1111-4111-8111-111111111111".into()
+                ]),
+                Some(vec![
+                    "claude".into(),
+                    "--session-id".into(),
+                    "22222222-2222-4222-8222-222222222222".into()
+                ]),
             ]),
             SidEvidence::Ambiguous
         );
         assert_eq!(
-            resume_evidence(&["claude --model opus".into()]),
+            resume_evidence(&[Some(vec!["claude".into(), "--model".into(), "opus".into()])]),
             SidEvidence::NoResumeArg
         );
+    }
+
+    #[test]
+    fn claude_session_id_uses_exact_native_or_interpreter_launch_argv() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        for args in [
+            vec!["claude", "--session-id", id],
+            vec!["/bin/sh", "/fixture/claude", "--session-id", id],
+        ] {
+            assert_eq!(
+                resume_evidence(&[argv(&args)]),
+                SidEvidence::ConfirmedResume(id.into())
+            );
+        }
+        for args in [
+            vec!["echo", "claude", "--session-id", id],
+            vec!["sh", "-c", "claude", "--session-id", id],
+            vec![
+                "claude",
+                "a prompt with --session-id 22222222-2222-4222-8222-222222222222",
+            ],
+        ] {
+            assert_ne!(
+                resume_evidence(&[argv(&args)]),
+                SidEvidence::ConfirmedResume(id.into())
+            );
+        }
+        assert_eq!(resume_evidence(&[None]), SidEvidence::Ambiguous);
     }
 
     #[test]
@@ -347,7 +435,7 @@ mod tests {
             &[CliPaneAgentProcess {
                 pid: 42,
                 cmdline: format!("claude --resume {observed}"),
-                argv: None,
+                argv: argv(&["claude", "--resume", observed]),
             }],
             None,
             None,
@@ -367,7 +455,7 @@ mod tests {
             &[CliPaneAgentProcess {
                 pid: 43,
                 cmdline: "claude --model opus".to_string(),
-                argv: None,
+                argv: argv(&["claude", "--model", "opus"]),
             }],
             None,
             None,
@@ -399,7 +487,7 @@ mod tests {
             &[CliPaneAgentProcess {
                 pid: 44,
                 cmdline: format!("claude --resume {observed}"),
-                argv: None,
+                argv: argv(&["claude", "--resume", observed]),
             }],
             None,
             Some(expected),
@@ -415,7 +503,7 @@ mod tests {
             &[CliPaneAgentProcess {
                 pid: 45,
                 cmdline: "claude --model opus".to_string(),
-                argv: None,
+                argv: argv(&["claude", "--model", "opus"]),
             }],
             None,
             Some(expected),

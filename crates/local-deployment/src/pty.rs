@@ -96,6 +96,24 @@ fn cli_bootstrap(
     deferred_prompt_pending: bool,
     busy_resume_file: Option<&Path>,
 ) -> String {
+    cli_bootstrap_with_exit(
+        spec,
+        resume_session_id,
+        prompt_file,
+        deferred_prompt_pending,
+        busy_resume_file,
+        "",
+    )
+}
+
+fn cli_bootstrap_with_exit(
+    spec: &CliLaunchSpec,
+    resume_session_id: Option<&str>,
+    prompt_file: Option<&Path>,
+    deferred_prompt_pending: bool,
+    busy_resume_file: Option<&Path>,
+    on_exit: &str,
+) -> String {
     // The program is a bare binary name from our own code; quote it anyway so
     // it can never be anything but a single command word.
     let prog = shell_single_quote(&spec.program);
@@ -213,8 +231,13 @@ fn cli_bootstrap(
         .map(|(key, value)| format!("export {key}={}; ", shell_single_quote(value)))
         .collect();
 
+    let exit = if on_exit.is_empty() {
+        String::new()
+    } else {
+        format!(" {on_exit}")
+    };
     format!(
-        r#"{env}if command -v {prog} >/dev/null 2>&1; then {launch}; else {missing}; fi; exec "${{SHELL:-/bin/sh}}""#
+        r#"{env}if command -v {prog} >/dev/null 2>&1; then {launch}; else {missing}; fi;{exit} exec "${{SHELL:-/bin/sh}}""#
     )
 }
 
@@ -500,6 +523,56 @@ pub fn cli_restart_bootstrap(spec: &CliLaunchSpec, resume_session_id: Option<&st
     cli_bootstrap(spec, resume_session_id, None, false, None)
 }
 
+/// Uses the CLI prompt transport and records process exit across server restarts.
+pub fn cli_handover_bootstrap(
+    workspace_id: Uuid,
+    spec: &CliLaunchSpec,
+    resume_session_id: Option<&str>,
+    initial_prompt: Option<&str>,
+    exit_file: &Path,
+    environment: &[(&str, &str)],
+) -> std::io::Result<String> {
+    let content = initial_prompt
+        .map(|prompt| {
+            cli_prompt_fits_inline(&spec.prompt_arg, prompt.len())
+                .then(|| cli_prompt_file_content(&spec.prompt_arg, prompt))
+                .flatten()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Handover prompt exceeds CLI inline transport bound",
+                    )
+                })
+        })
+        .transpose()?;
+    let prompt_file = content
+        .as_deref()
+        .map(|content| write_cli_prompt_file(workspace_id, content))
+        .transpose()?;
+    let on_exit = format!(
+        "printf 'exited\\n' > {};",
+        shell_single_quote(&exit_file.to_string_lossy())
+    );
+    let env = environment
+        .iter()
+        .map(|(key, value)| {
+            // Keys are fixed by the server; only values enter shell quoting.
+            format!("export {key}={}; ", shell_single_quote(value))
+        })
+        .collect::<String>();
+    Ok(format!(
+        "{env}{}",
+        cli_bootstrap_with_exit(
+            spec,
+            resume_session_id,
+            prompt_file.as_deref(),
+            false,
+            None,
+            &on_exit
+        )
+    ))
+}
+
 /// Workspaces with a pane respawn currently in flight. See [`CliRespawnClaim`].
 static CLI_RESPAWNS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
 
@@ -621,6 +694,11 @@ async fn respawn_cli_tmux_pane_on(
     Err(PtyError::CreateFailed(format!(
         "tmux respawn-pane failed for {session_name} (pane {pane_id}): {stderr}"
     )))
+}
+
+/// Read the exact pane identity without changing the terminal.
+pub async fn cli_workspace_pane_id(workspace_id: Uuid) -> Result<String, PtyError> {
+    resolve_cli_pane_id_on(cli_tmux_socket(), &cli_tmux_session_name(workspace_id)).await
 }
 
 /// Resolve the pane to respawn for an EXACT session name.

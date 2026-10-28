@@ -215,7 +215,63 @@ impl CliPaneBinding {
         workspace_id: Uuid,
         cwd: &str,
     ) -> Result<Option<ClaudeSessionLinkMutation>, sqlx::Error> {
+        Self::assign_checked(
+            pool,
+            binding_id,
+            current,
+            claude_session_id,
+            session_id,
+            workspace_id,
+            cwd,
+            None,
+        )
+        .await
+    }
+
+    /// Adoption changes the app owner only with the full predecessor fence and local discovery proof.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn adopt_session(
+        pool: &SqlitePool,
+        binding_id: Uuid,
+        expected_session_id: Uuid,
+        current: Option<&str>,
+        claude_session_id: &str,
+        session_id: Uuid,
+        workspace_id: Uuid,
+        cwd: &str,
+    ) -> Result<Option<ClaudeSessionLinkMutation>, sqlx::Error> {
+        Self::assign_checked(
+            pool,
+            binding_id,
+            current,
+            claude_session_id,
+            session_id,
+            workspace_id,
+            cwd,
+            Some(expected_session_id),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn assign_checked(
+        pool: &SqlitePool,
+        binding_id: Uuid,
+        current: Option<&str>,
+        claude_session_id: &str,
+        session_id: Uuid,
+        workspace_id: Uuid,
+        cwd: &str,
+        adoption: Option<Uuid>,
+    ) -> Result<Option<ClaudeSessionLinkMutation>, sqlx::Error> {
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(expected_session_id) = adoption {
+            let eligible: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cli_pane_bindings b JOIN sessions s ON s.id = ? WHERE b.id = ? AND b.workspace_id = ? AND b.session_id = ? AND b.claude_session_id IS ? AND b.released_at IS NULL AND s.workspace_id = b.workspace_id AND s.executor = 'CLAUDE_CODE' AND EXISTS (SELECT 1 FROM cli_native_files f WHERE f.claude_session_id = ? AND f.discovered_workspace_id = b.workspace_id) AND NOT EXISTS (SELECT 1 FROM cli_native_files f WHERE f.claude_session_id = ? AND f.discovered_workspace_id != b.workspace_id) AND NOT EXISTS (SELECT 1 FROM execution_processes ep WHERE ep.session_id IN (s.id, b.session_id) AND ep.run_reason = 'codingagent' AND ep.status = 'running' AND ep.dropped = FALSE))")
+                .bind(session_id).bind(binding_id).bind(workspace_id).bind(expected_session_id).bind(current).bind(claude_session_id).bind(claude_session_id).fetch_one(&mut *tx).await?;
+            if !eligible {
+                return Ok(None);
+            }
+        }
         let previous_session_id: Option<Uuid> = sqlx::query_scalar(
             "SELECT session_id FROM claude_session_links WHERE claude_session_id = ?",
         )
@@ -238,20 +294,24 @@ impl CliPaneBinding {
         if run_by_another_session {
             return Ok(None);
         }
-        let bound = sqlx::query(
-            "UPDATE cli_pane_bindings SET claude_session_id = ?1 \
-             WHERE id = ?2 AND released_at IS NULL \
-               AND claude_session_id IS ?3 \
-               AND (?3 IS NOT NULL OR bound_via = 'cli-fresh')",
-        )
-        .bind(claude_session_id)
-        .bind(binding_id)
-        .bind(current)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if bound == 0 {
-            return Ok(None);
+        if adoption.is_none() {
+            let bound = sqlx::query(
+                "UPDATE cli_pane_bindings SET claude_session_id = ?1 \
+                 WHERE id = ?2 AND workspace_id = ?5 AND released_at IS NULL \
+                   AND claude_session_id IS ?3 AND session_id = ?4 \
+                   AND (?3 IS NOT NULL OR bound_via = 'cli-fresh')",
+            )
+            .bind(claude_session_id)
+            .bind(binding_id)
+            .bind(current)
+            .bind(session_id)
+            .bind(workspace_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if bound == 0 {
+                return Ok(None);
+            }
         }
         sqlx::query(
             "INSERT INTO claude_session_links \
@@ -294,6 +354,13 @@ impl CliPaneBinding {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        if adoption.is_some() {
+            // Adoption is a new lifecycle generation; unfinished operations retain the released fence.
+            sqlx::query("UPDATE cli_pane_bindings SET released_at = datetime('now', 'subsec') WHERE id = ? AND released_at IS NULL")
+                .bind(binding_id).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO cli_pane_bindings (id, workspace_id, session_id, claude_session_id, bound_via) VALUES (?, ?, ?, ?, 'cli-fresh')")
+                .bind(Uuid::new_v4()).bind(workspace_id).bind(session_id).bind(claude_session_id).execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         let link = ClaudeSessionLink::find(pool, claude_session_id)
             .await?

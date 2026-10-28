@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use chrono::Utc;
 use db::models::workspace_cli_activity::{
@@ -40,6 +40,7 @@ pub async fn report_cli_activity(
     State(deployment): State<DeploymentImpl>,
     Path(workspace_id): Path<Uuid>,
     Query(query): Query<HookReportQuery>,
+    headers: HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> StatusCode {
     let pool = &deployment.db().pool;
@@ -78,6 +79,21 @@ pub async fn report_cli_activity(
             .await
     {
         tracing::debug!(?error, %workspace_id, "failed to record a CLI hook report");
+    }
+
+    if payload.get("hook_event_name").and_then(|v| v.as_str()) == Some("SessionStart")
+        && let Some(capability) = headers
+            .get("x-bc-handover-capability")
+            .and_then(|value| value.to_str().ok())
+        && let Err(error) = crate::routes::session_handover::fallback_ready(
+            &deployment,
+            workspace_id,
+            &next.agent_session_id,
+            capability,
+        )
+        .await
+    {
+        tracing::warn!(?error, %workspace_id, "failed to persist fallback initialization receipt");
     }
 
     // A CLI-mode Codex names its rollout; import a thread the feed does not

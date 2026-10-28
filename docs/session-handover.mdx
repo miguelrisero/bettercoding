@@ -1,0 +1,110 @@
+---
+title: "Recoverable session handover"
+description: "Replace a Claude session with durable confirmation and exact predecessor recovery."
+---
+
+## MCP contract
+
+Use `handover_workspace_session` with these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `workspace_id` | Workspace UUID |
+| `expected_binding_id` | Current CLI binding UUID |
+| `successor_session_id` | Fresh BetterCoding Claude session UUID in the same workspace |
+| `initial_prompt` | Initial `/goal` text and context path |
+| `fallback_session_id` | Exact predecessor native Claude UUID |
+| `confirm_deadline_secs` | Positive deadline in seconds, default `900` |
+| `request_id` | Workspace-scoped idempotency key |
+
+The receipt contains `operation_id`, `workspace_id`, `predecessor_session_id`, `successor_session_id`, `successor_native_session_id`, `phase`, `deadline_at`, `binding_id`, `fallback_session_id`, `confirmed_at` and `failure`.
+
+The phase is `starting`, `awaiting_confirmation`, `confirmed`, `rolled_back` or `failed`.
+`confirmed_at` and `failure` can be null.
+The server creates the successor native UUID and supplies Claude's `--session-id` argument.
+
+Use `get_handover` with `operation_id` to read the durable receipt.
+The launched successor can omit `operation_id` to use its inherited operation.
+The initial prompt also carries the operation and successor identities.
+The predecessor can terminate before receiving its request response.
+
+Use `confirm_handover` with `operation_id` from the launched successor.
+The confirmation receipt contains `operation_id`, `phase`, `confirmed_at`, `successor_session_id`, `successor_native_session_id` and `binding_id`.
+Repeated confirmation returns the same timestamp.
+
+## Ownership and recovery
+
+1. Confirm the handover from the successor.
+2. Persist the confirmation receipt.
+3. Prepare the timer receipts.
+4. Accept CoC ownership through the locked bootstrap transfer with a fresh owner epoch.
+5. Verify successor ownership.
+6. Apply the plugin's transcript cleanup checks.
+
+The server preserves transcripts.
+The server records the recovery operation and successor binding before replacing the pane process.
+A successor exit or expired deadline triggers `--resume` with the recorded fallback UUID.
+Startup reconciliation reads unfinished operations from SQLite.
+An interrupted launch triggers fallback recovery.
+A newer binding makes an older operation fail while preserving the current pane.
+The receipt reports fallback launch failures through `phase=failed` and `failure`.
+Fallback initialization requires a matching native `SessionStart` hook and a live process.
+Recovery retains its unfinished phase while it waits for that receipt.
+An exit before the initialization receipt makes recovery fail.
+The requested `confirm_deadline_secs` also bounds fallback initialization, counted from the persisted fallback launch time.
+An expired initialization deadline records failure and preserves the live process and operation journal.
+Recovery requires the matching native UUID, launch capability, PID and process start identity.
+The monitor commits `rolled_back` after initialization succeeds.
+
+## Local identity boundary
+
+The server creates a random capability for each successor launch.
+The pane passes that capability to its MCP child through `BC_HANDOVER_CAPABILITY`.
+The MCP tool forwards it through `x-bc-handover-capability`.
+The server resolves the confirming identity from its durable launch record.
+Workspace context alone supplies insufficient session identity.
+
+This boundary assumes cooperative agents running as the same Unix user.
+Same-user processes can inspect process environments and SQLite.
+A successor's child processes also inherit its capability.
+Use separate Unix users or authenticated process identities when agents need isolation against hostile peers.
+
+## Adopt a running session
+
+Use `adopt_workspace_session` to associate an existing Claude process with its BetterCoding session.
+Adoption preserves the pane and process.
+It changes session association only.
+
+Supply these fields:
+
+- `workspace_id`
+- `expected_binding_id`
+- `expected_session_id`, the old BetterCoding session UUID
+- `expected_native_session_id`, the old native UUID or null
+- `session_id`, the target BetterCoding Claude session UUID
+- `native_session_id`, the target native Claude UUID
+- `expected_pane_id`
+- `expected_pid`
+- `expected_start_time`, Linux `/proc/<pid>/stat` field 22
+
+The server checks the exact pane, process ancestry, process start time, workspace, working directory and transcript ownership.
+An open session-specific transcript or `~/.claude/tasks/<native_session_id>` directory ties the process to the native UUID.
+Ambiguous evidence causes refusal.
+The transcript must already belong to the workspace's discovery records.
+Another app session's transcript ownership causes refusal.
+Adoption creates a fresh binding generation.
+
+The receipt contains `workspace_id`, `binding_id`, `session_id`, `native_session_id`, `pane_id`, `pid` and `start_time`.
+Recreate an MCP process to refresh any cached workspace context after adoption.
+Adoption requires Linux process evidence.
+
+## HTTP routes
+
+- `POST /api/handovers`
+- `GET /api/handovers/{operation_id}`
+- `POST /api/handovers/{operation_id}/confirm`
+- `POST /api/sessions/adopt`
+
+The handover launch requires an existing Claude pane and matching working directories.
+The initial prompt must fit the existing CLI argument transport bound.
+The monitor checks recovery every two seconds.
