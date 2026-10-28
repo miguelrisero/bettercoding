@@ -166,9 +166,12 @@ pub(super) async fn resolve_cli_launch_spec(
     // inline with `-c` so neither ~/.codex nor the worktree is touched.
     if spec.program == "codex" {
         spec.session_args = codex_hook_args(&spec.base_args, workspace_id).await;
-        if runs_unrestricted(&spec) {
+        let unrestricted = runs_unrestricted(&spec);
+        if unrestricted {
             spec.session_args.extend(codex_mcp_args().await);
         }
+        spec.session_args
+            .extend(codex_lean_mcp_args(workspace_id, unrestricted).await);
     }
 
     // Everything else keeps the tmux poller's guess.
@@ -176,11 +179,7 @@ pub(super) async fn resolve_cli_launch_spec(
         // `--mcp-config` takes several values, so it must be followed by
         // another flag or it would swallow a positional prompt. It is only
         // ever pushed right before `--settings`.
-        let mcp_config = if runs_unrestricted(&spec) {
-            write_cli_mcp_config(workspace_id).await
-        } else {
-            None
-        };
+        let mcp_config = write_cli_mcp_config(workspace_id, runs_unrestricted(&spec)).await;
         if let Some(settings) = write_cli_hook_settings(workspace_id).await {
             if let Some((mcp_config, strict)) = mcp_config {
                 if strict {
@@ -344,43 +343,47 @@ const LEAN_MCP_SERVERS: &[&str] = &[
     "fff",
 ];
 
-/// Write the per-workspace MCP config that gives claude the BetterCoding tools
-/// (create, update, archive and delete workspaces, sessions, repos) plus the
-/// lean set of the user's servers, and return its path for
-/// `claude --mcp-config` with whether to pass `--strict-mcp-config`.
-///
-/// `cli-mcp/<workspace_id>.servers.json` overrides the set per workspace: a
-/// JSON array of extra server names from `~/.claude.json` (e.g.
-/// `["playwright"]`), or `"all"` to keep every server the user configured.
+/// Write the per-workspace MCP config for `claude --mcp-config` and return its
+/// path with whether to pass `--strict-mcp-config`. It holds the lean set of
+/// the user's servers and, for an unrestricted agent only, the BetterCoding
+/// tools (create, update, archive and delete workspaces, sessions, repos).
 /// The user's config is only read, never edited.
-async fn write_cli_mcp_config(workspace_id: Uuid) -> Option<(PathBuf, bool)> {
-    let (exe, url) = mcp_server_launch().await?;
+async fn write_cli_mcp_config(workspace_id: Uuid, unrestricted: bool) -> Option<(PathBuf, bool)> {
+    let launch = if unrestricted {
+        Some(mcp_server_launch().await?)
+    } else {
+        None
+    };
     let dir = utils::assets::asset_dir().join("cli-mcp");
     if let Err(error) = tokio::fs::create_dir_all(&dir).await {
         tracing::debug!(?error, "could not create the CLI MCP config directory");
         return None;
     }
-    let read_json = |path: PathBuf| async move {
-        let text = tokio::fs::read_to_string(path).await.ok()?;
-        serde_json::from_str::<serde_json::Value>(&text).ok()
-    };
-    let workspace_override = read_json(dir.join(format!("{workspace_id}.servers.json"))).await;
+    let names = lean_mcp_names(workspace_mcp_override(workspace_id).await.as_ref());
     let user_config = match dirs::home_dir() {
-        Some(home) => read_json(home.join(".claude.json")).await,
+        Some(home) => tokio::fs::read_to_string(home.join(".claude.json"))
+            .await
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok()),
         None => None,
     };
-    let lean = cli_mcp_servers(user_config.as_ref(), workspace_override.as_ref());
+    let lean = cli_mcp_servers(user_config.as_ref(), names.as_deref());
     let strict = lean.is_some();
     let mut servers = lean.unwrap_or_default();
-    servers.insert(
-        MCP_SERVER_NAME.to_string(),
-        serde_json::json!({
-            "type": "stdio",
-            "command": exe,
-            "args": ["mcp"],
-            "env": { "BC_BACKEND_URL": url },
-        }),
-    );
+    if let Some((exe, url)) = launch {
+        servers.insert(
+            MCP_SERVER_NAME.to_string(),
+            serde_json::json!({
+                "type": "stdio",
+                "command": exe,
+                "args": ["mcp"],
+                "env": { "BC_BACKEND_URL": url },
+            }),
+        );
+    }
+    if servers.is_empty() && !strict {
+        return None;
+    }
     let config = serde_json::json!({ "mcpServers": servers });
     let path = dir.join(format!("{workspace_id}.json"));
     // The copied server entries can carry the user's API keys.
@@ -393,17 +396,23 @@ async fn write_cli_mcp_config(workspace_id: Uuid) -> Option<(PathBuf, bool)> {
     }
 }
 
-/// The user's servers for a strict launch, or `None` to keep all of them: the
-/// override says `"all"`, or the user's config cannot be read (a strict launch
-/// then would silently drop every server).
-fn cli_mcp_servers(
-    user_config: Option<&serde_json::Value>,
-    workspace_override: Option<&serde_json::Value>,
-) -> Option<serde_json::Map<String, serde_json::Value>> {
+/// The per-workspace override `cli-mcp/<workspace_id>.servers.json`: a JSON
+/// array of extra server names (e.g. `["playwright"]`), or `"all"` to keep
+/// every server the user configured.
+async fn workspace_mcp_override(workspace_id: Uuid) -> Option<serde_json::Value> {
+    let path = utils::assets::asset_dir()
+        .join("cli-mcp")
+        .join(format!("{workspace_id}.servers.json"));
+    let text = tokio::fs::read_to_string(path).await.ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The user's server names an agent keeps: the lean set plus the override's
+/// extras, or `None` when the override keeps them all.
+fn lean_mcp_names(workspace_override: Option<&serde_json::Value>) -> Option<Vec<String>> {
     if workspace_override.and_then(|v| v.as_str()) == Some("all") {
         return None;
     }
-    let configured = user_config?.get("mcpServers")?.as_object()?;
     let extra = workspace_override
         .and_then(|v| v.as_array())
         .into_iter()
@@ -414,9 +423,75 @@ fn cli_mcp_servers(
             .iter()
             .copied()
             .chain(extra)
-            .filter_map(|name| Some((name.to_string(), configured.get(name)?.clone())))
+            .map(str::to_string)
             .collect(),
     )
+}
+
+/// The user's servers for a strict claude launch, or `None` to keep all of
+/// them: every name is kept, or the user's config cannot be read (a strict
+/// launch then would silently drop every server).
+fn cli_mcp_servers(
+    user_config: Option<&serde_json::Value>,
+    names: Option<&[String]>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let configured = user_config?.get("mcpServers")?.as_object()?;
+    Some(
+        names?
+            .iter()
+            .filter_map(|name| Some((name.clone(), configured.get(name)?.clone())))
+            .collect(),
+    )
+}
+
+/// The `-c mcp_servers.<name>.enabled=false` overrides that turn off every
+/// server in `~/.codex/config.toml` outside the lean set. Codex has no strict
+/// mode, so each extra server is switched off by name. An unrestricted agent
+/// keeps `bettercoding`; a restricted one loses it like any other server.
+async fn codex_lean_mcp_args(workspace_id: Uuid, unrestricted: bool) -> Vec<String> {
+    let Some(names) = lean_mcp_names(workspace_mcp_override(workspace_id).await.as_ref()) else {
+        return Vec::new();
+    };
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")));
+    let config = match codex_home {
+        Some(dir) => tokio::fs::read_to_string(dir.join("config.toml"))
+            .await
+            .ok()
+            .and_then(|text| text.parse::<toml::Table>().ok()),
+        None => None,
+    };
+    codex_lean_mcp_args_for(config.as_ref(), &names, unrestricted)
+}
+
+fn codex_lean_mcp_args_for(
+    config: Option<&toml::Table>,
+    names: &[String],
+    unrestricted: bool,
+) -> Vec<String> {
+    let Some(configured) = config
+        .and_then(|c| c.get("mcp_servers"))
+        .and_then(|v| v.as_table())
+    else {
+        return Vec::new();
+    };
+    configured
+        .keys()
+        .filter(|name| !names.contains(name))
+        .filter(|name| !(unrestricted && name.as_str() == MCP_SERVER_NAME))
+        // Only a bare TOML key can be named in a `-c` path.
+        .filter(|name| {
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+        .flat_map(|name| {
+            [
+                "-c".to_string(),
+                format!("mcp_servers.{name}.enabled=false"),
+            ]
+        })
+        .collect()
 }
 
 async fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
@@ -1617,7 +1692,10 @@ mod tests {
     use sqlx::SqlitePool;
     use uuid::Uuid;
 
-    use super::{MAX_CLI_SEND_BYTES, cli_mcp_servers, validate_cli_send_text};
+    use super::{
+        MAX_CLI_SEND_BYTES, cli_mcp_servers, codex_lean_mcp_args_for, lean_mcp_names,
+        validate_cli_send_text,
+    };
 
     #[test]
     fn cli_mcp_servers_keep_the_lean_set_plus_the_workspace_override() {
@@ -1632,16 +1710,52 @@ mod tests {
             names.sort();
             names
         };
+        let lean = lean_mcp_names(None).unwrap();
         assert_eq!(
-            names(cli_mcp_servers(Some(&user), None).unwrap()),
+            names(cli_mcp_servers(Some(&user), Some(&lean)).unwrap()),
             ["fff", "slack"]
         );
-        let extra = serde_json::json!(["playwright", "missing"]);
+        let extra = lean_mcp_names(Some(&serde_json::json!(["playwright", "missing"]))).unwrap();
         let servers = cli_mcp_servers(Some(&user), Some(&extra)).unwrap();
         assert_eq!(servers["slack"], user["mcpServers"]["slack"]);
         assert_eq!(names(servers), ["fff", "playwright", "slack"]);
-        assert!(cli_mcp_servers(Some(&user), Some(&serde_json::json!("all"))).is_none());
-        assert!(cli_mcp_servers(None, None).is_none());
+        assert!(lean_mcp_names(Some(&serde_json::json!("all"))).is_none());
+        assert!(cli_mcp_servers(Some(&user), None).is_none());
+        assert!(cli_mcp_servers(None, Some(&lean)).is_none());
+    }
+
+    #[test]
+    fn codex_lean_args_disable_every_other_server() {
+        let config: toml::Table = r#"
+            [mcp_servers.slack]
+            url = "https://mcp.slack.com/mcp"
+            [mcp_servers.gmail]
+            command = "npx"
+            [mcp_servers.bettercoding]
+            command = "bettercoding"
+            [mcp_servers."odd.name"]
+            command = "x"
+        "#
+        .parse()
+        .unwrap();
+        let lean = lean_mcp_names(None).unwrap();
+        let disabled = |unrestricted| {
+            let args = codex_lean_mcp_args_for(Some(&config), &lean, unrestricted);
+            for pair in args.chunks(2) {
+                assert_eq!(pair[0], "-c");
+                pair[1].parse::<toml::Table>().unwrap();
+            }
+            args.into_iter().filter(|a| a != "-c").collect::<Vec<_>>()
+        };
+        assert_eq!(
+            disabled(false),
+            [
+                "mcp_servers.bettercoding.enabled=false",
+                "mcp_servers.gmail.enabled=false"
+            ]
+        );
+        assert_eq!(disabled(true), ["mcp_servers.gmail.enabled=false"]);
+        assert!(codex_lean_mcp_args_for(None, &lean, false).is_empty());
     }
 
     #[test]
