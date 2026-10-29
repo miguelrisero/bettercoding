@@ -146,7 +146,7 @@ Supported relationship types: `blocking`, `related`, `has_duplicate`.
 | `start_workspace` | Create a workspace and start its first coding-agent session | `name`<br/>`executor`<br/>`repositories` | `prompt`<br/>`variant`<br/>`issue_id` | Workspace ID |
 | `create_session` | Create a session in an existing workspace | None | `workspace_id`<br/>`executor` | Session summary |
 | `list_sessions` | List sessions for a workspace | None | `workspace_id` | Session list |
-| `run_session_prompt` | Run a coding-agent prompt inside an existing session | `session_id`<br/>`prompt` | None | Execution details |
+| `run_session_prompt` | Dispatch a coding-agent prompt inside an existing session | `session_id`<br/>`prompt` | None | Dispatch outcome and execution, queue, or CLI delivery details |
 | `get_execution` | Inspect execution status and final message | `execution_id` | None | Execution details |
 
 The `repositories` parameter is an array of objects with:
@@ -154,6 +154,25 @@ The `repositories` parameter is an array of objects with:
 - `branch`: The branch for this repository
 
 When `issue_id` is provided, the workspace is automatically linked to the remote issue. If `prompt` is omitted, the linked issue's title and description are used as the workspace prompt.
+
+### Session prompt dispatch outcomes
+
+`run_session_prompt` returns immediately with `session_id` and an `outcome`:
+
+- `started` includes `execution_id` and the full `execution` object. Poll `get_execution` with this ID to inspect progress.
+- `queued` includes the complete queue receipt in `status`. The server holds the prompt for later dispatch.
+- `routed_to_cli` includes the complete CLI delivery receipt in `delivery`. Inspect its `status` for delivery progress.
+- `conflict` returns an MCP tool error with `success: false`, `error: "Session dispatch conflict"`, and the current queue receipt in `status`.
+
+Poll `get_execution` only for `started` outcomes.
+Queue and CLI delivery receipts describe dispatch state; they do not confirm that the agent completed the prompt.
+An HTTP 409 response with only a message returns an ordinary tool error with the server's message.
+
+<Warning>
+A response error can occur after the server accepts a prompt.
+The tool sends one follow-up request and never retries it automatically.
+Inspect the session before you submit the prompt again.
+</Warning>
 
 ### Supported Executors
 
