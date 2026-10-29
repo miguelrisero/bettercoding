@@ -1,10 +1,11 @@
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import type { ReportTab } from 'shared/types';
+import type { ReportTab, ReportTabs } from 'shared/types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { setLocalApiTransport } from '@/shared/lib/localApiTransport';
 import {
   loadReportTabs,
+  latestReportTabs,
   nextReportTab,
   reportLink,
   selectedReportTab,
@@ -34,6 +35,32 @@ const tab: ReportTab = {
 };
 
 afterEach(() => setLocalApiTransport(null));
+
+it('orders report snapshots across empty state and final tab deletion', () => {
+  const older: ReportTabs = { tabs: [tab], updated_at: '2026-10-29T12:00:00Z' };
+  const deleted: ReportTabs = { tabs: [], updated_at: '2026-10-29T12:01:00Z' };
+  expect(latestReportTabs(older, deleted)).toBe(deleted);
+  expect(latestReportTabs(deleted, older)).toBe(deleted);
+  expect(latestReportTabs(older, { ...older })).toBe(older);
+  expect(latestReportTabs(undefined, older)).toBe(older);
+  expect(latestReportTabs(older, undefined)).toBe(older);
+  expect(latestReportTabs({ tabs: [], updated_at: null }, older)).toBe(older);
+  expect(latestReportTabs(older, { tabs: [], updated_at: null })).toBe(older);
+});
+
+it('orders UTC revisions with optional fractions and microsecond precision', () => {
+  const snapshot = (updated_at: string): ReportTabs => ({
+    tabs: [tab],
+    updated_at,
+  });
+  const whole = snapshot('2026-10-29T12:00:00Z');
+  const milli = snapshot('2026-10-29T12:00:00.123Z');
+  const micro = snapshot('2026-10-29T12:00:00.123001Z');
+  expect(latestReportTabs(whole, milli)).toBe(milli);
+  expect(latestReportTabs(milli, whole)).toBe(milli);
+  expect(latestReportTabs(milli, micro)).toBe(micro);
+  expect(latestReportTabs(micro, milli)).toBe(micro);
+});
 
 describe('report requests', () => {
   it('routes each request to its explicit host and unwraps the envelope', async () => {

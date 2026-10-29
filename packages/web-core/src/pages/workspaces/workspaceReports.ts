@@ -15,6 +15,22 @@ export function reportSnapshot(state: ReportScratchState): ReportTabs {
     : { tabs: [], updated_at: null };
 }
 
+export function latestReportTabs(live?: ReportTabs, http?: ReportTabs) {
+  // Both snapshots carry the backend's UTC aggregate revision timestamp.
+  if (!live) return http;
+  if (!http?.updated_at) return live;
+  // Preserve sub-millisecond revisions and normalize Chrono's optional fraction.
+  const revision = (value: string) =>
+    value.replace(
+      /(?:\.(\d+))?Z$/,
+      (_, fraction = '') => `.${fraction.padEnd(9, '0')}Z`
+    );
+  return !live.updated_at ||
+    revision(http.updated_at) > revision(live.updated_at)
+    ? http
+    : live;
+}
+
 export async function loadReportTabs(
   workspaceId: string,
   hostId: string | null,

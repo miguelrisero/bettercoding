@@ -10,6 +10,7 @@ import { cn } from '@/shared/lib/utils';
 import {
   emptyReportScratch,
   loadReportTabs,
+  latestReportTabs,
   nextReportTab,
   reportLink,
   reportSnapshot,
@@ -141,7 +142,7 @@ function Reports({
       setLive(reportSnapshot(stream.data));
   }, [stream.data, stream.isInitialized]);
   const [selected, setSelected] = useState<string | null>(null);
-  const tabs = live ?? list.data;
+  const tabs = latestReportTabs(live, list.data);
   const tab = selectedReportTab(tabs?.tabs ?? [], selected);
   const id = useId();
   const buttons = useRef<Array<HTMLButtonElement | null>>([]);
@@ -150,8 +151,7 @@ function Reports({
     const timer = window.setInterval(() => tick((value) => value + 1), 60000);
     return () => window.clearInterval(timer);
   }, []);
-  const error =
-    stream.error ?? (live === undefined ? list.error?.message : null);
+  const error = stream.error ?? list.error?.message;
   return (
     <section
       aria-label="Reports"
