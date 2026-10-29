@@ -103,25 +103,14 @@ enum FollowUpOutcome {
         execution_process: Box<ExecutionProcess>,
     },
     Queued {
-        #[serde(deserialize_with = "deserialize_receipt")]
-        status: serde_json::Value,
+        status: serde_json::Map<String, serde_json::Value>,
     },
     RoutedToCli {
-        #[serde(deserialize_with = "deserialize_receipt")]
-        delivery: serde_json::Value,
+        delivery: serde_json::Map<String, serde_json::Value>,
     },
     Conflict {
-        #[serde(deserialize_with = "deserialize_receipt")]
-        status: serde_json::Value,
+        status: serde_json::Map<String, serde_json::Value>,
     },
-}
-
-// Preserve the complete receipt while rejecting missing, null, or scalar payloads.
-fn deserialize_receipt<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    serde_json::Map::deserialize(deserializer).map(serde_json::Value::Object)
 }
 
 #[derive(Debug, Deserialize)]
@@ -431,11 +420,11 @@ impl McpServer {
             }
             FollowUpOutcome::Queued { status } => {
                 result["outcome"] = serde_json::json!("queued");
-                result["status"] = status;
+                result["status"] = status.into();
             }
             FollowUpOutcome::RoutedToCli { delivery } => {
                 result["outcome"] = serde_json::json!("routed_to_cli");
-                result["delivery"] = delivery;
+                result["delivery"] = delivery.into();
             }
             FollowUpOutcome::Conflict { .. } => {
                 return Self::err("Invalid session dispatch response", None);
@@ -526,7 +515,7 @@ impl McpServer {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use rmcp::model::CallToolResult;
+    use rmcp::{handler::server::tool::ToolRouter, model::CallToolResult};
     use serde_json::{Value, json};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -535,7 +524,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::task_server::McpContext;
+    use crate::task_server::{McpContext, McpMode};
 
     struct MockApi {
         server: McpServer,
@@ -553,13 +542,17 @@ mod tests {
         async fn new(session: Value, status: u16, body: String) -> Self {
             super::super::tests::install_rustls_provider();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let mut server =
-                McpServer::new_orchestrator(&format!("http://{}", listener.local_addr().unwrap()));
-            server.client = reqwest::Client::builder()
-                .no_proxy()
-                .timeout(std::time::Duration::from_secs(2))
-                .build()
-                .unwrap();
+            let server = McpServer {
+                client: reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(std::time::Duration::from_secs(2))
+                    .build()
+                    .unwrap(),
+                base_url: format!("http://{}", listener.local_addr().unwrap()),
+                tool_router: ToolRouter::default(),
+                context: None,
+                mode: McpMode::Orchestrator,
+            };
             let requests = Arc::new(Mutex::new(Vec::new()));
             let recorded = requests.clone();
             let task = tokio::spawn(async move {
@@ -697,7 +690,7 @@ mod tests {
                 FollowUpOutcome::RoutedToCli { delivery } => delivery,
                 FollowUpOutcome::Started { .. } => panic!("unexpected started outcome"),
             };
-            assert_eq!(actual, receipt);
+            assert_eq!(Value::Object(actual), receipt);
         }
         for wire in [json!({}), json!({"outcome": "unknown"})] {
             assert!(serde_json::from_value::<FollowUpOutcome>(wire).is_err());
