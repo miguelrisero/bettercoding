@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, put},
@@ -11,6 +11,7 @@ use db::models::workspace_report::{
 };
 use deployment::Deployment;
 use serde::{Deserialize, Serialize};
+use services::services::events::EventService;
 use sqlx::SqlitePool;
 use utils::response::ApiResponse;
 use uuid::Uuid;
@@ -60,25 +61,35 @@ async fn list(
 }
 async fn set(
     State(pool): State<SqlitePool>,
+    Extension(events): Extension<EventService>,
     Path((workspace, id)): Path<(Uuid, String)>,
     Json(body): Json<SetReportTab>,
 ) -> RouteResult<ReportTab> {
-    Ok(Json(ApiResponse::success(
-        WorkspaceReport::set(&pool, workspace, &id, body).await?,
-    )))
+    let tab = WorkspaceReport::set(&pool, workspace, &id, body).await?;
+    events
+        .publish_workspace_reports(workspace)
+        .await
+        .map_err(ReportError::from)?;
+    Ok(Json(ApiResponse::success(tab)))
 }
 async fn delete(
     State(pool): State<SqlitePool>,
+    Extension(events): Extension<EventService>,
     Path((workspace, id)): Path<(Uuid, String)>,
     Query(query): Query<DeleteQuery>,
 ) -> RouteResult<ReportTabs> {
-    Ok(Json(ApiResponse::success(
-        WorkspaceReport::delete(&pool, workspace, &id, query.expected_updated_at).await?,
-    )))
+    let state = WorkspaceReport::delete(&pool, workspace, &id, query.expected_updated_at).await?;
+    events
+        .publish_workspace_reports(workspace)
+        .await
+        .map_err(ReportError::from)?;
+    Ok(Json(ApiResponse::success(state)))
 }
 
 pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
-    report_routes().with_state(deployment.db().pool.clone())
+    report_routes()
+        .layer(Extension(deployment.events().clone()))
+        .with_state(deployment.db().pool.clone())
 }
 fn report_routes() -> Router<SqlitePool> {
     Router::new()
@@ -131,8 +142,14 @@ mod tests {
         .await
         .unwrap();
         let workspace = Uuid::new_v4();
+        let events = EventService::new(
+            db::DBService { pool: pool.clone() },
+            std::sync::Arc::new(utils::msg_store::MsgStore::new()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(0)),
+        );
         let app = Router::new()
             .nest("/api/workspaces/{id}/report-tabs", report_routes())
+            .layer(Extension(events))
             .with_state(pool);
         let root = format!("/api/workspaces/{workspace}/report-tabs");
         let path = format!("{root}/build");

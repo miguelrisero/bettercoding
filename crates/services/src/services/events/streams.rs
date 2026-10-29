@@ -362,6 +362,148 @@ mod report_tests {
     use crate::services::events::{EventService, scratch_patch};
 
     #[tokio::test]
+    async fn committed_report_publication_survives_precommit_wal_hook_read() {
+        use db::models::workspace_report::ReportTabs;
+        use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+        let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let directory = tempfile::tempdir_in(scratch).unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(3)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(directory.path().join("reports.sqlite"))
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal),
+            )
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../../db/migrations/20251120000001_refactor_to_scratch.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let workspace = Uuid::new_v4();
+        WorkspaceReport::set(
+            &pool,
+            workspace,
+            "build",
+            SetReportTab {
+                title: "Before".into(),
+                columns: vec!["State".into()],
+                rows: vec![],
+                expected_updated_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let first = Scratch::find_by_id(&pool, workspace, &ScratchType::WorkspaceReports)
+            .await
+            .unwrap()
+            .unwrap();
+        let ScratchPayload::WorkspaceReports(mut state) = first.payload.clone() else {
+            panic!("expected reports")
+        };
+        let store = Arc::new(MsgStore::new());
+        let db = DBService { pool: pool.clone() };
+        let count = Arc::new(RwLock::new(0));
+        let events = EventService::new(db.clone(), store.clone(), count.clone());
+        let mut stream = events
+            .stream_scratch_raw(workspace, &ScratchType::WorkspaceReports)
+            .await
+            .unwrap();
+        stream.next().await.unwrap().unwrap();
+        stream.next().await.unwrap().unwrap();
+        let mut hook_events = store.get_receiver();
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        EventService::create_hook(store.clone(), count, db)(&mut tx)
+            .await
+            .unwrap();
+        let stamp = first.updated_at + chrono::Duration::seconds(1);
+        state.tabs[0].title = "Committed".into();
+        state.tabs[0].updated_at = stamp;
+        state.updated_at = Some(stamp);
+        sqlx::query("UPDATE scratch SET payload=?,updated_at=? WHERE id=? AND scratch_type='WORKSPACE_REPORTS'")
+            .bind(serde_json::to_string(&ScratchPayload::WorkspaceReports(state.clone())).unwrap()).bind(stamp).bind(workspace).execute(&mut *tx).await.unwrap();
+        // Force the real update hook's separate WAL reader to finish before COMMIT.
+        let hook = tokio::time::timeout(std::time::Duration::from_secs(2), hook_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let LogMsg::JsonPatch(patch) = hook else {
+            panic!("expected hook patch")
+        };
+        let json_patch::PatchOperation::Replace(op) = &patch.0[0] else {
+            panic!("expected replacement")
+        };
+        assert_eq!(op.value["payload"]["data"]["tabs"][0]["title"], "Before");
+        tx.commit().await.unwrap();
+        events.publish_workspace_reports(workspace).await.unwrap();
+        let LogMsg::JsonPatch(patch) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected committed patch")
+        };
+        let json_patch::PatchOperation::Replace(op) = &patch.0[0] else {
+            panic!("expected replacement")
+        };
+        let committed: ReportTabs =
+            serde_json::from_value(op.value["payload"]["data"].clone()).unwrap();
+        assert_eq!(committed, state);
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        EventService::create_hook(
+            store.clone(),
+            Arc::new(RwLock::new(0)),
+            DBService { pool: pool.clone() },
+        )(&mut tx)
+        .await
+        .unwrap();
+        state.tabs[0].title = "Rolled back".into();
+        state.tabs[0].updated_at = stamp + chrono::Duration::seconds(1);
+        state.updated_at = Some(state.tabs[0].updated_at);
+        sqlx::query("UPDATE scratch SET payload=? WHERE id=? AND scratch_type='WORKSPACE_REPORTS'")
+            .bind(serde_json::to_string(&ScratchPayload::WorkspaceReports(state)).unwrap())
+            .bind(workspace)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        // The rolled-back update hook can publish only the committed snapshot.
+        hook_events.recv().await.unwrap(); // Drain the explicit committed publication.
+        let hook = tokio::time::timeout(std::time::Duration::from_secs(2), hook_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let LogMsg::JsonPatch(patch) = hook else {
+            panic!("expected hook patch")
+        };
+        let json_patch::PatchOperation::Replace(op) = &patch.0[0] else {
+            panic!("expected replacement")
+        };
+        assert_eq!(op.value["payload"]["data"]["tabs"][0]["title"], "Committed");
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            WorkspaceReport::list(&pool, workspace).await.unwrap(),
+            committed
+        );
+        // Ready is a marker after all queued hooks: stale payloads must be filtered.
+        store.push(LogMsg::Ready);
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            LogMsg::Ready
+        ));
+        pool.close().await;
+    }
+
+    #[tokio::test]
     async fn report_stream_snapshot_filters_scope_and_stale_events() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
