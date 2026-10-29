@@ -1,3 +1,4 @@
+import { runInNewContext } from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 import {
   inputEmbeddingDocument,
@@ -117,6 +118,82 @@ describe('Input proposal bridge', () => {
     expect(
       validateInputAnswer({}, { ...contract, allow_no_answer_yet: true })
     ).toBe(true);
+  });
+  it('delivers the local renderer while retaining the existing proposal handshake', () => {
+    vi.stubGlobal('window', {
+      location: { href: 'https://app.test/workspaces/w' },
+    });
+    const document = inputEmbeddingDocument(
+      '/api/workspaces/w/inputs/i/versions/1/content',
+      makeBridge(),
+      'hash'
+    );
+    const listeners: Record<string, (event?: unknown) => void> = {};
+    const sent: unknown[] = [];
+    const child = {
+      postMessage(data: unknown) {
+        sent.push(data);
+      },
+    };
+    const frame = {
+      contentWindow: child,
+      addEventListener(type: string, fn: () => void) {
+        listeners[type] = fn;
+      },
+    };
+    const parent = {
+      postMessage(data: unknown) {
+        sent.push(data);
+      },
+    };
+    runInNewContext(
+      document.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)![1],
+      {
+        document: {
+          createElement() {
+            return frame;
+          },
+          body: { append() {} },
+        },
+        window: {
+          addEventListener(type: string, fn: () => void) {
+            listeners[type] = fn;
+          },
+        },
+        parent,
+      }
+    );
+    listeners.load();
+    expect(sent[0]).toMatchObject({
+      type: 'bc.input.init',
+      bridge_id: 'bridge',
+      input_id: 'input',
+      version: 1,
+    });
+    expect((sent[0] as { mermaid_source?: string }).mermaid_source).toContain(
+      'globalThis["mermaid"]'
+    );
+    listeners.message({ source: child, data: message });
+    expect(sent.at(-1)).toEqual(message);
+    const image = {
+      ...message,
+      type: 'bc.input.image.request',
+      index: 0,
+      src: '.bettercoding-uploads/a.png',
+    };
+    listeners.message({ source: child, data: image });
+    expect(sent.at(-1)).toEqual(image);
+    const reply = {
+      ...image,
+      type: 'bc.input.image',
+      src: 'data:image/png;base64,iVBORw==',
+    };
+    listeners.message({ source: parent, data: reply });
+    expect(sent.at(-1)).toEqual(reply);
+    const count = sent.length;
+    listeners.message({ source: {}, data: message });
+    expect(sent).toHaveLength(count);
+    vi.unstubAllGlobals();
   });
   it('restricts the embedding frame policy to the exact content route', () => {
     vi.stubGlobal('window', {

@@ -1,4 +1,5 @@
 import type { InputAnswer, InputContract } from 'shared/types';
+import mermaidSource from 'mermaid/dist/mermaid.min.js?raw';
 
 export type InputBridge = {
   id: string;
@@ -99,6 +100,7 @@ export function inputEmbeddingDocument(
     version: bridge.version,
     bridge_id: bridge.id,
     content_hash: contentHash,
+    mermaid_source: mermaidSource,
   }).replace(/</g, '\\u003c');
   const frameSource = `${url.origin}${url.pathname}`;
   return `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; frame-src ${frameSource}; connect-src 'none'; base-uri 'none'; form-action 'none'"><meta name="referrer" content="no-referrer"><style>html,body,iframe{margin:0;width:100%;height:100%;border:0;display:block}body{background:white}</style></head><body><script nonce="${nonce}">
@@ -109,13 +111,16 @@ let loads=0, valid=true;
 frame.addEventListener('load',()=>{
   loads++;
   if(loads>1){ valid=false; parent.postMessage({type:'bc.input.navigated',bridge_id:config.bridge_id},'*'); frame.remove(); return; }
-  frame.contentWindow.postMessage({type:'bc.input.init',protocol:1,input_id:config.input_id,version:config.version,content_hash:config.content_hash,bridge_id:config.bridge_id},'*');
+  frame.contentWindow.postMessage({type:'bc.input.init',protocol:1,input_id:config.input_id,version:config.version,content_hash:config.content_hash,bridge_id:config.bridge_id,mermaid_source:config.mermaid_source},'*');
   parent.postMessage({type:'bc.input.loaded',bridge_id:config.bridge_id},'*');
 });
 window.addEventListener('message',event=>{
-  if(!valid || event.source!==frame.contentWindow) return;
+  if(!valid) return;
   const d=event.data;
-  if(!d || d.type!=='bc.input.propose' || d.protocol!==1 || d.bridge_id!==config.bridge_id || d.input_id!==config.input_id || d.version!==config.version) return;
+  if(!d || d.protocol!==1 || d.bridge_id!==config.bridge_id || d.input_id!==config.input_id || d.version!==config.version) return;
+  if(event.source===parent && d.type==='bc.input.image') { frame.contentWindow.postMessage(d,'*'); return; }
+  if(event.source!==frame.contentWindow) return;
+  if(d.type!=='bc.input.propose' && d.type!=='bc.input.image.request') return;
   try{if(JSON.stringify(d).length>262144)return;}catch{return;}
   parent.postMessage(d,'*');
 });
