@@ -63,6 +63,7 @@ futures-util = "0.3"
 http = "1"
 base64 = "0.22"
 mime_guess = "2.0"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 rust-embed = "8.2"
 url = "2.5"
 rand = { version = "0.8", features = ["std"] }

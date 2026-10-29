@@ -16,6 +16,13 @@ import { useVisualViewportGeometry } from '@/shared/hooks/useVisualViewportGeome
 import { useIsMobile } from '@/shared/hooks/useIsMobile';
 import { cn } from '@/shared/lib/utils';
 import { formatDateShortWithTime, formatRelativeTime } from '@/shared/lib/date';
+import { makeLocalApiRequest } from '@/shared/lib/localApiTransport';
+import {
+  inputImagePath,
+  inputImageQueue,
+  readInputImage,
+  readInputImageRequest,
+} from './inputRichContent';
 import {
   inputEmbeddingDocument,
   inputFrameLoaded,
@@ -734,6 +741,9 @@ function InputBody({
     }
   }, [host, detail.input.id, key]);
   useEffect(() => {
+    const controller = new AbortController();
+    const requested = new Set<number>();
+    const enqueue = inputImageQueue();
     const listener = (event: MessageEvent) => {
       if (
         event.source !== frame.current?.contentWindow ||
@@ -743,6 +753,56 @@ function InputBody({
       if (event.data?.type === 'bc.input.navigated') {
         bridge.current.valid = false;
         setNavigated(true);
+        return;
+      }
+      const image = readInputImageRequest(event.data, bridge.current);
+      if (image && !requested.has(image.index)) {
+        requested.add(image.index);
+        const path = inputImagePath(
+          image.src,
+          workspaceId,
+          host,
+          window.location.origin
+        );
+        const current = bridge.current;
+        if (path)
+          void enqueue(async () => {
+            if (
+              controller.signal.aborted ||
+              current !== bridge.current ||
+              !current.valid
+            )
+              return;
+            try {
+              const response = await makeLocalApiRequest(path, {
+                hostScope: 'explicit',
+                hostId: host,
+                redirect: 'error',
+                signal: controller.signal,
+              });
+              const src = await readInputImage(response);
+              if (
+                src &&
+                !controller.signal.aborted &&
+                current === bridge.current &&
+                current.valid
+              )
+                frame.current?.contentWindow?.postMessage(
+                  {
+                    type: 'bc.input.image',
+                    protocol: 1,
+                    bridge_id: current.id,
+                    input_id: current.inputId,
+                    version: current.version,
+                    index: image.index,
+                    src,
+                  },
+                  '*'
+                );
+            } catch {
+              // Unavailable or rejected images keep their alt text.
+            }
+          });
         return;
       }
       const answer = readInputProposal(
@@ -758,8 +818,11 @@ function InputBody({
       }
     };
     window.addEventListener('message', listener);
-    return () => window.removeEventListener('message', listener);
-  }, [detail.version.contract]);
+    return () => {
+      controller.abort();
+      window.removeEventListener('message', listener);
+    };
+  }, [detail.version.contract, workspaceId, host, pageAttempt]);
   const submit = async () => {
     setBusy(true);
     setError(null);

@@ -359,6 +359,34 @@ pub async fn preview_file(
     serve_preview(&base, &path, workspace.id, request).await
 }
 
+// --- GET /input-image/{*path} ---
+
+/// Return only decoded raster pixels, bounded before any transport buffers them.
+async fn input_image_file(
+    Extension(workspace): Extension<Workspace>,
+    State(deployment): State<DeploymentImpl>,
+    RoutePath((_id, path)): RoutePath<(Uuid, String)>,
+) -> Result<Response, ApiError> {
+    let (base, _, filesystem_lock) = canonical_workspace(&deployment, &workspace).await?;
+    let guard = filesystem_lock.read_owned().await;
+    let bytes = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        super::input_image::raster_file(&base, &path)
+    })
+    .await
+    .map_err(|_| ApiError::BadRequest("Input image read failed".into()))?
+    .map_err(|error| *error)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 // --- PUT /inputs ---
 
 #[derive(Debug, Deserialize)]
@@ -926,6 +954,7 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
         .route("/list", get(list_files))
         .route("/download", get(download_file))
         .route("/preview/{*path}", get(preview_file))
+        .route("/input-image/{*path}", get(input_image_file))
         .route("/link", get(file_link))
         .route(
             "/inputs",

@@ -343,7 +343,12 @@ fn content_response(html: String) -> Response {
         .header(header::CACHE_CONTROL, "no-store")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(header::REFERRER_POLICY, "no-referrer")
-        .body(Body::from(html + INPUT_BASE_STYLE))
+        .body(Body::from(
+            html + INPUT_BASE_STYLE
+                + "<script>"
+                + include_str!("input-rich-content.js")
+                + "</script>",
+        ))
         .unwrap()
 }
 async fn content(
@@ -439,7 +444,8 @@ mod tests {
             .unwrap();
         let body = std::str::from_utf8(&body).unwrap();
         assert!(body.starts_with(page));
-        assert!(body.ends_with("}</style>"));
+        assert!(body.ends_with("</script>"));
+        assert!(body.contains(include_str!("input-rich-content.js")));
         assert!(body[page.len()..].starts_with("<style>@layer bc-base{"));
     }
 
