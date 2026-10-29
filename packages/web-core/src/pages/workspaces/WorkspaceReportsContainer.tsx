@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
+import type { ReportTab, ReportTabs } from 'shared/types';
 import * as Dialog from '@radix-ui/react-dialog';
 import { ArrowsOutSimpleIcon, XIcon } from '@phosphor-icons/react';
 import { useHostId } from '@/shared/providers/HostIdProvider';
@@ -13,8 +14,6 @@ import {
   reportLink,
   reportSnapshot,
   selectedReportTab,
-  type ReportTab,
-  type ReportTabs,
 } from './workspaceReports';
 
 const focusRing =

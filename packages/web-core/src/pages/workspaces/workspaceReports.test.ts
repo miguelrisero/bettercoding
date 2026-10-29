@@ -1,5 +1,6 @@
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+import type { ReportTab } from 'shared/types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { setLocalApiTransport } from '@/shared/lib/localApiTransport';
 import {
@@ -7,7 +8,6 @@ import {
   nextReportTab,
   reportLink,
   selectedReportTab,
-  type ReportTab,
 } from './workspaceReports';
 import { ReportTable } from './WorkspaceReportsContainer';
 

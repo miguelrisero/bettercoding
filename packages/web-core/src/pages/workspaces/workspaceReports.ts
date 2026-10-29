@@ -1,20 +1,5 @@
+import type { ReportTab, ReportTabs } from 'shared/types';
 import { makeLocalApiRequest } from '@/shared/lib/localApiTransport';
-
-// API-local types until the backend's shared type generation lands.
-export type ReportCell = {
-  text: string;
-  tone?: 'ok' | 'warn' | 'bad' | 'none';
-  url?: string;
-};
-export type ReportTab = {
-  id: string;
-  title: string;
-  columns: string[];
-  rows: ReportCell[][];
-  created_at: string;
-  updated_at: string;
-};
-export type ReportTabs = { tabs: ReportTab[]; updated_at: string | null };
 export type ReportScratchState = {
   scratch: {
     deleted?: boolean;
@@ -45,7 +30,7 @@ export async function loadReportTabs(
   return envelope.data;
 }
 
-export function reportLink(value?: string): string | undefined {
+export function reportLink(value?: string | null): string | undefined {
   if (
     !value ||
     /[\s\\]/.test(value) ||
