@@ -8866,6 +8866,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
+ "image",
  "local-deployment",
  "mcp",
  "mime_guess",

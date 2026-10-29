@@ -19,6 +19,7 @@ import { formatDateShortWithTime, formatRelativeTime } from '@/shared/lib/date';
 import { makeLocalApiRequest } from '@/shared/lib/localApiTransport';
 import {
   inputImagePath,
+  inputImageQueue,
   readInputImage,
   readInputImageRequest,
 } from './inputRichContent';
@@ -742,6 +743,7 @@ function InputBody({
   useEffect(() => {
     const controller = new AbortController();
     const requested = new Set<number>();
+    const enqueue = inputImageQueue();
     const listener = (event: MessageEvent) => {
       if (
         event.source !== frame.current?.contentWindow ||
@@ -764,7 +766,13 @@ function InputBody({
         );
         const current = bridge.current;
         if (path)
-          void (async () => {
+          void enqueue(async () => {
+            if (
+              controller.signal.aborted ||
+              current !== bridge.current ||
+              !current.valid
+            )
+              return;
             try {
               const response = await makeLocalApiRequest(path, {
                 hostScope: 'explicit',
@@ -794,7 +802,7 @@ function InputBody({
             } catch {
               // Unavailable or rejected images keep their alt text.
             }
-          })();
+          });
         return;
       }
       const answer = readInputProposal(

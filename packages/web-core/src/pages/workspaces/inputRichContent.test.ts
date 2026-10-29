@@ -5,12 +5,35 @@ import {
   inputImagePath,
   readInputImage,
   readInputImageRequest,
+  inputImageQueue,
 } from './inputRichContent';
 
 const origin = 'https://app.test';
 const route = '/api/workspaces/w/files/preview/';
+const safeRoute = '/api/workspaces/w/files/input-image/';
 
 describe('Input image boundary', () => {
+  it('serializes image transport requests and continues after rejection', async () => {
+    const enqueue = inputImageQueue();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const order: number[] = [];
+    const first = enqueue(async () => {
+      order.push(1);
+      await gate;
+      throw new Error('unavailable');
+    });
+    const second = enqueue(async () => {
+      order.push(2);
+    });
+    await Promise.resolve();
+    expect(order).toEqual([1]);
+    release();
+    await Promise.all([first, second]);
+    expect(order).toEqual([1, 2]);
+  });
   it('requires the current bridge and bounded image index before requesting bytes', () => {
     const bridge = { id: 'b', inputId: 'i', version: 1, valid: true, loads: 1 };
     const data = {
@@ -39,10 +62,10 @@ describe('Input image boundary', () => {
   it('accepts current workspace file links and upload paths', () => {
     expect(
       inputImagePath(`${origin}${route}diagram.png`, 'w', null, origin)
-    ).toBe(`${route}diagram.png`);
+    ).toBe(`${safeRoute}diagram.png`);
     expect(
       inputImagePath('.bettercoding-uploads/a b.png', 'w', null, origin)
-    ).toBe(`${route}.bettercoding-uploads/a%20b.png`);
+    ).toBe(`${safeRoute}.bettercoding-uploads/a%20b.png`);
     expect(
       inputImagePath(
         '/api/host/h/workspaces/w/files/preview/a.png',
@@ -50,7 +73,7 @@ describe('Input image boundary', () => {
         'h',
         origin
       )
-    ).toBe(`${route}a.png`);
+    ).toBe(`${safeRoute}a.png`);
   });
   it.each([
     'https://evil.test/api/workspaces/w/files/preview/a.png',

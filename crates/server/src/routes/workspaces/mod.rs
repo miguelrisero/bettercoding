@@ -10,6 +10,7 @@ pub mod file_policy;
 pub mod files;
 pub mod gh_cli_setup;
 pub mod git;
+mod input_image;
 pub mod inputs;
 pub mod integration;
 pub mod links;

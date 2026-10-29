@@ -1,5 +1,15 @@
 import type { InputBridge } from './inputBridge';
 
+export function inputImageQueue(): (
+  request: () => Promise<void>
+) => Promise<void> {
+  let pending = Promise.resolve();
+  return (request) => {
+    pending = pending.then(request).catch(() => {});
+    return pending;
+  };
+}
+
 export function readInputImageRequest(
   data: unknown,
   bridge: InputBridge
@@ -71,7 +81,10 @@ export function inputImagePath(
       return null;
     if (!/\.(?:png|jpe?g|gif|webp|avif|bmp|ico)$/i.test(parts.at(-1)!))
       return null;
-    return root + parts.map(encodeURIComponent).join('/');
+    return (
+      `/api/workspaces/${workspaceId}/files/input-image/` +
+      parts.map(encodeURIComponent).join('/')
+    );
   } catch {
     return null;
   }
