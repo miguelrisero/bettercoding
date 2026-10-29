@@ -8,6 +8,7 @@ import { TerminalPanelContainer } from '@/shared/components/TerminalPanelContain
 import { WorkspaceNotesContainer } from './WorkspaceNotesContainer';
 import { WorkspaceFilesContainer } from './WorkspaceFilesContainer';
 import { WorkspaceInputsContainer } from './WorkspaceInputsContainer';
+import { WorkspaceReportsContainer } from './WorkspaceReportsContainer';
 import { useHostId } from '@/shared/providers/HostIdProvider';
 import { useDiffs } from '@/shared/stores/useWorkspaceDiffStore';
 import { ArrowsOutSimpleIcon } from '@phosphor-icons/react';
@@ -77,6 +78,10 @@ export const RightSidebar = memo(function RightSidebar({
     PERSIST_KEYS.notesSection,
     false
   );
+  const [reportsExpanded] = usePersistedExpanded(
+    PERSIST_KEYS.reportsSection,
+    true
+  );
   const [inputsExpanded] = usePersistedExpanded(
     PERSIST_KEYS.inputsSection,
     true
@@ -131,6 +136,19 @@ export const RightSidebar = memo(function RightSidebar({
         expanded: terminalExpanded,
         content: <TerminalPanelContainer />,
         actions: [{ icon: ArrowsOutSimpleIcon, onClick: expandTerminal }],
+      },
+      {
+        title: 'Reports',
+        persistKey: PERSIST_KEYS.reportsSection,
+        visible: !!selectedWorkspace,
+        expanded: reportsExpanded,
+        content: selectedWorkspace ? (
+          <WorkspaceReportsContainer
+            key={`${hostId ?? 'local'}:${selectedWorkspace.id}`}
+            workspaceId={selectedWorkspace.id}
+          />
+        ) : null,
+        actions: [],
       },
       {
         title: 'Inputs',
@@ -221,6 +239,7 @@ export const RightSidebar = memo(function RightSidebar({
     notesExpanded,
     filesExpanded,
     inputsExpanded,
+    reportsExpanded,
     hostId,
     isTerminalVisible,
     isTerminalExpanded,

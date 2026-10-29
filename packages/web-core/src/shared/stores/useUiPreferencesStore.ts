@@ -299,6 +299,7 @@ export const PERSIST_KEYS = {
   // Files panel section
   filesSection: 'files-section',
   inputsSection: 'inputs-section',
+  reportsSection: 'reports-section',
   // GitHub comments toggle
   showGitHubComments: 'show-github-comments',
   // Panel sizes
@@ -333,6 +334,7 @@ export type PersistKey =
   | typeof PERSIST_KEYS.notesSection
   | typeof PERSIST_KEYS.filesSection
   | typeof PERSIST_KEYS.inputsSection
+  | typeof PERSIST_KEYS.reportsSection
   | typeof PERSIST_KEYS.showGitHubComments
   | typeof PERSIST_KEYS.rightMainPanel
   | typeof PERSIST_KEYS.rightPanelprocesses

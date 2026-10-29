@@ -167,6 +167,129 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe('report streams and host routing', () => {
+  it('passes explicit host scope and reconnects when the host changes', async () => {
+    const { useJsonPatchWsStream } = await import('./useJsonPatchWsStream');
+    const { openLocalApiWebSocket } = await import(
+      '@/shared/lib/localApiTransport'
+    );
+    let hostId: string | null = 'host-a';
+    let result!: ReturnType<typeof useJsonPatchWsStream<Feed>>;
+    const render = () => {
+      result = useJsonPatchWsStream('/api/feed', true, initialData, {
+        hostScope: 'explicit',
+        hostId,
+      });
+    };
+    react.mount(render);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(openLocalApiWebSocket).toHaveBeenLastCalledWith('/api/feed', {
+      hostScope: 'explicit',
+      hostId: 'host-a',
+      relayHostId: undefined,
+    });
+    const first = connectWith(['host-a-only']);
+    hostId = 'host-b';
+    react.mount(render);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(first.close).toHaveBeenCalled();
+    expect(result.data).toBeUndefined();
+    expect(result.isInitialized).toBe(false);
+    expect(openLocalApiWebSocket).toHaveBeenLastCalledWith('/api/feed', {
+      hostScope: 'explicit',
+      hostId: 'host-b',
+      relayHostId: undefined,
+    });
+    connectWith(['host-b-only']);
+    expect(result.data).toEqual({ entries: ['host-b-only'] });
+    hostId = null;
+    react.mount(render);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(openLocalApiWebSocket).toHaveBeenLastCalledWith('/api/feed', {
+      hostScope: 'explicit',
+      hostId: null,
+      relayHostId: undefined,
+    });
+    expect(result.data).toBeUndefined();
+  });
+
+  it('keeps default host behavior for existing callers', async () => {
+    await mountStream();
+    const { openLocalApiWebSocket } = await import(
+      '@/shared/lib/localApiTransport'
+    );
+    expect(openLocalApiWebSocket).toHaveBeenLastCalledWith('/api/feed', {
+      hostScope: undefined,
+      hostId: undefined,
+      relayHostId: undefined,
+    });
+  });
+
+  it('applies report replacements and deletion through the scratch stream', async () => {
+    const { useJsonPatchWsStream } = await import('./useJsonPatchWsStream');
+    const { emptyReportScratch, reportSnapshot } = await import(
+      '../../pages/workspaces/workspaceReports'
+    );
+    let result!: ReturnType<
+      typeof useJsonPatchWsStream<ReturnType<typeof emptyReportScratch>>
+    >;
+    react.mount(() => {
+      result = useJsonPatchWsStream(
+        '/api/scratch/WORKSPACE_REPORTS/workspace/stream/ws',
+        true,
+        emptyReportScratch,
+        {
+          hostScope: 'explicit',
+          hostId: null,
+          resyncOnPatchFailure: true,
+        }
+      );
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const socket = sockets[sockets.length - 1];
+    const report = (title: string) => ({
+      tabs: [
+        {
+          id: 'checks',
+          title,
+          columns: ['Status'],
+          rows: [[{ text: title }]],
+          created_at: '2026-10-29T12:00:00Z',
+          updated_at: '2026-10-29T12:00:00Z',
+        },
+      ],
+      updated_at: '2026-10-29T12:00:00Z',
+    });
+    const replace = (title: string) =>
+      socket.receive({
+        JsonPatch: [
+          {
+            op: 'replace',
+            path: '/scratch',
+            value: {
+              payload: { type: 'WORKSPACE_REPORTS', data: report(title) },
+            },
+          },
+        ],
+      });
+    socket.onopen?.();
+    replace('Pending');
+    socket.receive({ Ready: true });
+    expect(result.isInitialized).toBe(true);
+    expect(reportSnapshot(result.data!).tabs[0].title).toBe('Pending');
+    replace('Passed');
+    expect(reportSnapshot(result.data!).tabs[0].rows[0][0].text).toBe('Passed');
+    socket.receive({
+      JsonPatch: [{ op: 'replace', path: '/scratch', value: null }],
+    });
+    expect(reportSnapshot(result.data!).tabs).toEqual([]);
+    result.reconnect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(socket.close).toHaveBeenCalled();
+    expect(result.data).toBeUndefined();
+  });
+});
+
 describe('useJsonPatchWsStream resync on a failed patch', () => {
   it('drops the socket and loads a fresh snapshot from a new one', async () => {
     const stream = await mountStream();
