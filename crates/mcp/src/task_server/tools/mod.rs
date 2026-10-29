@@ -45,6 +45,7 @@ mod issue_relationships;
 mod issue_tags;
 mod organizations;
 mod remote_issues;
+mod report_tabs;
 mod repos;
 mod sessions;
 mod task_attempts;
@@ -57,6 +58,7 @@ impl McpServer {
             + Self::files_tools_router()
             + Self::handover_tools_router()
             + Self::inputs_tools_router()
+            + Self::report_tabs_tools_router()
             + Self::workspaces_tools_router()
             + Self::workspace_agents_tools_router()
             + Self::organizations_tools_router()
@@ -73,6 +75,7 @@ impl McpServer {
         let mut router = Self::context_tools_router()
             + Self::files_tools_router()
             + Self::inputs_tools_router()
+            + Self::report_tabs_tools_router()
             + Self::workspaces_tools_router()
             + Self::session_tools_router();
         router.remove_route("list_workspaces");
@@ -451,6 +454,9 @@ mod tests {
             "get_input".to_string(),
             "get_input_events".to_string(),
             "set_input_status".to_string(),
+            "set_report_tab".to_string(),
+            "list_report_tabs".to_string(),
+            "delete_report_tab".to_string(),
             "get_context".to_string(),
             "get_execution".to_string(),
             "list_sessions".to_string(),

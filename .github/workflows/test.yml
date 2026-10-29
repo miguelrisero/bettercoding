@@ -213,7 +213,21 @@ jobs:
           setup-sqlx-cli: 'true'
 
       - name: Check generated types
+        id: generated-types
         run: npm run generate-types:check
+
+      - name: Generate types artifact after drift
+        id: generate-types-artifact
+        if: failure() && steps.generated-types.outcome == 'failure'
+        run: npm run generate-types
+
+      - name: Upload generated types
+        if: failure() && steps.generated-types.outcome == 'failure' && steps.generate-types-artifact.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-types-${{ github.sha }}
+          path: shared/types.ts
+          if-no-files-found: error
 
       - name: Sqlx checks
         run: npm run prepare-db:check

@@ -2,14 +2,17 @@ import { useEffect, useState, useRef } from 'react';
 import { produce } from 'immer';
 import type { Operation } from 'rfc6902';
 import { applyPatchStrict, applyUpsertPatch } from '@/shared/lib/jsonPatch';
-import { openLocalApiWebSocket } from '@/shared/lib/localApiTransport';
+import {
+  openLocalApiWebSocket,
+  type LocalApiWebSocketOptions,
+} from '@/shared/lib/localApiTransport';
 
 type WsJsonPatchMsg = { JsonPatch: Operation[] };
 type WsReadyMsg = { Ready: true };
 type WsFinishedMsg = { finished: boolean };
 type WsMsg = WsJsonPatchMsg | WsReadyMsg | WsFinishedMsg;
 
-interface UseJsonPatchStreamOptions<T> {
+interface UseJsonPatchStreamOptions<T> extends LocalApiWebSocketOptions {
   /**
    * Called once when the stream starts to inject initial data
    */
@@ -31,6 +34,7 @@ interface UseJsonPatchStreamResult<T> {
   isConnected: boolean;
   isInitialized: boolean;
   error: string | null;
+  reconnect: () => void;
 }
 
 /**
@@ -59,6 +63,9 @@ export const useJsonPatchWsStream = <T extends object>(
   const injectInitialEntry = options?.injectInitialEntry;
   const deduplicatePatches = options?.deduplicatePatches;
   const resyncOnPatchFailure = options?.resyncOnPatchFailure ?? false;
+  const hostScope = options?.hostScope;
+  const hostId = options?.hostId;
+  const relayHostId = options?.relayHostId;
 
   function scheduleReconnect() {
     if (retryTimerRef.current) return; // already scheduled
@@ -112,7 +119,11 @@ export const useJsonPatchWsStream = <T extends object>(
 
       void (async () => {
         try {
-          const ws = await openLocalApiWebSocket(endpoint);
+          const ws = await openLocalApiWebSocket(endpoint, {
+            hostScope,
+            hostId,
+            relayHostId,
+          });
 
           if (cancelled) {
             ws.close();
@@ -280,6 +291,9 @@ export const useJsonPatchWsStream = <T extends object>(
     injectInitialEntry,
     deduplicatePatches,
     resyncOnPatchFailure,
+    hostScope,
+    hostId,
+    relayHostId,
     retryNonce,
   ]);
 
@@ -291,5 +305,6 @@ export const useJsonPatchWsStream = <T extends object>(
     isConnected,
     isInitialized: isInitializedForCurrentEndpoint,
     error,
+    reconnect: () => setRetryNonce((value) => value + 1),
   };
 };

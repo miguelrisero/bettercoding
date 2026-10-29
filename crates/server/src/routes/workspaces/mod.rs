@@ -15,6 +15,7 @@ pub mod inputs;
 pub mod integration;
 pub mod links;
 pub mod pr;
+pub mod report_tabs;
 pub mod repos;
 pub mod streams;
 pub mod workspace_summary;
@@ -42,6 +43,7 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
         .nest("/integration", integration::router())
         .nest("/repos", repos::router())
         .nest("/inputs", inputs::router(deployment))
+        .nest("/report-tabs", report_tabs::router(deployment))
         .nest("/pull-requests", pr::router())
         .layer(from_fn_with_state(
             deployment.clone(),

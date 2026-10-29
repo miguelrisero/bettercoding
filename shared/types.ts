@@ -90,6 +90,16 @@ export type PreviewSettingsData = { url: string, screen_size: string | null, res
 
 export type WorkspaceNotesData = { content: string, };
 
+export type ReportTone = "ok" | "warn" | "bad" | "none";
+
+export type ReportCell = { text: string, tone?: ReportTone | null, url?: string | null, };
+
+export type SetReportTab = { title: string, columns: Array<string>, rows: Array<Array<ReportCell>>, expected_updated_at: string | null, };
+
+export type ReportTab = { id: string, title: string, columns: Array<string>, rows: Array<Array<ReportCell>>, created_at: string, updated_at: string, };
+
+export type ReportTabs = { tabs: Array<ReportTab>, updated_at: string | null, };
+
 export type WorkspacePanelStateData = { right_main_panel_mode: string | null, is_left_main_panel_visible: boolean, 
 /**
  * What the left-main pane shows: "chat" (default) or "cli"
@@ -186,9 +196,9 @@ cli_default_applied: boolean | null, };
 
 export type ProjectRepoDefaultsData = { repos: Array<DraftWorkspaceRepo>, };
 
-export type ScratchPayload = { "type": "DRAFT_TASK", "data": string } | { "type": "DRAFT_FOLLOW_UP", "data": DraftFollowUpData } | { "type": "DRAFT_WORKSPACE", "data": DraftWorkspaceData } | { "type": "DRAFT_ISSUE", "data": DraftIssueData } | { "type": "PREVIEW_SETTINGS", "data": PreviewSettingsData } | { "type": "WORKSPACE_NOTES", "data": WorkspaceNotesData } | { "type": "UI_PREFERENCES", "data": UiPreferencesData } | { "type": "PROJECT_REPO_DEFAULTS", "data": ProjectRepoDefaultsData };
+export type ScratchPayload = { "type": "DRAFT_TASK", "data": string } | { "type": "DRAFT_FOLLOW_UP", "data": DraftFollowUpData } | { "type": "DRAFT_WORKSPACE", "data": DraftWorkspaceData } | { "type": "DRAFT_ISSUE", "data": DraftIssueData } | { "type": "PREVIEW_SETTINGS", "data": PreviewSettingsData } | { "type": "WORKSPACE_NOTES", "data": WorkspaceNotesData } | { "type": "WORKSPACE_REPORTS", "data": ReportTabs } | { "type": "UI_PREFERENCES", "data": UiPreferencesData } | { "type": "PROJECT_REPO_DEFAULTS", "data": ProjectRepoDefaultsData };
 
-export enum ScratchType { DRAFT_TASK = "DRAFT_TASK", DRAFT_FOLLOW_UP = "DRAFT_FOLLOW_UP", DRAFT_WORKSPACE = "DRAFT_WORKSPACE", DRAFT_ISSUE = "DRAFT_ISSUE", PREVIEW_SETTINGS = "PREVIEW_SETTINGS", WORKSPACE_NOTES = "WORKSPACE_NOTES", UI_PREFERENCES = "UI_PREFERENCES", PROJECT_REPO_DEFAULTS = "PROJECT_REPO_DEFAULTS" }
+export enum ScratchType { DRAFT_TASK = "DRAFT_TASK", DRAFT_FOLLOW_UP = "DRAFT_FOLLOW_UP", DRAFT_WORKSPACE = "DRAFT_WORKSPACE", DRAFT_ISSUE = "DRAFT_ISSUE", PREVIEW_SETTINGS = "PREVIEW_SETTINGS", WORKSPACE_NOTES = "WORKSPACE_NOTES", WORKSPACE_REPORTS = "WORKSPACE_REPORTS", UI_PREFERENCES = "UI_PREFERENCES", PROJECT_REPO_DEFAULTS = "PROJECT_REPO_DEFAULTS" }
 
 export type Scratch = { id: string, payload: ScratchPayload, created_at: string, updated_at: string, };
 

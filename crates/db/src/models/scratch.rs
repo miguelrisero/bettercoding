@@ -13,6 +13,8 @@ pub enum ScratchError {
     Serde(#[from] serde_json::Error),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
+    #[error("Workspace reports require the report-tabs API")]
+    ReservedType,
     #[error("Scratch type mismatch: expected '{expected}' but got '{actual}'")]
     TypeMismatch { expected: String, actual: String },
 }
@@ -260,6 +262,7 @@ pub enum ScratchPayload {
     DraftIssue(DraftIssueData),
     PreviewSettings(PreviewSettingsData),
     WorkspaceNotes(WorkspaceNotesData),
+    WorkspaceReports(super::workspace_report::ReportTabs),
     UiPreferences(UiPreferencesData),
     ProjectRepoDefaults(ProjectRepoDefaultsData),
 }
@@ -344,6 +347,9 @@ impl Scratch {
         id: Uuid,
         data: &CreateScratch,
     ) -> Result<Self, ScratchError> {
+        if data.payload.scratch_type() == ScratchType::WorkspaceReports {
+            return Err(ScratchError::ReservedType);
+        }
         let scratch_type_str = data.payload.scratch_type().to_string();
         let payload_str = serde_json::to_string(&data.payload)?;
 
@@ -429,6 +435,12 @@ impl Scratch {
         scratch_type: &ScratchType,
         data: &UpdateScratch,
     ) -> Result<Self, ScratchError> {
+        if *scratch_type == ScratchType::WorkspaceReports
+            || data.payload.scratch_type() == ScratchType::WorkspaceReports
+        {
+            return Err(ScratchError::ReservedType);
+        }
+        data.payload.validate_type(*scratch_type)?;
         let payload_str = serde_json::to_string(&data.payload)?;
         let scratch_type_str = scratch_type.to_string();
 
@@ -462,7 +474,10 @@ impl Scratch {
         pool: &SqlitePool,
         id: Uuid,
         scratch_type: &ScratchType,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<u64, ScratchError> {
+        if *scratch_type == ScratchType::WorkspaceReports {
+            return Err(ScratchError::ReservedType);
+        }
         let scratch_type_str = scratch_type.to_string();
         let result = sqlx::query!(
             "DELETE FROM scratch WHERE id = $1 AND scratch_type = $2",

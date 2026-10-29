@@ -338,6 +338,24 @@ impl EventService {
         }
     }
 
+    /// Publish after the report transaction commits. SQLite update hooks run before COMMIT,
+    /// so their separate WAL reader can only see the preceding report snapshot.
+    pub async fn publish_workspace_reports(
+        &self,
+        workspace: Uuid,
+    ) -> Result<(), db::models::scratch::ScratchError> {
+        let scratch = Scratch::find_by_id(
+            &self.db.pool,
+            workspace,
+            &db::models::scratch::ScratchType::WorkspaceReports,
+        )
+        .await?;
+        if let Some(scratch) = scratch {
+            self.msg_store.push_patch(scratch_patch::replace(&scratch));
+        }
+        Ok(())
+    }
+
     pub fn msg_store(&self) -> &Arc<MsgStore> {
         &self.msg_store
     }
