@@ -62,7 +62,10 @@ impl McpServer {
             expected_updated_at: request.expected_updated_at,
         };
         if let Err(error) = body.validate(&request.tab_id) {
-            return Self::err("REPORT_VALIDATION", Some(error.to_string()));
+            return Ok(Self::tool_error(ToolError::new(
+                "REPORT_VALIDATION",
+                Some(error.to_string()),
+            )));
         }
         self.report_response(
             self.client
@@ -103,7 +106,10 @@ impl McpServer {
             Err(error) => return Ok(Self::tool_error(error)),
         };
         if let Err(error) = validate_tab_id(&request.tab_id) {
-            return Self::err("REPORT_VALIDATION", Some(error.to_string()));
+            return Ok(Self::tool_error(ToolError::new(
+                "REPORT_VALIDATION",
+                Some(error.to_string()),
+            )));
         }
         let mut delete = self.client.delete(self.url(&format!(
             "/api/workspaces/{workspace}/report-tabs/{}",
@@ -141,7 +147,7 @@ mod tests {
         ] {
             let tools = router.list_all();
             for name in &names {
-                assert!(tools.iter().any(|tool| tool.name.as_ref() == name));
+                assert!(tools.iter().any(|tool| tool.name.as_ref() == name.as_str()));
             }
         }
         let schema = serde_json::to_value(schemars::schema_for!(SetRequest)).unwrap();
