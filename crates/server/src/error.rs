@@ -422,6 +422,10 @@ impl IntoResponse for ApiError {
             ApiError::ScratchError(ScratchError::Database(_)) => {
                 ErrorInfo::internal("ScratchError")
             }
+            ApiError::ScratchError(ScratchError::ReservedType) => ErrorInfo::bad_request(
+                "ScratchError",
+                "Workspace reports require the report-tabs API.",
+            ),
             ApiError::ScratchError(ScratchError::Serde(_)) => {
                 ErrorInfo::bad_request("ScratchError", "Invalid scratch data format.")
             }

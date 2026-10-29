@@ -153,6 +153,9 @@ impl EventService {
         futures::stream::BoxStream<'static, Result<LogMsg, std::io::Error>>,
         super::types::EventError,
     > {
+        // Subscribe before loading the snapshot so a concurrent report write is retained.
+        let receiver = self.msg_store.get_receiver();
+        let reports = *scratch_type == db::models::scratch::ScratchType::WorkspaceReports;
         // Treat errors (e.g., corrupted/malformed data) the same as "scratch not found"
         // This prevents the websocket from closing and retrying indefinitely
         let scratch = match Scratch::find_by_id(&self.db.pool, scratch_id, scratch_type).await {
@@ -176,48 +179,74 @@ impl EventService {
         let initial_msg = LogMsg::JsonPatch(serde_json::from_value(initial_patch).unwrap());
 
         let type_str = scratch_type.to_string();
+        let mut report_timestamp = scratch.as_ref().and_then(|scratch| {
+            if let db::models::scratch::ScratchPayload::WorkspaceReports(state) = &scratch.payload {
+                state.updated_at
+            } else {
+                None
+            }
+        });
 
-        // Filter to only this scratch's events by matching id and payload.type in the patch value
-        let filtered_stream =
-            BroadcastStream::new(self.msg_store.get_receiver()).filter_map(move |msg_result| {
-                let id_str = scratch_id.to_string();
-                let type_str = type_str.clone();
-                async move {
-                    match msg_result {
-                        Ok(LogMsg::JsonPatch(patch)) => {
-                            if let Some(op) = patch.0.first()
-                                && op.path() == "/scratch"
-                            {
-                                // Extract id and payload.type from the patch value
-                                let value = match op {
-                                    json_patch::PatchOperation::Add(a) => Some(&a.value),
-                                    json_patch::PatchOperation::Replace(r) => Some(&r.value),
-                                    json_patch::PatchOperation::Remove(_) => None,
-                                    _ => None,
-                                };
-
-                                let matches = value.is_some_and(|v| {
-                                    let id_matches =
-                                        v.get("id").and_then(|v| v.as_str()) == Some(&id_str);
-                                    let type_matches = v
-                                        .get("payload")
-                                        .and_then(|p| p.get("type"))
-                                        .and_then(|t| t.as_str())
-                                        == Some(&type_str);
-                                    id_matches && type_matches
-                                });
-
-                                if matches {
-                                    return Some(Ok(LogMsg::JsonPatch(patch)));
-                                }
-                            }
-                            None
+        // Filter to only this scratch's events by matching id and payload.type in the patch value.
+        let filtered_stream = BroadcastStream::new(receiver).filter_map(move |msg_result| {
+            let id_str = scratch_id.to_string();
+            let type_str = type_str.clone();
+            if reports {
+                if let Ok(LogMsg::JsonPatch(patch)) = &msg_result {
+                    let value = patch.0.first().and_then(|op| match op {
+                        json_patch::PatchOperation::Add(op) => Some(&op.value),
+                        json_patch::PatchOperation::Replace(op) => Some(&op.value),
+                        _ => None,
+                    });
+                    if let Some(value) = value.filter(|value| {
+                        value["id"].as_str() == Some(&id_str)
+                            && value["payload"]["type"].as_str() == Some(&type_str)
+                    }) {
+                        let timestamp = value["payload"]["data"]["updated_at"]
+                            .as_str()
+                            .and_then(|stamp| stamp.parse::<chrono::DateTime<chrono::Utc>>().ok());
+                        if timestamp <= report_timestamp {
+                            return futures::future::ready(None);
                         }
-                        Ok(other) => Some(Ok(other)),
-                        Err(_) => None,
+                        report_timestamp = timestamp;
                     }
                 }
-            });
+            }
+            futures::future::ready(match msg_result {
+                Ok(LogMsg::JsonPatch(patch)) => {
+                    if let Some(op) = patch.0.first()
+                        && op.path() == "/scratch"
+                    {
+                        // Extract id and payload.type from the patch value
+                        let value = match op {
+                            json_patch::PatchOperation::Add(a) => Some(&a.value),
+                            json_patch::PatchOperation::Replace(r) => Some(&r.value),
+                            json_patch::PatchOperation::Remove(_) => None,
+                            _ => None,
+                        };
+
+                        let matches = value.is_some_and(|v| {
+                            let id_matches = v.get("id").and_then(|v| v.as_str()) == Some(&id_str);
+                            let type_matches = v
+                                .get("payload")
+                                .and_then(|p| p.get("type"))
+                                .and_then(|t| t.as_str())
+                                == Some(&type_str);
+                            id_matches && type_matches
+                        });
+
+                        if matches {
+                            return futures::future::ready(Some(Ok(LogMsg::JsonPatch(patch))));
+                        }
+                    }
+                    None
+                }
+                Ok(other) => Some(Ok(other)),
+                // Report clients reconnect for a complete snapshot after lag.
+                Err(error) if reports => Some(Err(std::io::Error::other(error))),
+                Err(_) => None,
+            })
+        });
 
         let initial_stream = futures::stream::iter(vec![Ok(initial_msg), Ok(LogMsg::Ready)]);
         let combined_stream = initial_stream.chain(filtered_stream).boxed();
@@ -313,5 +342,123 @@ impl EventService {
 
         let initial_stream = futures::stream::iter(vec![Ok(initial_msg), Ok(LogMsg::Ready)]);
         Ok(initial_stream.chain(filtered_stream).boxed())
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use std::sync::Arc;
+
+    use db::{
+        DBService,
+        models::{
+            scratch::{Scratch, ScratchPayload, ScratchType},
+            workspace_report::{SetReportTab, WorkspaceReport},
+        },
+    };
+    use futures::StreamExt;
+    use tokio::sync::RwLock;
+    use utils::{log_msg::LogMsg, msg_store::MsgStore};
+    use uuid::Uuid;
+
+    use crate::services::events::{EventService, scratch_patch};
+
+    #[tokio::test]
+    async fn report_stream_snapshot_filters_scope_and_stale_events() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../../db/migrations/20251120000001_refactor_to_scratch.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let workspace = Uuid::new_v4();
+        let body = SetReportTab {
+            title: "First".into(),
+            columns: vec!["State".into()],
+            rows: vec![],
+            expected_updated_at: None,
+        };
+        WorkspaceReport::set(&pool, workspace, "build", body.clone())
+            .await
+            .unwrap();
+        let first = Scratch::find_by_id(&pool, workspace, &ScratchType::WorkspaceReports)
+            .await
+            .unwrap()
+            .unwrap();
+        let store = Arc::new(MsgStore::new());
+        let events = EventService::new(
+            DBService { pool: pool.clone() },
+            store.clone(),
+            Arc::new(RwLock::new(0)),
+        );
+        let mut stream = events
+            .stream_scratch_raw(workspace, &ScratchType::WorkspaceReports)
+            .await
+            .unwrap();
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            LogMsg::JsonPatch(_)
+        ));
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            LogMsg::Ready
+        ));
+        WorkspaceReport::set(
+            &pool,
+            workspace,
+            "build",
+            SetReportTab {
+                title: "Second".into(),
+                ..body
+            },
+        )
+        .await
+        .unwrap();
+        let latest = Scratch::find_by_id(&pool, workspace, &ScratchType::WorkspaceReports)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut foreign = latest.clone();
+        foreign.id = Uuid::new_v4();
+        store.push_patch(scratch_patch::replace(&foreign));
+        store.push_patch(scratch_patch::replace(&first));
+        store.push_patch(scratch_patch::replace(&latest));
+        let LogMsg::JsonPatch(patch) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected report patch")
+        };
+        let json_patch::PatchOperation::Replace(operation) = &patch.0[0] else {
+            panic!("expected replacement")
+        };
+        assert_eq!(operation.path, "/scratch");
+        let decoded: Scratch = serde_json::from_value(operation.value.clone()).unwrap();
+        let ScratchPayload::WorkspaceReports(state) = decoded.payload else {
+            panic!("expected reports")
+        };
+        assert_eq!(state.tabs[0].title, "Second");
+        let mut reconnected = events
+            .stream_scratch_raw(workspace, &ScratchType::WorkspaceReports)
+            .await
+            .unwrap();
+        let LogMsg::JsonPatch(patch) = reconnected.next().await.unwrap().unwrap() else {
+            panic!("expected snapshot")
+        };
+        let json_patch::PatchOperation::Replace(operation) = &patch.0[0] else {
+            panic!("expected replacement")
+        };
+        assert_eq!(
+            operation.value["payload"]["data"]["tabs"][0]["title"],
+            "Second"
+        );
     }
 }
