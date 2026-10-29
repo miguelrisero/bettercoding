@@ -191,25 +191,23 @@ impl EventService {
         let filtered_stream = BroadcastStream::new(receiver).filter_map(move |msg_result| {
             let id_str = scratch_id.to_string();
             let type_str = type_str.clone();
-            if reports {
-                if let Ok(LogMsg::JsonPatch(patch)) = &msg_result {
-                    let value = patch.0.first().and_then(|op| match op {
-                        json_patch::PatchOperation::Add(op) => Some(&op.value),
-                        json_patch::PatchOperation::Replace(op) => Some(&op.value),
-                        _ => None,
-                    });
-                    if let Some(value) = value.filter(|value| {
-                        value["id"].as_str() == Some(&id_str)
-                            && value["payload"]["type"].as_str() == Some(&type_str)
-                    }) {
-                        let timestamp = value["payload"]["data"]["updated_at"]
-                            .as_str()
-                            .and_then(|stamp| stamp.parse::<chrono::DateTime<chrono::Utc>>().ok());
-                        if timestamp <= report_timestamp {
-                            return futures::future::ready(None);
-                        }
-                        report_timestamp = timestamp;
+            if reports && let Ok(LogMsg::JsonPatch(patch)) = &msg_result {
+                let value = patch.0.first().and_then(|op| match op {
+                    json_patch::PatchOperation::Add(op) => Some(&op.value),
+                    json_patch::PatchOperation::Replace(op) => Some(&op.value),
+                    _ => None,
+                });
+                if let Some(value) = value.filter(|value| {
+                    value["id"].as_str() == Some(&id_str)
+                        && value["payload"]["type"].as_str() == Some(&type_str)
+                }) {
+                    let timestamp = value["payload"]["data"]["updated_at"]
+                        .as_str()
+                        .and_then(|stamp| stamp.parse::<chrono::DateTime<chrono::Utc>>().ok());
+                    if timestamp <= report_timestamp {
+                        return futures::future::ready(None);
                     }
+                    report_timestamp = timestamp;
                 }
             }
             futures::future::ready(match msg_result {
