@@ -43,6 +43,7 @@ export function WorkspaceSidebarGroup({
   const separatorRef = useRef<HTMLDivElement>(null);
   const groupRef = useRef<HTMLDivElement>(null);
   const initialWidth = useRef(width);
+  const registered = useRef(false);
   const visible = sidebar !== null && sidebar !== false;
   const restoreWidth = useCallback(() => {
     const group = groupRef.current;
@@ -71,12 +72,19 @@ export function WorkspaceSidebarGroup({
     });
     observer.observe(element);
     if (panelElementRef.current) observer.observe(panelElementRef.current);
+    if (registered.current) {
+      // Registration can restore cached percentages without changing geometry.
+      queueMicrotask(() => {
+        if (!disposed) flushSync(restoreWidth);
+      });
+    }
+    registered.current = true;
     return () => {
       disposed = true;
       cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [restoreWidth, contentMinWidth]);
+  }, [restoreWidth, contentMinWidth, visible, width]);
 
   const commitWidth = useCallback(() => {
     const size = panelRef.current?.getSize();
