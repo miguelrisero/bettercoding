@@ -139,6 +139,17 @@ Supported relationship types: `blocking`, `related`, `has_duplicate`.
 | `delete_workspace` | Delete a local workspace | None | `workspace_id`<br/>`delete_remote`<br/>`delete_branches` | Deletion confirmation |
 | `link_workspace_issue` | Link a workspace to a remote issue | `workspace_id`<br/>`issue_id` | None | Link confirmation |
 
+### Workspace Reports
+
+Use `set_report_tab` to create or replace a permanent workspace report tab.
+Use `list_report_tabs` to read the workspace reports.
+Use `delete_report_tab` to remove a report tab.
+
+Prefer at most 2 columns for readability in narrow report panels.
+Aim for 3–5 words per column entry.
+You can use more columns within the existing 6-column limit.
+Reports communicate agent status, never owner approval.
+
 ### Workspace Sessions
 
 | Tool | Purpose | Required Parameters | Optional Parameters | Returns |

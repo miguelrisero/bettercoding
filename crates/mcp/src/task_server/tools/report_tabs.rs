@@ -48,7 +48,7 @@ impl McpServer {
 #[tool_router(router = report_tabs_tools_router, vis = "pub")]
 impl McpServer {
     #[tool(
-        description = "Create or replace a permanent workspace report tab. Up to 8 tabs, 6 columns, 30 rectangular rows, 200 Unicode characters per cell. Cells contain plain text, optional ok/warn/bad/none tone and absolute HTTP(S) URL. tab_id uses 1..64 lowercase ASCII letters, digits, _ or -. Title uses 1..80 visible characters; header labels use 1..40. URLs use at most 2048 bytes with a host and no credentials. Optional expected_updated_at provides atomic compare-and-set. Equal content retries keep the timestamp. Reports communicate agent status, never owner approval."
+        description = "Create or replace a permanent workspace report tab. Up to 8 tabs, 6 columns, 30 rectangular rows, 200 Unicode characters per cell. Prefer at most 2 columns and 3-5 words per column entry for small-width readability. More columns are allowed within the existing 6-column limit. Cells contain plain text, optional ok/warn/bad/none tone and absolute HTTP(S) URL. tab_id uses 1..64 lowercase ASCII letters, digits, _ or -. Title uses 1..80 visible characters; header labels use 1..40. URLs use at most 2048 bytes with a host and no credentials. Optional expected_updated_at provides atomic compare-and-set. Equal content retries keep the timestamp. Reports communicate agent status, never owner approval."
     )]
     async fn set_report_tab(&self, Parameters(request): Parameters<SetRequest>) -> ToolCallResult {
         let workspace = match self.report_scope(request.workspace_id) {
