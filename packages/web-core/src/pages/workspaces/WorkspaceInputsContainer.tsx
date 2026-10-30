@@ -9,7 +9,12 @@ import {
   CheckIcon,
   XIcon,
 } from '@phosphor-icons/react';
-import type { AnswerInput, InputAnswer, InputDetail } from 'shared/types';
+import type {
+  AnswerInput,
+  InputAnswer,
+  InputDetail,
+  SnoozeInput,
+} from 'shared/types';
 import { useUiPreferencesStore } from '@/shared/stores/useUiPreferencesStore';
 import { useHostId } from '@/shared/providers/HostIdProvider';
 import { useVisualViewportGeometry } from '@/shared/hooks/useVisualViewportGeometry';
@@ -36,13 +41,17 @@ import {
   loadPendingInputs,
   refreshInputAfterConflict,
   setInputPriority,
+  setInputSchedule,
 } from './inputsApi';
 import {
   compareInputs,
   inputStatusLabel,
+  inputNavigationIsCurrent,
   nextOpenInput,
   splitRecommended,
 } from './inputFlow';
+
+import { fromUtcControl, toUtcControl } from './inputSchedule';
 
 const focusRing =
   'focus:outline-none focus-visible:ring-2 focus-visible:ring-brand';
@@ -274,7 +283,7 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
     setSelected(null);
     setDone(false);
   };
-  const advance = async (fromId: string) => {
+  const advance = async (fromId: string, saved = 'Answer saved') => {
     const started = session.current;
     let inputs: InputDetail[];
     try {
@@ -283,7 +292,15 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
     } catch {
       return; // Stay on the answered Input; its receipt is already shown.
     }
-    if (session.current !== started || selectedInput() !== fromId) return;
+    if (
+      !inputNavigationIsCurrent(
+        started,
+        session.current,
+        fromId,
+        selectedInput()
+      )
+    )
+      return;
     const current = queryClient.getQueryData<InputDetail>([
       'input',
       host,
@@ -301,7 +318,7 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
       setNotice('Saved');
       return; // "No answer yet" keeps the only open Input in view.
     }
-    setNotice('Answer saved');
+    setNotice(saved);
     if (next) {
       open(next);
     } else {
@@ -366,6 +383,7 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
                     }
               }
               onAnswered={() => advance(selected)}
+              onScheduled={() => advance(selected, 'Input scheduled')}
             />
           ) : (
             <InputsDone />
@@ -403,7 +421,8 @@ function InputsDone() {
           All caught up
         </Dialog.Title>
         <Dialog.Description className="mt-half text-low">
-          You answered every open Input. New ones show up in the Inputs panel.
+          Every available Input is complete. Due Inputs appear in the Inputs
+          panel.
         </Dialog.Description>
         <Dialog.Close
           className={`mt-double min-h-11 px-double rounded-md border text-high hover:bg-secondary ${focusRing}`}
@@ -421,6 +440,7 @@ function InputViewer({
   notice,
   position,
   onAnswered,
+  onScheduled,
 }: {
   workspaceId: string;
   inputId: string;
@@ -431,6 +451,7 @@ function InputViewer({
     step: (delta: number) => void;
   } | null;
   onAnswered: () => Promise<void>;
+  onScheduled: () => Promise<void>;
 }) {
   const host = useHostId();
   const queryClient = useQueryClient();
@@ -507,6 +528,14 @@ function InputViewer({
                 </label>
               ) : (
                 <PriorityBadge priority={input.priority} />
+              )}
+              {input.show_at && (
+                <span>
+                  Scheduled:{' '}
+                  <time dateTime={input.show_at}>
+                    {toUtcControl(input.show_at).replace('T', ' ')} UTC
+                  </time>
+                </span>
               )}
               <Age date={input.created_at} />
               {position && (
@@ -607,6 +636,7 @@ function InputViewer({
           workspaceId={workspaceId}
           detail={detail.data}
           onAnswered={onAnswered}
+          onScheduled={onScheduled}
           refreshAfterConflict={async () => {
             const result = await detail.refetch();
             if (result.error) throw result.error;
@@ -634,14 +664,17 @@ function InputBody({
   refresh,
   refreshAfterConflict,
   onAnswered,
+  onScheduled,
 }: {
   workspaceId: string;
   detail: InputDetail;
   refresh: () => Promise<void>;
   refreshAfterConflict: () => Promise<void>;
   onAnswered: () => Promise<void>;
+  onScheduled: () => Promise<void>;
 }) {
   const host = useHostId();
+  const queryClient = useQueryClient();
   const frame = useRef<HTMLIFrameElement>(null);
   const bridge = useRef<InputBridge>(
     createInputBridge(detail.input.id, detail.version.version)
@@ -668,6 +701,14 @@ function InputBody({
   const [busy, setBusy] = useState(false);
   const [undoSequence, setUndoSequence] = useState<number | null>(null);
   const answerRequest = useRef<AnswerInput | null>(null);
+  const scheduleRequest = useRef<SnoozeInput | null>(null);
+  const [scheduleTime, setScheduleTime] = useState(() =>
+    toUtcControl(detail.input.show_at)
+  );
+  useEffect(() => {
+    if (!scheduleRequest.current)
+      setScheduleTime(toUtcControl(detail.input.show_at));
+  }, [detail.input.show_at]);
   // A closed or moved dialog unmounts this body; its late answer must not advance.
   const mounted = useRef(true);
   useEffect(() => {
@@ -892,6 +933,60 @@ function InputBody({
       setBusy(false);
     }
   };
+  const schedule = async (showNow: boolean) => {
+    setError(null);
+    let showAt: string | null;
+    try {
+      showAt = showNow ? null : fromUtcControl(scheduleTime);
+    } catch (error) {
+      setError(String(error));
+      return;
+    }
+    setBusy(true);
+    // A transport retry retains the exact request, even if polling changes sequence.
+    if (
+      !scheduleRequest.current ||
+      scheduleRequest.current.show_at !== showAt
+    ) {
+      scheduleRequest.current = {
+        request_id: crypto.randomUUID(),
+        expected_sequence: detail.input.sequence,
+        show_at: showAt,
+      };
+    }
+    const request = scheduleRequest.current;
+    let saved = false;
+    try {
+      await setInputSchedule(
+        queryClient,
+        workspaceId,
+        host,
+        detail.input.id,
+        request
+      );
+      scheduleRequest.current = null;
+      answerRequest.current = null;
+      statusRequest.current = null;
+      saved = true;
+    } catch (error) {
+      try {
+        if (await refreshInputAfterConflict(error, refreshAfterConflict))
+          scheduleRequest.current = null;
+      } catch (refreshError) {
+        setError(String(refreshError));
+      }
+      setError(`${String(error)}. Your answer draft stays saved.`);
+    } finally {
+      setBusy(false);
+    }
+    if (
+      saved &&
+      mounted.current &&
+      request.show_at &&
+      Date.parse(request.show_at) > Date.now()
+    )
+      await onScheduled();
+  };
   const retryPage = () => {
     bridge.current = createInputBridge(detail.input.id, detail.version.version);
     setDocument('');
@@ -938,6 +1033,57 @@ function InputBody({
         }}
       >
         <div className="flex-1 p-base md:p-double space-y-double">
+          {detail.input.status === 'open' && (
+            <section
+              aria-label="Input schedule"
+              className="rounded-md border p-base space-y-base"
+            >
+              {detail.input.show_at && (
+                <p className="text-sm text-high">
+                  Scheduled for{' '}
+                  {toUtcControl(detail.input.show_at).replace('T', ' ')} UTC.
+                </p>
+              )}
+              <label className="block space-y-half">
+                <span className="block text-sm font-medium text-high">
+                  Show at (UTC)
+                </span>
+                <input
+                  type="datetime-local"
+                  step="60"
+                  value={scheduleTime}
+                  disabled={busy}
+                  className={`block w-full min-h-11 rounded-md border bg-secondary px-base text-high ${focusRing}`}
+                  onChange={(event) => {
+                    setScheduleTime(event.target.value);
+                    scheduleRequest.current = null;
+                  }}
+                />
+              </label>
+              <div className="flex flex-wrap gap-base">
+                <button
+                  className={quietButton}
+                  disabled={busy || !scheduleTime}
+                  onClick={() => void schedule(false)}
+                >
+                  {detail.input.show_at ? 'Reschedule' : 'Snooze'}
+                </button>
+                {detail.input.show_at && (
+                  <button
+                    className={quietButton}
+                    disabled={busy}
+                    onClick={() => void schedule(true)}
+                  >
+                    Show now
+                  </button>
+                )}
+              </div>
+              <p className="text-xs text-low">
+                Scheduling preserves your answer draft. Only Submit records an
+                answer.
+              </p>
+            </section>
+          )}
           {priorDraft && (
             <div className="rounded-md border p-base space-y-half text-sm">
               <p className="text-high">

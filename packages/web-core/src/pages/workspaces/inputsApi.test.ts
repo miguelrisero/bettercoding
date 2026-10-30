@@ -6,11 +6,107 @@ import {
   loadPendingInputs,
   refreshInputAfterConflict,
   setInputPriority,
+  setInputSchedule,
 } from './inputsApi';
 
 afterEach(() => setLocalApiTransport(null));
 
 describe('Input status actions', () => {
+  it.each([null, '2026-11-02T08:00:00.000Z'])(
+    'sends the exact schedule body with explicit host routing: %s',
+    async (show_at) => {
+      const request = vi.fn(
+        async () =>
+          new Response(JSON.stringify({ success: true, data: { sequence: 4 } }))
+      );
+      setLocalApiTransport({ request, openWebSocket: vi.fn() });
+      const body = {
+        request_id: 'schedule-retry',
+        expected_sequence: 3,
+        show_at,
+      };
+      await inputsApi.snooze('workspace', 'remote-host', 'input', body);
+      expect(request).toHaveBeenCalledWith(
+        '/api/host/remote-host/workspaces/workspace/inputs/input/snooze',
+        expect.objectContaining({ method: 'POST', body: JSON.stringify(body) })
+      );
+      expect(
+        JSON.parse(String(request.mock.calls[0][1]?.body))
+      ).not.toHaveProperty('answer');
+    }
+  );
+  it('retries the same schedule identity after a transport failure', async () => {
+    const request = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('network unavailable'))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ success: true, data: {} }))
+      );
+    setLocalApiTransport({ request, openWebSocket: vi.fn() });
+    const body = {
+      request_id: 'same-request',
+      expected_sequence: 3,
+      show_at: null,
+    };
+    await expect(
+      inputsApi.snooze('workspace', null, 'input', body)
+    ).rejects.toThrow('network unavailable');
+    await inputsApi.snooze('workspace', null, 'input', body);
+    expect(request.mock.calls[0][1].body).toBe(request.mock.calls[1][1].body);
+  });
+  it('invalidates schedule caches without replacing newer detail or touching a draft', async () => {
+    const request = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ success: true, data: { sequence: 4 } }))
+    );
+    setLocalApiTransport({ request, openWebSocket: vi.fn() });
+    const client = new QueryClient();
+    const detailKey = ['input', 'host', 'workspace', 'input'];
+    const listKey = ['inputs', 'host', 'workspace', false, ''];
+    const draftKey = ['input-draft', 'host', 'input', 2];
+    client.setQueryData(detailKey, {
+      input: { status: 'answered', sequence: 5 },
+    });
+    client.setQueryData(listKey, { inputs: [] });
+    client.setQueryData(draftKey, { text: 'Saved draft' });
+    await setInputSchedule(client, 'workspace', 'host', 'input', {
+      request_id: 'r',
+      expected_sequence: 3,
+      show_at: null,
+    });
+    expect(client.getQueryData(detailKey)).toEqual({
+      input: { status: 'answered', sequence: 5 },
+    });
+    expect(client.getQueryState(detailKey)?.isInvalidated).toBe(true);
+    expect(client.getQueryState(listKey)?.isInvalidated).toBe(true);
+    expect(client.getQueryData(draftKey)).toEqual({ text: 'Saved draft' });
+    client.clear();
+  });
+  it('refreshes a schedule conflict without submitting an answer or retrying the write', async () => {
+    const request = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            success: false,
+            message: 'SEQUENCE_CONFLICT: current_sequence=4',
+          }),
+          { status: 409 }
+        )
+    );
+    setLocalApiTransport({ request, openWebSocket: vi.fn() });
+    const refresh = vi.fn(async () => {});
+    try {
+      await inputsApi.snooze('workspace', null, 'input', {
+        request_id: 'r',
+        expected_sequence: 3,
+        show_at: null,
+      });
+    } catch (error) {
+      expect(await refreshInputAfterConflict(error, refresh)).toBe(true);
+    }
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledTimes(1);
+  });
   it('refreshes caches without replacing a close with a late priority response', async () => {
     let respond!: (response: Response) => void;
     const request = vi.fn(

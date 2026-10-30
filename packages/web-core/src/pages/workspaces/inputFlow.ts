@@ -48,3 +48,13 @@ export const inputStatusLabel: Record<string, string> = {
   closed: 'Closed',
   cancelled: 'Cancelled',
 };
+
+// The selection epoch also detects closing and reopening the same Input.
+export function inputNavigationIsCurrent(
+  started: number,
+  current: number,
+  fromId: string,
+  selectedId: string | null
+): boolean {
+  return started === current && selectedId === fromId;
+}

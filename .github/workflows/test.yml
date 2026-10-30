@@ -178,6 +178,9 @@ jobs:
       - name: Test workspace sidebar widths
         run: pnpm exec vitest run packages/web-core/src/pages/workspaces/workspaceSidebarWidths.test.ts --no-file-parallelism --maxWorkers 1
 
+      - name: Test Input scheduling and navigation
+        run: pnpm exec vitest run packages/web-core/src/pages/workspaces/inputsApi.test.ts packages/web-core/src/pages/workspaces/inputSchedule.test.ts packages/web-core/src/pages/workspaces/inputFlow.test.ts --no-file-parallelism --maxWorkers 1
+
       - name: Run frontend checks
         env:
           NODE_OPTIONS: --max-old-space-size=8192

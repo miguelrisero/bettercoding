@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { InputDetail } from 'shared/types';
-import { compareInputs, nextOpenInput, splitRecommended } from './inputFlow';
+import {
+  compareInputs,
+  nextOpenInput,
+  splitRecommended,
+  inputNavigationIsCurrent,
+} from './inputFlow';
 
 const item = (
   id: string,
@@ -17,6 +22,12 @@ describe('Input flow', () => {
     item('c', 'open'),
     item('d', 'open'),
   ];
+  it('guards a late schedule or answer against closing, moving, or reopening', () => {
+    expect(inputNavigationIsCurrent(3, 3, 'a', 'a')).toBe(true);
+    expect(inputNavigationIsCurrent(3, 4, 'a', 'a')).toBe(false);
+    expect(inputNavigationIsCurrent(3, 3, 'a', 'b')).toBe(false);
+    expect(inputNavigationIsCurrent(3, 4, 'a', null)).toBe(false);
+  });
   it('advances to the next open Input after the current one', () => {
     expect(nextOpenInput(list, item('a', 'answered'), 'priority')).toBe('c');
     expect(nextOpenInput(list, item('c', 'answered'), 'priority')).toBe('d');
