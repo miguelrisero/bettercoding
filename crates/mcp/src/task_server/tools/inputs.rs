@@ -279,7 +279,10 @@ mod tests {
             schemars::schema_for!(UpdateRequest),
         ] {
             let schema = serde_json::to_value(schema).unwrap();
-            assert!(schema["properties"].get("show_at").is_some());
+            assert_eq!(
+                schema["properties"]["show_at"]["type"],
+                serde_json::json!(["string", "null"])
+            );
             assert!(
                 !schema["required"]
                     .as_array()

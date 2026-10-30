@@ -72,6 +72,7 @@ pub struct CreateInput {
         with = "serde_with::rust::double_option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<String>")]
     #[ts(optional, type = "string | null")]
     pub show_at: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,6 +93,7 @@ pub struct PublishInput {
         with = "serde_with::rust::double_option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<String>")]
     #[ts(optional, type = "string | null")]
     pub show_at: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
