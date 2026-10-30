@@ -175,6 +175,9 @@ jobs:
       - name: Test signed terminal heartbeat
         run: pnpm exec vitest run packages/remote-web/src/shared/lib/relay/ws.test.ts --no-file-parallelism --maxWorkers 1
 
+      - name: Test workspace sidebar widths
+        run: pnpm exec vitest run packages/web-core/src/pages/workspaces/workspaceSidebarWidths.test.ts --no-file-parallelism --maxWorkers 1
+
       - name: Run frontend checks
         env:
           NODE_OPTIONS: --max-old-space-size=8192
