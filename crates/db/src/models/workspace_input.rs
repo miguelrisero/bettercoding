@@ -412,14 +412,33 @@ impl WorkspaceInput {
         version: Option<i64>,
         html: bool,
     ) -> Result<InputDetail> {
-        let input = Self::get(pool, workspace, id).await?;
+        let mut tx = pool.begin().await?;
+        let input = sqlx::query_as("SELECT * FROM workspace_inputs WHERE workspace_id=? AND id=?")
+            .bind(workspace)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(InputError::Code("NOT_FOUND"))?;
+        let detail = Self::detail_on(&mut tx, input, version, html).await?;
+        tx.commit().await?;
+        Ok(detail)
+    }
+
+    async fn detail_on(
+        connection: &mut sqlx::SqliteConnection,
+        input: Self,
+        version: Option<i64>,
+        html: bool,
+    ) -> Result<InputDetail> {
+        let workspace = input.workspace_id;
+        let id = &input.id;
         let version = version.unwrap_or(input.current_version);
         let (title, body, contract, content_hash): (String, String, String, String) = sqlx::query_as(
             "SELECT title,html,contract,content_hash FROM workspace_input_versions WHERE workspace_id=? AND input_id=? AND version=?")
-            .bind(workspace).bind(id).bind(version).fetch_optional(pool).await?
+            .bind(workspace).bind(id).bind(version).fetch_optional(&mut *connection).await?
             .ok_or(InputError::Code("NOT_FOUND"))?;
         let answers = sqlx::query_as("SELECT * FROM workspace_input_events WHERE workspace_id=? AND input_id=? AND event_type='answer_submitted' ORDER BY sequence")
-            .bind(workspace).bind(id).fetch_all(pool).await?;
+            .bind(workspace).bind(id).fetch_all(&mut *connection).await?;
         Ok(InputDetail {
             input,
             version: InputVersion {
@@ -448,12 +467,13 @@ impl WorkspaceInput {
         }
         let filter = statuses.join(",");
         let now = utc_string(Utc::now());
+        let mut tx = pool.begin().await?;
         let rows: Vec<WorkspaceInput> = sqlx::query_as("SELECT * FROM workspace_inputs WHERE workspace_id=? AND id>? AND (?='' OR instr(','||?||',', ','||status||',')>0) AND (status!='open' OR show_at IS NULL OR show_at<=?) ORDER BY id LIMIT ?")
-            .bind(workspace).bind(cursor).bind(&filter).bind(&filter).bind(&now).bind(limit.clamp(1, 100)+1).fetch_all(pool).await?;
+            .bind(workspace).bind(cursor).bind(&filter).bind(&filter).bind(&now).bind(limit.clamp(1, 100)+1).fetch_all(&mut *tx).await?;
         let more = rows.len() > limit.clamp(1, 100) as usize;
         let mut inputs = Vec::new();
         for row in rows.into_iter().take(limit.clamp(1, 100) as usize) {
-            inputs.push(Self::detail(pool, workspace, &row.id, None, false).await?);
+            inputs.push(Self::detail_on(&mut tx, row, None, false).await?);
         }
         let next_cursor = more.then(|| inputs.last().unwrap().input.id.clone());
         let (pending_count,): (i64,) = sqlx::query_as(
@@ -461,8 +481,9 @@ impl WorkspaceInput {
         )
         .bind(workspace)
         .bind(&now)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(InputPage {
             inputs,
             next_cursor,
@@ -778,7 +799,7 @@ impl WorkspaceInput {
         insert_event(&mut tx, &mut event).await?;
         sqlx::query("UPDATE workspace_inputs SET current_version=?,status=?,sequence=?,updated_at=?,priority=?,show_at=? WHERE workspace_id=? AND id=?")
             .bind(input.current_version).bind(&input.status).bind(input.sequence).bind(&now).bind(&input.priority).bind(&input.show_at).bind(workspace).bind(&input.id).execute(&mut *tx).await?;
-        if new_generation || input.status != "open" || matches!(&write, InputWrite::Answer(_)) {
+        if new_generation || input.status != "open" {
             sqlx::query("UPDATE workspace_input_availability SET finished_at=? WHERE workspace_id=? AND input_id=? AND finished_at IS NULL")
                 .bind(&now).bind(workspace).bind(&input.id).execute(&mut *tx).await?;
         }
@@ -1141,6 +1162,99 @@ mod tests {
                 .unwrap()
                 .valid
         );
+    }
+
+    #[tokio::test]
+    async fn future_no_answer_preserves_due_notification() {
+        let (pool, workspace) = setup().await;
+        let mut request = match create() {
+            InputWrite::Create(r) => r,
+            _ => unreachable!(),
+        };
+        request.show_at = Some(Some("2099-01-01T00:00:00Z".into()));
+        let created = WorkspaceInput::write(
+            &pool,
+            workspace,
+            None,
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Create(request),
+        )
+        .await
+        .unwrap();
+        let receipt = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::OwnerUi,
+            "owner",
+            InputWrite::Answer(AnswerInput {
+                request_id: "no-answer".into(),
+                expected_sequence: 1,
+                version: 1,
+                answer: InputAnswer::default(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.status, "open");
+        assert_eq!(WorkspaceInput::release_due(&pool).await.unwrap(), 0);
+        sqlx::query("UPDATE workspace_inputs SET show_at='2000-01-01T00:00:00.000000000Z'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(WorkspaceInput::release_due(&pool).await.unwrap(), 1);
+        assert!(
+            WorkspaceInput::claim_notification(&pool)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let detail = WorkspaceInput::detail(&pool, workspace, &created.input_id, None, false)
+            .await
+            .unwrap();
+        assert_eq!(detail.input.current_version, 1);
+        assert_eq!(detail.answers.len(), 1);
+        assert_eq!(detail.answers[0].payload["no_answer_yet"], true);
+        assert!(
+            WorkspaceInput::verify(&pool, workspace, &created.input_id)
+                .await
+                .unwrap()
+                .valid
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_snooze_lists_keep_rows_and_count_in_one_snapshot() {
+        let (pool, workspace) = setup().await;
+        let created = seed(&pool, workspace).await;
+        let mut sequence = 1;
+        for n in 0..20 {
+            let show_at = (n % 2 == 0).then(|| "2099-01-01T00:00:00Z".into());
+            let (page, receipt) = tokio::join!(
+                WorkspaceInput::list(&pool, workspace, None, "", 1),
+                WorkspaceInput::write(
+                    &pool,
+                    workspace,
+                    Some(&created.input_id),
+                    InputActorKind::OwnerUi,
+                    "owner",
+                    InputWrite::Snooze(SnoozeInput {
+                        request_id: format!("snooze-{n}"),
+                        expected_sequence: sequence,
+                        show_at,
+                    })
+                )
+            );
+            let page = page.unwrap();
+            sequence = receipt.unwrap().sequence;
+            assert_eq!(page.inputs.len() as i64, page.pending_count);
+            assert!(
+                page.inputs
+                    .iter()
+                    .all(|detail| detail.input.show_at.is_none())
+            );
+        }
     }
 
     #[tokio::test]
