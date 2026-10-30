@@ -1214,13 +1214,13 @@ async fn spawn_terminal(
 }
 
 async fn handle_terminal_ws(
-    mut socket: MaybeSignedWebSocket,
+    socket: MaybeSignedWebSocket,
     deployment: DeploymentImpl,
     spawned: SpawnedTerminal,
 ) {
     let SpawnedTerminal {
         session_id,
-        mut output_rx,
+        output_rx,
         tripwire_session,
     } = spawned;
 
@@ -1229,6 +1229,57 @@ async fn handle_terminal_ws(
 
     let pty_service = deployment.pty().clone();
     let session_id_for_input = session_id;
+
+    run_terminal_transport(
+        socket,
+        output_rx,
+        |cmd| {
+            if let TerminalCommand::Input { data } = &cmd
+                && let Ok(bytes) = BASE64.decode(data)
+            {
+                tripwire.observe(&bytes);
+            }
+            let pty_service = &pty_service;
+            async move {
+                match cmd {
+                    TerminalCommand::Input { data } => {
+                        if let Ok(bytes) = BASE64.decode(&data) {
+                            let _ = pty_service.write(session_id_for_input, &bytes).await;
+                        }
+                    }
+                    TerminalCommand::Resize { cols, rows } => {
+                        let _ = pty_service.resize(session_id_for_input, cols, rows).await;
+                    }
+                    TerminalCommand::Presence { visible } => {
+                        pty_service.set_cli_presence(session_id_for_input, visible);
+                    }
+                }
+            }
+        },
+        || async {
+            let _ = deployment.pty().close_session(session_id).await;
+        },
+    )
+    .await;
+}
+
+// Keep transport independent of PTY creation so regressions exercise the actual loop
+// without starting tmux, a native agent, or a database.
+async fn run_terminal_transport<S, Command, CommandFuture, Close, CloseFuture>(
+    mut socket: S,
+    mut output_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut command: Command,
+    close: Close,
+) where
+    S: futures_util::Stream<Item = anyhow::Result<Message>>
+        + futures_util::Sink<Message, Error = anyhow::Error>
+        + Unpin,
+    Command: FnMut(TerminalCommand) -> CommandFuture,
+    CommandFuture: std::future::Future<Output = ()>,
+    Close: FnOnce() -> CloseFuture,
+    CloseFuture: std::future::Future<Output = ()>,
+{
+    use futures_util::{SinkExt, StreamExt};
 
     loop {
         tokio::select! {
@@ -1249,30 +1300,17 @@ async fn handle_terminal_ws(
                     break;
                 }
             }
-            inbound = socket.recv() => {
+            inbound = socket.next() => {
                 match inbound {
-                    Ok(Some(Message::Text(text))) => {
+                    Some(Ok(Message::Text(text))) => {
                         if let Ok(cmd) = serde_json::from_str::<TerminalCommand>(text.as_str()) {
-                            match cmd {
-                                TerminalCommand::Input { data } => {
-                                    if let Ok(bytes) = BASE64.decode(&data) {
-                                        tripwire.observe(&bytes);
-                                        let _ = pty_service.write(session_id_for_input, &bytes).await;
-                                    }
-                                }
-                                TerminalCommand::Resize { cols, rows } => {
-                                    let _ = pty_service.resize(session_id_for_input, cols, rows).await;
-                                }
-                                TerminalCommand::Presence { visible } => {
-                                    pty_service.set_cli_presence(session_id_for_input, visible);
-                                }
-                            }
+                            command(cmd).await;
                         }
                     }
-                    Ok(Some(Message::Close(_))) => break,
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(error) => {
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
+                    None => break,
+                    Some(Err(error)) => {
                         tracing::warn!("terminal WS receive error: {}", error);
                         break;
                     }
@@ -1281,8 +1319,12 @@ async fn handle_terminal_ws(
         }
     }
 
-    let _ = deployment.pty().close_session(session_id).await;
+    close().await;
 }
+
+#[cfg(test)]
+#[path = "terminal_transport_tests.rs"]
+mod terminal_transport_tests;
 
 /// Poll for the workspace's CLI tmux session to appear after a spawn. The
 /// session existing proves tmux accepted `new-session` and the bootstrap (which

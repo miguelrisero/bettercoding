@@ -79,6 +79,7 @@ tempfile = "3"
 dotenv = "0.15"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] }

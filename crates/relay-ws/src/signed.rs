@@ -196,3 +196,54 @@ where
             .map_err(anyhow::Error::from)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use futures_util::{SinkExt, stream};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn signed_control_frames_roundtrip_inside_authenticated_envelopes() {
+        let signature = RequestSignature {
+            signing_session_id: uuid::Uuid::nil(),
+            timestamp: 0,
+            nonce: uuid::Uuid::nil(),
+            signature_b64: String::new(),
+        };
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let verify_key = signing_key.verifying_key();
+        let signing = RelaySigningService::new(signing_key);
+        let (outbound, mut captured) = futures_channel::mpsc::unbounded();
+        let mut sender = SignedWebSocket {
+            ws: outbound,
+            signer: WsFrameSigner::new(&signature, signing.clone()),
+            verifier: WsFrameVerifier::new(&signature, verify_key),
+            _message: PhantomData::<AxumMessage>,
+        };
+        for message in [
+            AxumMessage::Ping(b"terminal-probe".to_vec().into()),
+            AxumMessage::Pong(b"terminal-probe".to_vec().into()),
+        ] {
+            SinkExt::send(&mut sender, message).await.unwrap();
+        }
+        let first = captured.next().await.unwrap();
+        let second = captured.next().await.unwrap();
+        assert!(matches!(first, AxumMessage::Binary(_)));
+        assert!(matches!(second, AxumMessage::Binary(_)));
+        let mut receiver = SignedWebSocket {
+            ws: stream::iter([Ok::<_, std::io::Error>(first), Ok(second)]),
+            signer: WsFrameSigner::new(&signature, signing),
+            verifier: WsFrameVerifier::new(&signature, verify_key),
+            _message: PhantomData::<AxumMessage>,
+        };
+        assert!(
+            matches!(receiver.next().await.unwrap().unwrap(), AxumMessage::Ping(payload)
+            if payload.as_ref() == b"terminal-probe")
+        );
+        assert!(
+            matches!(receiver.next().await.unwrap().unwrap(), AxumMessage::Pong(payload)
+            if payload.as_ref() == b"terminal-probe")
+        );
+    }
+}
