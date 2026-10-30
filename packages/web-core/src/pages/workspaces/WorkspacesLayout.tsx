@@ -52,6 +52,15 @@ import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
 import { cliTabId, useTerminal } from '@/shared/hooks/useTerminal';
 import { blurActiveTerminalTextarea } from '@/shared/lib/blurActiveTerminalTextarea';
 import { retainedPaneWorkspace } from '@/shared/lib/paneRetention';
+import {
+  WorkspaceSidebarGroup,
+  SIDEBAR_SEPARATOR_WIDTH,
+} from './WorkspaceSidebarGroup';
+import {
+  readSidebarWidth,
+  writeSidebarWidth,
+  WORKSPACE_CENTER_MIN_WIDTH,
+} from './workspaceSidebarWidths';
 
 const WORKSPACES_GUIDE_ID = 'workspaces-guide';
 
@@ -127,6 +136,18 @@ export function WorkspacesLayout() {
       : 'create-mode-seed-default';
 
   const isMobile = useIsMobile();
+  const [leftSidebarWidth, setLeftSidebarWidth] = useState(() =>
+    readSidebarWidth('left')
+  );
+  const [rightSidebarWidth, setRightSidebarWidth] = useState(() =>
+    readSidebarWidth('right')
+  );
+  const saveLeftSidebarWidth = useCallback((width: number) => {
+    setLeftSidebarWidth(writeSidebarWidth('left', width));
+  }, []);
+  const saveRightSidebarWidth = useCallback((width: number) => {
+    setRightSidebarWidth(writeSidebarWidth('right', width));
+  }, []);
   const [mobileTab] = useMobileActiveTab();
   const hostId = useHostId();
   const mainContainerRef = useRef<WorkspacesMainContainerHandle>(null);
@@ -526,7 +547,21 @@ export function WorkspacesLayout() {
   const mainContent = (
     <ReviewProvider workspaceId={selectedWorkspace?.id}>
       <ChangesViewProvider>
-        <div className="flex h-full">
+        <WorkspaceSidebarGroup
+          side="right"
+          width={rightSidebarWidth}
+          onWidthChange={saveRightSidebarWidth}
+          contentMinWidth={WORKSPACE_CENTER_MIN_WIDTH}
+          sidebar={
+            isRightSidebarVisible && !isCreateMode ? (
+              <RightSidebar
+                rightMainPanelMode={rightMainPanelMode}
+                selectedWorkspace={selectedWorkspace}
+                repos={repos}
+              />
+            ) : null
+          }
+        >
           <Group
             orientation="horizontal"
             className="flex-1 min-w-0 h-full"
@@ -576,17 +611,7 @@ export function WorkspacesLayout() {
               </Panel>
             )}
           </Group>
-
-          {isRightSidebarVisible && !isCreateMode && (
-            <div className="w-[300px] shrink-0 h-full overflow-hidden">
-              <RightSidebar
-                rightMainPanelMode={rightMainPanelMode}
-                selectedWorkspace={selectedWorkspace}
-                repos={repos}
-              />
-            </div>
-          )}
-        </div>
+        </WorkspaceSidebarGroup>
       </ChangesViewProvider>
     </ReviewProvider>
   );
@@ -599,23 +624,36 @@ export function WorkspacesLayout() {
           workspaceId={selectedWorkspace.id}
         />
       )}
-      {isLeftSidebarVisible && (
-        <div className="w-[300px] shrink-0 h-full overflow-hidden">
-          <WorkspacesSidebarContainer onScrollToBottom={handleScrollToBottom} />
-        </div>
-      )}
-
-      <div className="flex-1 min-w-0 h-full">
-        {isCreateMode ? (
-          <CreateModeProvider
-            key={createModeProviderKey}
-            initialState={createModeSeed.state}
-          >
-            {mainContent}
-          </CreateModeProvider>
-        ) : (
-          mainContent
-        )}
+      <div className="flex-1 min-w-0 h-full overflow-x-auto">
+        <WorkspaceSidebarGroup
+          side="left"
+          width={leftSidebarWidth}
+          onWidthChange={saveLeftSidebarWidth}
+          contentMinWidth={
+            WORKSPACE_CENTER_MIN_WIDTH +
+            (isRightSidebarVisible && !isCreateMode
+              ? rightSidebarWidth + SIDEBAR_SEPARATOR_WIDTH
+              : 0)
+          }
+          sidebar={
+            isLeftSidebarVisible ? (
+              <WorkspacesSidebarContainer
+                onScrollToBottom={handleScrollToBottom}
+              />
+            ) : null
+          }
+        >
+          {isCreateMode ? (
+            <CreateModeProvider
+              key={createModeProviderKey}
+              initialState={createModeSeed.state}
+            >
+              {mainContent}
+            </CreateModeProvider>
+          ) : (
+            mainContent
+          )}
+        </WorkspaceSidebarGroup>
       </div>
     </div>
   );
