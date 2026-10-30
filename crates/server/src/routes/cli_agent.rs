@@ -246,6 +246,9 @@ async fn restart_agent(
     Path(workspace_id): Path<Uuid>,
 ) -> Result<ResponseJson<ApiResponse<CliRestartResponse>>, ApiError> {
     let _guard = cli_lifecycle_lock(workspace_id).lock_owned().await;
+    let _writer = local_deployment::pty::cli_writer_admission(&deployment.db().pool, workspace_id)
+        .await
+        .map_err(|e| ApiError::Conflict(e.to_string()))?;
     let context = cli_context(&deployment, workspace_id).await?;
 
     if context.executor_active {
@@ -337,6 +340,9 @@ async fn switch_agent_session(
     }
     let _guard = cli_lifecycle_lock(workspace_id).lock_owned().await;
     let pool = &deployment.db().pool;
+    let _writer = local_deployment::pty::cli_writer_admission(pool, workspace_id)
+        .await
+        .map_err(|e| ApiError::Conflict(e.to_string()))?;
     let session = Session::find_by_id(pool, session_id)
         .await?
         .filter(|session| session.workspace_id == workspace_id)

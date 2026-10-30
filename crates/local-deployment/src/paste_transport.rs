@@ -4,8 +4,10 @@ use uuid::Uuid;
 
 use crate::pty;
 
-#[derive(Debug, Clone, Default)]
-pub struct LocalCliPasteTransport;
+#[derive(Debug, Clone)]
+pub struct LocalCliPasteTransport {
+    pub pool: sqlx::SqlitePool,
+}
 
 #[async_trait]
 impl CliPasteTransport for LocalCliPasteTransport {
@@ -21,8 +23,10 @@ impl CliPasteTransport for LocalCliPasteTransport {
         let Some(target) = pty::locate_cli_tmux_target(workspace_id).await else {
             return false;
         };
-        pty::send_cli_keys_to_live_agent(&target, &[program], text)
+        pty::send_cli_keys_to_live_agent(&self.pool, &target, &[program], text)
             .await
+            .ok()
+            .flatten()
             .is_some_and(pty::CliSendResult::delivered)
     }
 
@@ -38,6 +42,7 @@ impl CliPasteTransport for LocalCliPasteTransport {
     }
 
     async fn signal_resume_ready(&self, workspace_id: Uuid, sid: &str) -> anyhow::Result<()> {
+        let _writer = pty::cli_writer_admission(&self.pool, workspace_id).await?;
         Ok(pty::write_cli_resume_ready_file(workspace_id, sid)?)
     }
 }

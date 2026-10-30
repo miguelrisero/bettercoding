@@ -82,7 +82,7 @@ async fn connection() -> Connection {
         socket,
         output_rx,
         false,
-        |_| async {},
+        |_| async { Ok(()) },
         move || async move {
             close_tx.send(id).unwrap();
         },
@@ -290,7 +290,7 @@ async fn signed_connection() -> Connection<relay_ws::SignedTungsteniteSocket> {
         socket,
         output_rx,
         true,
-        |_| async {},
+        |_| async { Ok(()) },
         move || async move {
             close_tx.send(id).unwrap();
         },
@@ -383,4 +383,34 @@ async fn signed_wrong_challenge_never_enables_receive_expiry() {
     assert!(!connection.task.is_finished());
     reader.abort();
     connection.task.abort();
+}
+
+#[tokio::test]
+async fn rejected_input_returns_explicit_error_and_keeps_transport_available() {
+    for error in ["CLI control busy; resubmit", "Failed to write to PTY"] {
+        let (server, peer) = tokio::io::duplex(1024);
+        let socket = TestSocket(WebSocketStream::from_raw_socket(server, Role::Server, None).await);
+        let mut peer = WebSocketStream::from_raw_socket(peer, Role::Client, None).await;
+        let (_output, output_rx) = mpsc::channel(8);
+        let task = tokio::spawn(run_terminal_transport(
+            socket,
+            output_rx,
+            false,
+            move |_| async move { Err(error.to_string()) },
+            || async {},
+        ));
+        for _ in 0..2 {
+            peer.send(tungstenite::Message::Text(
+                r#"{"type":"input","data":"eA=="}"#.into(),
+            ))
+            .await
+            .unwrap();
+            let response = peer.next().await.unwrap().unwrap().into_text().unwrap();
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["type"], "error");
+            assert_eq!(response["message"], error);
+        }
+        peer.send(tungstenite::Message::Close(None)).await.unwrap();
+        task.await.unwrap();
+    }
 }

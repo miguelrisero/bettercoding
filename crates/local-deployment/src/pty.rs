@@ -10,8 +10,13 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use db::models::{
+    cli_control_operation::{CliControlOperation, ControlRequest},
+    cli_pane_binding::CliPaneBinding,
+};
 use executors::executors::cli::{CliContinue, CliLaunchSpec, CliPromptArg, CliResume};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+use sqlx::SqlitePool;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use utils::shell::get_interactive_shell;
@@ -1907,12 +1912,14 @@ pub async fn capture_cli_pane(workspace_id: Uuid) -> Option<String> {
 /// multi-line text typed as keys would submit at its first newline. A paste
 /// has no argv size limit either. Sends only when a CLI agent owns the pane,
 /// so text never reaches the fallback shell. Best-effort.
-pub async fn send_cli_keys(workspace_id: Uuid, text: &str) -> bool {
+pub async fn send_cli_keys(pool: &SqlitePool, workspace_id: Uuid, text: &str) -> bool {
     let Some(target) = locate_cli_tmux_target(workspace_id).await else {
         return false;
     };
-    send_cli_keys_to_live_agent(&target, CLI_AGENT_PROGRAMS, text)
+    send_cli_keys_to_live_agent(pool, &target, CLI_AGENT_PROGRAMS, text)
         .await
+        .ok()
+        .flatten()
         .is_some_and(CliSendResult::delivered)
 }
 
@@ -1950,24 +1957,99 @@ fn cli_send_lock(workspace_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
     locks.entry(workspace_id).or_default().clone()
 }
 
-/// Send and submit text to one already-located target without allowing a
-/// second locator pass to switch homes midway through the transaction.
-pub async fn send_cli_keys_to(target: &CliTmuxTarget, text: &str) -> CliSendResult {
-    send_detached(target, None, text)
-        .await
-        .unwrap_or(CliSendResult::NotDelivered)
+/// Shared cooperating-writer custody. Database failure denies admission.
+/// ponytail: process-local exclusion; cross-process custody requires native acceptance.
+pub async fn cli_writer_admission(
+    pool: &SqlitePool,
+    workspace_id: Uuid,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, PtyError> {
+    let guard = cli_send_lock(workspace_id).lock_owned().await;
+    let busy: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cli_control_operations WHERE workspace_id = ? AND phase NOT IN ('applied', 'cancelled'))")
+        .bind(workspace_id).fetch_one(pool).await.map_err(|e| PtyError::AdmissionUnavailable(e.to_string()))?;
+    if busy {
+        return Err(PtyError::ControlBusy(workspace_id));
+    }
+    Ok(guard)
 }
 
-/// Like [`send_cli_keys_to`], but only when one of `programs` owns the pane,
+/// Call under the lifecycle lock; custody covers the complete durable reservation.
+pub async fn reserve_cli_control(
+    pool: &SqlitePool,
+    request: &ControlRequest,
+) -> Result<CliControlOperation, PtyError> {
+    let _guard = cli_send_lock(request.workspace_id).lock_owned().await;
+    CliControlOperation::reserve(pool, request)
+        .await
+        .map_err(|e| PtyError::AdmissionUnavailable(e.to_string()))
+}
+
+fn cli_client_matches_pane(listing: &str, pid: u32, pane: &str) -> bool {
+    listing.lines().any(|line| {
+        line.split_once('\t').is_some_and(|(client, active_pane)| {
+            client.parse::<u32>().ok() == Some(pid) && active_pane == pane
+        })
+    })
+}
+
+async fn validate_cli_client_pane(pid: u32, pane: &str) -> Result<(), PtyError> {
+    let output = run_cli_tmux(&[
+        "-L",
+        cli_tmux_socket(),
+        "list-clients",
+        "-F",
+        "#{client_pid}\t#{pane_id}",
+    ])
+    .await
+    .map_err(PtyError::AdmissionUnavailable)?;
+    if !cli_client_matches_pane(&String::from_utf8_lossy(&output.stdout), pid, pane) {
+        return Err(PtyError::StaleBinding);
+    }
+    Ok(())
+}
+
+async fn validate_cli_binding(
+    pool: &SqlitePool,
+    expected: &CliPaneBinding,
+) -> Result<(), PtyError> {
+    let active = CliPaneBinding::find_active_for_workspace(pool, expected.workspace_id)
+        .await
+        .map_err(|e| PtyError::AdmissionUnavailable(e.to_string()))?;
+    if !active.is_some_and(|b| {
+        b.id == expected.id
+            && b.session_id == expected.session_id
+            && (expected.claude_session_id.is_none()
+                || b.claude_session_id == expected.claude_session_id)
+    }) {
+        return Err(PtyError::StaleBinding);
+    }
+    Ok(())
+}
+
+/// Send and submit text to one already-located target without allowing a
+/// second locator pass to switch homes midway through the transaction.
+#[cfg(test)]
+async fn send_cli_keys_to(target: &CliTmuxTarget, text: &str) -> CliSendResult {
+    let target = target.clone();
+    let text = text.to_owned();
+    tokio::spawn(async move {
+        let _guard = cli_send_lock(target.workspace_id).lock_owned().await;
+        send_cli_keys_locked(&target, "", &text).await
+    })
+    .await
+    .unwrap()
+}
+
+/// Send only when one of `programs` owns the pane,
 /// probed under the send lock so a send queued behind another cannot act on a
 /// stale check. `None` means no listed agent is live (or the pane is
 /// unreadable) and nothing was sent.
 pub async fn send_cli_keys_to_live_agent(
+    pool: &SqlitePool,
     target: &CliTmuxTarget,
     programs: &[&str],
     text: &str,
-) -> Option<CliSendResult> {
-    send_detached(target, Some(programs), text).await
+) -> Result<Option<CliSendResult>, PtyError> {
+    send_detached(pool, target, programs, text).await
 }
 
 /// Run lock, optional ownership probe, paste and Enter as one spawned task. A
@@ -1975,31 +2057,33 @@ pub async fn send_cli_keys_to_live_agent(
 /// release the lock between paste and Enter, which would let the next sender
 /// join its text to this one, or skip the staged buffer's cleanup.
 async fn send_detached(
+    pool: &SqlitePool,
     target: &CliTmuxTarget,
-    programs: Option<&[&str]>,
+    programs: &[&str],
     text: &str,
-) -> Option<CliSendResult> {
-    let target = target.clone();
-    let programs: Option<Vec<String>> =
-        programs.map(|programs| programs.iter().map(|p| p.to_string()).collect());
+) -> Result<Option<CliSendResult>, PtyError> {
+    let pool = pool.clone();
+    let mut target = target.clone();
+    // Capture the generation before waiting for admission; a queued send cannot cross replacement.
+    let binding = CliPaneBinding::find_active_for_workspace(&pool, target.workspace_id)
+        .await
+        .map_err(|e| PtyError::AdmissionUnavailable(e.to_string()))?
+        .ok_or(PtyError::StaleBinding)?;
+    let programs: Vec<String> = programs.iter().map(|p| p.to_string()).collect();
     let text = text.to_owned();
-    let workspace_id = target.workspace_id;
     tokio::spawn(async move {
-        let _guard = cli_send_lock(target.workspace_id).lock_owned().await;
-        let program = match programs {
-            Some(programs) => {
-                let programs: Vec<&str> = programs.iter().map(String::as_str).collect();
-                pane_owner_among(&target, &programs).await?.to_owned()
-            }
-            None => String::new(),
+        let _guard = cli_writer_admission(&pool, target.workspace_id).await?;
+        validate_cli_binding(&pool, &binding).await?;
+        // All probe, paste and Enter calls address the exact pane under custody.
+        target.session_name = resolve_cli_pane_id_on(&target.socket, &target.session_name).await?;
+        let programs: Vec<&str> = programs.iter().map(String::as_str).collect();
+        let Some(program) = pane_owner_among(&target, &programs).await else {
+            return Ok(None);
         };
-        Some(send_cli_keys_locked(&target, &program, &text).await)
+        Ok(Some(send_cli_keys_locked(&target, program, &text).await))
     })
     .await
-    .unwrap_or_else(|error| {
-        tracing::warn!(%workspace_id, %error, "CLI send task failed");
-        Some(CliSendResult::NotDelivered)
-    })
+    .map_err(|e| PtyError::WriteFailed(e.to_string()))?
 }
 
 /// Bracketed-paste end marker. Text holding it would close the paste early
@@ -2606,6 +2690,12 @@ pub enum PtyError {
     PromptStageFailed,
     #[error("Session not found: {0}")]
     SessionNotFound(Uuid),
+    #[error("CLI control busy for workspace {0}; resubmit after reconciliation")]
+    ControlBusy(Uuid),
+    #[error("CLI attachment binding changed; reconnect before writing")]
+    StaleBinding,
+    #[error("CLI writer admission unavailable: {0}")]
+    AdmissionUnavailable(String),
     #[error("Failed to write to PTY: {0}")]
     WriteFailed(String),
     #[error("Failed to resize PTY: {0}")]
@@ -2690,6 +2780,8 @@ struct PtySession {
     /// Per-client tmux sizing state. Shell sessions (including CLI fallback
     /// when tmux is absent) have none; PID and presence always exist together.
     tmux_client: Option<CliTmuxClient>,
+    cli_workspace: Option<Uuid>,
+    cli_binding: Option<(CliPaneBinding, String)>,
     _output_handle: thread::JoinHandle<()>,
 }
 
@@ -2759,13 +2851,51 @@ impl Drop for PtySession {
 #[derive(Clone)]
 pub struct PtyService {
     sessions: Arc<Mutex<HashMap<Uuid, PtySession>>>,
+    pool: Option<SqlitePool>,
 }
 
 impl PtyService {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            pool: None,
         }
+    }
+
+    pub fn with_pool(pool: SqlitePool) -> Self {
+        Self {
+            pool: Some(pool),
+            ..Self::new()
+        }
+    }
+
+    /// Bind after launch registration, while the caller still holds lifecycle and writer custody.
+    pub async fn bind_cli_attachment(
+        &self,
+        session_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<(), PtyError> {
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| PtyError::AdmissionUnavailable("database missing".into()))?;
+        let binding = CliPaneBinding::find_active_for_workspace(pool, workspace_id)
+            .await
+            .map_err(|e| PtyError::AdmissionUnavailable(e.to_string()))?
+            .ok_or(PtyError::StaleBinding)?;
+        let pane = cli_workspace_pane_id(workspace_id).await?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|e| PtyError::WriteFailed(e.to_string()))?;
+        let session = sessions
+            .get_mut(&session_id)
+            .ok_or(PtyError::SessionNotFound(session_id))?;
+        if session.cli_workspace != Some(workspace_id) {
+            return Err(PtyError::StaleBinding);
+        }
+        session.cli_binding = Some((binding, pane));
+        Ok(())
     }
 
     pub async fn create_session(
@@ -3084,6 +3214,8 @@ impl PtyService {
                     pid,
                     presence: CliClientPresence::new(!tmux_connect_hidden),
                 }),
+                cli_workspace: tmux_workspace,
+                cli_binding: None,
                 _output_handle: output_handle,
             })
         })
@@ -3130,7 +3262,7 @@ impl PtyService {
         // that would freeze every other terminal — including new attaches —
         // with no errors anywhere. With the per-session lock, a wedged PTY
         // only ever blocks its own session.
-        let writer = {
+        let (writer, cli_workspace, cli_binding, client_pid) = {
             let sessions = self
                 .sessions
                 .lock()
@@ -3139,7 +3271,28 @@ impl PtyService {
                 .get(&session_id)
                 .ok_or(PtyError::SessionNotFound(session_id))?;
 
-            session.writer.clone()
+            (
+                session.writer.clone(),
+                session.cli_workspace,
+                session.cli_binding.clone(),
+                session.tmux_client.as_ref().map(|client| client.pid),
+            )
+        };
+        let _admission = if let Some(workspace_id) = cli_workspace {
+            let pool = self
+                .pool
+                .as_ref()
+                .ok_or_else(|| PtyError::AdmissionUnavailable("database missing".into()))?;
+            let guard = cli_writer_admission(pool, workspace_id).await?;
+            let (binding, pane) = cli_binding.ok_or(PtyError::StaleBinding)?;
+            validate_cli_binding(pool, &binding).await?;
+            if cli_workspace_pane_id(workspace_id).await? != pane {
+                return Err(PtyError::StaleBinding);
+            }
+            validate_cli_client_pane(client_pid.ok_or(PtyError::StaleBinding)?, &pane).await?;
+            Some(guard)
+        } else {
+            None
         };
 
         let mut writer = writer
@@ -3400,6 +3553,10 @@ impl Default for PtyService {
         Self::new()
     }
 }
+
+#[cfg(test)]
+#[path = "cli_control_tests.rs"]
+mod cli_control_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4198,13 +4355,55 @@ mod tests {
             .expect("readable pane");
         assert_eq!(program, Some("claude"));
 
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations_for_tests(&pool).await.unwrap();
+        for target in [&codex, &claude] {
+            db::models::workspace::Workspace::create(
+                &pool,
+                &db::models::workspace::CreateWorkspace {
+                    branch: "main".into(),
+                    name: None,
+                },
+                target.workspace_id,
+            )
+            .await
+            .unwrap();
+            let session = db::models::session::Session::create(
+                &pool,
+                &db::models::session::CreateSession {
+                    executor: Some("CLAUDE_CODE".into()),
+                    name: None,
+                },
+                Uuid::new_v4(),
+                target.workspace_id,
+            )
+            .await
+            .unwrap();
+            CliPaneBinding::record_launch(
+                &pool,
+                target.workspace_id,
+                session.id,
+                Some(thread),
+                db::models::cli_pane_binding::CliPaneBoundVia::CliFresh,
+            )
+            .await
+            .unwrap();
+        }
         // A lease derived for one agent never delivers into the other's pane.
         assert_eq!(
-            send_cli_keys_to_live_agent(&codex, &["claude"], "hello").await,
+            send_cli_keys_to_live_agent(&pool, &codex, &["claude"], "hello")
+                .await
+                .unwrap(),
             None
         );
         assert_eq!(
-            send_cli_keys_to_live_agent(&claude, &["codex"], "hello").await,
+            send_cli_keys_to_live_agent(&pool, &claude, &["codex"], "hello")
+                .await
+                .unwrap(),
             None
         );
     }
@@ -5258,6 +5457,8 @@ mod tests {
             child_killer,
             child_reaped: child_reaped.clone(),
             tmux_client: None,
+            cli_workspace: None,
+            cli_binding: None,
             _output_handle: output_handle,
         };
         drop(session);

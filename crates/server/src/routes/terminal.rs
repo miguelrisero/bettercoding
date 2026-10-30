@@ -624,6 +624,9 @@ async fn spawn_cli_terminal(
         .lock_owned()
         .await;
     let pool = &deployment.db().pool;
+    let _writer = local_deployment::pty::cli_writer_admission(pool, workspace.id)
+        .await
+        .map_err(|e| ApiError::Conflict(e.to_string()))?;
     let reservation = if cli_tmux_available()
         && cli_tmux_session_exists_checked(workspace.id).await?
     {
@@ -675,6 +678,16 @@ async fn spawn_cli_terminal(
         {
             let _ = deployment.pty().close_session(spawned.session_id).await;
             return Err(ApiError::Pty(error));
+        }
+        if cli_tmux_available() {
+            if let Err(error) = deployment
+                .pty()
+                .bind_cli_attachment(spawned.session_id, workspace.id)
+                .await
+            {
+                let _ = deployment.pty().close_session(spawned.session_id).await;
+                return Err(ApiError::Pty(error));
+            }
         }
         Ok(spawned)
     }
@@ -1146,7 +1159,7 @@ async fn spawn_terminal(
                 let _claim = delivery.claim;
                 let delivered = match &delivery.deferred {
                     Some(text) => {
-                        deliver_deferred_prompt(workspace_id, text, &delivery.program).await
+                        deliver_deferred_prompt(&pool, workspace_id, text, &delivery.program).await
                     }
                     None => confirm_baked_prompt_consumed(workspace_id, &delivery.program).await,
                 };
@@ -1246,7 +1259,12 @@ async fn handle_terminal_ws(
                 match cmd {
                     TerminalCommand::Input { data } => {
                         if let Ok(bytes) = BASE64.decode(&data) {
-                            let _ = pty_service.write(session_id_for_input, &bytes).await;
+                            pty_service
+                                .write(session_id_for_input, &bytes)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        } else {
+                            return Err("Invalid terminal input encoding".into());
                         }
                     }
                     TerminalCommand::Resize { cols, rows } => {
@@ -1256,6 +1274,7 @@ async fn handle_terminal_ws(
                         pty_service.set_cli_presence(session_id_for_input, visible);
                     }
                 }
+                Ok(())
             }
         },
         || async {
@@ -1295,7 +1314,7 @@ async fn run_terminal_transport<S, Command, CommandFuture, Close, CloseFuture>(
         + futures_util::Sink<Message, Error = anyhow::Error>
         + Unpin,
     Command: FnMut(TerminalCommand) -> CommandFuture,
-    CommandFuture: std::future::Future<Output = ()>,
+    CommandFuture: std::future::Future<Output = Result<(), String>>,
     Close: FnOnce() -> CloseFuture,
     CloseFuture: std::future::Future<Output = ()>,
 {
@@ -1345,7 +1364,11 @@ async fn run_terminal_transport<S, Command, CommandFuture, Close, CloseFuture>(
                             // Existing PTY writes/resize are synchronous and can block here.
                             // Their cancellation/worker design requires separate review;
                             // transport deadlines cannot preempt a blocked command.
-                            command(cmd).await;
+                            if let Err(message) = command(cmd).await {
+                                let error = TerminalMessage::Error { message };
+                                let Ok(json) = serde_json::to_string(&error) else { break; };
+                                if send_terminal_message(&mut socket, Message::Text(json.into())).await.is_err() { break; }
+                            }
                         }
                     }
                     Some(Ok(Message::Close(_))) => break,
@@ -1506,7 +1529,12 @@ async fn confirm_baked_prompt_consumed(workspace_id: Uuid, program: &str) -> boo
 /// unready pane leaves the prompt parked for the next attach's retry. The tmux
 /// target is located once before polling and reused through the post-paste ack,
 /// so a mid-delivery home flip cannot redirect any step to the other session.
-async fn deliver_deferred_prompt(workspace_id: Uuid, text: &str, program: &str) -> bool {
+async fn deliver_deferred_prompt(
+    pool: &SqlitePool,
+    workspace_id: Uuid,
+    text: &str,
+    program: &str,
+) -> bool {
     let Some(target) = locate_cli_tmux_target(workspace_id).await else {
         return false;
     };
@@ -1525,8 +1553,10 @@ async fn deliver_deferred_prompt(workspace_id: Uuid, text: &str, program: &str) 
                     }
                     // Re-probed under the send lock: a send queued behind
                     // another must not paste into a shell the agent left.
-                    if !send_cli_keys_to_live_agent(&target, &[program], text)
+                    if !send_cli_keys_to_live_agent(pool, &target, &[program], text)
                         .await
+                        .ok()
+                        .flatten()
                         .is_some_and(CliSendResult::delivered)
                     {
                         return false;
@@ -1714,7 +1744,10 @@ pub(crate) async fn send_text_to_cli_agent(
     let target = locate_cli_tmux_target(workspace_id)
         .await
         .ok_or_else(no_agent)?;
-    match send_cli_keys_to_live_agent(&target, &programs, text).await {
+    match send_cli_keys_to_live_agent(pool, &target, &programs, text)
+        .await
+        .map_err(|e| ApiError::Conflict(e.to_string()))?
+    {
         None => Err(no_agent()),
         Some(CliSendResult::NotDelivered) => Err(ApiError::BadGateway(
             "tmux did not confirm the paste; check the CLI pane before sending again".to_string(),
