@@ -6,6 +6,7 @@ import type {
   WorkspaceInput,
   InputReceipt,
   InputStatusWrite,
+  SnoozeInput,
 } from 'shared/types';
 import {
   localApiDocumentUrl,
@@ -29,7 +30,7 @@ export async function inputRequest<T>(
   workspace: string,
   hostId: string | null,
   suffix = '',
-  body?: AnswerInput | InputStatusWrite | { priority: string }
+  body?: AnswerInput | InputStatusWrite | SnoozeInput | { priority: string }
 ): Promise<T> {
   const response = await makeLocalApiRequest(
     `/api/workspaces/${workspace}/inputs${suffix}`,
@@ -87,6 +88,12 @@ export const inputsApi = {
     id: string,
     body: AnswerInput
   ) => inputRequest<InputReceipt>(workspace, host, `/${id}/answer`, body),
+  snooze: (
+    workspace: string,
+    host: string | null,
+    id: string,
+    body: SnoozeInput
+  ) => inputRequest<InputReceipt>(workspace, host, `/${id}/snooze`, body),
   status: (
     workspace: string,
     host: string | null,
@@ -138,4 +145,22 @@ export async function setInputPriority(
     }),
     queryClient.invalidateQueries({ queryKey: ['inputs', host, workspace] }),
   ]);
+}
+
+export async function setInputSchedule(
+  queryClient: QueryClient,
+  workspace: string,
+  host: string | null,
+  inputId: string,
+  body: SnoozeInput
+): Promise<InputReceipt> {
+  const receipt = await inputsApi.snooze(workspace, host, inputId, body);
+  await Promise.all([
+    queryClient.invalidateQueries({
+      queryKey: ['input', host, workspace, inputId],
+      exact: true,
+    }),
+    queryClient.invalidateQueries({ queryKey: ['inputs', host, workspace] }),
+  ]);
+  return receipt;
 }

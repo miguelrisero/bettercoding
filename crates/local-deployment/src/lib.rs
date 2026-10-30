@@ -275,6 +275,12 @@ impl Deployment for LocalDeployment {
                 .await;
         }
 
+        services::services::input_availability::spawn(
+            db.pool.clone(),
+            container.notification_service().clone(),
+            shutdown.child_token(),
+        );
+
         // Surface CLI-mode tmux claude activity as workspace stage state
         // (Running / Needs Attention buckets in the sidebar).
         cli_activity::CliActivityMonitor::spawn(db.clone(), pty.clone(), shutdown.child_token());
