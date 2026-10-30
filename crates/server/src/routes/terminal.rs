@@ -1233,6 +1233,7 @@ async fn handle_terminal_ws(
     run_terminal_transport(
         socket,
         output_rx,
+        false,
         |cmd| {
             if let TerminalCommand::Input { data } = &cmd
                 && let Ok(bytes) = BASE64.decode(data)
@@ -1285,6 +1286,7 @@ where
 async fn run_terminal_transport<S, Command, CommandFuture, Close, CloseFuture>(
     mut socket: S,
     mut output_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    _signed_transport: bool,
     mut command: Command,
     close: Close,
 ) where

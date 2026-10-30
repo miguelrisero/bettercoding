@@ -246,4 +246,47 @@ mod tests {
             if payload.as_ref() == b"terminal-probe")
         );
     }
+
+    #[tokio::test]
+    async fn unsigned_and_foreign_pongs_never_reach_signed_application_stream() {
+        let signature = RequestSignature {
+            signing_session_id: uuid::Uuid::new_v4(),
+            timestamp: 0,
+            nonce: uuid::Uuid::new_v4(),
+            signature_b64: String::new(),
+        };
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let verify_key = key.verifying_key();
+        let signing = RelaySigningService::new(key);
+        let mut receiver = SignedWebSocket {
+            ws: stream::iter([Ok::<_, std::io::Error>(AxumMessage::Pong(
+                b"exact-challenge".to_vec().into(),
+            ))]),
+            signer: WsFrameSigner::new(&signature, signing.clone()),
+            verifier: WsFrameVerifier::new(&signature, verify_key),
+            _message: PhantomData::<AxumMessage>,
+        };
+        assert!(receiver.next().await.is_none());
+        for foreign_session in [true, false] {
+            let mut foreign = signature.clone();
+            if foreign_session {
+                foreign.signing_session_id = uuid::Uuid::new_v4();
+            } else {
+                foreign.nonce = uuid::Uuid::new_v4();
+            }
+            let bytes = WsFrameSigner::new(&foreign, signing.clone())
+                .encode(RelayWsFrame {
+                    msg_type: RelayWsMessageType::Pong,
+                    payload: b"exact-challenge".to_vec(),
+                })
+                .unwrap();
+            let mut receiver = SignedWebSocket {
+                ws: stream::iter([Ok::<_, std::io::Error>(AxumMessage::Binary(bytes.into()))]),
+                signer: WsFrameSigner::new(&signature, signing.clone()),
+                verifier: WsFrameVerifier::new(&signature, verify_key),
+                _message: PhantomData::<AxumMessage>,
+            };
+            assert!(receiver.next().await.unwrap().is_err());
+        }
+    }
 }
