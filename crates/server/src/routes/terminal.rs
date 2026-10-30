@@ -1214,13 +1214,13 @@ async fn spawn_terminal(
 }
 
 async fn handle_terminal_ws(
-    mut socket: MaybeSignedWebSocket,
+    socket: MaybeSignedWebSocket,
     deployment: DeploymentImpl,
     spawned: SpawnedTerminal,
 ) {
     let SpawnedTerminal {
         session_id,
-        mut output_rx,
+        output_rx,
         tripwire_session,
     } = spawned;
 
@@ -1230,8 +1230,133 @@ async fn handle_terminal_ws(
     let pty_service = deployment.pty().clone();
     let session_id_for_input = session_id;
 
+    let signed_transport = socket.is_signed();
+    run_terminal_transport(
+        socket,
+        output_rx,
+        signed_transport,
+        |cmd| {
+            if let TerminalCommand::Input { data } = &cmd
+                && let Ok(bytes) = BASE64.decode(data)
+            {
+                tripwire.observe(&bytes);
+            }
+            let pty_service = &pty_service;
+            async move {
+                match cmd {
+                    TerminalCommand::Input { data } => {
+                        if let Ok(bytes) = BASE64.decode(&data) {
+                            let _ = pty_service.write(session_id_for_input, &bytes).await;
+                        }
+                    }
+                    TerminalCommand::Resize { cols, rows } => {
+                        let _ = pty_service.resize(session_id_for_input, cols, rows).await;
+                    }
+                    TerminalCommand::Presence { visible } => {
+                        pty_service.set_cli_presence(session_id_for_input, visible);
+                    }
+                }
+            }
+        },
+        || async {
+            let _ = deployment.pty().close_session(session_id).await;
+        },
+    )
+    .await;
+}
+
+// Capable signed viewers answer in JavaScript; suspension beyond the response window
+// releases this attach only. The native tmux session remains available on reconnect.
+const TERMINAL_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+const TERMINAL_HEARTBEAT_RESPONSE: std::time::Duration = std::time::Duration::from_secs(15);
+const TERMINAL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn send_terminal_message<S>(socket: &mut S, message: Message) -> anyhow::Result<()>
+where
+    S: futures_util::Sink<Message, Error = anyhow::Error> + Unpin,
+{
+    use futures_util::SinkExt;
+    // A signed send can advance its sequence before flushing. Every error,
+    // including cancellation at this deadline, permanently ends this transport.
+    tokio::time::timeout(TERMINAL_SEND_TIMEOUT, socket.send(message)).await??;
+    Ok(())
+}
+
+// Keep transport independent of PTY creation so regressions exercise the actual loop
+// without starting tmux, a native agent, or a database.
+async fn run_terminal_transport<S, Command, CommandFuture, Close, CloseFuture>(
+    mut socket: S,
+    mut output_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    signed_transport: bool,
+    mut command: Command,
+    close: Close,
+) where
+    S: futures_util::Stream<Item = anyhow::Result<Message>>
+        + futures_util::Sink<Message, Error = anyhow::Error>
+        + Unpin,
+    Command: FnMut(TerminalCommand) -> CommandFuture,
+    CommandFuture: std::future::Future<Output = ()>,
+    Close: FnOnce() -> CloseFuture,
+    CloseFuture: std::future::Future<Output = ()>,
+{
+    use futures_util::StreamExt;
+    use tokio::time::{Instant, sleep_until};
+
+    let mut next_probe = Instant::now() + TERMINAL_HEARTBEAT_INTERVAL;
+    let mut outstanding: Option<(Vec<u8>, Instant)> = None;
+    // Legacy signed viewers discard probes. Require a verified matching Pong
+    // before using missing responses as evidence of a dead signed connection.
+    let mut receive_expiry_enabled = !signed_transport;
+
     loop {
+        let deadline = outstanding
+            .as_ref()
+            .map_or(next_probe, |(_, deadline)| *deadline);
         tokio::select! {
+            // Always poll liveness and inbound control frames before a ready PTY stream.
+            biased;
+            _ = sleep_until(deadline) => {
+                if outstanding.is_some() && receive_expiry_enabled {
+                    break;
+                }
+                // Rotate unanswered legacy probes without enabling receive expiry.
+                let challenge = Uuid::new_v4().as_bytes().to_vec();
+                if send_terminal_message(&mut socket, Message::Ping(challenge.clone().into())).await.is_err() {
+                    break;
+                }
+                outstanding = Some((challenge, Instant::now() + TERMINAL_HEARTBEAT_RESPONSE));
+            }
+            inbound = socket.next() => {
+                match inbound {
+                    Some(Ok(Message::Pong(payload))) => {
+                        if outstanding.as_ref().is_some_and(|(challenge, _)| challenge.as_slice() == payload.as_ref()) {
+                            receive_expiry_enabled = true;
+                            outstanding = None;
+                            next_probe = Instant::now() + TERMINAL_HEARTBEAT_INTERVAL;
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if send_terminal_message(&mut socket, Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(cmd) = serde_json::from_str::<TerminalCommand>(text.as_str()) {
+                            // Existing PTY writes/resize are synchronous and can block here.
+                            // Their cancellation/worker design requires separate review;
+                            // transport deadlines cannot preempt a blocked command.
+                            command(cmd).await;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
+                    None => break,
+                    Some(Err(error)) => {
+                        tracing::warn!("terminal WS receive error: {}", error);
+                        break;
+                    }
+                }
+            }
             maybe_output = output_rx.recv() => {
                 let Some(data) = maybe_output else {
                     break;
@@ -1245,44 +1370,19 @@ async fn handle_terminal_ws(
                     Err(_) => continue,
                 };
 
-                if socket.send(Message::Text(json.into())).await.is_err() {
+                if send_terminal_message(&mut socket, Message::Text(json.into())).await.is_err() {
                     break;
-                }
-            }
-            inbound = socket.recv() => {
-                match inbound {
-                    Ok(Some(Message::Text(text))) => {
-                        if let Ok(cmd) = serde_json::from_str::<TerminalCommand>(text.as_str()) {
-                            match cmd {
-                                TerminalCommand::Input { data } => {
-                                    if let Ok(bytes) = BASE64.decode(&data) {
-                                        tripwire.observe(&bytes);
-                                        let _ = pty_service.write(session_id_for_input, &bytes).await;
-                                    }
-                                }
-                                TerminalCommand::Resize { cols, rows } => {
-                                    let _ = pty_service.resize(session_id_for_input, cols, rows).await;
-                                }
-                                TerminalCommand::Presence { visible } => {
-                                    pty_service.set_cli_presence(session_id_for_input, visible);
-                                }
-                            }
-                        }
-                    }
-                    Ok(Some(Message::Close(_))) => break,
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(error) => {
-                        tracing::warn!("terminal WS receive error: {}", error);
-                        break;
-                    }
                 }
             }
         }
     }
 
-    let _ = deployment.pty().close_session(session_id).await;
+    close().await;
 }
+
+#[cfg(test)]
+#[path = "terminal_transport_tests.rs"]
+mod terminal_transport_tests;
 
 /// Poll for the workspace's CLI tmux session to appear after a spawn. The
 /// session existing proves tmux accepted `new-session` and the bootstrap (which
@@ -1539,8 +1639,8 @@ async fn send_error(socket: &mut MaybeSignedWebSocket, message: &str) -> anyhow:
         message: message.to_string(),
     };
     let json = serde_json::to_string(&msg).unwrap_or_default();
-    socket.send(Message::Text(json.into())).await?;
-    socket.close().await?;
+    send_terminal_message(socket, Message::Text(json.into())).await?;
+    tokio::time::timeout(TERMINAL_SEND_TIMEOUT, socket.close()).await??;
     Ok(())
 }
 

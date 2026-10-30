@@ -7,6 +7,10 @@ export default {
   resolve: {
     alias: [
       {
+        find: /^@remote\//,
+        replacement: `${path.resolve(repoRoot, 'packages/remote-web/src')}/`,
+      },
+      {
         find: /^@\//,
         replacement: `${path.resolve(repoRoot, 'packages/web-core/src')}/`,
       },
