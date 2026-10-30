@@ -1263,6 +1263,23 @@ async fn handle_terminal_ws(
     .await;
 }
 
+// Signed viewers answer in JavaScript; suspension beyond the response window
+// releases this attach only. The native tmux session remains available on reconnect.
+const TERMINAL_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+const TERMINAL_HEARTBEAT_RESPONSE: std::time::Duration = std::time::Duration::from_secs(15);
+const TERMINAL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn send_terminal_message<S>(socket: &mut S, message: Message) -> anyhow::Result<()>
+where
+    S: futures_util::Sink<Message, Error = anyhow::Error> + Unpin,
+{
+    use futures_util::SinkExt;
+    // A signed send can advance its sequence before flushing. Every error,
+    // including cancellation at this deadline, permanently ends this transport.
+    tokio::time::timeout(TERMINAL_SEND_TIMEOUT, socket.send(message)).await??;
+    Ok(())
+}
+
 // Keep transport independent of PTY creation so regressions exercise the actual loop
 // without starting tmux, a native agent, or a database.
 async fn run_terminal_transport<S, Command, CommandFuture, Close, CloseFuture>(
@@ -1279,10 +1296,59 @@ async fn run_terminal_transport<S, Command, CommandFuture, Close, CloseFuture>(
     Close: FnOnce() -> CloseFuture,
     CloseFuture: std::future::Future<Output = ()>,
 {
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::StreamExt;
+    use tokio::time::{Instant, sleep_until};
+
+    let mut next_probe = Instant::now() + TERMINAL_HEARTBEAT_INTERVAL;
+    let mut outstanding: Option<(Vec<u8>, Instant)> = None;
 
     loop {
+        let deadline = outstanding
+            .as_ref()
+            .map_or(next_probe, |(_, deadline)| *deadline);
         tokio::select! {
+            // Always poll liveness and inbound control frames before a ready PTY stream.
+            biased;
+            _ = sleep_until(deadline) => {
+                if outstanding.is_some() {
+                    break;
+                }
+                let challenge = Uuid::new_v4().as_bytes().to_vec();
+                if send_terminal_message(&mut socket, Message::Ping(challenge.clone().into())).await.is_err() {
+                    break;
+                }
+                outstanding = Some((challenge, Instant::now() + TERMINAL_HEARTBEAT_RESPONSE));
+            }
+            inbound = socket.next() => {
+                match inbound {
+                    Some(Ok(Message::Pong(payload))) => {
+                        if outstanding.as_ref().is_some_and(|(challenge, _)| challenge.as_slice() == payload.as_ref()) {
+                            outstanding = None;
+                            next_probe = Instant::now() + TERMINAL_HEARTBEAT_INTERVAL;
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if send_terminal_message(&mut socket, Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(cmd) = serde_json::from_str::<TerminalCommand>(text.as_str()) {
+                            // Existing PTY writes/resize are synchronous and can block here.
+                            // Their cancellation/worker design requires separate review;
+                            // transport deadlines cannot preempt a blocked command.
+                            command(cmd).await;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
+                    None => break,
+                    Some(Err(error)) => {
+                        tracing::warn!("terminal WS receive error: {}", error);
+                        break;
+                    }
+                }
+            }
             maybe_output = output_rx.recv() => {
                 let Some(data) = maybe_output else {
                     break;
@@ -1296,24 +1362,8 @@ async fn run_terminal_transport<S, Command, CommandFuture, Close, CloseFuture>(
                     Err(_) => continue,
                 };
 
-                if socket.send(Message::Text(json.into())).await.is_err() {
+                if send_terminal_message(&mut socket, Message::Text(json.into())).await.is_err() {
                     break;
-                }
-            }
-            inbound = socket.next() => {
-                match inbound {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Ok(cmd) = serde_json::from_str::<TerminalCommand>(text.as_str()) {
-                            command(cmd).await;
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) => break,
-                    Some(Ok(_)) => {}
-                    None => break,
-                    Some(Err(error)) => {
-                        tracing::warn!("terminal WS receive error: {}", error);
-                        break;
-                    }
                 }
             }
         }
@@ -1581,8 +1631,8 @@ async fn send_error(socket: &mut MaybeSignedWebSocket, message: &str) -> anyhow:
         message: message.to_string(),
     };
     let json = serde_json::to_string(&msg).unwrap_or_default();
-    socket.send(Message::Text(json.into())).await?;
-    socket.close().await?;
+    send_terminal_message(socket, Message::Text(json.into())).await?;
+    tokio::time::timeout(TERMINAL_SEND_TIMEOUT, socket.close()).await??;
     Ok(())
 }
 

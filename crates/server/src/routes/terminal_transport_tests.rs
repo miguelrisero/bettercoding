@@ -158,9 +158,17 @@ async fn close_and_transport_error_each_run_exact_cleanup_once() {
                 .send(tungstenite::Message::Close(None))
                 .await
                 .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), &mut connection.task)
+                .await
+                .expect("Close must finish while the peer remains connected")
+                .unwrap();
+        } else {
+            drop(connection.peer);
+            tokio::time::timeout(Duration::from_secs(1), &mut connection.task)
+                .await
+                .expect("transport error must finish cleanup")
+                .unwrap();
         }
-        drop(connection.peer);
-        connection.task.await.unwrap();
         assert_eq!(connection.closed.recv().await, Some(connection.id));
         assert_eq!(connection.closed.recv().await, None);
         assert!(connection.output.is_closed());
@@ -200,4 +208,31 @@ async fn continuous_output_cannot_starve_silent_peer_expiry() {
     connection.task.await.unwrap();
     producer.await.unwrap();
     drain.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn wrong_pong_challenge_cannot_keep_a_connection_alive() {
+    let mut connection = connection().await;
+    let responder = tokio::spawn(async move {
+        while let Some(message) = connection.peer.next().await {
+            let Ok(message) = message else { break };
+            if matches!(message, tungstenite::Message::Ping(_)) {
+                // Replace the automatically queued matching Pong before flushing it.
+                if connection
+                    .peer
+                    .send(tungstenite::Message::Pong(
+                        b"foreign-attach".to_vec().into(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+    elapse(60).await;
+    assert_eq!(connection.closed.try_recv().ok(), Some(connection.id));
+    connection.task.await.unwrap();
+    responder.abort();
 }

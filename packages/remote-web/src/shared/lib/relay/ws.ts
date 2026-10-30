@@ -175,6 +175,22 @@ class RelaySignedWebSocket extends EventTarget {
         return;
       }
       case "ping":
+        this.outboundQueue = this.outboundQueue
+          .then(async () => {
+            if (this.rawSocket.readyState !== WebSocket.OPEN) {
+              return;
+            }
+            const envelope = await buildRelayWsEnvelope(
+              this.signingContext,
+              "pong",
+              payload,
+            );
+            this.rawSocket.send(JSON.stringify(envelope));
+          })
+          .catch((error) => {
+            this.emitProtocolError(error);
+          });
+        return;
       case "pong":
         return;
     }
