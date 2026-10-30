@@ -1,5 +1,5 @@
 //! Application-enforced history. A process with SQLite write access can rewrite this ledger.
-use chrono::Utc;
+use chrono::{DateTime, Datelike, SecondsFormat, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -9,6 +9,29 @@ use uuid::Uuid;
 
 pub const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_ANSWER_BYTES: usize = 256 * 1024;
+
+fn required_nullable<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
+}
+fn utc_string(time: DateTime<Utc>) -> String {
+    time.to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+fn normalize_show_at(value: Option<&str>) -> Result<Option<String>> {
+    value
+        .map(|value| {
+            let parsed = DateTime::parse_from_rfc3339(value)
+                .map_err(|_| InputError::Code("SCHEMA_INVALID"))?
+                .with_timezone(&Utc);
+            // Fixed four-digit years and ordinary seconds keep SQLite text ordering exact.
+            if !(1..=9999).contains(&parsed.year()) || parsed.nanosecond() >= 1_000_000_000 {
+                return Err(InputError::Code("SCHEMA_INVALID"));
+            }
+            Ok(utc_string(parsed))
+        })
+        .transpose()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -43,6 +66,14 @@ pub struct InputContent {
 #[derive(Debug, Clone, Serialize, Deserialize, TS, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateInput {
+    /// Omit to preserve the schedule; null clears it. Timestamps require RFC3339 with a timezone.
+    #[serde(
+        default,
+        with = "serde_with::rust::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, type = "string | null")]
+    pub show_at: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
     pub external_key: String,
@@ -55,6 +86,14 @@ pub struct CreateInput {
 #[derive(Debug, Clone, Serialize, Deserialize, TS, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublishInput {
+    /// Omit to preserve the schedule; null clears it. Timestamps require RFC3339 with a timezone.
+    #[serde(
+        default,
+        with = "serde_with::rust::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, type = "string | null")]
+    pub show_at: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
     pub request_id: String,
@@ -62,6 +101,16 @@ pub struct PublishInput {
     pub expected_sequence: i64,
     pub content: InputContent,
     pub request_answer: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct SnoozeInput {
+    pub request_id: String,
+    #[ts(type = "number")]
+    pub expected_sequence: i64,
+    #[serde(deserialize_with = "required_nullable")]
+    pub show_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, schemars::JsonSchema)]
@@ -87,6 +136,7 @@ pub struct InputStatusWrite {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 pub struct WorkspaceInput {
+    pub show_at: Option<String>,
     pub priority: String,
     pub id: String,
     pub workspace_id: Uuid,
@@ -213,6 +263,7 @@ pub enum InputWrite {
     Answer(AnswerInput),
     Status(InputStatusWrite),
     Undo(InputStatusWrite),
+    Snooze(SnoozeInput),
 }
 impl InputWrite {
     fn write_key(&self) -> (&str, i64) {
@@ -220,6 +271,7 @@ impl InputWrite {
             Self::Create(v) => (&v.request_id, v.expected_sequence),
             Self::Publish(v) => (&v.request_id, v.expected_sequence),
             Self::Answer(v) => (&v.request_id, v.expected_sequence),
+            Self::Snooze(v) => (&v.request_id, v.expected_sequence),
             Self::Status(v) | Self::Undo(v) => (&v.request_id, v.expected_sequence),
         }
     }
@@ -393,8 +445,9 @@ impl WorkspaceInput {
             return Err(InputError::Code("INVALID_TRANSITION"));
         }
         let filter = statuses.join(",");
-        let rows: Vec<WorkspaceInput> = sqlx::query_as("SELECT * FROM workspace_inputs WHERE workspace_id=? AND id>? AND (?='' OR instr(','||?||',', ','||status||',')>0) ORDER BY id LIMIT ?")
-            .bind(workspace).bind(cursor).bind(&filter).bind(&filter).bind(limit.clamp(1, 100)+1).fetch_all(pool).await?;
+        let now = utc_string(Utc::now());
+        let rows: Vec<WorkspaceInput> = sqlx::query_as("SELECT * FROM workspace_inputs WHERE workspace_id=? AND id>? AND (?='' OR instr(','||?||',', ','||status||',')>0) AND (status!='open' OR show_at IS NULL OR show_at<=?) ORDER BY id LIMIT ?")
+            .bind(workspace).bind(cursor).bind(&filter).bind(&filter).bind(&now).bind(limit.clamp(1, 100)+1).fetch_all(pool).await?;
         let more = rows.len() > limit.clamp(1, 100) as usize;
         let mut inputs = Vec::new();
         for row in rows.into_iter().take(limit.clamp(1, 100) as usize) {
@@ -402,9 +455,10 @@ impl WorkspaceInput {
         }
         let next_cursor = more.then(|| inputs.last().unwrap().input.id.clone());
         let (pending_count,): (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM workspace_inputs WHERE workspace_id=? AND status='open'",
+            "SELECT count(*) FROM workspace_inputs WHERE workspace_id=? AND status='open' AND (show_at IS NULL OR show_at<=?)",
         )
         .bind(workspace)
+        .bind(&now)
         .fetch_one(pool)
         .await?;
         Ok(InputPage {
@@ -496,8 +550,9 @@ impl WorkspaceInput {
                 .to_string();
             return Ok(receipt(event, status));
         }
-        let now = Utc::now().to_rfc3339();
+        let now = utc_string(Utc::now());
         let mut content = None;
+        let mut new_generation = false;
         let (mut input, event_type, payload) = match &write {
             InputWrite::Create(request) => {
                 if !matches!(actor_kind, InputActorKind::AgentMcp) {
@@ -523,7 +578,11 @@ impl WorkspaceInput {
                 if exists.is_some() {
                     return Err(InputError::Code("IDEMPOTENCY_CONFLICT"));
                 }
+                new_generation = true;
                 let input = Self {
+                    show_at: normalize_show_at(
+                        request.show_at.as_ref().and_then(|v| v.as_deref()),
+                    )?,
                     priority: request
                         .priority
                         .clone()
@@ -539,8 +598,8 @@ impl WorkspaceInput {
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 };
-                sqlx::query("INSERT INTO workspace_inputs (id,workspace_id,external_key,creator,current_version,status,sequence,created_at,updated_at,priority) VALUES (?,?,?,?,?,?,?,?,?,?)")
-                    .bind(&input.id).bind(workspace).bind(&input.external_key).bind(actor).bind(1).bind("open").bind(0).bind(&now).bind(&now).bind(&input.priority).execute(&mut *tx).await?;
+                sqlx::query("INSERT INTO workspace_inputs (id,workspace_id,external_key,creator,current_version,status,sequence,created_at,updated_at,priority,show_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+                    .bind(&input.id).bind(workspace).bind(&input.external_key).bind(actor).bind(1).bind("open").bind(0).bind(&now).bind(&now).bind(&input.priority).bind(&input.show_at).execute(&mut *tx).await?;
                 content = Some(request.content.clone());
                 (
                     input,
@@ -580,6 +639,11 @@ impl WorkspaceInput {
                             validate_priority(&priority)?;
                             input.priority = priority;
                         }
+                        if let Some(show_at) = &request.show_at {
+                            input.show_at = normalize_show_at(show_at.as_deref())?;
+                            new_generation = true;
+                        }
+                        new_generation |= request.request_answer && input.status == "answered";
                         input.current_version += 1;
                         if request.request_answer {
                             input.status = "open".into();
@@ -589,6 +653,17 @@ impl WorkspaceInput {
                             "version_published",
                             json!({"content":request.content,"request_answer":request.request_answer}),
                         )
+                    }
+                    InputWrite::Snooze(request) => {
+                        if !matches!(actor_kind, InputActorKind::OwnerUi) {
+                            return Err(InputError::Code("FORBIDDEN"));
+                        }
+                        if input.status != "open" {
+                            return Err(InputError::Code("INVALID_TRANSITION"));
+                        }
+                        input.show_at = normalize_show_at(request.show_at.as_deref())?;
+                        new_generation = true;
+                        ("snoozed", json!({"show_at":input.show_at}))
                     }
                     InputWrite::Answer(request) => {
                         if !matches!(actor_kind, InputActorKind::OwnerUi) {
@@ -653,6 +728,7 @@ impl WorkspaceInput {
                             .ok_or(InputError::Code("INVALID_TRANSITION"))?
                             .to_string();
                         let (title, html, contract): (String, String, String) = sqlx::query_as("SELECT title,html,contract FROM workspace_input_versions WHERE workspace_id=? AND input_id=? AND version=?").bind(workspace).bind(id).bind(input.current_version).fetch_one(&mut *tx).await?;
+                        new_generation = input.status == "open";
                         let snapshot = InputContent {
                             title,
                             html,
@@ -673,6 +749,7 @@ impl WorkspaceInput {
         input.sequence += 1;
         let mut payload = payload;
         payload["status"] = json!(input.status);
+        payload["show_at"] = json!(input.show_at);
         if let Some(content) = content {
             let hash = digest(&canonical(&serde_json::to_value(&content)?));
             sqlx::query("INSERT INTO workspace_input_versions (workspace_id,input_id,version,title,html,contract,content_hash) VALUES (?,?,?,?,?,?,?)")
@@ -696,15 +773,127 @@ impl WorkspaceInput {
             prev_hash: previous.map_or_else(String::new, |p| p.0),
             hash: String::new(),
         };
-        event.hash = event_hash(&event);
-        event.cursor = sqlx::query("INSERT INTO workspace_input_events (id,workspace_id,input_id,sequence,actor_kind,actor,event_type,version,payload,request_id,request_hash,created_at,prev_hash,hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-            .bind(&event.id).bind(workspace).bind(&input.id).bind(event.sequence).bind(&event.actor_kind).bind(actor).bind(event_type).bind(event.version).bind(canonical(&event.payload)).bind(request_id).bind(&event.request_hash).bind(&now).bind(&event.prev_hash).bind(&event.hash).execute(&mut *tx).await?.last_insert_rowid();
-        sqlx::query("UPDATE workspace_inputs SET current_version=?,status=?,sequence=?,updated_at=?,priority=? WHERE workspace_id=? AND id=?")
-            .bind(input.current_version).bind(&input.status).bind(input.sequence).bind(&now).bind(&input.priority).bind(workspace).bind(&input.id).execute(&mut *tx).await?;
+        insert_event(&mut tx, &mut event).await?;
+        sqlx::query("UPDATE workspace_inputs SET current_version=?,status=?,sequence=?,updated_at=?,priority=?,show_at=? WHERE workspace_id=? AND id=?")
+            .bind(input.current_version).bind(&input.status).bind(input.sequence).bind(&now).bind(&input.priority).bind(&input.show_at).bind(workspace).bind(&input.id).execute(&mut *tx).await?;
+        if new_generation || input.status != "open" || matches!(&write, InputWrite::Answer(_)) {
+            sqlx::query("UPDATE workspace_input_availability SET finished_at=? WHERE workspace_id=? AND input_id=? AND finished_at IS NULL")
+                .bind(&now).bind(workspace).bind(&input.id).execute(&mut *tx).await?;
+        }
+        if new_generation {
+            sqlx::query("UPDATE workspace_inputs SET availability_generation=? WHERE workspace_id=? AND id=?")
+                .bind(&event.id).bind(workspace).bind(&input.id).execute(&mut *tx).await?;
+            if input.status == "open" {
+                let available = input
+                    .show_at
+                    .as_deref()
+                    .is_none_or(|time| time <= now.as_str());
+                sqlx::query("INSERT INTO workspace_input_availability(generation,workspace_id,input_id,available_event_id) VALUES (?,?,?,?)")
+                    .bind(&event.id).bind(workspace).bind(&input.id).bind(available.then_some(&event.id)).execute(&mut *tx).await?;
+            }
+        }
         tx.commit().await?;
         Ok(receipt(event, input.status))
     }
 }
+#[derive(Debug, FromRow)]
+pub struct InputNotificationClaim {
+    pub generation: String,
+    pub workspace_id: Uuid,
+    pub token: String,
+}
+
+async fn insert_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    event: &mut InputEvent,
+) -> Result<()> {
+    event.hash = event_hash(event);
+    event.cursor = sqlx::query("INSERT INTO workspace_input_events (id,workspace_id,input_id,sequence,actor_kind,actor,event_type,version,payload,request_id,request_hash,created_at,prev_hash,hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(&event.id).bind(event.workspace_id).bind(&event.input_id).bind(event.sequence).bind(&event.actor_kind).bind(&event.actor).bind(&event.event_type).bind(event.version).bind(canonical(&event.payload)).bind(&event.request_id).bind(&event.request_hash).bind(&event.created_at).bind(&event.prev_hash).bind(&event.hash).execute(&mut **tx).await?.last_insert_rowid();
+    Ok(())
+}
+
+impl WorkspaceInput {
+    /// Release at most 100 generations per tick, including overdue work after restart.
+    pub async fn release_due(pool: &SqlitePool) -> Result<usize> {
+        let now = utc_string(Utc::now());
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let due: Vec<(String, Uuid, String, i64, i64)> = sqlx::query_as("SELECT a.generation,i.workspace_id,i.id,i.sequence,i.current_version FROM workspace_input_availability a JOIN workspace_inputs i ON i.id=a.input_id AND i.workspace_id=a.workspace_id JOIN workspaces w ON w.id=i.workspace_id WHERE a.generation=i.availability_generation AND a.available_event_id IS NULL AND a.finished_at IS NULL AND i.status='open' AND (i.show_at IS NULL OR i.show_at<=?) ORDER BY i.show_at,i.id LIMIT 100")
+            .bind(&now).fetch_all(&mut *tx).await?;
+        for (generation, workspace, id, sequence, version) in &due {
+            let (previous,): (String,) = sqlx::query_as("SELECT hash FROM workspace_input_events WHERE workspace_id=? AND input_id=? ORDER BY sequence DESC LIMIT 1")
+                .bind(workspace).bind(id).fetch_one(&mut *tx).await?;
+            let mut event = InputEvent {
+                cursor: 0,
+                id: Uuid::new_v4().to_string(),
+                workspace_id: *workspace,
+                input_id: id.clone(),
+                sequence: sequence + 1,
+                actor_kind: "system".into(),
+                actor: "input_availability".into(),
+                event_type: "available".into(),
+                version: *version,
+                payload: json!({"status":"open", "generation":generation}),
+                request_id: format!("availability:{}", Uuid::new_v4()),
+                request_hash: digest(&canonical(&json!({"generation":generation}))),
+                created_at: now.clone(),
+                prev_hash: previous,
+                hash: String::new(),
+            };
+            insert_event(&mut tx, &mut event).await?;
+            sqlx::query(
+                "UPDATE workspace_inputs SET sequence=?,updated_at=? WHERE workspace_id=? AND id=?",
+            )
+            .bind(event.sequence)
+            .bind(&now)
+            .bind(workspace)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE workspace_input_availability SET available_event_id=? WHERE generation=?",
+            )
+            .bind(&event.id)
+            .bind(generation)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(due.len())
+    }
+
+    /// One atomic, expiring claim. Competing workers cannot own the same token.
+    pub async fn claim_notification(pool: &SqlitePool) -> Result<Option<InputNotificationClaim>> {
+        let time = Utc::now();
+        let now = utc_string(time);
+        let until = utc_string(time + chrono::Duration::seconds(60));
+        let token = Uuid::new_v4().to_string();
+        let claim = sqlx::query_as("UPDATE workspace_input_availability SET claim_token=?,claim_until=? WHERE generation=(SELECT a.generation FROM workspace_input_availability a JOIN workspace_inputs i ON i.id=a.input_id AND i.workspace_id=a.workspace_id JOIN workspaces w ON w.id=i.workspace_id WHERE a.generation=i.availability_generation AND a.available_event_id IS NOT NULL AND a.finished_at IS NULL AND (a.claim_until IS NULL OR a.claim_until<=?) AND i.status='open' AND (i.show_at IS NULL OR i.show_at<=?) ORDER BY a.generation LIMIT 1) RETURNING generation,workspace_id,claim_token AS token")
+            .bind(&token).bind(until).bind(&now).bind(&now).fetch_optional(pool).await?;
+        Ok(claim)
+    }
+
+    /// Recheck immediately before the external call. OS display remains best effort.
+    pub async fn notification_is_current(
+        pool: &SqlitePool,
+        claim: &InputNotificationClaim,
+    ) -> Result<bool> {
+        let now = utc_string(Utc::now());
+        let live: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM workspace_input_availability a JOIN workspace_inputs i ON i.id=a.input_id AND i.workspace_id=a.workspace_id JOIN workspaces w ON w.id=i.workspace_id WHERE a.generation=? AND a.claim_token=? AND a.claim_until>? AND a.finished_at IS NULL AND a.available_event_id IS NOT NULL AND a.generation=i.availability_generation AND i.status='open' AND (i.show_at IS NULL OR i.show_at<=?)")
+            .bind(&claim.generation).bind(&claim.token).bind(&now).bind(&now).fetch_optional(pool).await?;
+        Ok(live.is_some())
+    }
+
+    pub async fn finish_notification(
+        pool: &SqlitePool,
+        claim: &InputNotificationClaim,
+    ) -> Result<bool> {
+        let now = utc_string(Utc::now());
+        Ok(sqlx::query("UPDATE workspace_input_availability SET finished_at=?,claim_token=NULL,claim_until=NULL WHERE generation=? AND claim_token=? AND claim_until>? AND finished_at IS NULL")
+            .bind(&now).bind(&claim.generation).bind(&claim.token).bind(&now).execute(pool).await?.rows_affected()==1)
+    }
+}
+
 fn receipt(event: InputEvent, status: String) -> InputReceipt {
     InputReceipt {
         input_id: event.input_id.clone(),
@@ -722,6 +911,673 @@ fn receipt(event: InputEvent, status: String) -> InputReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schedule_presence_and_timestamp_contract() {
+        let legacy =
+            json!({"external_key":"k","request_id":"r","expected_sequence":0,"content":content()});
+        let request: CreateInput = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), legacy);
+        let mut explicit = legacy;
+        explicit["show_at"] = Value::Null;
+        let request: CreateInput = serde_json::from_value(explicit.clone()).unwrap();
+        assert_eq!(request.show_at, Some(None));
+        assert_eq!(serde_json::to_value(request).unwrap(), explicit);
+        assert_eq!(
+            normalize_show_at(Some("2026-11-02T09:00:00+01:00"))
+                .unwrap()
+                .as_deref(),
+            Some("2026-11-02T08:00:00.000000000Z")
+        );
+        for value in [
+            "2026-11-02T08:00:00",
+            "invalid",
+            "2026-02-30T08:00:00Z",
+            "2026-11-02T08:00:60Z",
+            "9999-12-31T23:59:59-01:00",
+        ] {
+            assert!(normalize_show_at(Some(value)).is_err(), "{value}");
+        }
+        assert!(
+            serde_json::from_value::<SnoozeInput>(json!({"request_id":"s","expected_sequence":1}))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<SnoozeInput>(
+                json!({"request_id":"s","expected_sequence":1,"show_at":null})
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_visibility_snooze_and_exact_retry() {
+        let (pool, workspace) = setup().await;
+        let mut request = match create() {
+            InputWrite::Create(r) => r,
+            _ => unreachable!(),
+        };
+        request.show_at = Some(Some("2099-11-02T09:00:00+01:00".into()));
+        let created = WorkspaceInput::write(
+            &pool,
+            workspace,
+            None,
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Create(request.clone()),
+        )
+        .await
+        .unwrap();
+        let retry = WorkspaceInput::write(
+            &pool,
+            workspace,
+            None,
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Create(request),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&created).unwrap(),
+            serde_json::to_value(retry).unwrap()
+        );
+        let detail = WorkspaceInput::detail(&pool, workspace, &created.input_id, None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            detail.input.show_at.as_deref(),
+            Some("2099-11-02T08:00:00.000000000Z")
+        );
+        for status in [None, Some("open"), Some("open,answered")] {
+            let page = WorkspaceInput::list(&pool, workspace, status, "", 1)
+                .await
+                .unwrap();
+            assert!(page.inputs.is_empty());
+            assert_eq!(page.pending_count, 0);
+        }
+        // An omitted publish field preserves the schedule and its delivery generation.
+        let published = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::AgentMcp,
+            "requester",
+            publish(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            WorkspaceInput::get(&pool, workspace, &created.input_id)
+                .await
+                .unwrap()
+                .show_at,
+            detail.input.show_at
+        );
+        let published_hash =
+            WorkspaceInput::detail(&pool, workspace, &created.input_id, None, true)
+                .await
+                .unwrap()
+                .version
+                .content_hash;
+        assert!(matches!(
+            WorkspaceInput::write(
+                &pool,
+                workspace,
+                Some(&created.input_id),
+                InputActorKind::OwnerUi,
+                "owner",
+                InputWrite::Snooze(SnoozeInput {
+                    request_id: "stale".into(),
+                    expected_sequence: 1,
+                    show_at: None
+                })
+            )
+            .await,
+            Err(InputError::Sequence(2))
+        ));
+        let snooze = || {
+            InputWrite::Snooze(SnoozeInput {
+                request_id: "snooze".into(),
+                expected_sequence: published.sequence,
+                show_at: None,
+            })
+        };
+        assert!(matches!(
+            WorkspaceInput::write(
+                &pool,
+                workspace,
+                Some(&created.input_id),
+                InputActorKind::AgentMcp,
+                "requester",
+                snooze()
+            )
+            .await,
+            Err(InputError::Code("FORBIDDEN"))
+        ));
+        let shown = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::OwnerUi,
+            "owner",
+            snooze(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(shown.version, published.version);
+        assert_eq!(shown.event.actor_kind, "owner_ui");
+        assert_eq!(shown.event.event_type, "snoozed");
+        assert!(shown.event.payload.get("answer").is_none());
+        assert_eq!(
+            WorkspaceInput::list(&pool, workspace, None, "", 1)
+                .await
+                .unwrap()
+                .pending_count,
+            1
+        );
+        assert_eq!(
+            WorkspaceInput::detail(&pool, workspace, &created.input_id, None, true)
+                .await
+                .unwrap()
+                .version
+                .content_hash,
+            published_hash
+        );
+        let claim = WorkspaceInput::claim_notification(&pool)
+            .await
+            .unwrap()
+            .unwrap();
+        WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::OwnerUi,
+            "owner",
+            answer(shown.sequence, shown.version),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !WorkspaceInput::notification_is_current(&pool, &claim)
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            WorkspaceInput::write(
+                &pool,
+                workspace,
+                Some(&created.input_id),
+                InputActorKind::OwnerUi,
+                "owner",
+                InputWrite::Snooze(SnoozeInput {
+                    request_id: "answered-snooze".into(),
+                    expected_sequence: shown.sequence + 1,
+                    show_at: None
+                })
+            )
+            .await,
+            Err(InputError::Code("INVALID_TRANSITION"))
+        ));
+        let retry = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::OwnerUi,
+            "owner",
+            snooze(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(shown).unwrap(),
+            serde_json::to_value(retry).unwrap()
+        );
+        assert!(
+            WorkspaceInput::verify(&pool, workspace, &created.input_id)
+                .await
+                .unwrap()
+                .valid
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_null_legacy_hash_and_invalid_schedule_are_atomic() {
+        let (pool, workspace) = setup().await;
+        let created = seed(&pool, workspace).await;
+        let legacy = json!({"request_id":"publish-legacy","expected_sequence":1,"content":content(),"request_answer":false});
+        let published = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Publish(serde_json::from_value(legacy.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            published.event.request_hash,
+            digest(&canonical(
+                &json!({"input_id":created.input_id,"actor_kind":"agent_mcp","actor":"requester","write":{"operation":"publish","body":legacy}})
+            ))
+        );
+        let mut request: PublishInput = serde_json::from_value(json!({"request_id":"scheduled","expected_sequence":2,"content":content(),"request_answer":false,"show_at":"2099-01-01T01:00:00+01:00"})).unwrap();
+        let scheduled = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Publish(request.clone()),
+        )
+        .await
+        .unwrap();
+        request.show_at = Some(Some("2099-01-01T00:00:00Z".into()));
+        assert!(matches!(
+            WorkspaceInput::write(
+                &pool,
+                workspace,
+                Some(&created.input_id),
+                InputActorKind::AgentMcp,
+                "requester",
+                InputWrite::Publish(request.clone())
+            )
+            .await,
+            Err(InputError::Code("IDEMPOTENCY_CONFLICT"))
+        ));
+        request.request_id = "invalid".into();
+        request.expected_sequence = scheduled.sequence;
+        request.show_at = Some(Some("invalid".into()));
+        assert!(matches!(
+            WorkspaceInput::write(
+                &pool,
+                workspace,
+                Some(&created.input_id),
+                InputActorKind::AgentMcp,
+                "requester",
+                InputWrite::Publish(request.clone())
+            )
+            .await,
+            Err(InputError::Code("SCHEMA_INVALID"))
+        ));
+        assert_eq!(
+            WorkspaceInput::get(&pool, workspace, &created.input_id)
+                .await
+                .unwrap()
+                .sequence,
+            scheduled.sequence
+        );
+        request.request_id = "clear".into();
+        request.show_at = Some(None);
+        WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Publish(request),
+        )
+        .await
+        .unwrap();
+        assert!(
+            WorkspaceInput::get(&pool, workspace, &created.input_id)
+                .await
+                .unwrap()
+                .show_at
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_release_claim_recovery_and_suppression() {
+        let (pool, workspace) = setup().await;
+        let created = seed(&pool, workspace).await;
+        let first = WorkspaceInput::claim_notification(&pool)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            WorkspaceInput::claim_notification(&pool)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // A new worker sees durable expired work and receives a different claim token.
+        sqlx::query(
+            "UPDATE workspace_input_availability SET claim_until='2000-01-01T00:00:00.000000000Z'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let recovered = WorkspaceInput::claim_notification(&pool)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.token, recovered.token);
+        assert!(
+            !WorkspaceInput::finish_notification(&pool, &first)
+                .await
+                .unwrap()
+        );
+        assert!(
+            WorkspaceInput::finish_notification(&pool, &recovered)
+                .await
+                .unwrap()
+        );
+        assert!(
+            WorkspaceInput::claim_notification(&pool)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let scheduled = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::OwnerUi,
+            "owner",
+            InputWrite::Snooze(SnoozeInput {
+                request_id: "later".into(),
+                expected_sequence: 1,
+                show_at: Some("2099-01-01T00:00:00Z".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(WorkspaceInput::release_due(&pool).await.unwrap(), 0);
+        // Advance only the retained in-memory fixture's schedule to simulate downtime.
+        sqlx::query("UPDATE workspace_inputs SET show_at='2000-01-01T00:00:00.000000000Z'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (a, b) = tokio::join!(
+            WorkspaceInput::release_due(&pool),
+            WorkspaceInput::release_due(&pool)
+        );
+        assert_eq!(a.unwrap() + b.unwrap(), 1);
+        let input = WorkspaceInput::get(&pool, workspace, &created.input_id)
+            .await
+            .unwrap();
+        assert_eq!(input.sequence, scheduled.sequence + 1);
+        assert_eq!(input.current_version, 1);
+        let events = WorkspaceInput::events(&pool, workspace, Some(&created.input_id), 0, 100)
+            .await
+            .unwrap()
+            .events;
+        assert_eq!(events.last().unwrap().actor_kind, "system");
+        assert_eq!(events.last().unwrap().event_type, "available");
+        assert!(events.last().unwrap().payload.get("answer").is_none());
+        let (a, b) = tokio::join!(
+            WorkspaceInput::claim_notification(&pool),
+            WorkspaceInput::claim_notification(&pool)
+        );
+        assert_eq!(
+            usize::from(a.unwrap().is_some()) + usize::from(b.unwrap().is_some()),
+            1
+        );
+        WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::AgentMcp,
+            "requester",
+            status(input.sequence, "closed"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            WorkspaceInput::claim_notification(&pool)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            WorkspaceInput::verify(&pool, workspace, &created.input_id)
+                .await
+                .unwrap()
+                .valid
+        );
+    }
+
+    #[tokio::test]
+    async fn rescheduling_cancellation_and_workspace_loss_suppress_claims() {
+        let (pool, workspace) = setup().await;
+        let created = seed(&pool, workspace).await;
+        let old = WorkspaceInput::claim_notification(&pool)
+            .await
+            .unwrap()
+            .unwrap();
+        let rescheduled = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::OwnerUi,
+            "owner",
+            InputWrite::Snooze(SnoozeInput {
+                request_id: "reschedule".into(),
+                expected_sequence: 1,
+                show_at: Some("2099-01-01T00:00:00Z".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !WorkspaceInput::notification_is_current(&pool, &old)
+                .await
+                .unwrap()
+        );
+        assert!(
+            WorkspaceInput::claim_notification(&pool)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::AgentMcp,
+            "requester",
+            status(rescheduled.sequence, "cancelled"),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE workspace_inputs SET show_at=NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(WorkspaceInput::release_due(&pool).await.unwrap(), 0);
+        assert!(
+            WorkspaceInput::claim_notification(&pool)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut request = match create() {
+            InputWrite::Create(r) => r,
+            _ => unreachable!(),
+        };
+        request.external_key = "second".into();
+        request.request_id = "second".into();
+        let second = WorkspaceInput::write(
+            &pool,
+            workspace,
+            None,
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Create(request),
+        )
+        .await
+        .unwrap();
+        let claim = WorkspaceInput::claim_notification(&pool)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("DELETE FROM workspaces WHERE id=?")
+            .bind(workspace)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !WorkspaceInput::notification_is_current(&pool, &claim)
+                .await
+                .unwrap()
+        );
+        assert!(
+            WorkspaceInput::claim_notification(&pool)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(WorkspaceInput::release_due(&pool).await.unwrap(), 0);
+        assert!(
+            WorkspaceInput::verify(&pool, workspace, &second.input_id)
+                .await
+                .unwrap()
+                .valid
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_preserves_history_high_water_and_has_no_backlog() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql("PRAGMA foreign_keys=ON; CREATE TABLE workspaces(id BLOB PRIMARY KEY); INSERT INTO workspaces VALUES (X'01');").execute(&pool).await.unwrap();
+        for migration in [
+            include_str!("../../migrations/20261027090000_workspace_inputs.sql"),
+            include_str!("../../migrations/20261028120000_workspace_input_priority.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+        }
+        sqlx::raw_sql("INSERT INTO workspace_inputs VALUES ('legacy',X'01','key','agent',1,'open',1,'old','old','P2'); INSERT INTO workspace_input_events VALUES (7,'event',X'01','legacy',1,'agent_mcp','agent','created',1,'{}','request','request-hash','old','','hash'); UPDATE sqlite_sequence SET seq=77 WHERE name='workspace_input_events';").execute(&pool).await.unwrap();
+        let before: (i64, String, String, String) =
+            sqlx::query_as("SELECT cursor,payload,request_hash,hash FROM workspace_input_events")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20261030120000_workspace_input_schedule.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let after: (i64, String, String, String) =
+            sqlx::query_as("SELECT cursor,payload,request_hash,hash FROM workspace_input_events")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(before, after);
+        let (high_water,): (i64,) =
+            sqlx::query_as("SELECT seq FROM sqlite_sequence WHERE name='workspace_input_events'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(high_water, 77);
+        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM workspace_input_availability")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(WorkspaceInput::release_due(&pool).await.unwrap(), 0);
+        assert!(
+            WorkspaceInput::claim_notification(&pool)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduling_preserves_answered_status_and_filters_before_pagination() {
+        let (pool, workspace) = setup().await;
+        for n in 0..4 {
+            let mut request = match create() {
+                InputWrite::Create(r) => r,
+                _ => unreachable!(),
+            };
+            request.request_id = format!("create-{n}");
+            request.external_key = request.request_id.clone();
+            request.show_at = if n < 2 {
+                Some(Some("2099-01-01T00:00:00Z".into()))
+            } else {
+                Some(Some("2000-01-01T00:00:00Z".into()))
+            };
+            WorkspaceInput::write(
+                &pool,
+                workspace,
+                None,
+                InputActorKind::AgentMcp,
+                "requester",
+                InputWrite::Create(request),
+            )
+            .await
+            .unwrap();
+        }
+        let first = WorkspaceInput::list(&pool, workspace, None, "", 1)
+            .await
+            .unwrap();
+        assert_eq!(first.inputs.len(), 1);
+        assert_eq!(first.pending_count, 2);
+        let second = WorkspaceInput::list(
+            &pool,
+            workspace,
+            None,
+            first.next_cursor.as_deref().unwrap(),
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.inputs.len(), 1);
+        assert!(second.next_cursor.is_none());
+        let id = &first.inputs[0].input.id;
+        WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(id),
+            InputActorKind::OwnerUi,
+            "owner",
+            answer(1, 1),
+        )
+        .await
+        .unwrap();
+        let mut request = match publish(2) {
+            InputWrite::Publish(r) => r,
+            _ => unreachable!(),
+        };
+        request.request_answer = false;
+        request.show_at = Some(Some("2099-01-01T00:00:00Z".into()));
+        let receipt = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(id),
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Publish(request),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.status, "answered");
+        assert_eq!(
+            WorkspaceInput::detail(&pool, workspace, id, None, false)
+                .await
+                .unwrap()
+                .answers
+                .len(),
+            1
+        );
+        assert_eq!(
+            WorkspaceInput::list(&pool, workspace, Some("answered"), "", 100)
+                .await
+                .unwrap()
+                .inputs
+                .len(),
+            1
+        );
+    }
 
     async fn setup() -> (SqlitePool, Uuid) {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -749,6 +1605,12 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20261030120000_workspace_input_schedule.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         let workspace = Uuid::new_v4();
         sqlx::query("INSERT INTO workspaces (id) VALUES (?)")
             .bind(workspace)
@@ -767,6 +1629,7 @@ mod tests {
             let mut content = content();
             content.title = title.into();
             InputWrite::Create(CreateInput {
+                show_at: None,
                 priority: priority.map(Into::into),
                 external_key: key.into(),
                 request_id: key.into(),
@@ -808,6 +1671,7 @@ mod tests {
             InputActorKind::AgentMcp,
             "requester",
             InputWrite::Publish(PublishInput {
+                show_at: None,
                 priority: None,
                 request_id: "republish".into(),
                 expected_sequence: 1,
@@ -1006,6 +1870,7 @@ mod tests {
     }
     fn create() -> InputWrite {
         InputWrite::Create(CreateInput {
+            show_at: None,
             priority: None,
             external_key: "rollout".into(),
             request_id: "create".into(),
@@ -1046,6 +1911,7 @@ mod tests {
     }
     fn publish(sequence: i64) -> InputWrite {
         InputWrite::Publish(PublishInput {
+            show_at: None,
             priority: None,
             request_id: format!("publish-{sequence}"),
             expected_sequence: sequence,

@@ -88,7 +88,7 @@ impl McpServer {
 #[tool_router(router = inputs_tools_router, vis = "pub")]
 impl McpServer {
     #[tool(
-        description = "Create one independently answerable workspace Input with self-contained HTML and a fixed answer contract. expected_sequence must be 0. Returns input_id, version, sequence, status, owner_url and event. Answers come only from the owner's UI. Application-enforced history includes a per-event hash chain; same-user processes can edit SQLite directly. Use bc.input.init and bc.input.propose protocol version 1 for page proposals; the owner must submit in trusted chrome. Optional priority P0 through P4; when omitted, a leading \"P<n> · \" in the title sets it, else P2. Never collect secrets."
+        description = "Create one independently answerable workspace Input with self-contained HTML and a fixed answer contract. expected_sequence must be 0. Returns input_id, version, sequence, status, owner_url and event. Answers come only from the owner's UI. Application-enforced history includes a per-event hash chain; same-user processes can edit SQLite directly. Use bc.input.init and bc.input.propose protocol version 1 for page proposals; the owner must submit in trusted chrome. Optional priority P0 through P4; when omitted, a leading \"P<n> · \" in the title sets it, else P2. Optional show_at is a timezone-bearing RFC3339 timestamp; null means immediate. Future open Inputs stay hidden until due. Never collect secrets."
     )]
     async fn create_input(&self, Parameters(request): Parameters<CreateRequest>) -> ToolCallResult {
         let workspace = match self.input_scope(request.workspace_id) {
@@ -103,7 +103,7 @@ impl McpServer {
         .await
     }
     #[tool(
-        description = "Publish an immutable Input version. Requires requester ownership, request_id and expected_sequence. request_answer=true returns an answered Input to open. Optional priority P0 through P4; when omitted, a leading \"P<n> · \" in the title sets it, else the current value stays. Closed or cancelled Inputs cannot be reopened."
+        description = "Publish an immutable Input version. Requires requester ownership, request_id and expected_sequence. request_answer=true returns an answered Input to open. Optional priority P0 through P4; when omitted, a leading \"P<n> · \" in the title sets it, else the current value stays. Optional show_at: omit to preserve, null to clear, or supply timezone-bearing RFC3339. Closed or cancelled Inputs cannot be reopened."
     )]
     async fn update_input(&self, Parameters(request): Parameters<UpdateRequest>) -> ToolCallResult {
         let workspace = match self.input_scope(request.workspace_id) {
@@ -248,6 +248,48 @@ mod tests {
             assert!(!name.contains("answer"));
         }
     }
+    #[test]
+    fn input_tools_preserve_schedule_presence_and_schema() {
+        let mut body = serde_json::json!({"expected_sequence":0,"request_id":"r","external_key":"k","content":{"title":"t","html":"<p>yes</p>","contract":{"choices":[],"allow_text":true,"allow_no_answer_yet":false}}});
+        let omitted: CreateRequest = serde_json::from_value(body.clone()).unwrap();
+        assert!(
+            serde_json::to_value(omitted.input)
+                .unwrap()
+                .get("show_at")
+                .is_none()
+        );
+        for value in [Value::Null, serde_json::json!("2026-11-02T09:00:00+01:00")] {
+            body["show_at"] = value.clone();
+            let parsed: CreateRequest = serde_json::from_value(body.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(parsed.input).unwrap()["show_at"],
+                value
+            );
+        }
+        body.as_object_mut().unwrap().remove("external_key");
+        body["input_id"] = serde_json::json!(Uuid::new_v4());
+        body["request_answer"] = serde_json::json!(false);
+        let parsed: UpdateRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            serde_json::to_value(parsed.input).unwrap()["show_at"],
+            "2026-11-02T09:00:00+01:00"
+        );
+        for schema in [
+            schemars::schema_for!(CreateRequest),
+            schemars::schema_for!(UpdateRequest),
+        ] {
+            let schema = serde_json::to_value(schema).unwrap();
+            assert!(schema["properties"].get("show_at").is_some());
+            assert!(
+                !schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v == "show_at")
+            );
+        }
+    }
+
     #[test]
     fn input_tools_accept_optional_priority() {
         let mut request = serde_json::json!({"expected_sequence":0,"request_id":"r","external_key":"k","content":{"title":"t","html":"<p>yes</p>","contract":{"choices":[],"allow_text":true,"allow_no_answer_yet":false}}});

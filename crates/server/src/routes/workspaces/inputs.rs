@@ -258,6 +258,23 @@ async fn close(
         .await?,
     )))
 }
+async fn snooze(
+    State(pool): State<SqlitePool>,
+    Path((workspace, id)): Path<(Uuid, String)>,
+    Json(body): Json<SnoozeInput>,
+) -> RouteResult<InputReceipt> {
+    Ok(Json(ApiResponse::success(
+        WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&id),
+            InputActorKind::OwnerUi,
+            "owner",
+            InputWrite::Snooze(body),
+        )
+        .await?,
+    )))
+}
 async fn undo(
     State(pool): State<SqlitePool>,
     Path((workspace, id)): Path<(Uuid, String)>,
@@ -404,6 +421,7 @@ fn input_routes() -> Router<SqlitePool> {
             post(answer).layer(DefaultBodyLimit::max(super::file_policy::MAX_INPUT_BYTES)),
         )
         .route("/{input_id}/priority", post(priority))
+        .route("/{input_id}/snooze", post(snooze))
         .route("/{input_id}/close", post(close))
         .route("/{input_id}/undo-close", post(undo))
         .route("/{input_id}/verify", get(verify))
@@ -414,6 +432,56 @@ fn input_routes() -> Router<SqlitePool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn owner_snooze_requires_presence_and_preserves_content_and_retry() {
+        use serde_json::json;
+        let (app, workspace, _) = test_app().await;
+        let root = format!("/api/workspaces/{workspace}/inputs");
+        let (_, _, created) = request(app.clone(), "POST", &format!("{root}/agent"), json!({
+            "request_id":"create", "expected_sequence":0,"external_key":"scheduled","show_at":"2099-01-01T00:00:00Z",
+            "content":{"title":"Decision","html":"<p>Choose</p>","contract":{"choices":[],"allow_text":true,"allow_no_answer_yet":false}}
+        })).await;
+        let id = created["data"]["input_id"].as_str().unwrap();
+        let url = format!("{root}/{id}/snooze");
+        let body = json!({"request_id":"show","expected_sequence":1,"show_at":null});
+        assert_eq!(
+            request(
+                app.clone(),
+                "POST",
+                &format!("{root}/{id}/agent/snooze"),
+                body.clone()
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            request(
+                app.clone(),
+                "POST",
+                &url,
+                json!({"request_id":"show","expected_sequence":1})
+            )
+            .await
+            .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let mut forged = body.clone();
+        forged["actor_kind"] = json!("system");
+        assert_eq!(
+            request(app.clone(), "POST", &url, forged).await.0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let (status, _, receipt) = request(app.clone(), "POST", &url, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(receipt["data"]["version"], 1);
+        assert_eq!(receipt["data"]["event"]["actor_kind"], "owner_ui");
+        assert_eq!(receipt["data"]["event"]["event_type"], "snoozed");
+        assert_eq!(request(app.clone(), "POST", &url, body).await.2, receipt);
+        let (_, _, list) = request(app, "GET", &root, json!(null)).await;
+        assert_eq!(list["data"]["pending_count"], 1);
+    }
 
     #[test]
     fn input_content_has_exact_isolated_headers() {
@@ -467,6 +535,12 @@ mod tests {
         .unwrap();
         sqlx::raw_sql(include_str!(
             "../../../../db/migrations/20261028120000_workspace_input_priority.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../../db/migrations/20261030120000_workspace_input_schedule.sql"
         ))
         .execute(&pool)
         .await
