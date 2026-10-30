@@ -5,6 +5,7 @@ import {
   useRef,
   type ReactNode,
 } from 'react';
+import { flushSync } from 'react-dom';
 import {
   Group,
   Panel,
@@ -38,25 +39,40 @@ export function WorkspaceSidebarGroup({
   children,
 }: WorkspaceSidebarGroupProps) {
   const panelRef = useRef<PanelImperativeHandle>(null);
+  const panelElementRef = useRef<HTMLDivElement>(null);
   const separatorRef = useRef<HTMLDivElement>(null);
   const groupRef = useRef<HTMLDivElement>(null);
+  const initialWidth = useRef(width);
   const visible = sidebar !== null && sidebar !== false;
   const restoreWidth = useCallback(() => {
-    if (visible) panelRef.current?.resize(width);
+    const group = groupRef.current;
+    if (visible && group) {
+      const available = group.clientWidth - SIDEBAR_SEPARATOR_WIDTH;
+      if (available > 0)
+        panelRef.current?.resize(`${(width / available) * 100}%`);
+    }
   }, [visible, width]);
 
   // Panel layouts are percentages internally. Restore the pixel preference when
   // parent geometry changes, without turning automatic geometry into a preference.
   useLayoutEffect(() => {
-    let frame = requestAnimationFrame(restoreWidth);
+    const frame = requestAnimationFrame(restoreWidth);
     const element = groupRef.current;
     if (!element) return;
+    let disposed = false;
     const observer = new ResizeObserver(() => {
-      cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(restoreWidth);
+      // Restore during observer delivery, before paint. Panel observation also
+      // catches constraint normalization that follows the group callback.
+      if (separatorRef.current?.getAttribute('data-separator') !== 'active') {
+        queueMicrotask(() => {
+          if (!disposed) flushSync(restoreWidth);
+        });
+      }
     });
     observer.observe(element);
+    if (panelElementRef.current) observer.observe(panelElementRef.current);
     return () => {
+      disposed = true;
       cancelAnimationFrame(frame);
       observer.disconnect();
     };
@@ -64,7 +80,12 @@ export function WorkspaceSidebarGroup({
 
   const commitWidth = useCallback(() => {
     const size = panelRef.current?.getSize();
-    if (size) onWidthChange(size.inPixels);
+    const group = groupRef.current;
+    if (size && group) {
+      // The library store updates before React commits the panel's DOM width.
+      const available = group.clientWidth - SIDEBAR_SEPARATOR_WIDTH;
+      onWidthChange((size.asPercentage / 100) * available);
+    }
   }, [onWidthChange]);
 
   useEffect(() => {
@@ -94,7 +115,8 @@ export function WorkspaceSidebarGroup({
     <Panel
       id={`${side}-sidebar`}
       panelRef={panelRef}
-      defaultSize={width}
+      elementRef={panelElementRef}
+      defaultSize={initialWidth.current}
       minSize={SIDEBAR_MIN_WIDTH}
       maxSize={SIDEBAR_MAX_WIDTH}
       className="h-full overflow-hidden"
@@ -109,7 +131,7 @@ export function WorkspaceSidebarGroup({
       aria-label={`Resize ${side} sidebar`}
       className="w-1 bg-transparent hover:bg-brand/50 focus-visible:bg-brand/50 focus-visible:outline-none transition-colors cursor-col-resize"
       style={{ width: SIDEBAR_SEPARATOR_WIDTH }}
-      onKeyUp={(event) => {
+      onKeyDown={(event) => {
         if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
           commitWidth();
         }
