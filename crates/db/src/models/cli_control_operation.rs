@@ -1,4 +1,9 @@
 //! Inert control custody. Native dispatch, confirmation provisioning and hook registration are unavailable.
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -76,6 +81,18 @@ pub struct CliControlOperation {
     pub confirmation_receipt_id: Option<String>,
     pub confirmation_principal: Option<String>,
     pub post_receipt_id: Option<String>,
+}
+
+/// Shared cooperating-writer mutex, including service-owned destructive lifecycle operations.
+/// ponytail: process-local exclusion; cross-process custody requires native acceptance.
+pub fn cli_writer_lock(workspace_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    locks.entry(workspace_id).or_default().clone()
 }
 
 pub fn digest(value: &str) -> String {

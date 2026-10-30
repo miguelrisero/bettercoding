@@ -192,3 +192,74 @@ async fn reservation_denies_resume_launch_signal_before_filesystem_effects() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn destructive_cleanup_refuses_fenced_workspace_before_effects() {
+    let (pool, request) = fixture().await;
+    reserve_cli_control(&pool, &request).await.unwrap();
+    assert!(matches!(
+        kill_cli_tmux_session(&pool, request.workspace_id, "test:fenced-delete").await,
+        Err(PtyError::ControlBusy(_))
+    ));
+    assert_eq!(
+        reap_cli_tmux_session_if_inactive(
+            &pool,
+            request.workspace_id,
+            ReapThresholds {
+                detached_idle_secs: 0,
+                attached_idle_secs: Some(0)
+            }
+        )
+        .await,
+        0
+    );
+    let workspace = Workspace::find_by_id(&pool, request.workspace_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!workspace.archived);
+    assert!(!workspace.worktree_deleted);
+}
+
+#[tokio::test]
+async fn leased_conversation_cannot_deliver_after_binding_replacement() {
+    use services::services::cli_collab::CliPasteTransport;
+    let (pool, request) = fixture().await;
+    let original = CliPaneBinding::find_by_id(&pool, request.binding_id)
+        .await
+        .unwrap()
+        .unwrap();
+    Session::set_pending_cli_prompt_if_empty(&pool, request.session_id, "queued for A")
+        .await
+        .unwrap();
+    CliPaneBinding::record_launch(
+        &pool,
+        request.workspace_id,
+        request.session_id,
+        Some(&Uuid::new_v4().to_string()),
+        CliPaneBoundVia::CliFresh,
+    )
+    .await
+    .unwrap();
+    let transport = crate::paste_transport::LocalCliPasteTransport { pool: pool.clone() };
+    assert!(
+        !transport
+            .paste_and_submit(
+                &services::services::cli_collab::CliPasteIdentity {
+                    workspace_id: original.workspace_id,
+                    session_id: original.session_id,
+                    binding_id: original.id,
+                    native_session_id: original.claude_session_id
+                },
+                "claude",
+                "queued for A"
+            )
+            .await
+    );
+    assert_eq!(
+        Session::peek_pending_cli_prompt_for_workspace(&pool, request.workspace_id)
+            .await
+            .unwrap(),
+        Some((request.session_id, "queued for A".into()))
+    );
+}

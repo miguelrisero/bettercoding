@@ -652,6 +652,10 @@ pub enum CreateFromPrError {
 /// as a background task to avoid blocking the error response.
 async fn cleanup_failed_pr_workspace(pool: &sqlx::SqlitePool, workspace: &Workspace) {
     let workspace_id = workspace.id;
+    let Ok(_writer) = local_deployment::pty::cli_writer_admission(pool, workspace_id).await else {
+        tracing::info!(%workspace_id, "Skipping failed PR cleanup under CLI control custody");
+        return;
+    };
 
     // Gather data needed for background filesystem cleanup before deleting DB records
     let workspace_dir = workspace.container_ref.clone().map(PathBuf::from);
@@ -679,6 +683,7 @@ async fn cleanup_failed_pr_workspace(pool: &sqlx::SqlitePool, workspace: &Worksp
     // Spawn background cleanup for filesystem resources (worktrees, workspace dir)
     if let Some(workspace_dir) = workspace_dir {
         tokio::spawn(async move {
+            let _writer = _writer;
             if let Err(e) = WorkspaceManager::cleanup_workspace(&workspace_dir, &repositories).await
             {
                 tracing::error!(

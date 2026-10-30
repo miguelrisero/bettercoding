@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use services::services::cli_collab::CliPasteTransport;
+use services::services::cli_collab::{CliPasteIdentity, CliPasteTransport};
 use uuid::Uuid;
 
 use crate::pty;
@@ -11,7 +11,12 @@ pub struct LocalCliPasteTransport {
 
 #[async_trait]
 impl CliPasteTransport for LocalCliPasteTransport {
-    async fn paste_and_submit(&self, workspace_id: Uuid, program: &str, text: &str) -> bool {
+    async fn paste_and_submit(
+        &self,
+        binding: &CliPasteIdentity,
+        program: &str,
+        text: &str,
+    ) -> bool {
         // Close the lease-to-paste TOCTOU window with a fresh pane-subtree
         // check under the send lock, immediately before the irreversible
         // keystroke injection. Only the agent the lease was derived for may
@@ -20,10 +25,7 @@ impl CliPasteTransport for LocalCliPasteTransport {
         if !pty::CLI_AGENT_PROGRAMS.contains(&program) {
             return false;
         }
-        let Some(target) = pty::locate_cli_tmux_target(workspace_id).await else {
-            return false;
-        };
-        pty::send_cli_keys_to_live_agent(&self.pool, &target, &[program], text)
+        pty::send_cli_keys_for_lease(&self.pool, binding, program, text)
             .await
             .ok()
             .flatten()

@@ -1863,7 +1863,24 @@ async fn kill_cli_tmux_sessions_on(workspace_id: Uuid, socket: &str, reason: &st
 /// Best-effort kill of a workspace's CLI tmux session so it cannot outlive
 /// its worktree. `=` forces exact-name matching; tmux `-t` is otherwise a
 /// prefix match.
-pub async fn kill_cli_tmux_session(workspace_id: Uuid, reason: &str) {
+pub async fn kill_cli_tmux_session(
+    pool: &SqlitePool,
+    workspace_id: Uuid,
+    reason: &str,
+) -> Result<(), PtyError> {
+    let _writer = cli_writer_admission(pool, workspace_id).await?;
+    kill_cli_tmux_session_admitted(pool, workspace_id, reason).await
+}
+
+/// Caller holds writer custody for the complete enclosing lifecycle operation.
+pub async fn kill_cli_tmux_session_admitted(
+    pool: &SqlitePool,
+    workspace_id: Uuid,
+    reason: &str,
+) -> Result<(), PtyError> {
+    CliControlOperation::ensure_unfenced(pool, workspace_id)
+        .await
+        .map_err(|e| PtyError::AdmissionUnavailable(e.to_string()))?;
     if tmux_available() {
         kill_cli_tmux_sessions_on(workspace_id, cli_tmux_socket(), reason).await;
     }
@@ -1874,6 +1891,7 @@ pub async fn kill_cli_tmux_session(workspace_id: Uuid, reason: &str) {
     // with an empty prompt while a concurrent delivery confirmation reads
     // "file gone + agent up" as delivered and clears the parked DB copy.
     remove_cli_prompt_file(workspace_id);
+    Ok(())
 }
 
 /// Capture the visible content of a workspace's CLI tmux pane (best-effort).
@@ -1948,13 +1966,7 @@ impl CliSendResult {
 /// sender holds are pruned on each lookup, so the map stays as small as the
 /// set of in-flight sends.
 fn cli_send_lock(workspace_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
-    let mut locks = LOCKS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
-    locks.entry(workspace_id).or_default().clone()
+    db::models::cli_control_operation::cli_writer_lock(workspace_id)
 }
 
 /// Shared cooperating-writer custody. Database failure denies admission.
@@ -2050,6 +2062,42 @@ pub async fn send_cli_keys_to_live_agent(
     text: &str,
 ) -> Result<Option<CliSendResult>, PtyError> {
     send_detached(pool, target, programs, text).await
+}
+
+pub async fn send_cli_keys_for_lease(
+    pool: &SqlitePool,
+    binding: &services::services::cli_collab::CliPasteIdentity,
+    program: &str,
+    text: &str,
+) -> Result<Option<CliSendResult>, PtyError> {
+    let pool = pool.clone();
+    let binding = binding.clone();
+    let program = program.to_owned();
+    let text = text.to_owned();
+    tokio::spawn(async move {
+        let _guard = cli_writer_admission(&pool, binding.workspace_id).await?;
+        let active = CliPaneBinding::find_active_for_workspace(&pool, binding.workspace_id)
+            .await
+            .map_err(|e| PtyError::AdmissionUnavailable(e.to_string()))?
+            .ok_or(PtyError::StaleBinding)?;
+        if active.id != binding.binding_id
+            || active.session_id != binding.session_id
+            || active.claude_session_id != binding.native_session_id
+        {
+            return Err(PtyError::StaleBinding);
+        }
+        let Some(mut target) = locate_cli_tmux_target(binding.workspace_id).await else {
+            return Ok(None);
+        };
+        target.session_name = resolve_cli_pane_id_on(&target.socket, &target.session_name).await?;
+        let programs = [program.as_str()];
+        let Some(owner) = pane_owner_among(&target, &programs).await else {
+            return Ok(None);
+        };
+        Ok(Some(send_cli_keys_locked(&target, owner, &text).await))
+    })
+    .await
+    .map_err(|e| PtyError::WriteFailed(e.to_string()))?
 }
 
 /// Run lock, optional ownership probe, paste and Enter as one spawned task. A
@@ -2575,9 +2623,13 @@ async fn reap_cli_tmux_session_with_liveness_on(
 /// session is spared unless
 /// [`ReapThresholds::attached_idle_secs`] says otherwise.
 pub(crate) async fn reap_cli_tmux_session_if_inactive(
+    pool: &SqlitePool,
     workspace_id: Uuid,
     thresholds: ReapThresholds,
 ) -> usize {
+    let Ok(_writer) = cli_writer_admission(pool, workspace_id).await else {
+        return 0;
+    };
     if !tmux_available() {
         return 0;
     }

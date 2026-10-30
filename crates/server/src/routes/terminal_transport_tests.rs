@@ -407,7 +407,7 @@ async fn rejected_input_returns_explicit_error_and_keeps_transport_available() {
             .unwrap();
             let response = peer.next().await.unwrap().unwrap().into_text().unwrap();
             let response: serde_json::Value = serde_json::from_str(&response).unwrap();
-            assert_eq!(response["type"], "error");
+            assert_eq!(response["type"], "input_rejected");
             assert_eq!(response["message"], error);
         }
         peer.send(tungstenite::Message::Close(None)).await.unwrap();

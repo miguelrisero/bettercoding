@@ -37,7 +37,7 @@ use local_deployment::{
     cli_activity::{AgentPresence, probe_workspace_agent},
     pty::{
         CliRespawnClaim, cli_restart_bootstrap, cli_tmux_available,
-        cli_tmux_session_exists_checked, kill_cli_tmux_session, respawn_cli_tmux_pane,
+        cli_tmux_session_exists_checked, kill_cli_tmux_session_admitted, respawn_cli_tmux_pane,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -365,7 +365,7 @@ async fn switch_agent_session(
         }
         let native_id = CliPaneBinding::resume_session_id(pool, session.id).await?;
         if cli_tmux_session_exists_checked(workspace_id).await? {
-            kill_cli_tmux_session(workspace_id, "switch_agent_session:explicit_handover").await;
+            kill_cli_tmux_session_admitted(pool, workspace_id, "switch_agent_session:explicit_handover").await?;
             if cli_tmux_session_exists_checked(workspace_id).await? {
                 return Err(ApiError::BadGateway(
                     "The CLI pane could not close for the conversation switch".into(),

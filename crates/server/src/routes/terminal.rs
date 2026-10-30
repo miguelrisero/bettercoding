@@ -35,9 +35,9 @@ use local_deployment::pty::{
     CLI_AGENT_PROGRAMS, CLI_PROMPT_PARKED_NOTICE, CliPromptDelivery, CliPromptRouting,
     CliSendResult, PtyCommand, capture_cli_pane, cli_pane_agent_running_at, cli_prompt_file_exists,
     cli_tmux_available, cli_tmux_session_exists_checked, cli_tmux_session_name,
-    cli_tmux_target_exists, kill_cli_tmux_session, locate_cli_tmux_target, remove_cli_prompt_file,
-    remove_cli_resume_ready_file, route_followup_prompt, route_initial_prompt,
-    send_cli_keys_to_live_agent,
+    cli_tmux_target_exists, kill_cli_tmux_session_admitted, locate_cli_tmux_target,
+    remove_cli_prompt_file, remove_cli_resume_ready_file, route_followup_prompt,
+    route_initial_prompt, send_cli_keys_to_live_agent,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -99,6 +99,7 @@ enum TerminalCommand {
 enum TerminalMessage {
     Output { data: String },
     Error { message: String },
+    InputRejected { message: String },
 }
 
 /// Recover the model + reasoning effort the workspace's CLI session should
@@ -679,15 +680,14 @@ async fn spawn_cli_terminal(
             let _ = deployment.pty().close_session(spawned.session_id).await;
             return Err(ApiError::Pty(error));
         }
-        if cli_tmux_available() {
-            if let Err(error) = deployment
+        if cli_tmux_available()
+            && let Err(error) = deployment
                 .pty()
                 .bind_cli_attachment(spawned.session_id, workspace.id)
                 .await
-            {
-                let _ = deployment.pty().close_session(spawned.session_id).await;
-                return Err(ApiError::Pty(error));
-            }
+        {
+            let _ = deployment.pty().close_session(spawned.session_id).await;
+            return Err(ApiError::Pty(error));
         }
         Ok(spawned)
     }
@@ -1133,11 +1133,13 @@ async fn spawn_terminal(
             Err(error) => Err(ApiError::Pty(error)),
         };
         if let Err(error) = registered {
-            kill_cli_tmux_session(
+            kill_cli_tmux_session_admitted(
+                &deployment.db().pool,
                 registration.workspace_id,
                 "spawn_terminal:registration_failed",
             )
-            .await;
+            .await
+            .map_err(|e| e.to_string())?;
             if let Some(delivery) = &prompt_delivery {
                 remove_cli_prompt_file(delivery.workspace_id);
             }
@@ -1365,7 +1367,7 @@ async fn run_terminal_transport<S, Command, CommandFuture, Close, CloseFuture>(
                             // Their cancellation/worker design requires separate review;
                             // transport deadlines cannot preempt a blocked command.
                             if let Err(message) = command(cmd).await {
-                                let error = TerminalMessage::Error { message };
+                                let error = TerminalMessage::InputRejected { message };
                                 let Ok(json) = serde_json::to_string(&error) else { break; };
                                 if send_terminal_message(&mut socket, Message::Text(json.into())).await.is_err() { break; }
                             }
