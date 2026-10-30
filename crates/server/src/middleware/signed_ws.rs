@@ -130,6 +130,10 @@ pub struct MaybeSignedWebSocket {
 }
 
 impl MaybeSignedWebSocket {
+    pub(crate) fn is_signed(&self) -> bool {
+        matches!(&self.inner, WebSocketInner::Signed(_))
+    }
+
     pub async fn send(&mut self, message: Message) -> anyhow::Result<()> {
         match &mut self.inner {
             WebSocketInner::Plain(ws) => SinkExt::send(ws, message)

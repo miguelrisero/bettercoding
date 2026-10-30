@@ -1230,10 +1230,11 @@ async fn handle_terminal_ws(
     let pty_service = deployment.pty().clone();
     let session_id_for_input = session_id;
 
+    let signed_transport = socket.is_signed();
     run_terminal_transport(
         socket,
         output_rx,
-        false,
+        signed_transport,
         |cmd| {
             if let TerminalCommand::Input { data } = &cmd
                 && let Ok(bytes) = BASE64.decode(data)
@@ -1264,7 +1265,7 @@ async fn handle_terminal_ws(
     .await;
 }
 
-// Signed viewers answer in JavaScript; suspension beyond the response window
+// Capable signed viewers answer in JavaScript; suspension beyond the response window
 // releases this attach only. The native tmux session remains available on reconnect.
 const TERMINAL_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 const TERMINAL_HEARTBEAT_RESPONSE: std::time::Duration = std::time::Duration::from_secs(15);
@@ -1286,7 +1287,7 @@ where
 async fn run_terminal_transport<S, Command, CommandFuture, Close, CloseFuture>(
     mut socket: S,
     mut output_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    _signed_transport: bool,
+    signed_transport: bool,
     mut command: Command,
     close: Close,
 ) where
@@ -1303,6 +1304,9 @@ async fn run_terminal_transport<S, Command, CommandFuture, Close, CloseFuture>(
 
     let mut next_probe = Instant::now() + TERMINAL_HEARTBEAT_INTERVAL;
     let mut outstanding: Option<(Vec<u8>, Instant)> = None;
+    // Legacy signed viewers discard probes. Require a verified matching Pong
+    // before using missing responses as evidence of a dead signed connection.
+    let mut receive_expiry_enabled = !signed_transport;
 
     loop {
         let deadline = outstanding
@@ -1312,9 +1316,10 @@ async fn run_terminal_transport<S, Command, CommandFuture, Close, CloseFuture>(
             // Always poll liveness and inbound control frames before a ready PTY stream.
             biased;
             _ = sleep_until(deadline) => {
-                if outstanding.is_some() {
+                if outstanding.is_some() && receive_expiry_enabled {
                     break;
                 }
+                // Rotate unanswered legacy probes without enabling receive expiry.
                 let challenge = Uuid::new_v4().as_bytes().to_vec();
                 if send_terminal_message(&mut socket, Message::Ping(challenge.clone().into())).await.is_err() {
                     break;
@@ -1325,6 +1330,7 @@ async fn run_terminal_transport<S, Command, CommandFuture, Close, CloseFuture>(
                 match inbound {
                     Some(Ok(Message::Pong(payload))) => {
                         if outstanding.as_ref().is_some_and(|(challenge, _)| challenge.as_slice() == payload.as_ref()) {
+                            receive_expiry_enabled = true;
                             outstanding = None;
                             next_probe = Instant::now() + TERMINAL_HEARTBEAT_INTERVAL;
                         }
