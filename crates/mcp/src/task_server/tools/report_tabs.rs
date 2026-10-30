@@ -48,7 +48,7 @@ impl McpServer {
 #[tool_router(router = report_tabs_tools_router, vis = "pub")]
 impl McpServer {
     #[tool(
-        description = "Create or replace a permanent workspace report tab. Up to 8 tabs, 6 columns, 30 rectangular rows, 200 Unicode characters per cell. Cells contain plain text, optional ok/warn/bad/none tone and absolute HTTP(S) URL. tab_id uses 1..64 lowercase ASCII letters, digits, _ or -. Title uses 1..80 visible characters; header labels use 1..40. URLs use at most 2048 bytes with a host and no credentials. Optional expected_updated_at provides atomic compare-and-set. Equal content retries keep the timestamp. Reports communicate agent status, never owner approval."
+        description = "Create or replace a permanent workspace report tab. Up to 8 tabs, 6 columns, 30 rectangular rows, 200 Unicode characters per cell. Prefer at most 2 columns and 3-5 words per column entry for small-width readability. More columns are allowed within the existing 6-column limit. Cells contain plain text, optional ok/warn/bad/none tone and absolute HTTP(S) URL. tab_id uses 1..64 lowercase ASCII letters, digits, _ or -. Title uses 1..80 visible characters; header labels use 1..40. URLs use at most 2048 bytes with a host and no credentials. Optional expected_updated_at provides atomic compare-and-set. Equal content retries keep the timestamp. Reports communicate agent status, never owner approval."
     )]
     async fn set_report_tab(&self, Parameters(request): Parameters<SetRequest>) -> ToolCallResult {
         let workspace = match self.report_scope(request.workspace_id) {
@@ -174,6 +174,33 @@ mod tests {
             serde_json::from_value::<DeleteRequest>(json!({"tab_id":"a","expected_updated_at":3}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn published_report_tool_recommends_narrow_tables_within_six_column_limit() {
+        for router in [
+            McpServer::report_tabs_tools_router(),
+            McpServer::global_mode_router(),
+            McpServer::orchestrator_mode_router(),
+        ] {
+            let tools = router.list_all();
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == "set_report_tab")
+                .expect("set_report_tab must be published");
+            let description = tool.description.as_deref().expect("report tool guidance");
+            for guidance in [
+                "at most 2 columns",
+                "3-5 words per column entry",
+                "small-width readability",
+                "More columns are allowed within the existing 6-column limit",
+            ] {
+                assert!(
+                    description.contains(guidance),
+                    "missing guidance: {guidance}"
+                );
+            }
+        }
     }
 
     #[test]
