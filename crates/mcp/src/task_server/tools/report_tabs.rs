@@ -177,6 +177,33 @@ mod tests {
     }
 
     #[test]
+    fn published_report_tool_recommends_narrow_tables_within_six_column_limit() {
+        for router in [
+            McpServer::report_tabs_tools_router(),
+            McpServer::global_mode_router(),
+            McpServer::orchestrator_mode_router(),
+        ] {
+            let tools = router.list_all();
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == "set_report_tab")
+                .expect("set_report_tab must be published");
+            let description = tool.description.as_deref().expect("report tool guidance");
+            for guidance in [
+                "at most 2 columns",
+                "3-5 words per column entry",
+                "small-width readability",
+                "More columns are allowed within the existing 6-column limit",
+            ] {
+                assert!(
+                    description.contains(guidance),
+                    "missing guidance: {guidance}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn report_tools_enforce_workspace_scope() {
         super::super::tests::install_rustls_provider();
         let mut server = McpServer::new_orchestrator("http://127.0.0.1:1");
