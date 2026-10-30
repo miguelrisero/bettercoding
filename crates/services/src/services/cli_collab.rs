@@ -96,11 +96,10 @@ pub trait CliWriterProbe: Send + Sync {
 
 #[async_trait]
 pub trait CliPasteTransport: Send + Sync {
-    /// Paste `text` and submit it, only if `program` still owns the pane when
-    /// the send lock is held. `program` is the agent the lease was derived
-    /// for, so the lease probe and the delivery can never disagree about
-    /// which agent receives the text.
-    async fn paste_and_submit(&self, workspace_id: Uuid, program: &str, text: &str) -> bool;
+    /// Paste only when the original lease's binding, app session, native session,
+    /// and program still match under shared writer custody. A mismatch retains the queue.
+    async fn paste_and_submit(&self, binding: &CliPasteIdentity, program: &str, text: &str)
+    -> bool;
     async fn pane_alive(&self, workspace_id: Uuid) -> AnyhowResult<bool>;
     async fn agent_running(&self, workspace_id: Uuid) -> Option<bool>;
     async fn signal_resume_ready(&self, workspace_id: Uuid, sid: &str) -> AnyhowResult<()>;
@@ -145,11 +144,20 @@ pub struct RetryDispatchContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliPasteIdentity {
+    pub workspace_id: Uuid,
+    pub session_id: Uuid,
+    pub binding_id: Uuid,
+    pub native_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriterLease {
     Executor,
     /// `claude_session_id` is the agent's own session id (a Codex thread id
     /// for Codex); `program` is the pane agent the paste must reach.
     Cli {
+        binding_id: Uuid,
         claude_session_id: Option<String>,
         program: String,
     },
@@ -363,12 +371,14 @@ impl CliCollabService {
         match (expected_sid.as_deref(), &report.sid_evidence) {
             (Some(expected), SidEvidence::ConfirmedResume(observed)) if expected == observed => {
                 WriterLease::Cli {
+                    binding_id: binding.id,
                     claude_session_id: Some(expected.to_string()),
                     program,
                 }
             }
             (None, SidEvidence::NoResumeArg) if binding.claude_session_id.is_none() => {
                 WriterLease::Cli {
+                    binding_id: binding.id,
                     claude_session_id: None,
                     program,
                 }
@@ -476,6 +486,7 @@ impl CliCollabService {
                 .await?
             }
             WriterLease::Cli {
+                binding_id,
                 claude_session_id,
                 program,
             } if !self.routing_disabled => {
@@ -486,8 +497,14 @@ impl CliCollabService {
                             .await?
                     }
                 };
-                self.paste_slot(session, row, claude_session_id.as_deref(), &program)
-                    .await?
+                self.paste_slot(
+                    session,
+                    row,
+                    binding_id,
+                    claude_session_id.as_deref(),
+                    &program,
+                )
+                .await?
             }
             WriterLease::Cli { .. } => {
                 self.queue_or_status(
@@ -681,6 +698,7 @@ impl CliCollabService {
         &self,
         session: &Session,
         row: SessionQueuedMessage,
+        binding_id: Uuid,
         claude_session_id: Option<&str>,
         program: &str,
     ) -> Result<DispatchOutcome, CliCollabError> {
@@ -698,7 +716,16 @@ impl CliCollabService {
         };
         if self
             .transport
-            .paste_and_submit(session.workspace_id, program, &claimed.prompt)
+            .paste_and_submit(
+                &CliPasteIdentity {
+                    workspace_id: session.workspace_id,
+                    session_id: session.id,
+                    binding_id,
+                    native_session_id: claude_session_id.map(str::to_owned),
+                },
+                program,
+                &claimed.prompt,
+            )
             .await
         {
             if !SessionQueuedMessage::mark_pasted(
@@ -1163,6 +1190,7 @@ impl CliCollabService {
             WriterLease::Executor | WriterLease::CliAmbiguous | WriterLease::Busy => Ok(false),
             WriterLease::Cli { .. } if dispatch_context.is_some() => Ok(false),
             WriterLease::Cli {
+                binding_id,
                 claude_session_id,
                 program,
             } => {
@@ -1170,7 +1198,13 @@ impl CliCollabService {
                     return Ok(false);
                 }
                 let routed = self
-                    .paste_slot(&session, row, claude_session_id.as_deref(), &program)
+                    .paste_slot(
+                        &session,
+                        row,
+                        binding_id,
+                        claude_session_id.as_deref(),
+                        &program,
+                    )
                     .await?;
                 Ok(matches!(routed, DispatchOutcome::RoutedToCli { .. }))
             }
@@ -1559,7 +1593,12 @@ mod tests {
 
     #[async_trait]
     impl CliPasteTransport for FakeTransport {
-        async fn paste_and_submit(&self, _workspace_id: Uuid, _program: &str, _text: &str) -> bool {
+        async fn paste_and_submit(
+            &self,
+            _binding: &CliPasteIdentity,
+            _program: &str,
+            _text: &str,
+        ) -> bool {
             true
         }
 
@@ -1592,7 +1631,12 @@ mod tests {
 
     #[async_trait]
     impl CliPasteTransport for RecordingTransport {
-        async fn paste_and_submit(&self, _workspace_id: Uuid, program: &str, text: &str) -> bool {
+        async fn paste_and_submit(
+            &self,
+            _binding: &CliPasteIdentity,
+            program: &str,
+            text: &str,
+        ) -> bool {
             let state = SessionQueuedMessage::find_active(&self.db.pool, self.session_id)
                 .await
                 .unwrap()
@@ -1626,7 +1670,12 @@ mod tests {
 
     #[async_trait]
     impl CliPasteTransport for SlowPasteTransport {
-        async fn paste_and_submit(&self, _workspace_id: Uuid, _program: &str, _text: &str) -> bool {
+        async fn paste_and_submit(
+            &self,
+            _binding: &CliPasteIdentity,
+            _program: &str,
+            _text: &str,
+        ) -> bool {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
                 self.started.notify_one();
@@ -1660,7 +1709,12 @@ mod tests {
 
     #[async_trait]
     impl CliPasteTransport for ResumeRecordingTransport {
-        async fn paste_and_submit(&self, _workspace_id: Uuid, _program: &str, _text: &str) -> bool {
+        async fn paste_and_submit(
+            &self,
+            _binding: &CliPasteIdentity,
+            _program: &str,
+            _text: &str,
+        ) -> bool {
             true
         }
 
@@ -2087,6 +2141,11 @@ mod tests {
         assert_eq!(
             service.derive_lease(&session).await,
             WriterLease::Cli {
+                binding_id: CliPaneBinding::find_active_for_session(&db.pool, session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
                 claude_session_id: Some("11111111-1111-4111-8111-111111111111".to_string()),
                 program: "claude".to_string(),
             }
@@ -2242,6 +2301,11 @@ mod tests {
         assert_eq!(
             service.derive_lease(&session).await,
             WriterLease::Cli {
+                binding_id: CliPaneBinding::find_active_for_session(&db.pool, session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
                 claude_session_id: Some(sid.to_string()),
                 program: "claude".to_string(),
             }
@@ -2636,6 +2700,11 @@ mod tests {
         assert_eq!(
             service.derive_lease(&session).await,
             WriterLease::Cli {
+                binding_id: CliPaneBinding::find_active_for_session(&db.pool, session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
                 claude_session_id: Some(thread.to_string()),
                 program: "codex".to_string(),
             }
@@ -3653,5 +3722,90 @@ mod tests {
                 .unwrap()
         );
         assert!(transport_state.lock().unwrap().pasted_prompts.is_empty());
+    }
+    #[tokio::test]
+    async fn paste_claim_keeps_original_lease_and_requeues_after_conversation_switch() {
+        struct SwitchBeforeDelivery {
+            db: DBService,
+            original: Uuid,
+            bytes: Arc<StdMutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl CliPasteTransport for SwitchBeforeDelivery {
+            async fn paste_and_submit(
+                &self,
+                identity: &CliPasteIdentity,
+                _: &str,
+                text: &str,
+            ) -> bool {
+                let claimed = SessionQueuedMessage::find_active(&self.db.pool, identity.session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(claimed.state, QueuedMessageState::Pasting);
+                assert_eq!(identity.binding_id, self.original);
+                assert_eq!(
+                    identity.native_session_id.as_deref(),
+                    Some("11111111-1111-4111-8111-111111111111")
+                );
+                CliPaneBinding::record_launch(
+                    &self.db.pool,
+                    identity.workspace_id,
+                    identity.session_id,
+                    Some("22222222-2222-4222-8222-222222222222"),
+                    CliPaneBoundVia::CliFresh,
+                )
+                .await
+                .unwrap();
+                let active =
+                    CliPaneBinding::find_active_for_workspace(&self.db.pool, identity.workspace_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                if active.id != identity.binding_id {
+                    return false;
+                }
+                self.bytes.lock().unwrap().push(text.to_string());
+                true
+            }
+            async fn pane_alive(&self, _: Uuid) -> AnyhowResult<bool> {
+                Ok(true)
+            }
+            async fn agent_running(&self, _: Uuid) -> Option<bool> {
+                Some(true)
+            }
+            async fn signal_resume_ready(&self, _: Uuid, _: &str) -> AnyhowResult<()> {
+                Ok(())
+            }
+        }
+        let (db, workspace, session) = fixture().await;
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let original = bind_confirmed_cli(&db, &workspace, &session, sid).await;
+        let row = store_message(
+            &db,
+            session.id,
+            "for original conversation",
+            QueuedMessageSource::Ui,
+        )
+        .await;
+        let bytes = Arc::new(StdMutex::new(Vec::new()));
+        let (service, _) = service_with_components(
+            db.clone(),
+            report(true, Some(true), SidEvidence::ConfirmedResume(sid.into())),
+            Arc::new(SwitchBeforeDelivery {
+                db: db.clone(),
+                original: original.id,
+                bytes: bytes.clone(),
+            }),
+            Arc::new(NeverDispatcher),
+        );
+        assert!(!service.drain_session(session.id).await.unwrap());
+        let retained = SessionQueuedMessage::find_by_id(&db.pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.state, QueuedMessageState::Queued);
+        assert_eq!(retained.prompt, "for original conversation");
+        assert!(bytes.lock().unwrap().is_empty());
     }
 }

@@ -33,6 +33,9 @@ async fn adopt(
 ) -> Result<Json<ApiResponse<AdoptWorkspaceSessionResponse>>, ApiError> {
     let _guard = cli_lifecycle_lock(request.workspace_id).lock_owned().await;
     let pool = &deployment.db().pool;
+    let _writer = local_deployment::pty::cli_writer_admission(pool, request.workspace_id)
+        .await
+        .map_err(|e| ApiError::Conflict(e.to_string()))?;
     let reservation = db::models::workspace_spawn_reservation::WorkspaceSpawnReservation::acquire(
         pool,
         request.workspace_id,

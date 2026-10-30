@@ -1,15 +1,22 @@
 use async_trait::async_trait;
-use services::services::cli_collab::CliPasteTransport;
+use services::services::cli_collab::{CliPasteIdentity, CliPasteTransport};
 use uuid::Uuid;
 
 use crate::pty;
 
-#[derive(Debug, Clone, Default)]
-pub struct LocalCliPasteTransport;
+#[derive(Debug, Clone)]
+pub struct LocalCliPasteTransport {
+    pub pool: sqlx::SqlitePool,
+}
 
 #[async_trait]
 impl CliPasteTransport for LocalCliPasteTransport {
-    async fn paste_and_submit(&self, workspace_id: Uuid, program: &str, text: &str) -> bool {
+    async fn paste_and_submit(
+        &self,
+        binding: &CliPasteIdentity,
+        program: &str,
+        text: &str,
+    ) -> bool {
         // Close the lease-to-paste TOCTOU window with a fresh pane-subtree
         // check under the send lock, immediately before the irreversible
         // keystroke injection. Only the agent the lease was derived for may
@@ -18,11 +25,10 @@ impl CliPasteTransport for LocalCliPasteTransport {
         if !pty::CLI_AGENT_PROGRAMS.contains(&program) {
             return false;
         }
-        let Some(target) = pty::locate_cli_tmux_target(workspace_id).await else {
-            return false;
-        };
-        pty::send_cli_keys_to_live_agent(&target, &[program], text)
+        pty::send_cli_keys_for_lease(&self.pool, binding, program, text)
             .await
+            .ok()
+            .flatten()
             .is_some_and(pty::CliSendResult::delivered)
     }
 
@@ -38,6 +44,7 @@ impl CliPasteTransport for LocalCliPasteTransport {
     }
 
     async fn signal_resume_ready(&self, workspace_id: Uuid, sid: &str) -> anyhow::Result<()> {
+        let _writer = pty::cli_writer_admission(&self.pool, workspace_id).await?;
         Ok(pty::write_cli_resume_ready_file(workspace_id, sid)?)
     }
 }

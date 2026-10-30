@@ -488,7 +488,7 @@ async fn deliver_due_wakeups(db: &DBService, _now: DateTime<Utc>) -> Result<(), 
             }
         }
 
-        if send_cli_keys(wid, &prompt).await {
+        if send_cli_keys(pool, wid, &prompt).await {
             if is_limit {
                 let _ = LoopAutomation::increment_attempts(pool, wid).await;
             }
