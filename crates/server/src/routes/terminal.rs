@@ -342,6 +342,7 @@ const LEAN_MCP_SERVERS: &[&str] = &[
     "context7",
     "fff",
     "figma",
+    "vanta",
 ];
 
 /// Write the per-workspace MCP config for `claude --mcp-config` and return its
@@ -1854,6 +1855,21 @@ mod tests {
         let servers = cli_mcp_servers(Some(&user), Some(&extra)).unwrap();
         assert_eq!(servers["figma"], user["mcpServers"]["figma"]);
         assert_eq!(servers["playwright"], user["mcpServers"]["playwright"]);
+    }
+
+    #[test]
+    fn cli_mcp_servers_preserve_configured_vanta_and_skip_absent_vanta() {
+        let lean = lean_mcp_names(None).unwrap();
+        assert!(lean.iter().any(|name| name == "vanta"));
+        let user = serde_json::json!({"mcpServers": {
+            "vanta": {"command": "synthetic-vanta", "args": ["--synthetic"],
+                      "env": {"SYNTHETIC_VALUE": "fixture"}}
+        }});
+        let servers = cli_mcp_servers(Some(&user), Some(&lean)).unwrap();
+        assert_eq!(servers["vanta"], user["mcpServers"]["vanta"]);
+        let absent = serde_json::json!({"mcpServers": {}});
+        let servers = cli_mcp_servers(Some(&absent), Some(&lean)).unwrap();
+        assert!(!servers.contains_key("vanta"));
     }
 
     #[test]
