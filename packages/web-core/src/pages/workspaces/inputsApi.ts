@@ -1,4 +1,4 @@
-import type { QueryClient } from '@tanstack/react-query';
+import { queryOptions, type QueryClient } from '@tanstack/react-query';
 import type {
   AnswerInput,
   InputDetail,
@@ -114,6 +114,19 @@ export const inputsApi = {
       }
     ),
 };
+
+export function inputDetailQueryOptions(
+  workspace: string,
+  host: string | null,
+  inputId: string
+) {
+  return queryOptions({
+    queryKey: ['input', host, workspace, inputId],
+    queryFn: () => inputsApi.get(workspace, host, inputId),
+    refetchOnWindowFocus: false,
+    refetchInterval: 10000,
+  });
+}
 
 // ponytail: pending queues are small; load every page, use server sorting if queues grow large.
 export async function loadPendingInputs(

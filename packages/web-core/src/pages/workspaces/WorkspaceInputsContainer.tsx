@@ -37,6 +37,7 @@ import {
   type InputBridge,
 } from './inputBridge';
 import {
+  inputDetailQueryOptions,
   inputsApi,
   loadPendingInputs,
   refreshInputAfterConflict,
@@ -458,11 +459,7 @@ function InputViewer({
   const [priorityBusy, setPriorityBusy] = useState(false);
   const [priorityError, setPriorityError] = useState<string | null>(null);
   const [reviewMessage, setReviewMessage] = useState<string | null>(null);
-  const detail = useQuery({
-    queryKey: ['input', host, workspaceId, inputId],
-    queryFn: () => inputsApi.get(workspaceId, host, inputId),
-    refetchOnWindowFocus: false,
-  });
+  const detail = useQuery(inputDetailQueryOptions(workspaceId, host, inputId));
   const input = detail.data?.input;
   return (
     <>
