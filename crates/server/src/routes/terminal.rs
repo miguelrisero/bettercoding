@@ -189,7 +189,9 @@ pub(super) async fn prepare_cli_launch_spec(
         let policy = claude_mcp_policy(workspace_id).await?;
         let generation = Uuid::new_v4();
         let unrestricted = runs_unrestricted(&spec);
-        let mcp_config = write_cli_mcp_config(generation, unrestricted, &policy).await?;
+        let mcp_config =
+            write_cli_mcp_config(workspace_id, generation, unrestricted, &policy).await?;
+        let supplement_present = unrestricted && mcp_config.is_some();
         if let Some((mcp_config, strict)) = mcp_config {
             if strict {
                 spec.base_args.push("--strict-mcp-config".to_string());
@@ -198,9 +200,12 @@ pub(super) async fn prepare_cli_launch_spec(
             spec.base_args
                 .push(mcp_config.to_string_lossy().into_owned());
         }
-        let settings =
-            write_cli_hook_settings(workspace_id, generation, policy.settings(unrestricted))
-                .await?;
+        let settings = write_cli_hook_settings(
+            workspace_id,
+            generation,
+            policy.settings(unrestricted, supplement_present),
+        )
+        .await?;
         spec.base_args.push("--settings".to_string());
         spec.base_args.push(settings.to_string_lossy().into_owned());
         if let Some(name) = workspace_name.map(str::trim).filter(|n| !n.is_empty()) {
@@ -354,6 +359,10 @@ const LEAN_MCP_SERVERS: &[&str] = &[
     "vanta",
 ];
 
+/// Native allowlists merge across settings scopes. Command or URL entries in
+/// another scope can prevent name matching; managed and built-in servers can
+/// be exempt. Names accept ASCII letters, digits, hyphens, and underscores,
+/// so connector display names require a different native policy mechanism.
 #[derive(Debug, PartialEq)]
 enum ClaudeMcpPolicy {
     All,
@@ -428,19 +437,22 @@ impl ClaudeMcpPolicy {
         }
     }
 
-    fn settings(&self, unrestricted: bool) -> serde_json::Value {
-        let Self::Allowlist(names) = self else {
-            return serde_json::json!({});
-        };
-        // Native policy keeps scope, trust, and managed-policy semantics.
-        let mut allowed: Vec<_> = names
-            .iter()
-            .map(|name| serde_json::json!({"serverName": name}))
-            .collect();
-        if unrestricted && !names.iter().any(|name| name == MCP_SERVER_NAME) {
-            allowed.push(serde_json::json!({"serverName": MCP_SERVER_NAME}));
+    fn settings(&self, unrestricted: bool, supplement_present: bool) -> serde_json::Value {
+        let mut settings = serde_json::json!({});
+        if !unrestricted {
+            settings["deniedMcpServers"] = serde_json::json!([{"serverName": MCP_SERVER_NAME}]);
         }
-        serde_json::json!({"allowedMcpServers": allowed})
+        if let Self::Allowlist(names) = self {
+            let mut allowed: Vec<_> = names
+                .iter()
+                .map(|name| serde_json::json!({"serverName": name}))
+                .collect();
+            if supplement_present && !names.iter().any(|name| name == MCP_SERVER_NAME) {
+                allowed.push(serde_json::json!({"serverName": MCP_SERVER_NAME}));
+            }
+            settings["allowedMcpServers"] = serde_json::json!(allowed);
+        }
+        settings
     }
 }
 
@@ -471,6 +483,7 @@ async fn claude_mcp_policy(workspace_id: Uuid) -> Result<ClaudeMcpPolicy, ApiErr
 /// profile copies user definitions and uses strict mode; native selection keeps
 /// project definitions, trust decisions, and command working directories.
 async fn write_cli_mcp_config(
+    workspace_id: Uuid,
     generation: Uuid,
     unrestricted: bool,
     policy: &ClaudeMcpPolicy,
@@ -518,7 +531,7 @@ async fn write_cli_mcp_config(
         return Ok(None);
     }
     let config = serde_json::json!({ "mcpServers": servers });
-    let path = dir.join(format!("{generation}.json"));
+    let path = dir.join(format!("{workspace_id}.{generation}.json"));
     // The copied legacy entries can carry the user's API keys.
     write_private(&path, config.to_string().as_bytes())
         .await
@@ -526,9 +539,8 @@ async fn write_cli_mcp_config(
     Ok(Some((path, strict)))
 }
 
-/// The per-workspace override `cli-mcp/<workspace_id>.servers.json`: a JSON
-/// array of extra server names (e.g. `["playwright"]`), or `"all"` to keep
-/// every server the user configured.
+/// Codex's legacy workspace override: an array adds names to its lean set;
+/// `"all"` preserves native discovery. Claude policies use a separate reader.
 async fn workspace_mcp_override(workspace_id: Uuid) -> Option<serde_json::Value> {
     let path = utils::assets::asset_dir()
         .join("cli-mcp")
@@ -558,14 +570,18 @@ fn lean_mcp_names(workspace_override: Option<&serde_json::Value>) -> Option<Vec<
     )
 }
 
-/// The user's servers plus a default Figma endpoint for a strict claude launch.
-/// `None` keeps all servers when requested or when the user's config cannot be
-/// read (a strict launch then would silently drop every configured server).
+/// Select legacy user servers with a default Figma endpoint. An absent map
+/// means zero user servers; malformed maps or absent input return `None`.
 fn cli_mcp_servers(
     user_config: Option<&serde_json::Value>,
     names: Option<&[String]>,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
-    let configured = user_config?.get("mcpServers")?.as_object()?;
+    let user_config = user_config?;
+    let empty = serde_json::Map::new();
+    let configured = match user_config.get("mcpServers") {
+        None => &empty,
+        Some(value) => value.as_object()?,
+    };
     Some(
         names?
             .iter()
@@ -706,7 +722,7 @@ async fn write_cli_hook_settings(
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|_| ApiError::Conflict("Could not create CLI settings directory".into()))?;
-    let path = dir.join(format!("{generation}.json"));
+    let path = dir.join(format!("{workspace_id}.{generation}.json"));
     write_private(&path, settings.to_string().as_bytes())
         .await
         .map_err(|_| ApiError::Conflict("Could not write CLI launch settings".into()))?;
@@ -1931,9 +1947,45 @@ mod tests {
     };
 
     #[test]
+    fn restricted_claude_denies_native_bettercoding_control() {
+        for policy in [
+            super::ClaudeMcpPolicy::All,
+            super::ClaudeMcpPolicy::Allowlist(vec!["bettercoding".into()]),
+            super::ClaudeMcpPolicy::Legacy(vec!["bettercoding".into()]),
+        ] {
+            assert_eq!(
+                policy.settings(false, false)["deniedMcpServers"],
+                serde_json::json!([{"serverName": "bettercoding"}])
+            );
+            assert!(
+                policy
+                    .settings(true, false)
+                    .get("deniedMcpServers")
+                    .is_none()
+            );
+        }
+        let policy = super::ClaudeMcpPolicy::Allowlist(vec!["slack".into()]);
+        assert_eq!(
+            policy.settings(true, false)["allowedMcpServers"],
+            serde_json::json!([{"serverName": "slack"}])
+        );
+    }
+
+    #[test]
+    fn legacy_claude_accepts_an_absent_user_server_map() {
+        let names = vec!["figma".to_string()];
+        let empty = serde_json::json!({});
+        let servers = cli_mcp_servers(Some(&empty), Some(&names)).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers["figma"]["url"], "https://mcp.figma.com/mcp");
+        let invalid = serde_json::json!({"mcpServers": []});
+        assert!(cli_mcp_servers(Some(&invalid), Some(&names)).is_none());
+    }
+
+    #[test]
     fn claude_mcp_default_keeps_native_discovery() {
         let policy = super::ClaudeMcpPolicy::parse(None).unwrap();
-        let settings = policy.settings(false);
+        let settings = policy.settings(true, false);
         assert!(settings.get("allowedMcpServers").is_none());
         assert!(policy.legacy_names().is_none());
         assert_eq!(
@@ -1949,14 +2001,14 @@ mod tests {
         })))
         .unwrap();
         assert_eq!(
-            policy.settings(false),
+            policy.settings(true, false),
             serde_json::json!({"allowedMcpServers": [
                 {"serverName": "patricia-staff"}, {"serverName": "project-only"}
             ]})
         );
         assert!(policy.legacy_names().is_none());
         assert_eq!(
-            policy.settings(true)["allowedMcpServers"],
+            policy.settings(true, true)["allowedMcpServers"],
             serde_json::json!([
                 {"serverName": "patricia-staff"}, {"serverName": "project-only"},
                 {"serverName": "bettercoding"}
@@ -1965,7 +2017,7 @@ mod tests {
         let empty =
             super::ClaudeMcpPolicy::parse(Some(&serde_json::json!({"allowlist": []}))).unwrap();
         assert_eq!(
-            empty.settings(false),
+            empty.settings(true, false),
             serde_json::json!({"allowedMcpServers": []})
         );
     }
@@ -2082,7 +2134,6 @@ mod tests {
         let lean = lean_mcp_names(None).unwrap();
         for user in [
             None,
-            Some(serde_json::json!({})),
             Some(serde_json::json!({"mcpServers": []})),
         ] {
             assert!(cli_mcp_servers(user.as_ref(), Some(&lean)).is_none());
