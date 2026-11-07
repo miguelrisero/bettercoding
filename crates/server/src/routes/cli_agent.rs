@@ -404,6 +404,22 @@ async fn switch_agent_session(
     result
 }
 
+pub(super) fn router() -> Router<DeploymentImpl> {
+    Router::new()
+        .route(
+            "/workspaces/{workspace_id}/cli/session/{session_id}",
+            post(switch_agent_session),
+        )
+        .route(
+            "/workspaces/{workspace_id}/cli/agent-status",
+            get(get_agent_status),
+        )
+        .route(
+            "/workspaces/{workspace_id}/cli/restart",
+            post(restart_agent),
+        )
+}
+
 #[cfg(test)]
 mod binding_diagnostics_tests {
     use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
@@ -523,7 +539,10 @@ mod binding_diagnostics_tests {
             let json = serde_json::to_value(&status).unwrap();
             assert_eq!(json["binding_id"], serde_json::json!(expected.0));
             assert_eq!(json["bound_app_session_id"], serde_json::json!(expected.1));
-            assert_eq!(json["bound_native_session_id"], serde_json::json!(expected.2));
+            assert_eq!(
+                json["bound_native_session_id"],
+                serde_json::json!(expected.2)
+            );
         }
     }
 
@@ -556,7 +575,12 @@ mod binding_diagnostics_tests {
         )
         .await
         .unwrap();
-        assert_binding(&pool, workspace_id, (Some(fresh.id), Some(session_id), None)).await;
+        assert_binding(
+            &pool,
+            workspace_id,
+            (Some(fresh.id), Some(session_id), None),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -630,20 +654,4 @@ mod binding_diagnostics_tests {
         )
         .await;
     }
-}
-
-pub(super) fn router() -> Router<DeploymentImpl> {
-    Router::new()
-        .route(
-            "/workspaces/{workspace_id}/cli/session/{session_id}",
-            post(switch_agent_session),
-        )
-        .route(
-            "/workspaces/{workspace_id}/cli/agent-status",
-            get(get_agent_status),
-        )
-        .route(
-            "/workspaces/{workspace_id}/cli/restart",
-            post(restart_agent),
-        )
 }
