@@ -149,6 +149,15 @@ async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switc
         .oneshot(())
         .await
         .unwrap();
+    fenced_archive_and_delete_have_zero_effects(
+        &app,
+        &deployment,
+        &workspace,
+        &session,
+        &native_id,
+        &pane_dir,
+    )
+    .await;
     let prefix = format!("/api/workspaces/{}/cli", workspace.id);
     existing_pane_reattaches_while_executor_holds_reservation(&app, pool, workspace.id, &prefix)
         .await;
@@ -204,7 +213,9 @@ async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switc
             local_deployment::cli_activity::AgentPresence::Alive
         );
     }
-    local_deployment::pty::kill_cli_tmux_session(workspace.id, "test:replace_sleep_fixture").await;
+    local_deployment::pty::kill_cli_tmux_session(pool, workspace.id, "test:replace_sleep_fixture")
+        .await
+        .unwrap();
 
     // Recreate and respawn the incident pane without any handover request.
     let stale_ack = acknowledge(pool, workspace.id).await;
@@ -224,7 +235,9 @@ async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switc
         local_deployment::cli_activity::probe_workspace_agent(workspace.id, "claude").await,
         local_deployment::cli_activity::AgentPresence::Alive
     );
-    local_deployment::pty::kill_cli_tmux_session(workspace.id, "test:passive_cleanup").await;
+    local_deployment::pty::kill_cli_tmux_session(pool, workspace.id, "test:passive_cleanup")
+        .await
+        .unwrap();
 
     for (executor, program, native) in [
         ("CLAUDE_CODE", "claude", native_id.clone()),
@@ -335,10 +348,12 @@ async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switc
                 fs::remove_file(&args_file).unwrap();
             } else if args_file.exists() {
                 local_deployment::pty::kill_cli_tmux_session(
+                    pool,
                     workspace.id,
                     "test:session_recreation",
                 )
-                .await;
+                .await
+                .unwrap();
                 fs::remove_file(&args_file).unwrap();
             }
             let response = app
@@ -366,7 +381,9 @@ async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switc
             );
         }
         if program == "codex" {
-            local_deployment::pty::kill_cli_tmux_session(workspace.id, "test:case_cleanup").await;
+            local_deployment::pty::kill_cli_tmux_session(pool, workspace.id, "test:case_cleanup")
+                .await
+                .unwrap();
         }
     }
     let foreign_workspace = Workspace::create(
@@ -456,9 +473,13 @@ async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switc
             .any(|arg| matches!(arg, "--continue" | "--resume")),
         "{args}"
     );
-    local_deployment::pty::kill_cli_tmux_session(workspace.id, "test:fresh_cleanup").await;
+    local_deployment::pty::kill_cli_tmux_session(pool, workspace.id, "test:fresh_cleanup")
+        .await
+        .unwrap();
     spawn_retries_executor_reservation_contention(&app, pool, workspace.id, &prefix).await;
-    local_deployment::pty::kill_cli_tmux_session(workspace.id, "test:retry_cleanup").await;
+    local_deployment::pty::kill_cli_tmux_session(pool, workspace.id, "test:retry_cleanup")
+        .await
+        .unwrap();
     reservation_release_failure_closes_spawned_tmux_client(
         &app,
         pool,
@@ -706,7 +727,9 @@ async fn reservation_release_failure_closes_spawned_tmux_client(
         .execute(pool)
         .await
         .unwrap();
-    local_deployment::pty::kill_cli_tmux_session(workspace, "test:release_failure_cleanup").await;
+    local_deployment::pty::kill_cli_tmux_session(pool, workspace, "test:release_failure_cleanup")
+        .await
+        .unwrap();
 }
 
 fn tmux_client_count(socket: &str) -> usize {
@@ -748,4 +771,99 @@ async fn spawn_retries_executor_reservation_contention(
         .await
         .unwrap();
     assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+}
+
+async fn fenced_archive_and_delete_have_zero_effects(
+    app: &axum::Router,
+    deployment: &LocalDeployment,
+    workspace: &Workspace,
+    session: &Session,
+    native_id: &str,
+    directory: &Path,
+) {
+    use db::models::cli_control_operation::{
+        CliControlOperation, ControlRequest, LaunchIdentity, digest,
+    };
+    use services::services::container::ContainerService;
+    let pool = &deployment.db().pool;
+    let binding = CliPaneBinding::find_active_for_workspace(pool, workspace.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let operation = local_deployment::pty::reserve_cli_control(
+        pool,
+        &ControlRequest {
+            request_id: "fenced-lifecycle".into(),
+            workspace_id: workspace.id,
+            session_id: session.id,
+            binding_id: binding.id,
+            launch: LaunchIdentity {
+                launch_id: Uuid::new_v4(),
+                native_session_id: native_id.into(),
+                socket: "synthetic".into(),
+                tmux_session: "synthetic".into(),
+                window: "@1".into(),
+                pane: "%1".into(),
+                pid: 42,
+                process_start: "100".into(),
+                executor: "CLAUDE_CODE".into(),
+                cwd: directory.to_string_lossy().into_owned(),
+            },
+            expected_model: "opus".into(),
+            target_model: "sol".into(),
+            requester: "owner".into(),
+            confirmation_principal: "owner-confirmation".into(),
+            hook_capability_digest: digest("synthetic"),
+            deadline_at: chrono::Utc::now() + chrono::Duration::minutes(1),
+        },
+    )
+    .await
+    .unwrap();
+    let url = format!("/api/workspaces/{}", workspace.id);
+    let archive = app
+        .clone()
+        .oneshot(
+            Request::put(&url)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"archived":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archive.status(), StatusCode::CONFLICT);
+    let delete = app
+        .clone()
+        .oneshot(Request::delete(&url).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), StatusCode::CONFLICT);
+    assert!(
+        deployment
+            .container()
+            .kill_cli_session(workspace.id)
+            .await
+            .is_err()
+    );
+    assert!(deployment.container().delete(workspace).await.is_err());
+    assert!(
+        deployment
+            .container()
+            .archive_workspace(workspace.id)
+            .await
+            .is_err()
+    );
+    let preserved = Workspace::find_by_id(pool, workspace.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!preserved.archived);
+    assert!(!preserved.worktree_deleted);
+    assert!(directory.is_dir());
+    assert_eq!(
+        local_deployment::cli_activity::probe_workspace_agent(workspace.id, "claude").await,
+        local_deployment::cli_activity::AgentPresence::Alive
+    );
+    CliControlOperation::cancel_undispatched(pool, operation.operation_id)
+        .await
+        .unwrap();
 }

@@ -85,6 +85,9 @@ async fn begin(
 ) -> Result<Json<ApiResponse<HandoverResponse>>, ApiError> {
     let _guard = cli_lifecycle_lock(request.workspace_id).lock_owned().await;
     let pool = &deployment.db().pool;
+    let _writer = local_deployment::pty::cli_writer_admission(pool, request.workspace_id)
+        .await
+        .map_err(|e| ApiError::Conflict(e.to_string()))?;
     let request_json = serde_json::to_string(&request).map_err(json_error)?;
     if let Some(op) =
         SessionHandover::find_request(pool, request.workspace_id, &request.request_id).await?
@@ -556,6 +559,10 @@ async fn confirm(
 ) -> Result<Json<ApiResponse<ConfirmHandoverResponse>>, ApiError> {
     let op = load(&deployment, id).await?;
     let _guard = cli_lifecycle_lock(op.workspace_id).lock_owned().await;
+    let _writer =
+        local_deployment::pty::cli_writer_admission(&deployment.db().pool, op.workspace_id)
+            .await
+            .map_err(|e| ApiError::Conflict(e.to_string()))?;
     let op = load(&deployment, id).await?;
     let token = headers
         .get("x-bc-handover-capability")
@@ -611,6 +618,12 @@ async fn confirm(
 pub async fn reconcile(deployment: &DeploymentImpl, now: DateTime<Utc>) -> Result<(), ApiError> {
     for pending in SessionHandover::unfinished(&deployment.db().pool).await? {
         let _guard = cli_lifecycle_lock(pending.workspace_id).lock_owned().await;
+        let _writer = local_deployment::pty::cli_writer_admission(
+            &deployment.db().pool,
+            pending.workspace_id,
+        )
+        .await
+        .map_err(|e| ApiError::Conflict(e.to_string()))?;
         let op = load(deployment, pending.operation_id).await?;
         if !matches!(op.phase.as_str(), "starting" | "awaiting_confirmation") {
             continue;

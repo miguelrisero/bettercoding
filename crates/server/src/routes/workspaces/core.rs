@@ -93,6 +93,24 @@ pub async fn update_workspace(
     let pool = &deployment.db().pool;
     let is_archiving = request.archived == Some(true) && !workspace.archived;
 
+    let _lifecycle = if is_archiving {
+        Some(
+            crate::routes::cli_agent::cli_lifecycle_lock(workspace.id)
+                .lock_owned()
+                .await,
+        )
+    } else {
+        None
+    };
+    let _writer = if is_archiving {
+        Some(
+            local_deployment::pty::cli_writer_admission(pool, workspace.id)
+                .await
+                .map_err(|e| ApiError::Conflict(e.to_string()))?,
+        )
+    } else {
+        None
+    };
     let old_name = workspace.name.clone();
     Workspace::update(
         pool,
@@ -102,6 +120,12 @@ pub async fn update_workspace(
         request.name.as_deref(),
     )
     .await?;
+    if is_archiving {
+        deployment
+            .container()
+            .archive_workspace_admitted(workspace.id)
+            .await?;
+    }
     let updated = Workspace::find_by_id(pool, workspace.id)
         .await?
         .ok_or(WorkspaceError::WorkspaceNotFound)?;
@@ -137,10 +161,6 @@ pub async fn update_workspace(
             )
             .await;
         });
-    }
-
-    if is_archiving && let Err(e) = deployment.container().archive_workspace(workspace.id).await {
-        tracing::error!("Failed to archive workspace {}: {}", workspace.id, e);
     }
 
     Ok(ResponseJson(ApiResponse::success(updated)))
@@ -296,6 +316,12 @@ pub async fn delete_workspace_core(
     let pool = &deployment.db().pool;
     let workspace_manager = deployment.workspace_manager();
     let workspace_id = workspace.id;
+    let _lifecycle = crate::routes::cli_agent::cli_lifecycle_lock(workspace_id)
+        .lock_owned()
+        .await;
+    let _writer = local_deployment::pty::cli_writer_admission(pool, workspace_id)
+        .await
+        .map_err(|e| ApiError::Conflict(e.to_string()))?;
 
     if ExecutionProcess::has_running_non_dev_server_processes_for_workspace(pool, workspace_id)
         .await?
@@ -332,7 +358,10 @@ pub async fn delete_workspace_core(
     // not an execution_process, so the running-process guard above misses it;
     // without this, deletion can orphan a `bc_<id>` tmux session.
     // Best-effort + idempotent (no-op if already gone or tmux is absent).
-    deployment.container().kill_cli_session(workspace_id).await;
+    deployment
+        .container()
+        .kill_cli_session_admitted(workspace_id)
+        .await?;
 
     let managed_workspace = workspace_manager.load_managed_workspace(workspace).await?;
     let deletion_context = managed_workspace.prepare_deletion_context().await?;

@@ -248,7 +248,7 @@ impl Deployment for LocalDeployment {
 
         let file_search_cache = Arc::new(FileSearchCache::new());
 
-        let pty = PtyService::new();
+        let pty = PtyService::with_pool(db.pool.clone());
         let relay_hosts = match remote_client.clone().ok() {
             Some(remote_client) => Some(Arc::new(
                 RelayHosts::load(
@@ -293,7 +293,9 @@ impl Deployment for LocalDeployment {
         let cli_collab = CliCollabService::spawn(
             db.clone(),
             writer_probe,
-            Arc::new(LocalCliPasteTransport),
+            Arc::new(LocalCliPasteTransport {
+                pool: db.pool.clone(),
+            }),
             Arc::new(container.clone()),
             claude_transcript_ingest.clone(),
             shutdown.child_token(),

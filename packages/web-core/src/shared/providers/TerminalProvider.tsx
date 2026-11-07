@@ -16,6 +16,7 @@ import {
 import { openLocalApiWebSocket } from '@/shared/lib/localApiTransport';
 import { sendPresence } from '@/shared/lib/terminalPresence';
 import { terminalAttemptIsStale } from '@/shared/lib/terminalWsUrl';
+import { handleTerminalCommandError } from '@/shared/lib/terminalCommandError';
 
 interface TerminalConnection {
   ws: WebSocket;
@@ -712,16 +713,11 @@ export function TerminalProvider({ children }: TerminalProviderProps) {
                   callbacks.onData(decodeBase64(msg.data));
                 } else if (msg.type === 'exit' && callbacks) {
                   callbacks.onExit?.();
-                } else if (msg.type === 'error' && callbacks) {
-                  // Hard backend error (e.g. PTY creation failed). Surface it
-                  // in the terminal and stop the reconnect loop — retrying a
-                  // failed create_session forever just blinks silently. The
-                  // release frees the slot so the NEXT user-initiated mount
-                  // or session switch tries once afresh.
-                  release();
-                  callbacks.onData(
-                    `\r\n\x1b[31m${msg.message ?? 'terminal error'}\x1b[0m\r\n`
-                  );
+                } else if (
+                  (msg.type === 'error' || msg.type === 'input_rejected') &&
+                  callbacks
+                ) {
+                  handleTerminalCommandError(msg, release, callbacks.onData);
                 }
               } catch {
                 // Ignore parse errors

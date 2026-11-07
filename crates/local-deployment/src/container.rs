@@ -292,9 +292,27 @@ impl LocalContainerService {
     }
 
     async fn cleanup_workspace(&self, workspace: &Workspace) {
+        let Ok(_writer) = crate::pty::cli_writer_admission(&self.db.pool, workspace.id).await
+        else {
+            tracing::info!(workspace_id = %workspace.id, "Skipping cleanup under CLI control custody");
+            return;
+        };
+        self.cleanup_workspace_admitted(workspace).await;
+    }
+
+    async fn cleanup_workspace_admitted(&self, workspace: &Workspace) {
         // The workspace's CLI tmux session (if any) must not outlive its
         // worktree. Best-effort.
-        crate::pty::kill_cli_tmux_session(workspace.id, "cleanup_workspace:worktree_cleanup").await;
+        if let Err(error) = crate::pty::kill_cli_tmux_session_admitted(
+            &self.db.pool,
+            workspace.id,
+            "cleanup_workspace:worktree_cleanup",
+        )
+        .await
+        {
+            tracing::warn!(%error, "Skipping workspace cleanup");
+            return;
+        }
 
         let Some(container_ref) = &workspace.container_ref else {
             return;
@@ -526,6 +544,7 @@ impl LocalContainerService {
             // decision independently for each home. A user may have attached,
             // activity may be fresh, or one socket may now be unreadable.
             let killed = crate::pty::reap_cli_tmux_session_if_inactive(
+                &self.db.pool,
                 workspace_id,
                 crate::pty::ReapThresholds {
                     detached_idle_secs: ACTIVITY_GRACE_SECS,
@@ -1426,8 +1445,14 @@ impl ContainerService for LocalContainerService {
         &self.msg_stores
     }
 
-    async fn kill_cli_session(&self, workspace_id: Uuid) {
-        crate::pty::kill_cli_tmux_session(workspace_id, "kill_cli_session:explicit_cleanup").await;
+    async fn kill_cli_session_admitted(&self, workspace_id: Uuid) -> Result<(), ContainerError> {
+        crate::pty::kill_cli_tmux_session_admitted(
+            &self.db.pool,
+            workspace_id,
+            "kill_cli_session:explicit_cleanup",
+        )
+        .await
+        .map_err(|e| ContainerError::CliControlBusy(e.to_string()))
     }
 
     fn db(&self) -> &DBService {
@@ -1532,8 +1557,11 @@ impl ContainerService for LocalContainerService {
     }
 
     async fn delete(&self, workspace: &Workspace) -> Result<(), ContainerError> {
+        let _writer = crate::pty::cli_writer_admission(&self.db.pool, workspace.id)
+            .await
+            .map_err(|e| ContainerError::CliControlBusy(e.to_string()))?;
         self.try_stop(workspace, true).await;
-        self.cleanup_workspace(workspace).await;
+        self.cleanup_workspace_admitted(workspace).await;
         Ok(())
     }
 

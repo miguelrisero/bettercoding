@@ -23,6 +23,7 @@ sha2 = "0.10"
 schemars = { workspace = true }
 url = "2.5"
 
-[dev-dependencies]
 tokio = { workspace = true }
+
+[dev-dependencies]
 tempfile = "3"

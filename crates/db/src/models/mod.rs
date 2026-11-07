@@ -1,5 +1,6 @@
 pub mod archive_bucket;
 pub mod claude_session_link;
+pub mod cli_control_operation;
 pub mod cli_ingest_outbox;
 pub mod cli_native_file;
 pub mod cli_native_record;

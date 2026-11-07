@@ -141,8 +141,10 @@ async fn propagate_rename(pool: &SqlitePool, workspace_id: Uuid, name: &str) -> 
         && should_inject_rename_keys(name, Some(latest_activity), now_unix_secs())
     {
         let command = format!("/rename {name}");
-        if !send_cli_keys_to_live_agent(&target, &["claude"], &command)
+        if !send_cli_keys_to_live_agent(pool, &target, &["claude"], &command)
             .await
+            .ok()
+            .flatten()
             .is_some_and(CliSendResult::delivered)
         {
             tracing::debug!(

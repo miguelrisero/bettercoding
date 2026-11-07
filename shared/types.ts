@@ -499,7 +499,15 @@ blocker: CliRestartBlocker | null,
 /**
  * The agent binary the liveness probe looked for, for diagnostics.
  */
-program: string, binding_id: string | null, };
+program: string, binding_id: string | null, 
+/**
+ * App session owned by the same active binding as `binding_id`.
+ */
+bound_app_session_id: string | null, 
+/**
+ * Native session recorded on that active binding, when discovered.
+ */
+bound_native_session_id: string | null, };
 
 export type SwitchCliSessionRequest = { acknowledge_agent_shutdown: boolean, expected_binding_id: string | null, };
 

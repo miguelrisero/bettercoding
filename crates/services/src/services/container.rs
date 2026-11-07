@@ -64,6 +64,8 @@ pub type ContainerRef = String;
 
 #[derive(Debug, Error)]
 pub enum ContainerError {
+    #[error("CLI control custody prevents workspace lifecycle effects: {0}")]
+    CliControlBusy(String),
     #[error(transparent)]
     GitServiceError(#[from] GitServiceError),
     #[error(transparent)]
@@ -546,12 +548,38 @@ pub trait ContainerService {
     /// deployment) MUST override this so delete/archive don't leak a detached
     /// `claude` session that outlives its workspace — the interactive session
     /// is not an `execution_process`, so the running-process guards miss it.
-    async fn kill_cli_session(&self, _workspace_id: Uuid) {}
+    async fn kill_cli_session(&self, workspace_id: Uuid) -> Result<(), ContainerError> {
+        let _writer = db::models::cli_control_operation::cli_writer_lock(workspace_id)
+            .lock_owned()
+            .await;
+        db::models::cli_control_operation::CliControlOperation::ensure_unfenced(
+            &self.db().pool,
+            workspace_id,
+        )
+        .await
+        .map_err(|e| ContainerError::CliControlBusy(e.to_string()))?;
+        self.kill_cli_session_admitted(workspace_id).await
+    }
+
+    /// Caller holds the shared writer lock for the enclosing lifecycle operation.
+    async fn kill_cli_session_admitted(&self, _workspace_id: Uuid) -> Result<(), ContainerError> {
+        Ok(())
+    }
 
     /// Archive a workspace: set archived flag, stop running dev servers, and run archive script.
     async fn archive_workspace(&self, workspace_id: Uuid) -> Result<(), ContainerError> {
-        let pool = &self.db().pool;
+        let _writer = db::models::cli_control_operation::cli_writer_lock(workspace_id)
+            .lock_owned()
+            .await;
+        self.archive_workspace_admitted(workspace_id).await
+    }
 
+    /// Caller holds shared writer custody before any archive mutation or script.
+    async fn archive_workspace_admitted(&self, workspace_id: Uuid) -> Result<(), ContainerError> {
+        let pool = &self.db().pool;
+        db::models::cli_control_operation::CliControlOperation::ensure_unfenced(pool, workspace_id)
+            .await
+            .map_err(|e| ContainerError::CliControlBusy(e.to_string()))?;
         Workspace::set_archived(pool, workspace_id, true).await?;
 
         // Stop running dev servers
@@ -576,7 +604,7 @@ pub trait ContainerService {
         // Reap the CLI tmux session BEFORE the archive script runs, so a live
         // `claude` turn can't keep mutating files while the script snapshots or
         // moves workspace state. Best-effort + idempotent.
-        self.kill_cli_session(workspace_id).await;
+        self.kill_cli_session_admitted(workspace_id).await?;
 
         // Run archive script (silently skips if not configured)
         if let Err(e) = self.try_run_archive_script(workspace_id).await {
