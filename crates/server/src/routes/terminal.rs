@@ -2132,10 +2132,7 @@ mod tests {
         let all = lean_mcp_names(Some(&serde_json::json!("all")));
         assert!(cli_mcp_servers(Some(&user), all.as_deref()).is_none());
         let lean = lean_mcp_names(None).unwrap();
-        for user in [
-            None,
-            Some(serde_json::json!({"mcpServers": []})),
-        ] {
+        for user in [None, Some(serde_json::json!({"mcpServers": []}))] {
             assert!(cli_mcp_servers(user.as_ref(), Some(&lean)).is_none());
         }
         let figma_only = vec!["figma".to_string()];
