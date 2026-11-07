@@ -80,6 +80,10 @@ pub struct CliAgentStatus {
     /// The agent binary the liveness probe looked for, for diagnostics.
     pub program: String,
     pub binding_id: Option<Uuid>,
+    /// App session owned by the same active binding as `binding_id`.
+    pub bound_app_session_id: Option<Uuid>,
+    /// Native session recorded on that active binding, when discovered.
+    pub bound_native_session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, TS)]
@@ -197,22 +201,36 @@ async fn get_agent_status(
 ) -> Result<ResponseJson<ApiResponse<CliAgentStatus>>, ApiError> {
     let _guard = cli_lifecycle_lock(workspace_id).lock_owned().await;
     let context = cli_context(&deployment, workspace_id).await?;
-    let binding_id = CliPaneBinding::find_active_for_workspace(&deployment.db().pool, workspace_id)
-        .await?
-        .map(|binding| binding.id);
+    let binding =
+        CliPaneBinding::find_active_for_workspace(&deployment.db().pool, workspace_id).await?;
 
-    if !cli_tmux_available() {
-        return Ok(ResponseJson(ApiResponse::success(CliAgentStatus {
-            agent_alive: None,
-            session_present: false,
-            restartable: false,
-            blocker: Some(CliRestartBlocker::Unknown),
-            program: context.program,
-            binding_id,
-        })));
-    }
+    let presence = if cli_tmux_available() {
+        probe_workspace_agent(workspace_id, &context.program).await
+    } else {
+        AgentPresence::Unknown
+    };
+    Ok(ResponseJson(ApiResponse::success(project_agent_status(
+        context.program,
+        presence,
+        context.executor_active,
+        binding,
+    ))))
+}
 
-    let presence = probe_workspace_agent(workspace_id, &context.program).await;
+fn project_agent_status(
+    program: String,
+    presence: AgentPresence,
+    executor_active: bool,
+    binding: Option<CliPaneBinding>,
+) -> CliAgentStatus {
+    let (binding_id, bound_app_session_id, bound_native_session_id) = match binding {
+        Some(binding) => (
+            Some(binding.id),
+            Some(binding.session_id),
+            binding.claude_session_id,
+        ),
+        None => (None, None, None),
+    };
     let (agent_alive, session_present, blocker) = match presence {
         AgentPresence::Alive => (Some(true), true, None),
         AgentPresence::Absent => (Some(false), true, None),
@@ -224,21 +242,21 @@ async fn get_agent_status(
     // ExecutorRunning, so the UI explains the wait instead of offering a button
     // that would only ever be refused.
     let blocker = if agent_alive == Some(false) {
-        context
-            .executor_active
-            .then_some(CliRestartBlocker::ExecutorRunning)
+        executor_active.then_some(CliRestartBlocker::ExecutorRunning)
     } else {
         blocker
     };
 
-    Ok(ResponseJson(ApiResponse::success(CliAgentStatus {
+    CliAgentStatus {
         agent_alive,
         session_present,
         restartable: agent_alive == Some(false) && blocker.is_none(),
         blocker,
-        program: context.program,
+        program,
         binding_id,
-    })))
+        bound_app_session_id,
+        bound_native_session_id,
+    }
 }
 
 async fn restart_agent(
@@ -384,6 +402,234 @@ async fn switch_agent_session(
     }.await;
     WorkspaceSpawnReservation::release(pool, workspace_id, &reservation.fence).await?;
     result
+}
+
+#[cfg(test)]
+mod binding_diagnostics_tests {
+    use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+
+    use super::*;
+
+    async fn fixture() -> (SqlitePool, Uuid, Uuid) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE workspaces (id BLOB PRIMARY KEY);
+             CREATE TABLE sessions (id BLOB PRIMARY KEY, workspace_id BLOB NOT NULL);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/20260721092000_add_cli_pane_bindings.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let workspace_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO workspaces (id) VALUES (?)")
+            .bind(workspace_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO sessions (id, workspace_id) VALUES (?, ?)")
+            .bind(session_id)
+            .bind(workspace_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        (pool, workspace_id, session_id)
+    }
+
+    // Exercise the route's projection with the real active-row lookup and every
+    // liveness/executor result. Binding diagnostics must not alter restart policy.
+    async fn assert_binding(
+        pool: &SqlitePool,
+        workspace_id: Uuid,
+        expected: (Option<Uuid>, Option<Uuid>, Option<&str>),
+    ) {
+        for (presence, executor_active, alive, present, restartable, blocker) in [
+            (AgentPresence::Alive, false, Some(true), true, false, None),
+            (AgentPresence::Alive, true, Some(true), true, false, None),
+            (AgentPresence::Absent, false, Some(false), true, true, None),
+            (
+                AgentPresence::Absent,
+                true,
+                Some(false),
+                true,
+                false,
+                Some(CliRestartBlocker::ExecutorRunning),
+            ),
+            (
+                AgentPresence::NoSession,
+                false,
+                None,
+                false,
+                false,
+                Some(CliRestartBlocker::NoSession),
+            ),
+            (
+                AgentPresence::NoSession,
+                true,
+                None,
+                false,
+                false,
+                Some(CliRestartBlocker::NoSession),
+            ),
+            (
+                AgentPresence::Unknown,
+                false,
+                None,
+                false,
+                false,
+                Some(CliRestartBlocker::Unknown),
+            ),
+            (
+                AgentPresence::Unknown,
+                true,
+                None,
+                false,
+                false,
+                Some(CliRestartBlocker::Unknown),
+            ),
+        ] {
+            let binding = CliPaneBinding::find_active_for_workspace(pool, workspace_id)
+                .await
+                .unwrap();
+            let status = project_agent_status("claude".into(), presence, executor_active, binding);
+            assert_eq!(
+                (
+                    status.binding_id,
+                    status.bound_app_session_id,
+                    status.bound_native_session_id.as_deref(),
+                ),
+                expected,
+            );
+            assert_eq!(
+                (
+                    status.agent_alive,
+                    status.session_present,
+                    status.restartable,
+                    status.blocker,
+                ),
+                (alive, present, restartable, blocker),
+            );
+            assert_eq!(status.program, "claude");
+            let json = serde_json::to_value(&status).unwrap();
+            assert_eq!(json["binding_id"], serde_json::json!(expected.0));
+            assert_eq!(json["bound_app_session_id"], serde_json::json!(expected.1));
+            assert_eq!(json["bound_native_session_id"], serde_json::json!(expected.2));
+        }
+    }
+
+    #[tokio::test]
+    async fn active_binding_reports_matching_app_and_native_ids() {
+        let (pool, workspace_id, session_id) = fixture().await;
+        let binding = CliPaneBinding::record_launch(
+            &pool,
+            workspace_id,
+            session_id,
+            Some("native-active"),
+            CliPaneBoundVia::CliResume,
+        )
+        .await
+        .unwrap();
+        assert_binding(
+            &pool,
+            workspace_id,
+            (Some(binding.id), Some(session_id), Some("native-active")),
+        )
+        .await;
+
+        // A fresh active binding has an app owner before native discovery.
+        let fresh = CliPaneBinding::record_launch(
+            &pool,
+            workspace_id,
+            session_id,
+            None,
+            CliPaneBoundVia::CliFresh,
+        )
+        .await
+        .unwrap();
+        assert_binding(&pool, workspace_id, (Some(fresh.id), Some(session_id), None)).await;
+    }
+
+    #[tokio::test]
+    async fn absent_binding_reports_null_ids_without_another_workspaces_binding() {
+        let (pool, workspace_id, session_id) = fixture().await;
+        CliPaneBinding::record_launch(
+            &pool,
+            workspace_id,
+            session_id,
+            Some("native-other-workspace"),
+            CliPaneBoundVia::CliResume,
+        )
+        .await
+        .unwrap();
+        assert_binding(&pool, Uuid::new_v4(), (None, None, None)).await;
+    }
+
+    #[tokio::test]
+    async fn released_binding_reports_null_ids() {
+        let (pool, workspace_id, session_id) = fixture().await;
+        let binding = CliPaneBinding::record_launch(
+            &pool,
+            workspace_id,
+            session_id,
+            Some("native-released"),
+            CliPaneBoundVia::CliResume,
+        )
+        .await
+        .unwrap();
+        assert!(CliPaneBinding::release(&pool, binding.id).await.unwrap());
+        assert_binding(&pool, workspace_id, (None, None, None)).await;
+    }
+
+    #[tokio::test]
+    async fn replacement_binding_reports_only_the_replacement_generation_ids() {
+        let (pool, workspace_id, session_id) = fixture().await;
+        let previous = CliPaneBinding::record_launch(
+            &pool,
+            workspace_id,
+            session_id,
+            Some("native-previous"),
+            CliPaneBoundVia::CliResume,
+        )
+        .await
+        .unwrap();
+        let replacement_session_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO sessions (id, workspace_id) VALUES (?, ?)")
+            .bind(replacement_session_id)
+            .bind(workspace_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let replacement = CliPaneBinding::record_launch(
+            &pool,
+            workspace_id,
+            replacement_session_id,
+            Some("native-replacement"),
+            CliPaneBoundVia::CliResume,
+        )
+        .await
+        .unwrap();
+        assert_ne!(previous.id, replacement.id);
+        assert_binding(
+            &pool,
+            workspace_id,
+            (
+                Some(replacement.id),
+                Some(replacement_session_id),
+                Some("native-replacement"),
+            ),
+        )
+        .await;
+    }
 }
 
 pub(super) fn router() -> Router<DeploymentImpl> {
