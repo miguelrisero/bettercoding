@@ -198,12 +198,9 @@ pub(super) async fn prepare_cli_launch_spec(
             spec.base_args
                 .push(mcp_config.to_string_lossy().into_owned());
         }
-        let settings = write_cli_hook_settings(
-            workspace_id,
-            generation,
-            policy.settings(unrestricted),
-        )
-        .await?;
+        let settings =
+            write_cli_hook_settings(workspace_id, generation, policy.settings(unrestricted))
+                .await?;
         spec.base_args.push("--settings".to_string());
         spec.base_args.push(settings.to_string_lossy().into_owned());
         if let Some(name) = workspace_name.map(str::trim).filter(|n| !n.is_empty()) {
@@ -365,8 +362,8 @@ enum ClaudeMcpPolicy {
 }
 
 impl ClaudeMcpPolicy {
-    fn parse(value: Option<&serde_json::Value>) -> Result<Self, ApiError> {
-        let invalid = || ApiError::BadRequest("Invalid Claude MCP selection policy".into());
+    fn parse(value: Option<&serde_json::Value>) -> Result<Self, &'static str> {
+        let invalid = || "Invalid Claude MCP selection policy";
         let Some(value) = value else {
             return Ok(Self::All);
         };
@@ -378,7 +375,10 @@ impl ClaudeMcpPolicy {
             (value.as_array().unwrap(), true)
         } else {
             let object = value.as_object().ok_or_else(invalid)?;
-            if object.keys().any(|key| key != "allowlist" && key != "legacy") {
+            if object
+                .keys()
+                .any(|key| key != "allowlist" && key != "legacy")
+            {
                 return Err(invalid());
             }
             let compatibility = match object.get("legacy") {
@@ -386,19 +386,27 @@ impl ClaudeMcpPolicy {
                 Some(value) => value.as_bool().ok_or_else(invalid)?,
             };
             (
-                object.get("allowlist").and_then(|v| v.as_array()).ok_or_else(invalid)?,
+                object
+                    .get("allowlist")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(invalid)?,
                 compatibility,
             )
         };
         let mut names = if legacy {
-            LEAN_MCP_SERVERS.iter().map(|name| name.to_string()).collect()
+            LEAN_MCP_SERVERS
+                .iter()
+                .map(|name| name.to_string())
+                .collect()
         } else {
             Vec::new()
         };
         for value in values {
             let name = value.as_str().ok_or_else(invalid)?;
             if name.is_empty()
-                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             {
                 return Err(invalid());
             }
@@ -406,7 +414,11 @@ impl ClaudeMcpPolicy {
                 names.push(name.to_string());
             }
         }
-        Ok(if compatibility { Self::Legacy(names) } else { Self::Allowlist(names) })
+        Ok(if compatibility {
+            Self::Legacy(names)
+        } else {
+            Self::Allowlist(names)
+        })
     }
 
     fn legacy_names(&self) -> Option<Vec<String>> {
@@ -421,7 +433,8 @@ impl ClaudeMcpPolicy {
             return serde_json::json!({});
         };
         // Native policy keeps scope, trust, and managed-policy semantics.
-        let mut allowed: Vec<_> = names.iter()
+        let mut allowed: Vec<_> = names
+            .iter()
             .map(|name| serde_json::json!({"serverName": name}))
             .collect();
         if unrestricted && !names.iter().any(|name| name == MCP_SERVER_NAME) {
@@ -433,21 +446,25 @@ impl ClaudeMcpPolicy {
 
 async fn read_claude_mcp_policy(path: &Path) -> Result<Option<serde_json::Value>, ApiError> {
     match tokio::fs::read(path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).map(Some)
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
             .map_err(|_| ApiError::BadRequest("Invalid Claude MCP selection policy JSON".into())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(ApiError::Conflict("Could not read Claude MCP selection policy".into())),
+        Err(_) => Err(ApiError::Conflict(
+            "Could not read Claude MCP selection policy".into(),
+        )),
     }
 }
 
 async fn claude_mcp_policy(workspace_id: Uuid) -> Result<ClaudeMcpPolicy, ApiError> {
     let dir = utils::assets::asset_dir().join("cli-mcp");
-    let workspace = read_claude_mcp_policy(&dir.join(format!("{workspace_id}.servers.json"))).await?;
+    let workspace =
+        read_claude_mcp_policy(&dir.join(format!("{workspace_id}.servers.json"))).await?;
     let value = match workspace {
         Some(value) => Some(value),
         None => read_claude_mcp_policy(&dir.join("default.servers.json")).await?,
     };
-    ClaudeMcpPolicy::parse(value.as_ref())
+    ClaudeMcpPolicy::parse(value.as_ref()).map_err(|error| ApiError::BadRequest(error.into()))
 }
 
 /// Write a launch-specific BetterCoding supplement. Only the explicit legacy
@@ -459,9 +476,7 @@ async fn write_cli_mcp_config(
     policy: &ClaudeMcpPolicy,
 ) -> Result<Option<(PathBuf, bool)>, ApiError> {
     let launch = if unrestricted {
-        Some(mcp_server_launch().await.ok_or_else(|| {
-            ApiError::Conflict("Could not resolve BetterCoding MCP launch".into())
-        })?)
+        mcp_server_launch().await
     } else {
         None
     };
@@ -471,8 +486,11 @@ async fn write_cli_mcp_config(
         let home = dirs::home_dir().ok_or_else(|| {
             ApiError::Conflict("Could not resolve Claude configuration home".into())
         })?;
-        let bytes = tokio::fs::read(home.join(".claude.json")).await
-            .map_err(|_| ApiError::Conflict("Could not read legacy Claude MCP configuration".into()))?;
+        let bytes = tokio::fs::read(home.join(".claude.json"))
+            .await
+            .map_err(|_| {
+                ApiError::Conflict("Could not read legacy Claude MCP configuration".into())
+            })?;
         let user: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|_| ApiError::Conflict("Invalid legacy Claude MCP configuration".into()))?;
         cli_mcp_servers(Some(&user), Some(&names)).ok_or_else(|| {
@@ -482,8 +500,9 @@ async fn write_cli_mcp_config(
         serde_json::Map::new()
     };
     let dir = utils::assets::asset_dir().join("cli-mcp");
-    tokio::fs::create_dir_all(&dir).await
-        .map_err(|_| ApiError::Conflict("Could not create CLI MCP configuration directory".into()))?;
+    tokio::fs::create_dir_all(&dir).await.map_err(|_| {
+        ApiError::Conflict("Could not create CLI MCP configuration directory".into())
+    })?;
     if let Some((exe, url)) = launch {
         servers.insert(
             MCP_SERVER_NAME.to_string(),
@@ -501,7 +520,8 @@ async fn write_cli_mcp_config(
     let config = serde_json::json!({ "mcpServers": servers });
     let path = dir.join(format!("{generation}.json"));
     // The copied legacy entries can carry the user's API keys.
-    write_private(&path, config.to_string().as_bytes()).await
+    write_private(&path, config.to_string().as_bytes())
+        .await
         .map_err(|_| ApiError::Conflict("Could not write CLI MCP configuration".into()))?;
     Ok(Some((path, strict)))
 }
@@ -668,25 +688,27 @@ async fn write_cli_hook_settings(
     mut settings: serde_json::Value,
 ) -> Result<PathBuf, ApiError> {
     if let Ok(port) = utils::port_file::read_port_file("bettercoding").await {
-    let entry = serde_json::json!([{
-        "hooks": [{
-            "type": "command",
-            "command": hook_report_command(port, workspace_id),
-            "timeout": 3,
-        }]
-    }]);
-    let hooks: serde_json::Map<String, serde_json::Value> = HOOK_EVENTS
-        .iter()
-        .map(|event| ((*event).to_string(), entry.clone()))
-        .collect();
-    settings["hooks"] = serde_json::json!(hooks);
+        let entry = serde_json::json!([{
+            "hooks": [{
+                "type": "command",
+                "command": hook_report_command(port, workspace_id),
+                "timeout": 3,
+            }]
+        }]);
+        let hooks: serde_json::Map<String, serde_json::Value> = HOOK_EVENTS
+            .iter()
+            .map(|event| ((*event).to_string(), entry.clone()))
+            .collect();
+        settings["hooks"] = serde_json::json!(hooks);
     }
 
     let dir = utils::assets::asset_dir().join("cli-hooks");
-    tokio::fs::create_dir_all(&dir).await
+    tokio::fs::create_dir_all(&dir)
+        .await
         .map_err(|_| ApiError::Conflict("Could not create CLI settings directory".into()))?;
     let path = dir.join(format!("{generation}.json"));
-    write_private(&path, settings.to_string().as_bytes()).await
+    write_private(&path, settings.to_string().as_bytes())
+        .await
         .map_err(|_| ApiError::Conflict("Could not write CLI launch settings".into()))?;
     Ok(path)
 }
@@ -1940,9 +1962,12 @@ mod tests {
                 {"serverName": "bettercoding"}
             ])
         );
-        let empty = super::ClaudeMcpPolicy::parse(Some(&serde_json::json!({"allowlist": []})))
-            .unwrap();
-        assert_eq!(empty.settings(false), serde_json::json!({"allowedMcpServers": []}));
+        let empty =
+            super::ClaudeMcpPolicy::parse(Some(&serde_json::json!({"allowlist": []}))).unwrap();
+        assert_eq!(
+            empty.settings(false),
+            serde_json::json!({"allowedMcpServers": []})
+        );
     }
 
     #[test]
@@ -1964,8 +1989,8 @@ mod tests {
 
     #[test]
     fn claude_mcp_legacy_selection_preserves_figma_compatibility() {
-        let extras = super::ClaudeMcpPolicy::parse(Some(&serde_json::json!(["playwright"])))
-            .unwrap();
+        let extras =
+            super::ClaudeMcpPolicy::parse(Some(&serde_json::json!(["playwright"]))).unwrap();
         let names = extras.legacy_names().unwrap();
         assert!(names.iter().any(|name| name == "playwright"));
         assert!(names.iter().any(|name| name == "slack"));
