@@ -159,9 +159,16 @@ pub(super) async fn resolve_cli_launch_spec(
     dir: &Path,
     workspace_id: Uuid,
     workspace_name: Option<&str>,
-) -> CliLaunchSpec {
-    let mut spec = resolve_cli_agent_spec(session, model_id, reasoning_id, dir);
+) -> Result<CliLaunchSpec, ApiError> {
+    let spec = resolve_cli_agent_spec(session, model_id, reasoning_id, dir);
+    prepare_cli_launch_spec(spec, workspace_id, workspace_name).await
+}
 
+pub(super) async fn prepare_cli_launch_spec(
+    mut spec: CliLaunchSpec,
+    workspace_id: Uuid,
+    workspace_name: Option<&str>,
+) -> Result<CliLaunchSpec, ApiError> {
     // Codex reports its state through the same hook endpoint, registered
     // inline with `-c` so neither ~/.codex nor the worktree is touched.
     if spec.program == "codex" {
@@ -179,32 +186,39 @@ pub(super) async fn resolve_cli_launch_spec(
         // `--mcp-config` takes several values, so it must be followed by
         // another flag or it would swallow a positional prompt. It is only
         // ever pushed right before `--settings`.
-        let mcp_config = write_cli_mcp_config(workspace_id, runs_unrestricted(&spec)).await;
-        if let Some(settings) = write_cli_hook_settings(workspace_id).await {
-            if let Some((mcp_config, strict)) = mcp_config {
-                if strict {
-                    spec.base_args.push("--strict-mcp-config".to_string());
-                }
-                spec.base_args.push("--mcp-config".to_string());
-                spec.base_args
-                    .push(mcp_config.to_string_lossy().into_owned());
+        let policy = claude_mcp_policy(workspace_id).await?;
+        let generation = Uuid::new_v4();
+        let unrestricted = runs_unrestricted(&spec);
+        let mcp_config = write_cli_mcp_config(generation, unrestricted, &policy).await?;
+        if let Some((mcp_config, strict)) = mcp_config {
+            if strict {
+                spec.base_args.push("--strict-mcp-config".to_string());
             }
-            spec.base_args.push("--settings".to_string());
-            spec.base_args.push(settings.to_string_lossy().into_owned());
+            spec.base_args.push("--mcp-config".to_string());
+            spec.base_args
+                .push(mcp_config.to_string_lossy().into_owned());
         }
+        let settings = write_cli_hook_settings(
+            workspace_id,
+            generation,
+            policy.settings(unrestricted),
+        )
+        .await?;
+        spec.base_args.push("--settings".to_string());
+        spec.base_args.push(settings.to_string_lossy().into_owned());
         if let Some(name) = workspace_name.map(str::trim).filter(|n| !n.is_empty()) {
             spec.base_args.push("--name".to_string());
             spec.base_args.push(name.to_string());
         }
     }
 
-    spec
+    Ok(spec)
 }
 
 /// The side-effect-free part of [`resolve_cli_launch_spec`]: the selected
 /// agent's interactive spec with model/effort folded in, before any hook
 /// settings are written. Its `program` is the binary CLI mode launches.
-fn resolve_cli_agent_spec(
+pub(super) fn resolve_cli_agent_spec(
     session: Option<&Session>,
     model_id: Option<String>,
     reasoning_id: Option<String>,
@@ -327,10 +341,8 @@ async fn mcp_server_launch() -> Option<(String, String)> {
     Some((exe, format!("http://127.0.0.1:{port}")))
 }
 
-/// The user's own MCP servers a workspace agent starts with, next to
-/// BetterCoding's. Every other server in `~/.claude.json` and every plugin
-/// server stays off: a stdio server is one or more processes per agent, and
-/// dozens of agents each starting all of them overload the host.
+/// The legacy Claude profile and the unchanged Codex default. Claude uses
+/// native discovery unless an explicit selection requests this legacy set.
 const LEAN_MCP_SERVERS: &[&str] = &[
     "slack",
     "linear-server",
@@ -345,33 +357,133 @@ const LEAN_MCP_SERVERS: &[&str] = &[
     "vanta",
 ];
 
-/// Write the per-workspace MCP config for `claude --mcp-config` and return its
-/// path with whether to pass `--strict-mcp-config`. It holds the lean set of
-/// the user's servers and, for an unrestricted agent only, the BetterCoding
-/// tools (create, update, archive and delete workspaces, sessions, repos).
-/// The user's config is only read, never edited.
-async fn write_cli_mcp_config(workspace_id: Uuid, unrestricted: bool) -> Option<(PathBuf, bool)> {
+#[derive(Debug, PartialEq)]
+enum ClaudeMcpPolicy {
+    All,
+    Allowlist(Vec<String>),
+    Legacy(Vec<String>),
+}
+
+impl ClaudeMcpPolicy {
+    fn parse(value: Option<&serde_json::Value>) -> Result<Self, ApiError> {
+        let invalid = || ApiError::BadRequest("Invalid Claude MCP selection policy".into());
+        let Some(value) = value else {
+            return Ok(Self::All);
+        };
+        if value.as_str() == Some("all") {
+            return Ok(Self::All);
+        }
+        let legacy = value.is_array();
+        let (values, compatibility) = if legacy {
+            (value.as_array().unwrap(), true)
+        } else {
+            let object = value.as_object().ok_or_else(invalid)?;
+            if object.keys().any(|key| key != "allowlist" && key != "legacy") {
+                return Err(invalid());
+            }
+            let compatibility = match object.get("legacy") {
+                None => false,
+                Some(value) => value.as_bool().ok_or_else(invalid)?,
+            };
+            (
+                object.get("allowlist").and_then(|v| v.as_array()).ok_or_else(invalid)?,
+                compatibility,
+            )
+        };
+        let mut names = if legacy {
+            LEAN_MCP_SERVERS.iter().map(|name| name.to_string()).collect()
+        } else {
+            Vec::new()
+        };
+        for value in values {
+            let name = value.as_str().ok_or_else(invalid)?;
+            if name.is_empty()
+                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return Err(invalid());
+            }
+            if !names.iter().any(|existing| existing == name) {
+                names.push(name.to_string());
+            }
+        }
+        Ok(if compatibility { Self::Legacy(names) } else { Self::Allowlist(names) })
+    }
+
+    fn legacy_names(&self) -> Option<Vec<String>> {
+        match self {
+            Self::Legacy(names) => Some(names.clone()),
+            _ => None,
+        }
+    }
+
+    fn settings(&self, unrestricted: bool) -> serde_json::Value {
+        let Self::Allowlist(names) = self else {
+            return serde_json::json!({});
+        };
+        // Native policy keeps scope, trust, and managed-policy semantics.
+        let mut allowed: Vec<_> = names.iter()
+            .map(|name| serde_json::json!({"serverName": name}))
+            .collect();
+        if unrestricted && !names.iter().any(|name| name == MCP_SERVER_NAME) {
+            allowed.push(serde_json::json!({"serverName": MCP_SERVER_NAME}));
+        }
+        serde_json::json!({"allowedMcpServers": allowed})
+    }
+}
+
+async fn read_claude_mcp_policy(path: &Path) -> Result<Option<serde_json::Value>, ApiError> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some)
+            .map_err(|_| ApiError::BadRequest("Invalid Claude MCP selection policy JSON".into())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(ApiError::Conflict("Could not read Claude MCP selection policy".into())),
+    }
+}
+
+async fn claude_mcp_policy(workspace_id: Uuid) -> Result<ClaudeMcpPolicy, ApiError> {
+    let dir = utils::assets::asset_dir().join("cli-mcp");
+    let workspace = read_claude_mcp_policy(&dir.join(format!("{workspace_id}.servers.json"))).await?;
+    let value = match workspace {
+        Some(value) => Some(value),
+        None => read_claude_mcp_policy(&dir.join("default.servers.json")).await?,
+    };
+    ClaudeMcpPolicy::parse(value.as_ref())
+}
+
+/// Write a launch-specific BetterCoding supplement. Only the explicit legacy
+/// profile copies user definitions and uses strict mode; native selection keeps
+/// project definitions, trust decisions, and command working directories.
+async fn write_cli_mcp_config(
+    generation: Uuid,
+    unrestricted: bool,
+    policy: &ClaudeMcpPolicy,
+) -> Result<Option<(PathBuf, bool)>, ApiError> {
     let launch = if unrestricted {
-        Some(mcp_server_launch().await?)
+        Some(mcp_server_launch().await.ok_or_else(|| {
+            ApiError::Conflict("Could not resolve BetterCoding MCP launch".into())
+        })?)
     } else {
         None
     };
-    let dir = utils::assets::asset_dir().join("cli-mcp");
-    if let Err(error) = tokio::fs::create_dir_all(&dir).await {
-        tracing::debug!(?error, "could not create the CLI MCP config directory");
-        return None;
-    }
-    let names = lean_mcp_names(workspace_mcp_override(workspace_id).await.as_ref());
-    let user_config = match dirs::home_dir() {
-        Some(home) => tokio::fs::read_to_string(home.join(".claude.json"))
-            .await
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok()),
-        None => None,
+    let names = policy.legacy_names();
+    let strict = names.is_some();
+    let mut servers = if let Some(names) = names {
+        let home = dirs::home_dir().ok_or_else(|| {
+            ApiError::Conflict("Could not resolve Claude configuration home".into())
+        })?;
+        let bytes = tokio::fs::read(home.join(".claude.json")).await
+            .map_err(|_| ApiError::Conflict("Could not read legacy Claude MCP configuration".into()))?;
+        let user: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|_| ApiError::Conflict("Invalid legacy Claude MCP configuration".into()))?;
+        cli_mcp_servers(Some(&user), Some(&names)).ok_or_else(|| {
+            ApiError::Conflict("Legacy Claude MCP configuration has no server map".into())
+        })?
+    } else {
+        serde_json::Map::new()
     };
-    let lean = cli_mcp_servers(user_config.as_ref(), names.as_deref());
-    let strict = lean.is_some();
-    let mut servers = lean.unwrap_or_default();
+    let dir = utils::assets::asset_dir().join("cli-mcp");
+    tokio::fs::create_dir_all(&dir).await
+        .map_err(|_| ApiError::Conflict("Could not create CLI MCP configuration directory".into()))?;
     if let Some((exe, url)) = launch {
         servers.insert(
             MCP_SERVER_NAME.to_string(),
@@ -384,18 +496,14 @@ async fn write_cli_mcp_config(workspace_id: Uuid, unrestricted: bool) -> Option<
         );
     }
     if servers.is_empty() && !strict {
-        return None;
+        return Ok(None);
     }
     let config = serde_json::json!({ "mcpServers": servers });
-    let path = dir.join(format!("{workspace_id}.json"));
-    // The copied server entries can carry the user's API keys.
-    match write_private(&path, config.to_string().as_bytes()).await {
-        Ok(()) => Some((path, strict)),
-        Err(error) => {
-            tracing::debug!(?error, "could not write the CLI MCP config file");
-            None
-        }
-    }
+    let path = dir.join(format!("{generation}.json"));
+    // The copied legacy entries can carry the user's API keys.
+    write_private(&path, config.to_string().as_bytes()).await
+        .map_err(|_| ApiError::Conflict("Could not write CLI MCP configuration".into()))?;
+    Ok(Some((path, strict)))
 }
 
 /// The per-workspace override `cli-mcp/<workspace_id>.servers.json`: a JSON
@@ -550,21 +658,16 @@ fn codex_mcp_args_for(exe: &str, url: &str) -> Vec<String> {
 /// `--settings` MERGES with the user's own `~/.claude/settings.json` rather
 /// than replacing it, which is the whole reason to use it: bettercoding never
 /// edits the user's global config, and never puts a settings file in the
-/// worktree where it would show up in `git status`. The file is rewritten on
-/// every launch, so the baked-in port is the port of the server doing the
-/// launching.
-///
-/// Returns `None` on any failure. A missing activity signal is a worse sidebar,
-/// not a broken launch.
-async fn write_cli_hook_settings(workspace_id: Uuid) -> Option<PathBuf> {
-    let port = match utils::port_file::read_port_file("bettercoding").await {
-        Ok(port) => port,
-        Err(error) => {
-            tracing::debug!(?error, "no port file; CLI activity hooks not registered");
-            return None;
-        }
-    };
-
+/// worktree where it would show up in `git status`. Each launch gets a unique
+/// file, preserving settings referenced by existing agents. A missing activity
+/// port omits hooks; a settings write failure blocks launch so an explicit
+/// MCP restriction cannot disappear.
+async fn write_cli_hook_settings(
+    workspace_id: Uuid,
+    generation: Uuid,
+    mut settings: serde_json::Value,
+) -> Result<PathBuf, ApiError> {
+    if let Ok(port) = utils::port_file::read_port_file("bettercoding").await {
     let entry = serde_json::json!([{
         "hooks": [{
             "type": "command",
@@ -576,21 +679,16 @@ async fn write_cli_hook_settings(workspace_id: Uuid) -> Option<PathBuf> {
         .iter()
         .map(|event| ((*event).to_string(), entry.clone()))
         .collect();
-    let settings = serde_json::json!({ "hooks": hooks });
+    settings["hooks"] = serde_json::json!(hooks);
+    }
 
     let dir = utils::assets::asset_dir().join("cli-hooks");
-    if let Err(error) = tokio::fs::create_dir_all(&dir).await {
-        tracing::debug!(?error, "could not create the CLI hook settings directory");
-        return None;
-    }
-    let path = dir.join(format!("{workspace_id}.json"));
-    match tokio::fs::write(&path, settings.to_string()).await {
-        Ok(()) => Some(path),
-        Err(error) => {
-            tracing::debug!(?error, "could not write the CLI hook settings file");
-            None
-        }
-    }
+    tokio::fs::create_dir_all(&dir).await
+        .map_err(|_| ApiError::Conflict("Could not create CLI settings directory".into()))?;
+    let path = dir.join(format!("{generation}.json"));
+    write_private(&path, settings.to_string().as_bytes()).await
+        .map_err(|_| ApiError::Conflict("Could not write CLI launch settings".into()))?;
+    Ok(path)
 }
 
 /// The workspace's directory, which must exist for any terminal to open in it.
@@ -842,15 +940,19 @@ async fn prepare_cli_attach(
     // Honor the workspace's selected agent + model/effort at launch
     // (defaults to claude at Opus/max when nothing was selected).
     let (model_id, reasoning_id) = resolve_cli_model_effort(pool, session.as_ref()).await;
-    let spec = resolve_cli_launch_spec(
-        session.as_ref(),
-        model_id,
-        reasoning_id,
-        &dir,
-        workspace.id,
-        workspace.name.as_deref(),
-    )
-    .await;
+    let spec = if attach_only || cli_session_exists || !tmux_available {
+        resolve_cli_agent_spec(session.as_ref(), model_id, reasoning_id, &dir)
+    } else {
+        resolve_cli_launch_spec(
+            session.as_ref(),
+            model_id,
+            reasoning_id,
+            &dir,
+            workspace.id,
+            workspace.name.as_deref(),
+        )
+        .await?
+    };
 
     // How the parked prompt travels:
     // - Genuine first attach (no tmux session yet, nothing to resume):
@@ -1805,6 +1907,81 @@ mod tests {
         MAX_CLI_SEND_BYTES, cli_mcp_servers, codex_lean_mcp_args_for, lean_mcp_names,
         validate_cli_send_text,
     };
+
+    #[test]
+    fn claude_mcp_default_keeps_native_discovery() {
+        let policy = super::ClaudeMcpPolicy::parse(None).unwrap();
+        let settings = policy.settings(false);
+        assert!(settings.get("allowedMcpServers").is_none());
+        assert!(policy.legacy_names().is_none());
+        assert_eq!(
+            super::ClaudeMcpPolicy::parse(Some(&serde_json::json!("all"))).unwrap(),
+            policy
+        );
+    }
+
+    #[test]
+    fn claude_mcp_allowlist_keeps_only_selected_native_names() {
+        let policy = super::ClaudeMcpPolicy::parse(Some(&serde_json::json!({
+            "allowlist": ["patricia-staff", "project-only"]
+        })))
+        .unwrap();
+        assert_eq!(
+            policy.settings(false),
+            serde_json::json!({"allowedMcpServers": [
+                {"serverName": "patricia-staff"}, {"serverName": "project-only"}
+            ]})
+        );
+        assert!(policy.legacy_names().is_none());
+        assert_eq!(
+            policy.settings(true)["allowedMcpServers"],
+            serde_json::json!([
+                {"serverName": "patricia-staff"}, {"serverName": "project-only"},
+                {"serverName": "bettercoding"}
+            ])
+        );
+        let empty = super::ClaudeMcpPolicy::parse(Some(&serde_json::json!({"allowlist": []})))
+            .unwrap();
+        assert_eq!(empty.settings(false), serde_json::json!({"allowedMcpServers": []}));
+    }
+
+    #[test]
+    fn claude_mcp_invalid_restrictions_fail_closed() {
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!("typo"),
+            serde_json::json!({}),
+            serde_json::json!({"allowlist": "slack"}),
+            serde_json::json!({"allowlist": [1]}),
+            serde_json::json!({"allowlist": [""]}),
+            serde_json::json!({"allowlist": ["server.with.dots"]}),
+            serde_json::json!({"allowlist": ["slack"], "typo": true}),
+            serde_json::json!([1]),
+        ] {
+            assert!(super::ClaudeMcpPolicy::parse(Some(&value)).is_err());
+        }
+    }
+
+    #[test]
+    fn claude_mcp_legacy_selection_preserves_figma_compatibility() {
+        let extras = super::ClaudeMcpPolicy::parse(Some(&serde_json::json!(["playwright"])))
+            .unwrap();
+        let names = extras.legacy_names().unwrap();
+        assert!(names.iter().any(|name| name == "playwright"));
+        assert!(names.iter().any(|name| name == "slack"));
+        let explicit = super::ClaudeMcpPolicy::parse(Some(&serde_json::json!({
+            "allowlist": ["figma", "vanta"], "legacy": true
+        })))
+        .unwrap();
+        let user = serde_json::json!({"mcpServers": {
+            "vanta": {"command": "synthetic-vanta"},
+            "unselected": {"command": "synthetic-other"}
+        }});
+        let servers = cli_mcp_servers(Some(&user), explicit.legacy_names().as_deref()).unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers["vanta"], user["mcpServers"]["vanta"]);
+        assert_eq!(servers["figma"]["url"], "https://mcp.figma.com/mcp");
+    }
 
     #[test]
     fn cli_mcp_servers_keep_the_lean_set_plus_the_workspace_override() {

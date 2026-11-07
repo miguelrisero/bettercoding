@@ -111,6 +111,7 @@ pub struct SwitchCliSessionRequest {
 /// Everything the two handlers need about a workspace's CLI launch.
 pub(super) struct CliContext {
     pub(super) program: String,
+    pub(super) workspace_name: Option<String>,
     pub(super) working_dir: std::path::PathBuf,
     resume_session_id: Option<String>,
     executor_active: bool,
@@ -124,7 +125,13 @@ pub(super) async fn cli_context(
     deployment: &DeploymentImpl,
     workspace_id: Uuid,
 ) -> Result<CliContext, ApiError> {
-    let pool = &deployment.db().pool;
+    cli_context_from_pool(&deployment.db().pool, workspace_id).await
+}
+
+async fn cli_context_from_pool(
+    pool: &sqlx::SqlitePool,
+    workspace_id: Uuid,
+) -> Result<CliContext, ApiError> {
     let workspace = Workspace::find_by_id(pool, workspace_id)
         .await?
         .ok_or_else(|| ApiError::BadRequest("Workspace not found".to_string()))?;
@@ -172,18 +179,16 @@ pub(super) async fn cli_context(
     };
 
     let (model_id, reasoning_id) = terminal::resolve_cli_model_effort(pool, session.as_ref()).await;
-    let spec = terminal::resolve_cli_launch_spec(
+    let spec = terminal::resolve_cli_agent_spec(
         session.as_ref(),
         model_id,
         reasoning_id,
         &working_dir,
-        workspace_id,
-        workspace.name.as_deref(),
-    )
-    .await;
+    );
 
     Ok(CliContext {
         program: spec.program.clone(),
+        workspace_name: workspace.name,
         working_dir,
         resume_session_id: (!executor_active).then_some(known_session_id).flatten(),
         executor_active,
@@ -287,7 +292,13 @@ async fn restart_agent(
         ));
     };
 
-    let bootstrap = cli_restart_bootstrap(&context.spec, context.resume_session_id.as_deref());
+    let spec = terminal::prepare_cli_launch_spec(
+        context.spec,
+        workspace_id,
+        context.workspace_name.as_deref(),
+    )
+    .await?;
+    let bootstrap = cli_restart_bootstrap(&spec, context.resume_session_id.as_deref());
     // Surface the tmux failure verbatim rather than letting `?` fold it into
     // `ApiError::Pty(_)`, which renders as a bare "An internal error occurred"
     // with the cause dropped. A failed respawn is an operational condition the
@@ -394,4 +405,59 @@ pub(super) fn router() -> Router<DeploymentImpl> {
             "/workspaces/{workspace_id}/cli/restart",
             post(restart_agent),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn status_context_resolves_without_generating_launch_settings() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE workspaces (
+                id BLOB PRIMARY KEY, task_id BLOB, container_ref TEXT, branch TEXT NOT NULL,
+                setup_completed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                archived INTEGER NOT NULL, archived_at TEXT, pinned INTEGER NOT NULL,
+                name TEXT, worktree_deleted INTEGER NOT NULL
+             );
+             CREATE TABLE sessions (
+                id BLOB PRIMARY KEY, workspace_id BLOB, name TEXT, executor TEXT,
+                agent_working_dir TEXT, created_at TEXT, updated_at TEXT
+             );
+             CREATE TABLE cli_pane_bindings (
+                session_id BLOB, workspace_id BLOB, released_at TEXT, created_at TEXT
+             );
+             CREATE TABLE execution_processes (
+                session_id BLOB, created_at TEXT, run_reason TEXT, dropped INTEGER
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let id = Uuid::new_v4();
+        let cwd = std::env::current_dir().unwrap();
+        sqlx::query(
+            "INSERT INTO workspaces VALUES
+             (?, NULL, ?, 'synthetic', NULL, '2026-01-01T00:00:00Z',
+              '2026-01-01T00:00:00Z', 0, NULL, 0, 'Synthetic', 0)",
+        )
+        .bind(id)
+        .bind(cwd.to_str().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let context = cli_context_from_pool(&pool, id).await.unwrap();
+        assert_eq!(context.program, "claude");
+        assert_eq!(context.working_dir, cwd);
+        assert!(!context.executor_active);
+        assert!(context.resume_session_id.is_none());
+        for flag in ["--settings", "--mcp-config", "--strict-mcp-config"] {
+            assert!(!context.spec.base_args.iter().any(|arg| arg == flag));
+        }
+    }
 }
