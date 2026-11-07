@@ -66,7 +66,7 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let socket = Socket(format!("bc-handover-{}", Uuid::new_v4().simple()));
-    for dir in ["home", "data", "worktrees", "bin"] {
+    for dir in ["home", "data", "worktrees", "bin", "tmp"] {
         fs::create_dir(root.join(dir)).unwrap();
     }
     let fake = root.join("bin/claude");
@@ -75,6 +75,7 @@ async fn durable_handover_success_retries_crash_deadline_restart_and_binding_fen
     let original_fake = fs::read(&fake).unwrap();
     unsafe {
         std::env::set_var("HOME", root.join("home"));
+        std::env::set_var("TMPDIR", root.join("tmp"));
         std::env::set_var("SHELL", "/bin/sh");
         std::env::set_var("ENABLE_CLI_HANDOVER", "1");
         std::env::remove_var("DISABLE_CLI_COLLAB_ROUTING");

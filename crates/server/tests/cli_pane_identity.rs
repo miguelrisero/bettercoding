@@ -51,6 +51,8 @@ async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switc
     let pane_dir = worktrees.join("pane");
     let home = root.join("home");
     fs::create_dir(&home).unwrap();
+    let tmp = root.join("tmp");
+    fs::create_dir(&tmp).unwrap();
     let fake_bin = root.join("bin");
     fs::create_dir(&fake_bin).unwrap();
     for program in ["claude", "codex"] {
@@ -61,6 +63,7 @@ async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switc
     // This integration binary owns the environment before deployment caches initialise.
     unsafe {
         std::env::set_var("HOME", &home);
+        std::env::set_var("TMPDIR", &tmp);
         std::env::set_var("SHELL", "/bin/sh");
         std::env::set_var(
             "PATH",

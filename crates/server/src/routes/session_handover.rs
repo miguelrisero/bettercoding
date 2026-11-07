@@ -191,7 +191,13 @@ async fn begin(
     std::fs::create_dir_all(&dir)?;
     let successor_exit = dir.join(format!("{operation_id}.successor-exit"));
     let fallback_exit = dir.join(format!("{operation_id}.fallback-exit"));
-    let mut spec = context.spec.clone();
+    let launch_spec = terminal::prepare_cli_launch_spec(
+        context.spec.clone(),
+        request.workspace_id,
+        context.workspace_name.as_deref(),
+    )
+    .await?;
+    let mut spec = launch_spec.clone();
     spec.session_args
         .extend(["--session-id".into(), native_id.clone()]);
     let prompt = format!(
@@ -211,7 +217,7 @@ async fn begin(
     )?;
     let fallback_bootstrap = cli_handover_bootstrap(
         request.workspace_id,
-        &context.spec,
+        &launch_spec,
         Some(&request.fallback_session_id),
         None,
         &fallback_exit,
