@@ -342,6 +342,8 @@ const LEAN_MCP_SERVERS: &[&str] = &[
     "patricia",
     "context7",
     "fff",
+    "figma",
+    "vanta",
 ];
 
 /// Write the per-workspace MCP config for `claude --mcp-config` and return its
@@ -429,9 +431,9 @@ fn lean_mcp_names(workspace_override: Option<&serde_json::Value>) -> Option<Vec<
     )
 }
 
-/// The user's servers for a strict claude launch, or `None` to keep all of
-/// them: every name is kept, or the user's config cannot be read (a strict
-/// launch then would silently drop every server).
+/// The user's servers plus a default Figma endpoint for a strict claude launch.
+/// `None` keeps all servers when requested or when the user's config cannot be
+/// read (a strict launch then would silently drop every configured server).
 fn cli_mcp_servers(
     user_config: Option<&serde_json::Value>,
     names: Option<&[String]>,
@@ -440,7 +442,14 @@ fn cli_mcp_servers(
     Some(
         names?
             .iter()
-            .filter_map(|name| Some((name.clone(), configured.get(name)?.clone())))
+            .filter_map(|name| {
+                let server = configured.get(name).cloned().or_else(|| {
+                    (name == "figma").then(
+                        || serde_json::json!({"type": "http", "url": "https://mcp.figma.com/mcp"}),
+                    )
+                })?;
+                Some((name.clone(), server))
+            })
             .collect(),
     )
 }
@@ -1848,15 +1857,74 @@ mod tests {
         let lean = lean_mcp_names(None).unwrap();
         assert_eq!(
             names(cli_mcp_servers(Some(&user), Some(&lean)).unwrap()),
-            ["fff", "slack"]
+            ["fff", "figma", "slack"]
         );
         let extra = lean_mcp_names(Some(&serde_json::json!(["playwright", "missing"]))).unwrap();
         let servers = cli_mcp_servers(Some(&user), Some(&extra)).unwrap();
         assert_eq!(servers["slack"], user["mcpServers"]["slack"]);
-        assert_eq!(names(servers), ["fff", "playwright", "slack"]);
+        assert_eq!(names(servers), ["fff", "figma", "playwright", "slack"]);
         assert!(lean_mcp_names(Some(&serde_json::json!("all"))).is_none());
         assert!(cli_mcp_servers(Some(&user), None).is_none());
         assert!(cli_mcp_servers(None, Some(&lean)).is_none());
+    }
+
+    #[test]
+    fn cli_mcp_servers_add_default_figma_and_preserve_explicit_entries() {
+        let lean = lean_mcp_names(None).unwrap();
+        assert!(lean.iter().any(|name| name == "figma"));
+        let user = serde_json::json!({"mcpServers": {
+            "bettercoding": {"command": "user-configured-bettercoding"}
+        }});
+        let servers = cli_mcp_servers(Some(&user), Some(&lean)).unwrap();
+        assert_eq!(
+            servers["figma"],
+            serde_json::json!({"type": "http", "url": "https://mcp.figma.com/mcp"})
+        );
+        assert!(!servers.contains_key("bettercoding"));
+
+        let user = serde_json::json!({"mcpServers": {
+            "figma": {"command": "custom-figma", "args": ["--local"]},
+            "playwright": {"command": "playwright-mcp"}
+        }});
+        let extra = lean_mcp_names(Some(&serde_json::json!(["playwright"]))).unwrap();
+        let servers = cli_mcp_servers(Some(&user), Some(&extra)).unwrap();
+        assert_eq!(servers["figma"], user["mcpServers"]["figma"]);
+        assert_eq!(servers["playwright"], user["mcpServers"]["playwright"]);
+    }
+
+    #[test]
+    fn cli_mcp_servers_preserve_configured_vanta_and_skip_absent_vanta() {
+        let lean = lean_mcp_names(None).unwrap();
+        assert!(lean.iter().any(|name| name == "vanta"));
+        let user = serde_json::json!({"mcpServers": {
+            "vanta": {"command": "synthetic-vanta", "args": ["--synthetic"],
+                      "env": {"SYNTHETIC_VALUE": "fixture"}}
+        }});
+        let servers = cli_mcp_servers(Some(&user), Some(&lean)).unwrap();
+        assert_eq!(servers["vanta"], user["mcpServers"]["vanta"]);
+        let absent = serde_json::json!({"mcpServers": {}});
+        let servers = cli_mcp_servers(Some(&absent), Some(&lean)).unwrap();
+        assert!(!servers.contains_key("vanta"));
+    }
+
+    #[test]
+    fn cli_mcp_figma_preserves_all_and_unreadable_config_fallback() {
+        let user = serde_json::json!({"mcpServers": {"gmail": {"command": "mail-mcp"}}});
+        let all = lean_mcp_names(Some(&serde_json::json!("all")));
+        assert!(cli_mcp_servers(Some(&user), all.as_deref()).is_none());
+        let lean = lean_mcp_names(None).unwrap();
+        for user in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"mcpServers": []})),
+        ] {
+            assert!(cli_mcp_servers(user.as_ref(), Some(&lean)).is_none());
+        }
+        let figma_only = vec!["figma".to_string()];
+        let fallback = cli_mcp_servers(Some(&user), Some(&figma_only)).unwrap();
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback["figma"]["url"], "https://mcp.figma.com/mcp");
+        assert!(!fallback.contains_key("bettercoding"));
     }
 
     #[test]
