@@ -639,7 +639,8 @@ async fn adoption_contract(
     )
     .await
     .unwrap();
-    let cwd = root.join("worktrees/adoption");
+    // Synthetic adoption evidence lives outside the managed orphan-sweep root.
+    let cwd = root.join("adoption");
     fs::create_dir(&cwd).unwrap();
     Workspace::update_container_ref(pool, workspace.id, cwd.to_str().unwrap())
         .await
