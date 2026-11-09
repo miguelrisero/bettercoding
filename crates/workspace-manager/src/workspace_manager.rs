@@ -204,6 +204,18 @@ pub struct WorkspaceManager {
 }
 
 impl WorkspaceManager {
+    // One server process coordinates materialization and orphan deletion here.
+    fn lifecycle_lock() -> &'static tokio::sync::RwLock<()> {
+        static LOCK: OnceLock<tokio::sync::RwLock<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::RwLock::new(()))
+    }
+
+    /// Hold once, before filesystem materialization through database path publication.
+    /// Acquire repository locks beneath this guard; complete short-temp locking first.
+    pub async fn materialization_guard() -> tokio::sync::RwLockReadGuard<'static, ()> {
+        Self::lifecycle_lock().read().await
+    }
+
     // In-process serialization: multiple server processes require a database-backed lock.
     fn short_tmp_lock(workspace_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
         static LOCKS: OnceLock<Mutex<HashMap<Uuid, Weak<tokio::sync::Mutex<()>>>>> =
@@ -548,14 +560,7 @@ impl WorkspaceManager {
         );
 
         // Move old worktree to temp location (can't move into subdirectory of itself)
-        let temp_name = format!(
-            "{}-migrating",
-            workspace_dir
-                .file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default()
-        );
-        let temp_path = workspace_dir.with_file_name(temp_name);
+        let temp_path = Self::legacy_migration_path(workspace_dir);
 
         WorktreeManager::move_worktree(&repo.path, workspace_dir, &temp_path).await?;
 
@@ -575,6 +580,34 @@ impl WorkspaceManager {
         );
 
         Ok(true)
+    }
+
+    fn legacy_migration_path(workspace_dir: &Path) -> PathBuf {
+        workspace_dir.with_file_name(format!(
+            "{}-migrating",
+            workspace_dir
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default()
+        ))
+    }
+
+    async fn protected_workspace_paths(
+        &self,
+    ) -> Result<HashSet<PathBuf>, db::models::workspace::WorkspaceError> {
+        let workspaces = DbWorkspace::fetch_all(&self.db.pool).await?;
+        let mut protected = HashSet::new();
+        for path in workspaces
+            .iter()
+            .filter_map(|workspace| workspace.container_ref.as_deref())
+        {
+            let path = Path::new(path);
+            let canonical_path = canonical(path);
+            protected.insert(canonical(Self::legacy_migration_path(path)));
+            protected.insert(canonical(Self::legacy_migration_path(&canonical_path)));
+            protected.insert(canonical_path);
+        }
+        Ok(protected)
     }
 
     /// Helper to cleanup worktrees during rollback
@@ -602,16 +635,18 @@ impl WorkspaceManager {
             return;
         }
 
+        self.cleanup_orphan_workspaces_in_directory(&Self::get_workspace_base_dir())
+            .await;
+    }
+
+    async fn cleanup_orphan_workspaces_in_directory(&self, base: &Path) {
+        let _guard = Self::lifecycle_lock().write().await;
         // Only the root new workspaces are created in. A former root (the
         // default dir after a workspace-dir override, or a legacy root older
         // workspaces still live in) can hold anything, such as another tool's
         // files or live lock files, so it is never swept.
-        let registered: HashSet<PathBuf> = match DbWorkspace::fetch_all(&self.db.pool).await {
-            Ok(workspaces) => workspaces
-                .iter()
-                .filter_map(|w| w.container_ref.as_deref())
-                .map(canonical)
-                .collect(),
+        let registered = match self.protected_workspace_paths().await {
+            Ok(registered) => registered,
             Err(e) => {
                 warn!(
                     "Skipping orphan workspace cleanup: failed to list workspaces: {}",
@@ -620,8 +655,7 @@ impl WorkspaceManager {
                 return;
             }
         };
-        self.cleanup_orphans_in_directory(&Self::get_workspace_base_dir(), &registered)
-            .await;
+        self.cleanup_orphans_in_directory(base, &registered).await;
     }
 
     async fn cleanup_orphans_in_directory(
@@ -667,6 +701,14 @@ impl WorkspaceManager {
             let workspace_path_str = path.to_string_lossy().to_string();
             // Canonical paths, so a symlinked root cannot hide a registered workspace.
             if !registered.contains(&canonical(&path)) {
+                match self.protected_workspace_paths().await {
+                    Ok(current) if current.contains(&canonical(&path)) => continue,
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(%error, "Skipping orphan workspace cleanup: current registration lookup failed");
+                        return;
+                    }
+                }
                 warn!(
                     "Removing orphaned workspace directory {}",
                     workspace_path_str
@@ -786,6 +828,243 @@ mod tests {
             Err(WorkspaceError::WorkspaceNotFound)
         ));
         assert!(!resource.join("orphan").exists());
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_preserves_a_workspace_registered_after_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("worktrees");
+        fs::create_dir(&base).unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations_for_tests(&pool).await.unwrap();
+        assert!(DbWorkspace::fetch_all(&pool).await.unwrap().is_empty());
+        let snapshot = HashSet::new();
+
+        let workspace = DbWorkspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "registered-after-snapshot".into(),
+                name: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        let registered = base.join("registered-after-snapshot");
+        fs::create_dir(&registered).unwrap();
+        fs::write(registered.join("sentinel"), "workspace contents").unwrap();
+        DbWorkspace::update_container_ref(&pool, workspace.id, registered.to_str().unwrap())
+            .await
+            .unwrap();
+        let orphan = base.join("real-orphan");
+        fs::create_dir(&orphan).unwrap();
+
+        WorkspaceManager::new(DBService { pool })
+            .cleanup_orphans_in_directory(&base, &snapshot)
+            .await;
+
+        assert!(
+            !orphan.exists(),
+            "a real orphan remains eligible for cleanup"
+        );
+        assert!(
+            registered.is_dir(),
+            "a workspace registered after the snapshot must survive"
+        );
+        assert_eq!(
+            fs::read_to_string(registered.join("sentinel")).unwrap(),
+            "workspace contents"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_preserves_interrupted_legacy_migration_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("worktrees");
+        fs::create_dir(&base).unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations_for_tests(&pool).await.unwrap();
+        let workspace = DbWorkspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "interrupted-legacy-migration".into(),
+                name: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        let registered = base.join("legacy-workspace");
+        DbWorkspace::update_container_ref(&pool, workspace.id, registered.to_str().unwrap())
+            .await
+            .unwrap();
+        let staging = registered.with_file_name(format!(
+            "{}-migrating",
+            registered.file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("sentinel"), "interrupted workspace contents").unwrap();
+        let orphan = base.join("unrelated-orphan");
+        fs::create_dir(&orphan).unwrap();
+        let snapshot = HashSet::from([canonical(&registered)]);
+
+        WorkspaceManager::new(DBService { pool })
+            .cleanup_orphans_in_directory(&base, &snapshot)
+            .await;
+
+        assert!(
+            !orphan.exists(),
+            "an unrelated orphan remains eligible for cleanup"
+        );
+        assert!(
+            staging.is_dir(),
+            "an interrupted legacy migration staging directory must survive"
+        );
+        assert_eq!(
+            fs::read_to_string(staging.join("sentinel")).unwrap(),
+            "interrupted workspace contents"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_waits_for_materialization_publication() {
+        use std::{future::Future, task::Poll};
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("worktrees");
+        fs::create_dir(&base).unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations_for_tests(&pool).await.unwrap();
+        let manager = WorkspaceManager::new(DBService { pool });
+        let guard = WorkspaceManager::materialization_guard().await;
+        let registered = base.join("materializing");
+        fs::create_dir(&registered).unwrap();
+        fs::write(registered.join("sentinel"), "materializing contents").unwrap();
+        let mut sweep = Box::pin(manager.cleanup_orphan_workspaces_in_directory(&base));
+        std::future::poll_fn(|cx| {
+            assert!(sweep.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let workspace = DbWorkspace::create(
+            &manager.db.pool,
+            &CreateWorkspace {
+                branch: "materializing".into(),
+                name: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        DbWorkspace::update_container_ref(
+            &manager.db.pool,
+            workspace.id,
+            registered.to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        drop(guard);
+        sweep.await;
+        assert_eq!(
+            fs::read_to_string(registered.join("sentinel")).unwrap(),
+            "materializing contents"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialization_waits_for_an_active_orphan_sweep() {
+        use std::{future::Future, task::Poll};
+
+        let sweep = WorkspaceManager::lifecycle_lock().write().await;
+        let mut materialization = Box::pin(WorkspaceManager::materialization_guard());
+        std::future::poll_fn(|cx| {
+            assert!(materialization.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(sweep);
+        let _guard = materialization.await;
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_preserves_candidates_when_database_reads_fail() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("worktrees");
+        let candidate = base.join("unverified");
+        fs::create_dir_all(&candidate).unwrap();
+        fs::write(candidate.join("sentinel"), "unverified contents").unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations_for_tests(&pool).await.unwrap();
+        pool.close().await;
+        WorkspaceManager::new(DBService { pool })
+            .cleanup_orphans_in_directory(&base, &HashSet::new())
+            .await;
+        assert_eq!(
+            fs::read_to_string(candidate.join("sentinel")).unwrap(),
+            "unverified contents"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orphan_sweep_preserves_migration_staging_through_a_registered_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("worktrees");
+        fs::create_dir(&base).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&base, &alias).unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations_for_tests(&pool).await.unwrap();
+        let workspace = DbWorkspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "migration-alias".into(),
+                name: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        DbWorkspace::update_container_ref(
+            &pool,
+            workspace.id,
+            alias.join("legacy").to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        let staging = base.join("legacy-migrating");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("sentinel"), "migration contents").unwrap();
+        let orphan = base.join("unrelated-migrating");
+        fs::create_dir(&orphan).unwrap();
+        WorkspaceManager::new(DBService { pool })
+            .cleanup_orphans_in_directory(&base, &HashSet::new())
+            .await;
+        assert!(!orphan.exists());
+        assert_eq!(
+            fs::read_to_string(staging.join("sentinel")).unwrap(),
+            "migration contents"
+        );
     }
 
     #[cfg(unix)]
