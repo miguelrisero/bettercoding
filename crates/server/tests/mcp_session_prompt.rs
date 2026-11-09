@@ -1,11 +1,7 @@
 #![cfg(all(target_os = "linux", not(feature = "qa-mode")))]
 
 use std::{
-    fs,
-    os::unix::fs::PermissionsExt,
-    panic::AssertUnwindSafe,
-    process::Stdio,
-    time::Duration,
+    fs, os::unix::fs::PermissionsExt, panic::AssertUnwindSafe, process::Stdio, time::Duration,
 };
 
 use db::models::{
@@ -60,6 +56,12 @@ fn tool_payload(result: Value) -> Value {
 async fn stdio_session_prompt_returns_started_for_the_owned_executor() {
     // Regresses decoding the dispatch envelope as a bare ExecutionProcess.
     // This integration binary owns process-wide caches and environment.
+    for dsn in [option_env!("SENTRY_DSN"), option_env!("SENTRY_DSN_REMOTE")] {
+        assert!(
+            dsn.is_none_or(str::is_empty),
+            "fixture requires telemetry-free binaries"
+        );
+    }
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     for dir in ["home", "data", "worktrees", "bin", "tmp", "repo", "mcp"] {
@@ -139,11 +141,13 @@ async fn stdio_session_prompt_returns_started_for_the_owned_executor() {
             std::env::remove_var(name);
         }
     }
-    let mut config = Config::default();
-    config.onboarding_acknowledged = true;
-    config.analytics_enabled = false;
-    config.pr_auto_description_enabled = false;
-    config.commit_reminder_enabled = false;
+    let mut config = Config {
+        onboarding_acknowledged: true,
+        analytics_enabled: false,
+        pr_auto_description_enabled: false,
+        commit_reminder_enabled: false,
+        ..Default::default()
+    };
     config.notifications.sound_enabled = false;
     config.notifications.push_enabled = false;
     fs::write(
@@ -169,8 +173,14 @@ async fn stdio_session_prompt_returns_started_for_the_owned_executor() {
         for args in [
             vec!["init", "-b", "main"],
             vec![
-                "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
-                "commit", "--allow-empty", "-m", "fixture",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fixture",
             ],
         ] {
             let mut git = tokio::process::Command::new("git");
@@ -182,11 +192,16 @@ async fn stdio_session_prompt_returns_started_for_the_owned_executor() {
                 .kill_on_drop(true);
             assert!(
                 tokio::time::timeout(Duration::from_secs(5), git.status())
-                    .await.unwrap().unwrap().success()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .success()
             );
         }
         let pool = &deployment.db().pool;
-        let repo = Repo::find_or_create(pool, &repo_path, "fixture").await.unwrap();
+        let repo = Repo::find_or_create(pool, &repo_path, "fixture")
+            .await
+            .unwrap();
         WorkspaceRepo::create_many(
             pool,
             workspace_id,
@@ -225,29 +240,52 @@ async fn stdio_session_prompt_returns_started_for_the_owned_executor() {
         let mut input = mcp.stdin.take().unwrap();
         let mut output = BufReader::new(mcp.stdout.take().unwrap());
         tokio::time::timeout(Duration::from_secs(20), async {
-            rpc(&mut input, &mut output, json!({
-                "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": {"protocolVersion": "2025-03-26", "capabilities": {},
-                    "clientInfo": {"name": "fixture", "version": "1"}}
-            })).await;
-            input.write_all(
-                b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n"
-            ).await.unwrap();
-            let created = tool_payload(rpc(&mut input, &mut output, json!({
-                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": {"name": "create_session", "arguments": {
-                    "workspace_id": workspace_id, "executor": "CLAUDE_CODE"}}
-            })).await);
+            rpc(
+                &mut input,
+                &mut output,
+                json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                        "clientInfo": {"name": "fixture", "version": "1"}}
+                }),
+            )
+            .await;
+            input
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                .await
+                .unwrap();
+            let created = tool_payload(
+                rpc(
+                    &mut input,
+                    &mut output,
+                    json!({
+                        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                        "params": {"name": "create_session", "arguments": {
+                            "workspace_id": workspace_id, "executor": "CLAUDE_CODE"}}
+                    }),
+                )
+                .await,
+            );
             let session_id = Uuid::parse_str(created["session"]["id"].as_str().unwrap()).unwrap();
-            let receipt = tool_payload(rpc(&mut input, &mut output, json!({
-                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                "params": {"name": "run_session_prompt", "arguments": {
-                    "session_id": session_id, "prompt": "fixture prompt"}}
-            })).await);
+            let receipt = tool_payload(
+                rpc(
+                    &mut input,
+                    &mut output,
+                    json!({
+                        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                        "params": {"name": "run_session_prompt", "arguments": {
+                            "session_id": session_id, "prompt": "fixture prompt"}}
+                    }),
+                )
+                .await,
+            );
             assert_eq!(receipt["outcome"], "started", "{receipt}");
             assert_eq!(receipt["session_id"], session_id.to_string());
             let execution_id = Uuid::parse_str(receipt["execution_id"].as_str().unwrap()).unwrap();
-            let process = ExecutionProcess::find_by_id(pool, execution_id).await.unwrap().unwrap();
+            let process = ExecutionProcess::find_by_id(pool, execution_id)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(process.session_id, session_id);
             assert_eq!(process.status, ExecutionProcessStatus::Running);
             assert_eq!(receipt["execution"]["id"], execution_id.to_string());
@@ -262,13 +300,19 @@ async fn stdio_session_prompt_returns_started_for_the_owned_executor() {
             };
             assert_eq!(delivered["message"]["content"], "fixture prompt");
             let pid: u32 = fs::read_to_string(marker.with_extension("pid"))
-                .unwrap().trim().parse().unwrap();
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
             assert_eq!(
                 fs::read_link(format!("/proc/{pid}/cwd")).unwrap(),
                 container.join(&repo.name)
             );
             let argv = fs::read(format!("/proc/{pid}/cmdline")).unwrap();
-            assert!(argv.split(|byte| *byte == 0).any(|arg| arg == agent.as_os_str().as_encoded_bytes()));
+            assert!(
+                argv.split(|byte| *byte == 0)
+                    .any(|arg| arg == agent.as_os_str().as_encoded_bytes())
+            );
         })
         .await
         .expect("MCP dispatch exceeds fixture deadline");
@@ -287,8 +331,13 @@ async fn stdio_session_prompt_returns_started_for_the_owned_executor() {
         let pool = &deployment.db().pool;
         for session in Session::find_by_workspace_id(pool, workspace_id).await? {
             let processes = ExecutionProcess::find_by_session_id(pool, session.id, false).await?;
-            if processes.iter().any(|process| process.status == ExecutionProcessStatus::Running) {
-                return Err(sqlx::Error::Protocol("fixture executor remains running".into()));
+            if processes
+                .iter()
+                .any(|process| process.status == ExecutionProcessStatus::Running)
+            {
+                return Err(sqlx::Error::Protocol(
+                    "fixture executor remains running".into(),
+                ));
             }
         }
         WorkspaceManager::delete_record_with_short_tmp(pool, workspace_id).await
