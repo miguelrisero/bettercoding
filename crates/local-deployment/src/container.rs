@@ -1612,6 +1612,7 @@ impl ContainerService for LocalContainerService {
 
     async fn create(&self, workspace: &Workspace) -> Result<ContainerRef, ContainerError> {
         let short_tmp = self.ensure_short_tmp(workspace.id).await?;
+        let _materialization = WorkspaceManager::materialization_guard().await;
         let label = workspace.name.as_deref().unwrap_or("workspace");
         let workspace_dir_name =
             LocalContainerService::dir_name_from_workspace(&workspace.id, label);
@@ -1663,6 +1664,7 @@ impl ContainerService for LocalContainerService {
         workspace: &Workspace,
     ) -> Result<ContainerRef, ContainerError> {
         let short_tmp = self.ensure_short_tmp(workspace.id).await?;
+        let _materialization = WorkspaceManager::materialization_guard().await;
         self.touch(workspace).await?;
         let (repositories, workspace_inputs) = self.workspace_repo_inputs(workspace.id).await?;
 
