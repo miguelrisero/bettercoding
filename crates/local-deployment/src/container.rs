@@ -2022,6 +2022,82 @@ mod tests {
         assert!(appended.contains("## Workspace file hygiene"), "{appended}");
     }
 
+    #[tokio::test]
+    async fn workspace_config_files_explain_managed_short_tmp_lifetime() {
+        let dir = TempDir::new().unwrap();
+
+        LocalContainerService::create_workspace_config_files(dir.path(), &[])
+            .await
+            .unwrap();
+
+        for config_file in ["CLAUDE.md", "AGENTS.md"] {
+            let content = std::fs::read_to_string(dir.path().join(config_file)).unwrap();
+            assert!(
+                content.contains("BC_SHORT_TMP"),
+                "{config_file} must expose the managed short-temp exception: {content}"
+            );
+            assert!(
+                content.contains("deleted with the workspace"),
+                "{config_file} must explain the short-temp cleanup lifetime: {content}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_config_files_migrate_managed_hygiene_preserving_user_content() {
+        let dir = TempDir::new().unwrap();
+        let prefix = "@repo/CLAUDE.md\n\nUser instructions before the managed block.  \n\n";
+        let suffix = "\n\n## User instructions\n\nKeep this user-owned suffix.  \n";
+        let legacy_hygiene = concat!(
+            "<!-- bettercoding:workspace-hygiene -->\n",
+            "## Workspace file hygiene\n\n",
+            "This directory is a disposable workspace. It is deleted whole when the ",
+            "workspace is cleaned up, and nothing outside it is ever deleted.\n\n",
+            "- Keep every file you create inside this directory.\n",
+            "- Put scratch work in `.scratch/`: plans, notes, logs, reports, downloads, ",
+            "screenshots, one-off scripts, analysis output. It sits outside every repo ",
+            "checkout, so it never appears in `git status` and never lands in a commit.\n",
+            "- Do not write outside this directory. Files left in `/tmp`, `/var/tmp`, ",
+            "`$HOME`, `$HOME/.cache` or any parent of this directory survive cleanup as ",
+            "orphans nobody finds again. If a tool needs a temp path, point it at ",
+            "`.scratch/`.\n",
+            "- Do not park scratch files in a repo checkout. A repo directory is for the ",
+            "changes the task actually asks for.\n",
+            "- Create any extra git worktree inside this directory too, not beside it.\n",
+        );
+        let existing = format!("{prefix}{legacy_hygiene}{suffix}");
+        for config_file in ["CLAUDE.md", "AGENTS.md"] {
+            std::fs::write(dir.path().join(config_file), &existing).unwrap();
+        }
+
+        LocalContainerService::create_workspace_config_files(dir.path(), &[])
+            .await
+            .unwrap();
+
+        for config_file in ["CLAUDE.md", "AGENTS.md"] {
+            let path = dir.path().join(config_file);
+            let migrated = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                migrated.contains("BC_SHORT_TMP"),
+                "{config_file} must migrate an existing managed hygiene block: {migrated}"
+            );
+            assert!(migrated.starts_with(prefix), "{config_file}: {migrated}");
+            assert!(migrated.ends_with(suffix), "{config_file}: {migrated}");
+            assert_eq!(
+                migrated
+                    .matches("<!-- bettercoding:workspace-hygiene -->")
+                    .count(),
+                1,
+                "{config_file} must retain exactly one managed block"
+            );
+
+            LocalContainerService::create_workspace_config_files(dir.path(), &[])
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), migrated);
+        }
+    }
+
     #[test]
     fn retry_threads_transcript_truncation_into_follow_up_action() {
         let reset_to_message_id = "assistant-message-to-retry".to_string();
