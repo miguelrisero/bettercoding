@@ -123,7 +123,10 @@ mod short_tmp_tests {
 pub async fn get_workspace_short_tmp(
     Extension(workspace): Extension<Workspace>,
 ) -> Result<ResponseJson<ApiResponse<String>>, ApiError> {
-    Ok(workspace_short_tmp_response(std::path::Path::new("/tmp"), workspace.id)?)
+    Ok(workspace_short_tmp_response(
+        std::path::Path::new("/tmp"),
+        workspace.id,
+    )?)
 }
 
 fn workspace_short_tmp_response(

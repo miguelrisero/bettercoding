@@ -229,7 +229,8 @@ impl LocalContainerService {
                     if !std::fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir()) {
                         return Ok(());
                     }
-                    Self::create_workspace_config_files(root, &[], short_tmp.as_deref(), false).await
+                    Self::create_workspace_config_files(root, &[], short_tmp.as_deref(), false)
+                        .await
                 }
                 .await;
                 if let Err(error) = result {

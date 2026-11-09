@@ -47,11 +47,9 @@ pub(crate) async fn create_workspace_record(
     .await?;
 
     #[cfg(unix)]
-    if let Err(error) = workspace_manager::WorkspaceManager::ensure_short_tmp(
-        &deployment.db().pool,
-        workspace.id,
-    )
-    .await
+    if let Err(error) =
+        workspace_manager::WorkspaceManager::ensure_short_tmp(&deployment.db().pool, workspace.id)
+            .await
     {
         match workspace_manager::WorkspaceManager::delete_record_with_short_tmp(
             &deployment.db().pool,

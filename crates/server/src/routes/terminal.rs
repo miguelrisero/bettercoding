@@ -173,7 +173,8 @@ pub(super) async fn prepare_cli_launch_spec(
 ) -> Result<CliLaunchSpec, ApiError> {
     #[cfg(unix)]
     {
-        spec.short_tmp = Some(workspace_manager::WorkspaceManager::ensure_short_tmp(pool, workspace_id).await?);
+        spec.short_tmp =
+            Some(workspace_manager::WorkspaceManager::ensure_short_tmp(pool, workspace_id).await?);
     }
     // Codex reports its state through the same hook endpoint, registered
     // inline with `-c` so neither ~/.codex nor the worktree is touched.

@@ -112,7 +112,8 @@ fn remove_in(root: &Path, workspace_id: Uuid) -> io::Result<()> {
             "short temporary directory changed during cleanup",
         ));
     }
-    if unsafe { nix::libc::unlinkat(root.as_raw_fd(), name.as_ptr(), nix::libc::AT_REMOVEDIR) } != 0 {
+    if unsafe { nix::libc::unlinkat(root.as_raw_fd(), name.as_ptr(), nix::libc::AT_REMOVEDIR) } != 0
+    {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -201,10 +202,9 @@ fn remove_in(_root: &Path, _workspace_id: Uuid) -> io::Result<()> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     use tempfile::TempDir;
 
@@ -280,7 +280,10 @@ mod tests {
         }
         std::fs::write(nested.join("keep"), "protected").unwrap();
         assert!(remove_in(root.path(), id).is_err());
-        assert_eq!(std::fs::read_to_string(nested.join("keep")).unwrap(), "protected");
+        assert_eq!(
+            std::fs::read_to_string(nested.join("keep")).unwrap(),
+            "protected"
+        );
     }
 
     #[test]

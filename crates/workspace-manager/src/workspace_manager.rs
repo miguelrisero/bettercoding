@@ -206,7 +206,8 @@ pub struct WorkspaceManager {
 impl WorkspaceManager {
     // In-process serialization: multiple server processes require a database-backed lock.
     fn short_tmp_lock(workspace_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
-        static LOCKS: OnceLock<Mutex<HashMap<Uuid, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+        static LOCKS: OnceLock<Mutex<HashMap<Uuid, Weak<tokio::sync::Mutex<()>>>>> =
+            OnceLock::new();
         let mut locks = LOCKS
             .get_or_init(Mutex::default)
             .lock()
