@@ -169,6 +169,10 @@ pub(super) async fn prepare_cli_launch_spec(
     workspace_id: Uuid,
     workspace_name: Option<&str>,
 ) -> Result<CliLaunchSpec, ApiError> {
+    #[cfg(unix)]
+    {
+        spec.short_tmp = Some(utils::workspace_tmp::ensure(workspace_id)?);
+    }
     // Codex reports its state through the same hook endpoint, registered
     // inline with `-c` so neither ~/.codex nor the worktree is touched.
     if spec.program == "codex" {

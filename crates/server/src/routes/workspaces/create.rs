@@ -46,6 +46,18 @@ pub(crate) async fn create_workspace_record(
     )
     .await?;
 
+    #[cfg(unix)]
+    if let Err(error) = utils::workspace_tmp::ensure(workspace.id) {
+        match Workspace::delete(&deployment.db().pool, workspace.id).await {
+            Ok(rows) if rows > 0 => {
+                if let Err(cleanup_error) = utils::workspace_tmp::remove(workspace.id) {
+                    tracing::warn!(workspace_id = %workspace.id, %cleanup_error, "Failed creation leaves a residual short temporary directory");
+                }
+            }
+            result => tracing::warn!(workspace_id = %workspace.id, ?result, "Failed creation retains the workspace record and short temporary resource"),
+        }
+        return Err(error.into());
+    }
     Ok(workspace)
 }
 

@@ -173,9 +173,56 @@ impl LocalContainerService {
             remote_client,
         };
 
+        container.reconcile_workspace_short_tmp().await;
         container.spawn_workspace_cleanup();
 
         container
+    }
+
+    #[cfg(unix)]
+    fn set_short_tmp_env(env: &mut ExecutionEnv, root: &Path, workspace_id: Uuid) {
+        match utils::workspace_tmp::validate_in(root, workspace_id) {
+            Ok(path) => env.set_short_tmp(Some(&path)),
+            Err(error) => {
+                env.set_short_tmp(None);
+                tracing::warn!(%workspace_id, %error, "Headless launch withholds BC_SHORT_TMP because the managed directory is unavailable");
+            }
+        }
+    }
+
+    fn ensure_short_tmp(workspace_id: Uuid) -> std::io::Result<Option<PathBuf>> {
+        #[cfg(unix)]
+        { utils::workspace_tmp::ensure(workspace_id).map(Some) }
+        #[cfg(not(unix))]
+        { let _ = workspace_id; Ok(None) }
+    }
+
+    /// Reconcile serially before the cleanup task starts; never restore worktrees
+    /// or restart agents to advertise the supported discovery endpoint.
+    async fn reconcile_workspace_short_tmp(&self) {
+        #[cfg(unix)]
+        {
+            let workspaces = match Workspace::fetch_all(&self.db.pool).await {
+                Ok(workspaces) => workspaces,
+                Err(error) => {
+                    tracing::warn!(%error, "Cannot reconcile workspace short temporary directories");
+                    return;
+                }
+            };
+            for workspace in workspaces {
+                let Some(root) = workspace.container_ref.as_deref().map(Path::new) else { continue; };
+                if !std::fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir()) {
+                    continue;
+                }
+                let result = async {
+                    let short_tmp = utils::workspace_tmp::ensure(workspace.id)?;
+                    Self::create_workspace_config_files(root, &[], Some(&short_tmp), false).await
+                }.await;
+                if let Err(error) = result {
+                    tracing::warn!(workspace_id = %workspace.id, %error, "Workspace short temporary directory reconciliation failed");
+                }
+            }
+        }
     }
 
     pub fn set_cli_collab(&self, cli_collab: Arc<CliCollabService>) {
@@ -1192,11 +1239,8 @@ impl LocalContainerService {
     /// `cleanup_workspace` removes it with the rest of the workspace.
     const SCRATCH_DIR: &'static str = ".scratch";
 
-    /// Tells the agent where it may write and where it may not. Agents that
-    /// scatter notes, logs and downloads across `/tmp` or `$HOME` leave files
-    /// behind that no workspace cleanup ever reaches, because cleanup only
-    /// deletes the workspace directory.
-    fn workspace_hygiene_block() -> String {
+    /// Exact legacy text is the only unbounded block eligible for migration.
+    fn legacy_workspace_hygiene_block() -> String {
         format!(
             "{marker}\n\
              ## Workspace file hygiene\n\n\
@@ -1218,6 +1262,18 @@ impl LocalContainerService {
         )
     }
 
+    fn workspace_hygiene_block(short_tmp: Option<&Path>) -> String {
+        let mut block = Self::legacy_workspace_hygiene_block()
+            .replace("and nothing outside it is ever deleted.", "and its managed short temporary directory is deleted with the workspace.")
+            .replace("- Keep every file you create inside this directory.", "- Keep files inside this directory, except for the managed short temporary directory below.")
+            .replace("- Do not write outside this directory.", "- Use only the managed short temporary directory as an outside-workspace exception.");
+        let location = short_tmp.map(|path| format!("`{}`", path.display()))
+            .unwrap_or_else(|| "the path in `BC_SHORT_TMP`".to_string());
+        block.push_str(&format!("- Use {location} (`BC_SHORT_TMP`) when a tool needs a short temporary path. This private directory is deleted with the workspace. Keep `TMPDIR` unchanged.\n"));
+        block.push_str("<!-- /bettercoding:workspace-hygiene -->\n");
+        block
+    }
+
     /// Create workspace-level CLAUDE.md and AGENTS.md files: `@import` lines for
     /// each repo's own config file, plus the workspace hygiene block that keeps
     /// agent-created files inside the workspace.
@@ -1229,33 +1285,62 @@ impl LocalContainerService {
     async fn create_workspace_config_files(
         workspace_dir: &Path,
         repos: &[Repo],
+        short_tmp: Option<&Path>,
+        create_missing: bool,
     ) -> Result<(), ContainerError> {
         const CONFIG_FILES: [&str; 2] = ["CLAUDE.md", "AGENTS.md"];
 
-        if let Err(e) = tokio::fs::create_dir_all(workspace_dir.join(Self::SCRATCH_DIR)).await {
+        if create_missing
+            && let Err(e) = tokio::fs::create_dir_all(workspace_dir.join(Self::SCRATCH_DIR)).await
+        {
             tracing::warn!("Failed to create workspace scratch directory: {}", e);
         }
 
-        let hygiene = Self::workspace_hygiene_block();
+        let hygiene = Self::workspace_hygiene_block(short_tmp);
 
         for config_file in CONFIG_FILES {
             let workspace_config_path = workspace_dir.join(config_file);
 
-            let existing = tokio::fs::read_to_string(&workspace_config_path)
-                .await
-                .unwrap_or_default();
+            use std::io::{Read, Seek, Write};
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            let mut file = match options.open(&workspace_config_path) {
+                Ok(file) if file.metadata()?.is_file() => file,
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
+                    options.create_new(true).open(&workspace_config_path)?
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!(path = %workspace_config_path.display(), %error, "Refusing unsafe workspace instruction file");
+                    continue;
+                }
+            };
+            let mut existing = String::new();
+            file.read_to_string(&mut existing)?;
 
             if existing.contains(Self::HYGIENE_MARKER) {
-                tracing::trace!(
-                    "Workspace config file {} already carries the hygiene block, skipping",
-                    config_file
-                );
+                let legacy = Self::legacy_workspace_hygiene_block();
+                if let Some(start) = existing.find(&legacy) {
+                    // Preserve every byte outside the exact application-owned text.
+                    let migrated = format!("{}{}{}", &existing[..start], hygiene, &existing[start + legacy.len()..]);
+                    if migrated != existing {
+                        file.rewind()?;
+                        file.write_all(migrated.as_bytes())?;
+                        file.set_len(migrated.len() as u64)?;
+                    }
+                }
                 continue;
             }
 
             let mut sections = Vec::new();
 
-            if existing.trim().is_empty() {
+            if existing.is_empty() {
                 let mut import_lines = Vec::new();
                 for repo in repos {
                     let repo_config_path = workspace_dir.join(&repo.name).join(config_file);
@@ -1267,20 +1352,15 @@ impl LocalContainerService {
                     sections.push(import_lines.join("\n"));
                 }
             } else {
-                sections.push(existing.trim_end().to_string());
+                sections.push(existing.clone());
             }
 
             sections.push(hygiene.clone());
             let content = sections.join("\n\n");
 
-            if let Err(e) = tokio::fs::write(&workspace_config_path, &content).await {
-                tracing::warn!(
-                    "Failed to write workspace config file {}: {}",
-                    config_file,
-                    e
-                );
-                continue;
-            }
+            file.rewind()?;
+            file.write_all(content.as_bytes())?;
+            file.set_len(content.len() as u64)?;
 
             tracing::info!("Wrote workspace {}", config_file);
         }
@@ -1496,6 +1576,7 @@ impl ContainerService for LocalContainerService {
     }
 
     async fn create(&self, workspace: &Workspace) -> Result<ContainerRef, ContainerError> {
+        let short_tmp = Self::ensure_short_tmp(workspace.id)?;
         let label = workspace.name.as_deref().unwrap_or("workspace");
         let workspace_dir_name =
             LocalContainerService::dir_name_from_workspace(&workspace.id, label);
@@ -1515,7 +1596,7 @@ impl ContainerService for LocalContainerService {
         self.copy_files_and_images(&created_workspace.workspace_dir, workspace)
             .await?;
 
-        Self::create_workspace_config_files(&created_workspace.workspace_dir, &repositories)
+        Self::create_workspace_config_files(&created_workspace.workspace_dir, &repositories, short_tmp.as_deref(), true)
             .await?;
 
         Workspace::update_container_ref(
@@ -1541,6 +1622,7 @@ impl ContainerService for LocalContainerService {
         &self,
         workspace: &Workspace,
     ) -> Result<ContainerRef, ContainerError> {
+        let short_tmp = Self::ensure_short_tmp(workspace.id)?;
         self.touch(workspace).await?;
         let (repositories, workspace_inputs) = self.workspace_repo_inputs(workspace.id).await?;
 
@@ -1578,7 +1660,7 @@ impl ContainerService for LocalContainerService {
         self.copy_files_and_images(&workspace_dir, workspace)
             .await?;
 
-        Self::create_workspace_config_files(&workspace_dir, &repositories).await?;
+        Self::create_workspace_config_files(&workspace_dir, &repositories, short_tmp.as_deref(), true).await?;
 
         Ok(workspace_dir.to_string_lossy().to_string())
     }
@@ -1659,6 +1741,8 @@ impl ContainerService for LocalContainerService {
         let workspace_id = workspace.id.to_string();
         env.insert("BC_WORKSPACE_ID", &workspace_id);
         env.insert("BC_WORKSPACE_BRANCH", &workspace.branch);
+        #[cfg(unix)]
+        Self::set_short_tmp_env(&mut env, Path::new("/tmp"), workspace.id);
 
         // Create the child and stream, add to execution tracker with timeout
         let mut spawned = tokio::time::timeout(
@@ -1990,7 +2074,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
 
-        LocalContainerService::create_workspace_config_files(root, &[])
+        LocalContainerService::create_workspace_config_files(root, &[], None, true)
             .await
             .unwrap();
 
@@ -2005,7 +2089,7 @@ mod tests {
         }
 
         // Workspace restore runs this again; the block must not accumulate.
-        LocalContainerService::create_workspace_config_files(root, &[])
+        LocalContainerService::create_workspace_config_files(root, &[], None, true)
             .await
             .unwrap();
         let again = std::fs::read_to_string(root.join("CLAUDE.md")).unwrap();
@@ -2014,7 +2098,7 @@ mod tests {
 
         // A file that already has content keeps it and gains the block.
         std::fs::write(root.join("AGENTS.md"), "@repo/AGENTS.md\n").unwrap();
-        LocalContainerService::create_workspace_config_files(root, &[])
+        LocalContainerService::create_workspace_config_files(root, &[], None, true)
             .await
             .unwrap();
         let appended = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
@@ -2026,7 +2110,7 @@ mod tests {
     async fn workspace_config_files_explain_managed_short_tmp_lifetime() {
         let dir = TempDir::new().unwrap();
 
-        LocalContainerService::create_workspace_config_files(dir.path(), &[])
+        LocalContainerService::create_workspace_config_files(dir.path(), &[], None, true)
             .await
             .unwrap();
 
@@ -2070,7 +2154,7 @@ mod tests {
             std::fs::write(dir.path().join(config_file), &existing).unwrap();
         }
 
-        LocalContainerService::create_workspace_config_files(dir.path(), &[])
+        LocalContainerService::create_workspace_config_files(dir.path(), &[], None, true)
             .await
             .unwrap();
 
@@ -2091,10 +2175,74 @@ mod tests {
                 "{config_file} must retain exactly one managed block"
             );
 
-            LocalContainerService::create_workspace_config_files(dir.path(), &[])
+            LocalContainerService::create_workspace_config_files(dir.path(), &[], None, true)
                 .await
                 .unwrap();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), migrated);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn headless_short_tmp_validates_export_and_withholds_unsafe_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        let id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap();
+        let path = root.path().join("bc-0123456789abcdef0123456789abcdef");
+        let mut env = ExecutionEnv::new(RepoContext::default(), false, String::new());
+        env.insert("TMPDIR", "/fixture/existing-temp");
+        env.insert("BC_SHORT_TMP", "/fixture/unsafe");
+        for mode in [None, Some(0o700), Some(0o755)] {
+            if let Some(mode) = mode {
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+            LocalContainerService::set_short_tmp_env(&mut env, root.path(), id);
+            let mut command = tokio::process::Command::new("unused-test-program");
+            command.env("BC_SHORT_TMP", "/fixture/inherited");
+            env.apply_to_command(&mut command);
+            let values = command.as_std().get_envs().collect::<HashMap<_, _>>();
+            let expected = (mode == Some(0o700)).then_some(path.as_os_str());
+            assert_eq!(values.get(std::ffi::OsStr::new("BC_SHORT_TMP")), Some(&expected));
+            assert_eq!(values.get(std::ffi::OsStr::new("TMPDIR")), Some(&Some(std::ffi::OsStr::new("/fixture/existing-temp"))));
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_config_files_preserve_unknown_managed_blocks() {
+        let dir = TempDir::new().unwrap();
+        let existing = "User prefix.\n<!-- bettercoding:workspace-hygiene -->\nCustom managed text.\nUser suffix.  \n";
+        std::fs::write(dir.path().join("CLAUDE.md"), existing).unwrap();
+        LocalContainerService::create_workspace_config_files(dir.path(), &[], None, false)
+            .await.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(), existing);
+        assert!(!dir.path().join("AGENTS.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_config_files_refuse_symlink_targets() {
+        let dir = TempDir::new().unwrap();
+        let external = dir.path().join("external");
+        std::fs::write(&external, "Protected user instructions.\n").unwrap();
+        std::os::unix::fs::symlink(&external, dir.path().join("CLAUDE.md")).unwrap();
+        LocalContainerService::create_workspace_config_files(dir.path(), &[], None, true)
+            .await.unwrap();
+        assert_eq!(std::fs::read_to_string(external).unwrap(), "Protected user instructions.\n");
+        assert!(std::fs::symlink_metadata(dir.path().join("CLAUDE.md")).unwrap().is_symlink());
+    }
+
+    #[tokio::test]
+    async fn workspace_config_files_advertise_the_exact_short_path() {
+        let dir = TempDir::new().unwrap();
+        let short_tmp = dir.path().join("private-short");
+        std::fs::create_dir(&short_tmp).unwrap();
+        LocalContainerService::create_workspace_config_files(dir.path(), &[], Some(&short_tmp), true)
+            .await.unwrap();
+        for config_file in ["CLAUDE.md", "AGENTS.md"] {
+            let content = std::fs::read_to_string(dir.path().join(config_file)).unwrap();
+            assert!(content.contains(&format!("`{}` (`BC_SHORT_TMP`)", short_tmp.display())), "{content}");
         }
     }
 

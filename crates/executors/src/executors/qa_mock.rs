@@ -39,7 +39,7 @@ impl StandardCodingAgentExecutor for QaMockExecutor {
         &self,
         current_dir: &Path,
         prompt: &str,
-        _env: &ExecutionEnv,
+        env: &ExecutionEnv,
     ) -> Result<SpawnedChild, ExecutorError> {
         info!("QA Mock Executor: spawning mock execution");
 
@@ -65,13 +65,7 @@ impl StandardCodingAgentExecutor for QaMockExecutor {
             log_file.display()
         );
 
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c")
-            .arg(&script)
-            .current_dir(current_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
+        let mut cmd = mock_command(current_dir, &script, env);
         let child = cmd.group_spawn_no_window().map_err(ExecutorError::Io)?;
         Ok(SpawnedChild::from(child))
     }
@@ -196,6 +190,14 @@ async fn perform_file_operations(dir: &Path) {
             files.len()
         );
     }
+}
+
+fn mock_command(current_dir: &Path, script: &str, env: &ExecutionEnv) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("sh");
+    command.arg("-c").arg(script).current_dir(current_dir)
+        .stdout(Stdio::piped()).stderr(Stdio::piped());
+    env.apply_to_command(&mut command);
+    command
 }
 
 /// Generate 10 mock log entries in ClaudeJson format using strongly-typed structs
@@ -394,6 +396,19 @@ fn generate_mock_logs(prompt: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mock_command_suppresses_unvalidated_short_tmp_and_preserves_other_values() {
+        let mut env = ExecutionEnv::new(crate::env::RepoContext::default(), false, String::new());
+        env.insert("BC_SHORT_TMP", "/fixture/unsafe");
+        env.insert("TMPDIR", "/fixture/temp");
+        env.insert("BC_WORKSPACE_ID", "fixture-workspace");
+        let command = mock_command(Path::new("/fixture/workspace"), "printf fixture", &env);
+        let values = command.as_std().get_envs().collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(values.get(std::ffi::OsStr::new("BC_SHORT_TMP")), Some(&None));
+        assert_eq!(values.get(std::ffi::OsStr::new("TMPDIR")), Some(&Some(std::ffi::OsStr::new("/fixture/temp"))));
+        assert_eq!(values.get(std::ffi::OsStr::new("BC_WORKSPACE_ID")), Some(&Some(std::ffi::OsStr::new("fixture-workspace"))));
+    }
 
     #[test]
     fn test_generate_mock_logs_count() {

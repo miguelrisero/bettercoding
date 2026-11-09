@@ -226,10 +226,15 @@ fn cli_bootstrap_with_exit(
 
     // Agent environment first, so it applies to every launch form below (and
     // to the fallback shell the pane drops into).
-    let env: String = cli_launch_env(&spec.program)
+    let mut env: String = cli_launch_env(&spec.program)
         .iter()
         .map(|(key, value)| format!("export {key}={}; ", shell_single_quote(value)))
         .collect();
+    if let Some(path) = &spec.short_tmp {
+        env.push_str(&format!("export BC_SHORT_TMP={}; ", shell_single_quote(&path.to_string_lossy())));
+    } else {
+        env.push_str("unset BC_SHORT_TMP; ");
+    }
 
     let exit = if on_exit.is_empty() {
         String::new()
@@ -3455,6 +3460,32 @@ mod tests {
     }
 
     #[test]
+    fn cli_bootstrap_without_short_tmp_suppresses_inherited_values() {
+        let spec = codex_spec(&[]);
+        assert!(cli_restart_bootstrap(&spec, None).starts_with("unset BC_SHORT_TMP; "));
+    }
+
+    #[test]
+    fn cli_bootstrap_short_tmp_is_quoted_on_every_launch_form() {
+        let mut spec = codex_spec(&[]);
+        spec.short_tmp = Some(PathBuf::from("/fixture/a'b; $(false)"));
+        let resume = "01234567-89ab-cdef-0123-456789abcdef";
+        for command in [
+            cli_bootstrap(&spec, None, None, false, None),
+            cli_bootstrap(&spec, Some(resume), None, false, None),
+            cli_bootstrap(&spec, None, Some(Path::new("/fixture/prompt")), false, None),
+            cli_restart_bootstrap(&spec, Some(resume)),
+            cli_handover_bootstrap(
+                Uuid::nil(), &spec, Some(resume), None,
+                Path::new("/fixture/exit"), &[],
+            ).unwrap(),
+        ] {
+            assert!(command.contains("export BC_SHORT_TMP='/fixture/a'\\''b; $(false)'; "), "{command}");
+            assert!(!command.contains("export TMPDIR="), "{command}");
+        }
+    }
+
+    #[test]
     fn cli_bootstrap_runs_program_then_drops_to_shell() {
         let b = cli_bootstrap(&claude_spec(&[]), None, None, false, None);
         assert!(b.contains("command -v 'claude'"));
@@ -4540,11 +4571,12 @@ mod tests {
             );
         }
 
-        // Agents that need no environment get no export noise at all.
+        // An absent workspace resource must suppress inherited values.
         let codex = CliLaunchSpec::new("codex", vec![]);
         assert!(
-            cli_bootstrap(&codex, None, None, false, None).starts_with("if command -v 'codex'"),
-            "only agents with an env entry get an export prefix"
+            cli_bootstrap(&codex, None, None, false, None)
+                .starts_with("unset BC_SHORT_TMP; if command -v 'codex'"),
+            "agents without a validated resource must clear the inherited value"
         );
     }
 

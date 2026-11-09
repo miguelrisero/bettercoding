@@ -193,7 +193,15 @@ impl ManagedWorkspace {
     }
 
     pub async fn delete_record(&self) -> Result<u64, sqlx::Error> {
-        DbWorkspace::delete(&self.db.pool, self.workspace.id).await
+        let rows = DbWorkspace::delete(&self.db.pool, self.workspace.id).await?;
+        if rows > 0 {
+            let workspace_id = self.workspace.id;
+            match tokio::task::spawn_blocking(move || utils::workspace_tmp::remove(workspace_id)).await {
+                Ok(Ok(())) => {},
+                result => warn!(%workspace_id, ?result, "Deleted workspace leaves a residual short temporary directory"),
+            }
+        }
+        Ok(rows)
     }
 }
 
