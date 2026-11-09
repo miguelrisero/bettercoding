@@ -836,6 +836,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn orphan_sweep_preserves_interrupted_legacy_migration_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("worktrees");
+        fs::create_dir(&base).unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations_for_tests(&pool).await.unwrap();
+        let workspace = DbWorkspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "interrupted-legacy-migration".into(),
+                name: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        let registered = base.join("legacy-workspace");
+        DbWorkspace::update_container_ref(&pool, workspace.id, registered.to_str().unwrap())
+            .await
+            .unwrap();
+        let staging = registered.with_file_name(format!(
+            "{}-migrating",
+            registered.file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("sentinel"), "interrupted workspace contents").unwrap();
+        let orphan = base.join("unrelated-orphan");
+        fs::create_dir(&orphan).unwrap();
+        let snapshot = HashSet::from([canonical(&registered)]);
+
+        WorkspaceManager::new(DBService { pool })
+            .cleanup_orphans_in_directory(&base, &snapshot)
+            .await;
+
+        assert!(
+            !orphan.exists(),
+            "an unrelated orphan remains eligible for cleanup"
+        );
+        assert!(
+            staging.is_dir(),
+            "an interrupted legacy migration staging directory must survive"
+        );
+        assert_eq!(
+            fs::read_to_string(staging.join("sentinel")).unwrap(),
+            "interrupted workspace contents"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn orphan_sweep_only_removes_unregistered_dirs_in_the_base_dir() {
