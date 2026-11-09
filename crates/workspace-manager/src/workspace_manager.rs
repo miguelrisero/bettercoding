@@ -788,6 +788,54 @@ mod tests {
         assert!(!resource.join("orphan").exists());
     }
 
+    #[tokio::test]
+    async fn orphan_sweep_preserves_a_workspace_registered_after_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("worktrees");
+        fs::create_dir(&base).unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations_for_tests(&pool).await.unwrap();
+        assert!(DbWorkspace::fetch_all(&pool).await.unwrap().is_empty());
+        let snapshot = HashSet::new();
+
+        let workspace = DbWorkspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "registered-after-snapshot".into(),
+                name: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        let registered = base.join("registered-after-snapshot");
+        fs::create_dir(&registered).unwrap();
+        fs::write(registered.join("sentinel"), "workspace contents").unwrap();
+        DbWorkspace::update_container_ref(&pool, workspace.id, registered.to_str().unwrap())
+            .await
+            .unwrap();
+        let orphan = base.join("real-orphan");
+        fs::create_dir(&orphan).unwrap();
+
+        WorkspaceManager::new(DBService { pool })
+            .cleanup_orphans_in_directory(&base, &snapshot)
+            .await;
+
+        assert!(!orphan.exists(), "a real orphan remains eligible for cleanup");
+        assert!(
+            registered.is_dir(),
+            "a workspace registered after the snapshot must survive"
+        );
+        assert_eq!(
+            fs::read_to_string(registered.join("sentinel")).unwrap(),
+            "workspace contents"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn orphan_sweep_only_removes_unregistered_dirs_in_the_base_dir() {
