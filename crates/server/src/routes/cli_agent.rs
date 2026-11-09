@@ -289,6 +289,7 @@ async fn restart_agent(
     };
 
     let spec = terminal::prepare_cli_launch_spec(
+        &deployment.db().pool,
         context.spec,
         workspace_id,
         context.workspace_name.as_deref(),

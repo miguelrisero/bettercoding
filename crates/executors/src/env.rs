@@ -166,8 +166,14 @@ mod tests {
         let mut command = Command::new("unused-test-program");
         env.with_overrides(&profile).apply_to_command(&mut command);
         let values = command.as_std().get_envs().collect::<HashMap<_, _>>();
-        assert_eq!(values.get(std::ffi::OsStr::new("BC_SHORT_TMP")), Some(&Some(std::ffi::OsStr::new("/fixture/private-short"))));
-        assert_eq!(values.get(std::ffi::OsStr::new("TMPDIR")), Some(&Some(std::ffi::OsStr::new("/fixture/existing-temp"))));
+        assert_eq!(
+            values.get(std::ffi::OsStr::new("BC_SHORT_TMP")),
+            Some(&Some(std::ffi::OsStr::new("/fixture/private-short")))
+        );
+        assert_eq!(
+            values.get(std::ffi::OsStr::new("TMPDIR")),
+            Some(&Some(std::ffi::OsStr::new("/fixture/existing-temp")))
+        );
     }
 
     #[test]
@@ -182,8 +188,14 @@ mod tests {
         command.env("BC_SHORT_TMP", "/fixture/inherited");
         env.with_overrides(&profile).apply_to_command(&mut command);
         let values = command.as_std().get_envs().collect::<HashMap<_, _>>();
-        assert_eq!(values.get(std::ffi::OsStr::new("BC_SHORT_TMP")), Some(&None));
-        assert_eq!(values.get(std::ffi::OsStr::new("TMPDIR")), Some(&Some(std::ffi::OsStr::new("/fixture/existing-temp"))));
+        assert_eq!(
+            values.get(std::ffi::OsStr::new("BC_SHORT_TMP")),
+            Some(&None)
+        );
+        assert_eq!(
+            values.get(std::ffi::OsStr::new("TMPDIR")),
+            Some(&Some(std::ffi::OsStr::new("/fixture/existing-temp")))
+        );
     }
 
     #[test]

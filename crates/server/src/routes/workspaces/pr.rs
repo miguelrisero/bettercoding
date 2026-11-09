@@ -668,13 +668,8 @@ async fn cleanup_failed_pr_workspace(pool: &sqlx::SqlitePool, workspace: &Worksp
     };
 
     // Delete the workspace — FK CASCADE handles workspace_repos, sessions, merges, etc.
-    match Workspace::delete(pool, workspace_id).await {
-        Ok(rows) if rows > 0 => {
-            match tokio::task::spawn_blocking(move || utils::workspace_tmp::remove(workspace_id)).await {
-                Ok(Ok(())) => {},
-                result => tracing::warn!(%workspace_id, ?result, "Failed creation leaves a residual short temporary directory"),
-            }
-        }
+    match WorkspaceManager::delete_record_with_short_tmp(pool, workspace_id).await {
+        Ok(rows) if rows > 0 => {}
         result => {
             tracing::warn!(%workspace_id, ?result, "Failed workspace deletion retains filesystem resources");
             return;
@@ -732,7 +727,7 @@ pub async fn create_workspace_from_pr(
     .await?;
 
     #[cfg(unix)]
-    if let Err(error) = utils::workspace_tmp::ensure(workspace.id) {
+    if let Err(error) = WorkspaceManager::ensure_short_tmp(pool, workspace.id).await {
         cleanup_failed_pr_workspace(pool, &workspace).await;
         return Err(error.into());
     }
@@ -745,7 +740,8 @@ pub async fn create_workspace_from_pr(
             target_branch: target_branch_ref.clone(),
         }],
     )
-    .await {
+    .await
+    {
         cleanup_failed_pr_workspace(pool, &workspace).await;
         return Err(error.into());
     }
@@ -753,7 +749,8 @@ pub async fn create_workspace_from_pr(
     let container_ref = match deployment
         .container()
         .ensure_container_exists(&workspace)
-        .await {
+        .await
+    {
         Ok(container_ref) => container_ref,
         Err(error) => {
             cleanup_failed_pr_workspace(pool, &workspace).await;

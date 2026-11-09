@@ -194,8 +194,12 @@ async fn perform_file_operations(dir: &Path) {
 
 fn mock_command(current_dir: &Path, script: &str, env: &ExecutionEnv) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("sh");
-    command.arg("-c").arg(script).current_dir(current_dir)
-        .stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .arg("-c")
+        .arg(script)
+        .current_dir(current_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     env.apply_to_command(&mut command);
     command
 }
@@ -404,10 +408,22 @@ mod tests {
         env.insert("TMPDIR", "/fixture/temp");
         env.insert("BC_WORKSPACE_ID", "fixture-workspace");
         let command = mock_command(Path::new("/fixture/workspace"), "printf fixture", &env);
-        let values = command.as_std().get_envs().collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(values.get(std::ffi::OsStr::new("BC_SHORT_TMP")), Some(&None));
-        assert_eq!(values.get(std::ffi::OsStr::new("TMPDIR")), Some(&Some(std::ffi::OsStr::new("/fixture/temp"))));
-        assert_eq!(values.get(std::ffi::OsStr::new("BC_WORKSPACE_ID")), Some(&Some(std::ffi::OsStr::new("fixture-workspace"))));
+        let values = command
+            .as_std()
+            .get_envs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            values.get(std::ffi::OsStr::new("BC_SHORT_TMP")),
+            Some(&None)
+        );
+        assert_eq!(
+            values.get(std::ffi::OsStr::new("TMPDIR")),
+            Some(&Some(std::ffi::OsStr::new("/fixture/temp")))
+        );
+        assert_eq!(
+            values.get(std::ffi::OsStr::new("BC_WORKSPACE_ID")),
+            Some(&Some(std::ffi::OsStr::new("fixture-workspace")))
+        );
     }
 
     #[test]

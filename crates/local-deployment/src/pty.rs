@@ -231,7 +231,10 @@ fn cli_bootstrap_with_exit(
         .map(|(key, value)| format!("export {key}={}; ", shell_single_quote(value)))
         .collect();
     if let Some(path) = &spec.short_tmp {
-        env.push_str(&format!("export BC_SHORT_TMP={}; ", shell_single_quote(&path.to_string_lossy())));
+        env.push_str(&format!(
+            "export BC_SHORT_TMP={}; ",
+            shell_single_quote(&path.to_string_lossy())
+        ));
     } else {
         env.push_str("unset BC_SHORT_TMP; ");
     }
@@ -3476,11 +3479,19 @@ mod tests {
             cli_bootstrap(&spec, None, Some(Path::new("/fixture/prompt")), false, None),
             cli_restart_bootstrap(&spec, Some(resume)),
             cli_handover_bootstrap(
-                Uuid::nil(), &spec, Some(resume), None,
-                Path::new("/fixture/exit"), &[],
-            ).unwrap(),
+                Uuid::nil(),
+                &spec,
+                Some(resume),
+                None,
+                Path::new("/fixture/exit"),
+                &[],
+            )
+            .unwrap(),
         ] {
-            assert!(command.contains("export BC_SHORT_TMP='/fixture/a'\\''b; $(false)'; "), "{command}");
+            assert!(
+                command.contains("export BC_SHORT_TMP='/fixture/a'\\''b; $(false)'; "),
+                "{command}"
+            );
             assert!(!command.contains("export TMPDIR="), "{command}");
         }
     }

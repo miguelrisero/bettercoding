@@ -102,11 +102,20 @@ mod short_tmp_tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(path.join("active"), "preserved").unwrap();
         let response = workspace_short_tmp_response(root.path(), id).unwrap();
-        assert_eq!(serde_json::to_value(response.0).unwrap()["data"], path.to_string_lossy().as_ref());
-        assert_eq!(std::fs::read_to_string(path.join("active")).unwrap(), "preserved");
+        assert_eq!(
+            serde_json::to_value(response.0).unwrap()["data"],
+            path.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("active")).unwrap(),
+            "preserved"
+        );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(workspace_short_tmp_response(root.path(), id).is_err());
-        assert_eq!(std::fs::read_to_string(path.join("active")).unwrap(), "preserved");
+        assert_eq!(
+            std::fs::read_to_string(path.join("active")).unwrap(),
+            "preserved"
+        );
     }
 }
 
@@ -114,15 +123,17 @@ mod short_tmp_tests {
 pub async fn get_workspace_short_tmp(
     Extension(workspace): Extension<Workspace>,
 ) -> Result<ResponseJson<ApiResponse<String>>, ApiError> {
-    workspace_short_tmp_response(std::path::Path::new("/tmp"), workspace.id)
+    Ok(workspace_short_tmp_response(std::path::Path::new("/tmp"), workspace.id)?)
 }
 
 fn workspace_short_tmp_response(
     root: &std::path::Path,
     workspace_id: Uuid,
-) -> Result<ResponseJson<ApiResponse<String>>, ApiError> {
+) -> std::io::Result<ResponseJson<ApiResponse<String>>> {
     let path = utils::workspace_tmp::validate_in(root, workspace_id)?;
-    Ok(ResponseJson(ApiResponse::success(path.to_string_lossy().into_owned())))
+    Ok(ResponseJson(ApiResponse::success(
+        path.to_string_lossy().into_owned(),
+    )))
 }
 
 pub async fn update_workspace(

@@ -153,6 +153,7 @@ pub(super) async fn resolve_cli_model_effort(
 /// same selection as headless mode. Agents without their own interactive CLI
 /// support fall back to a default claude launch so CLI mode always works.
 pub(super) async fn resolve_cli_launch_spec(
+    pool: &sqlx::SqlitePool,
     session: Option<&Session>,
     model_id: Option<String>,
     reasoning_id: Option<String>,
@@ -161,17 +162,18 @@ pub(super) async fn resolve_cli_launch_spec(
     workspace_name: Option<&str>,
 ) -> Result<CliLaunchSpec, ApiError> {
     let spec = resolve_cli_agent_spec(session, model_id, reasoning_id, dir);
-    prepare_cli_launch_spec(spec, workspace_id, workspace_name).await
+    prepare_cli_launch_spec(pool, spec, workspace_id, workspace_name).await
 }
 
 pub(super) async fn prepare_cli_launch_spec(
+    pool: &sqlx::SqlitePool,
     mut spec: CliLaunchSpec,
     workspace_id: Uuid,
     workspace_name: Option<&str>,
 ) -> Result<CliLaunchSpec, ApiError> {
     #[cfg(unix)]
     {
-        spec.short_tmp = Some(utils::workspace_tmp::ensure(workspace_id)?);
+        spec.short_tmp = Some(workspace_manager::WorkspaceManager::ensure_short_tmp(pool, workspace_id).await?);
     }
     // Codex reports its state through the same hook endpoint, registered
     // inline with `-c` so neither ~/.codex nor the worktree is touched.
@@ -986,6 +988,7 @@ async fn prepare_cli_attach(
         resolve_cli_agent_spec(session.as_ref(), model_id, reasoning_id, &dir)
     } else {
         resolve_cli_launch_spec(
+            pool,
             session.as_ref(),
             model_id,
             reasoning_id,

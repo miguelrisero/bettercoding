@@ -190,11 +190,22 @@ impl LocalContainerService {
         }
     }
 
-    fn ensure_short_tmp(workspace_id: Uuid) -> std::io::Result<Option<PathBuf>> {
+    async fn ensure_short_tmp(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Option<PathBuf>, ContainerError> {
         #[cfg(unix)]
-        { utils::workspace_tmp::ensure(workspace_id).map(Some) }
+        {
+            WorkspaceManager::ensure_short_tmp(&self.db.pool, workspace_id)
+                .await
+                .map(Some)
+                .map_err(Self::map_workspace_manager_error)
+        }
         #[cfg(not(unix))]
-        { let _ = workspace_id; Ok(None) }
+        {
+            let _ = workspace_id;
+            Ok(None)
+        }
     }
 
     /// Reconcile serially before the cleanup task starts; never restore worktrees
@@ -210,14 +221,17 @@ impl LocalContainerService {
                 }
             };
             for workspace in workspaces {
-                let Some(root) = workspace.container_ref.as_deref().map(Path::new) else { continue; };
-                if !std::fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir()) {
-                    continue;
-                }
                 let result = async {
-                    let short_tmp = utils::workspace_tmp::ensure(workspace.id)?;
-                    Self::create_workspace_config_files(root, &[], Some(&short_tmp), false).await
-                }.await;
+                    let short_tmp = self.ensure_short_tmp(workspace.id).await?;
+                    let Some(root) = workspace.container_ref.as_deref().map(Path::new) else {
+                        return Ok(());
+                    };
+                    if !std::fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir()) {
+                        return Ok(());
+                    }
+                    Self::create_workspace_config_files(root, &[], short_tmp.as_deref(), false).await
+                }
+                .await;
                 if let Err(error) = result {
                     tracing::warn!(workspace_id = %workspace.id, %error, "Workspace short temporary directory reconciliation failed");
                 }
@@ -1267,7 +1281,8 @@ impl LocalContainerService {
             .replace("and nothing outside it is ever deleted.", "and its managed short temporary directory is deleted with the workspace.")
             .replace("- Keep every file you create inside this directory.", "- Keep files inside this directory, except for the managed short temporary directory below.")
             .replace("- Do not write outside this directory.", "- Use only the managed short temporary directory as an outside-workspace exception.");
-        let location = short_tmp.map(|path| format!("`{}`", path.display()))
+        let location = short_tmp
+            .map(|path| format!("`{}`", path.display()))
             .unwrap_or_else(|| "the path in `BC_SHORT_TMP`".to_string());
         block.push_str(&format!("- Use {location} (`BC_SHORT_TMP`) when a tool needs a short temporary path. This private directory is deleted with the workspace. Keep `TMPDIR` unchanged.\n"));
         block.push_str("<!-- /bettercoding:workspace-hygiene -->\n");
@@ -1309,6 +1324,12 @@ impl LocalContainerService {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
             }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+                options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            }
             let mut file = match options.open(&workspace_config_path) {
                 Ok(file) if file.metadata()?.is_file() => file,
                 Ok(_) => continue,
@@ -1321,6 +1342,14 @@ impl LocalContainerService {
                     continue;
                 }
             };
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+                if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    continue;
+                }
+            }
             let mut existing = String::new();
             file.read_to_string(&mut existing)?;
 
@@ -1328,7 +1357,12 @@ impl LocalContainerService {
                 let legacy = Self::legacy_workspace_hygiene_block();
                 if let Some(start) = existing.find(&legacy) {
                     // Preserve every byte outside the exact application-owned text.
-                    let migrated = format!("{}{}{}", &existing[..start], hygiene, &existing[start + legacy.len()..]);
+                    let migrated = format!(
+                        "{}{}{}",
+                        &existing[..start],
+                        hygiene,
+                        &existing[start + legacy.len()..]
+                    );
                     if migrated != existing {
                         file.rewind()?;
                         file.write_all(migrated.as_bytes())?;
@@ -1576,7 +1610,7 @@ impl ContainerService for LocalContainerService {
     }
 
     async fn create(&self, workspace: &Workspace) -> Result<ContainerRef, ContainerError> {
-        let short_tmp = Self::ensure_short_tmp(workspace.id)?;
+        let short_tmp = self.ensure_short_tmp(workspace.id).await?;
         let label = workspace.name.as_deref().unwrap_or("workspace");
         let workspace_dir_name =
             LocalContainerService::dir_name_from_workspace(&workspace.id, label);
@@ -1596,8 +1630,13 @@ impl ContainerService for LocalContainerService {
         self.copy_files_and_images(&created_workspace.workspace_dir, workspace)
             .await?;
 
-        Self::create_workspace_config_files(&created_workspace.workspace_dir, &repositories, short_tmp.as_deref(), true)
-            .await?;
+        Self::create_workspace_config_files(
+            &created_workspace.workspace_dir,
+            &repositories,
+            short_tmp.as_deref(),
+            true,
+        )
+        .await?;
 
         Workspace::update_container_ref(
             &self.db.pool,
@@ -1622,7 +1661,7 @@ impl ContainerService for LocalContainerService {
         &self,
         workspace: &Workspace,
     ) -> Result<ContainerRef, ContainerError> {
-        let short_tmp = Self::ensure_short_tmp(workspace.id)?;
+        let short_tmp = self.ensure_short_tmp(workspace.id).await?;
         self.touch(workspace).await?;
         let (repositories, workspace_inputs) = self.workspace_repo_inputs(workspace.id).await?;
 
@@ -1660,7 +1699,13 @@ impl ContainerService for LocalContainerService {
         self.copy_files_and_images(&workspace_dir, workspace)
             .await?;
 
-        Self::create_workspace_config_files(&workspace_dir, &repositories, short_tmp.as_deref(), true).await?;
+        Self::create_workspace_config_files(
+            &workspace_dir,
+            &repositories,
+            short_tmp.as_deref(),
+            true,
+        )
+        .await?;
 
         Ok(workspace_dir.to_string_lossy().to_string())
     }
@@ -2204,8 +2249,14 @@ mod tests {
             env.apply_to_command(&mut command);
             let values = command.as_std().get_envs().collect::<HashMap<_, _>>();
             let expected = (mode == Some(0o700)).then_some(path.as_os_str());
-            assert_eq!(values.get(std::ffi::OsStr::new("BC_SHORT_TMP")), Some(&expected));
-            assert_eq!(values.get(std::ffi::OsStr::new("TMPDIR")), Some(&Some(std::ffi::OsStr::new("/fixture/existing-temp"))));
+            assert_eq!(
+                values.get(std::ffi::OsStr::new("BC_SHORT_TMP")),
+                Some(&expected)
+            );
+            assert_eq!(
+                values.get(std::ffi::OsStr::new("TMPDIR")),
+                Some(&Some(std::ffi::OsStr::new("/fixture/existing-temp")))
+            );
         }
     }
 
@@ -2215,8 +2266,12 @@ mod tests {
         let existing = "User prefix.\n<!-- bettercoding:workspace-hygiene -->\nCustom managed text.\nUser suffix.  \n";
         std::fs::write(dir.path().join("CLAUDE.md"), existing).unwrap();
         LocalContainerService::create_workspace_config_files(dir.path(), &[], None, false)
-            .await.unwrap();
-        assert_eq!(std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(), existing);
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(),
+            existing
+        );
         assert!(!dir.path().join("AGENTS.md").exists());
     }
 
@@ -2228,9 +2283,33 @@ mod tests {
         std::fs::write(&external, "Protected user instructions.\n").unwrap();
         std::os::unix::fs::symlink(&external, dir.path().join("CLAUDE.md")).unwrap();
         LocalContainerService::create_workspace_config_files(dir.path(), &[], None, true)
-            .await.unwrap();
-        assert_eq!(std::fs::read_to_string(external).unwrap(), "Protected user instructions.\n");
-        assert!(std::fs::symlink_metadata(dir.path().join("CLAUDE.md")).unwrap().is_symlink());
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(external).unwrap(),
+            "Protected user instructions.\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(dir.path().join("CLAUDE.md"))
+                .unwrap()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn workspace_config_files_refuse_windows_reparse_targets() {
+        let dir = TempDir::new().unwrap();
+        let external = dir.path().join("external");
+        std::fs::write(&external, "Protected user instructions.\n").unwrap();
+        std::os::windows::fs::symlink_file(&external, dir.path().join("CLAUDE.md")).unwrap();
+        LocalContainerService::create_workspace_config_files(dir.path(), &[], None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(external).unwrap(),
+            "Protected user instructions.\n"
+        );
     }
 
     #[tokio::test]
@@ -2238,11 +2317,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let short_tmp = dir.path().join("private-short");
         std::fs::create_dir(&short_tmp).unwrap();
-        LocalContainerService::create_workspace_config_files(dir.path(), &[], Some(&short_tmp), true)
-            .await.unwrap();
+        LocalContainerService::create_workspace_config_files(
+            dir.path(),
+            &[],
+            Some(&short_tmp),
+            true,
+        )
+        .await
+        .unwrap();
         for config_file in ["CLAUDE.md", "AGENTS.md"] {
             let content = std::fs::read_to_string(dir.path().join(config_file)).unwrap();
-            assert!(content.contains(&format!("`{}` (`BC_SHORT_TMP`)", short_tmp.display())), "{content}");
+            assert!(
+                content.contains(&format!("`{}` (`BC_SHORT_TMP`)", short_tmp.display())),
+                "{content}"
+            );
         }
     }
 

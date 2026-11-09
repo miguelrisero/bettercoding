@@ -74,17 +74,37 @@ pub fn validate_in(root: &Path, workspace_id: Uuid) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+fn open_directory_at(fd: std::os::fd::RawFd, name: &std::ffi::CStr) -> io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+
+    use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
+
+    let how = OpenHow::new()
+        .flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC)
+        .resolve(
+            ResolveFlag::RESOLVE_NO_XDEV
+                | ResolveFlag::RESOLVE_NO_SYMLINKS
+                | ResolveFlag::RESOLVE_BENEATH,
+        );
+    let child = openat2(fd, name, how).map_err(io::Error::from)?;
+    Ok(unsafe { std::fs::File::from_raw_fd(child) })
+}
+
+#[cfg(target_os = "linux")]
 fn remove_in(root: &Path, workspace_id: Uuid) -> io::Result<()> {
     use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
 
     let path = path_in(root, workspace_id);
-    let directory = match open_private(&path) {
+    let root = std::fs::File::open(root)?;
+    let name = std::ffi::CString::new(format!("bc-{}", workspace_id.simple())).unwrap();
+    let directory = match open_directory_at(root.as_raw_fd(), &name) {
         Ok(directory) => directory,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    remove_contents(directory.as_raw_fd(), directory.metadata()?.dev())?;
+    validate_metadata(&directory.metadata()?, nix::unistd::geteuid().as_raw())?;
+    remove_contents(directory.as_raw_fd(), 0)?;
     let current = std::fs::symlink_metadata(&path)?;
     let opened = directory.metadata()?;
     if current.dev() != opened.dev() || current.ino() != opened.ino() {
@@ -92,18 +112,21 @@ fn remove_in(root: &Path, workspace_id: Uuid) -> io::Result<()> {
             "short temporary directory changed during cleanup",
         ));
     }
-    std::fs::remove_dir(path)
+    if unsafe { nix::libc::unlinkat(root.as_raw_fd(), name.as_ptr(), nix::libc::AT_REMOVEDIR) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
-#[cfg(unix)]
-fn remove_contents(fd: std::os::fd::RawFd, device: u64) -> io::Result<()> {
-    use std::{
-        ffi::CStr,
-        os::{
-            fd::{AsRawFd, FromRawFd},
-            unix::fs::MetadataExt,
-        },
-    };
+#[cfg(target_os = "linux")]
+fn remove_contents(fd: std::os::fd::RawFd, depth: usize) -> io::Result<()> {
+    use std::{ffi::CStr, os::fd::AsRawFd};
+
+    if depth >= 64 {
+        return Err(io::Error::other(
+            "short temporary cleanup exceeds the maximum depth",
+        ));
+    }
 
     use nix::libc;
 
@@ -135,27 +158,16 @@ fn remove_contents(fd: std::os::fd::RawFd, device: u64) -> io::Result<()> {
             if name.to_bytes() == b"." || name.to_bytes() == b".." {
                 continue;
             }
-            let child = unsafe {
-                libc::openat(
-                    fd,
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            let flags = if child >= 0 {
-                let child = unsafe { std::fs::File::from_raw_fd(child) };
-                if child.metadata()?.dev() != device {
-                    return Err(io::Error::other("refusing to cross a mount during cleanup"));
+            let flags = match open_directory_at(fd, name) {
+                Ok(child) => {
+                    remove_contents(child.as_raw_fd(), depth + 1)?;
+                    libc::AT_REMOVEDIR
                 }
-                remove_contents(child.as_raw_fd(), device)?;
-                libc::AT_REMOVEDIR
-            } else {
-                let error = io::Error::last_os_error();
-                match error.raw_os_error() {
+                Err(error) => match error.raw_os_error() {
                     Some(libc::ENOTDIR | libc::ELOOP) => 0,
                     Some(libc::ENOENT) => continue,
                     _ => return Err(error),
-                }
+                },
             };
             if unsafe { libc::unlinkat(fd, name.as_ptr(), flags) } != 0 {
                 return Err(io::Error::last_os_error());
@@ -179,14 +191,20 @@ pub fn validate_in(root: &Path, workspace_id: Uuid) -> io::Result<PathBuf> {
     ensure_in(root, workspace_id)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn remove_in(_root: &Path, _workspace_id: Uuid) -> io::Result<()> {
-    Ok(())
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "mount-safe short temporary cleanup requires Linux openat2",
+    ))
 }
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::symlink;
 
     use tempfile::TempDir;
 
@@ -202,6 +220,7 @@ mod tests {
         assert_eq!(path(id).as_os_str().len(), 40);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_directory_reuse_preserves_contents_and_cleanup_is_bounded() {
         let root = TempDir::new().unwrap();
@@ -239,6 +258,31 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn safe_opener_refuses_a_known_mount_boundary() {
+        use std::os::fd::AsRawFd;
+        let root = std::fs::File::open("/").unwrap();
+        let error = open_directory_at(root.as_raw_fd(), c"proc").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EXDEV));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_refuses_excessive_depth_and_preserves_the_leaf() {
+        let root = TempDir::new().unwrap();
+        let id = Uuid::new_v4();
+        let owned = ensure_in(root.path(), id).unwrap();
+        let mut nested = owned.clone();
+        for _ in 0..65 {
+            nested.push("d");
+            std::fs::create_dir(&nested).unwrap();
+        }
+        std::fs::write(nested.join("keep"), "protected").unwrap();
+        assert!(remove_in(root.path(), id).is_err());
+        assert_eq!(std::fs::read_to_string(nested.join("keep")).unwrap(), "protected");
+    }
+
     #[test]
     fn ownership_validation_refuses_a_different_owner() {
         let root = TempDir::new().unwrap();
@@ -249,6 +293,7 @@ mod tests {
         assert!(validate_metadata(&metadata, metadata.uid()).is_ok());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn collisions_and_external_symlink_targets_remain_untouched() {
         let root = TempDir::new().unwrap();
