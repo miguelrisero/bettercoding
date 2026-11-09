@@ -668,12 +668,12 @@ async fn cleanup_failed_pr_workspace(pool: &sqlx::SqlitePool, workspace: &Worksp
     };
 
     // Delete the workspace — FK CASCADE handles workspace_repos, sessions, merges, etc.
-    if let Err(e) = Workspace::delete(pool, workspace_id).await {
-        tracing::warn!(
-            "Failed to delete workspace {} during cleanup: {}",
-            workspace_id,
-            e
-        );
+    match WorkspaceManager::delete_record_with_short_tmp(pool, workspace_id).await {
+        Ok(rows) if rows > 0 => {}
+        result => {
+            tracing::warn!(%workspace_id, ?result, "Failed workspace deletion retains filesystem resources");
+            return;
+        }
     }
 
     // Spawn background cleanup for filesystem resources (worktrees, workspace dir)
@@ -726,7 +726,13 @@ pub async fn create_workspace_from_pr(
     )
     .await?;
 
-    WorkspaceRepo::create_many(
+    #[cfg(unix)]
+    if let Err(error) = WorkspaceManager::ensure_short_tmp(pool, workspace.id).await {
+        cleanup_failed_pr_workspace(pool, &workspace).await;
+        return Err(error.into());
+    }
+
+    if let Err(error) = WorkspaceRepo::create_many(
         pool,
         workspace.id,
         &[CreateWorkspaceRepo {
@@ -734,12 +740,23 @@ pub async fn create_workspace_from_pr(
             target_branch: target_branch_ref.clone(),
         }],
     )
-    .await?;
+    .await
+    {
+        cleanup_failed_pr_workspace(pool, &workspace).await;
+        return Err(error.into());
+    }
 
-    let container_ref = deployment
+    let container_ref = match deployment
         .container()
         .ensure_container_exists(&workspace)
-        .await?;
+        .await
+    {
+        Ok(container_ref) => container_ref,
+        Err(error) => {
+            cleanup_failed_pr_workspace(pool, &workspace).await;
+            return Err(error.into());
+        }
+    };
 
     // Update workspace with container_ref so start_execution can find it
     workspace.container_ref = Some(container_ref.clone());

@@ -192,6 +192,7 @@ async fn begin(
     let successor_exit = dir.join(format!("{operation_id}.successor-exit"));
     let fallback_exit = dir.join(format!("{operation_id}.fallback-exit"));
     let launch_spec = terminal::prepare_cli_launch_spec(
+        &deployment.db().pool,
         context.spec.clone(),
         request.workspace_id,
         context.workspace_name.as_deref(),

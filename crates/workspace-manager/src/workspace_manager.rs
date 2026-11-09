@@ -1,6 +1,7 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 use db::{
@@ -193,7 +194,7 @@ impl ManagedWorkspace {
     }
 
     pub async fn delete_record(&self) -> Result<u64, sqlx::Error> {
-        DbWorkspace::delete(&self.db.pool, self.workspace.id).await
+        WorkspaceManager::delete_record_with_short_tmp(&self.db.pool, self.workspace.id).await
     }
 }
 
@@ -203,6 +204,64 @@ pub struct WorkspaceManager {
 }
 
 impl WorkspaceManager {
+    // In-process serialization: multiple server processes require a database-backed lock.
+    fn short_tmp_lock(workspace_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        static LOCKS: OnceLock<Mutex<HashMap<Uuid, Weak<tokio::sync::Mutex<()>>>>> =
+            OnceLock::new();
+        let mut locks = LOCKS
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&workspace_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(workspace_id, Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn with_short_tmp_record<T>(
+        pool: &sqlx::SqlitePool,
+        workspace_id: Uuid,
+        operation: impl FnOnce() -> std::io::Result<T>,
+    ) -> Result<T, WorkspaceError> {
+        let _guard = Self::short_tmp_lock(workspace_id).lock_owned().await;
+        if DbWorkspace::find_by_id(pool, workspace_id).await?.is_none() {
+            return Err(WorkspaceError::WorkspaceNotFound);
+        }
+        Ok(operation()?)
+    }
+
+    pub async fn ensure_short_tmp(
+        pool: &sqlx::SqlitePool,
+        workspace_id: Uuid,
+    ) -> Result<PathBuf, WorkspaceError> {
+        Self::with_short_tmp_record(pool, workspace_id, || {
+            utils::workspace_tmp::ensure(workspace_id)
+        })
+        .await
+    }
+
+    pub async fn delete_record_with_short_tmp(
+        pool: &sqlx::SqlitePool,
+        workspace_id: Uuid,
+    ) -> Result<u64, sqlx::Error> {
+        let _guard = Self::short_tmp_lock(workspace_id).lock_owned().await;
+        let rows = DbWorkspace::delete(pool, workspace_id).await?;
+        if rows > 0 {
+            match tokio::task::spawn_blocking(move || utils::workspace_tmp::remove(workspace_id))
+                .await
+            {
+                Ok(Ok(())) => {}
+                result => {
+                    warn!(%workspace_id, ?result, "Deleted workspace leaves a residual short temporary directory")
+                }
+            }
+        }
+        Ok(rows)
+    }
+
     pub fn new(db: DBService) -> Self {
         Self { db }
     }
@@ -682,6 +741,52 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::*;
+
+    #[tokio::test]
+    async fn short_tmp_record_fence_refuses_stale_snapshots() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations_for_tests(&pool).await.unwrap();
+        let id = Uuid::new_v4();
+        DbWorkspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "short-tmp-fence".into(),
+                name: None,
+            },
+            id,
+        )
+        .await
+        .unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let resource = fixture.path().join("resource");
+        WorkspaceManager::with_short_tmp_record(&pool, id, || {
+            fs::create_dir(&resource)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let guard = WorkspaceManager::short_tmp_lock(id).lock_owned().await;
+        let waiting_pool = pool.clone();
+        let waiting_resource = resource.clone();
+        let waiting = tokio::spawn(async move {
+            WorkspaceManager::with_short_tmp_record(&waiting_pool, id, || {
+                fs::write(waiting_resource.join("orphan"), "unsafe")?;
+                Ok(())
+            })
+            .await
+        });
+        DbWorkspace::delete(&pool, id).await.unwrap();
+        drop(guard);
+        assert!(matches!(
+            waiting.await.unwrap(),
+            Err(WorkspaceError::WorkspaceNotFound)
+        ));
+        assert!(!resource.join("orphan").exists());
+    }
 
     #[cfg(unix)]
     #[tokio::test]

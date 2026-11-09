@@ -78,6 +78,7 @@ impl RepoContext {
 #[derive(Debug, Clone)]
 pub struct ExecutionEnv {
     pub vars: HashMap<String, String>,
+    short_tmp: Option<PathBuf>,
     pub repo_context: RepoContext,
     pub commit_reminder: bool,
     pub commit_reminder_prompt: String,
@@ -91,6 +92,7 @@ impl ExecutionEnv {
     ) -> Self {
         Self {
             vars: HashMap::new(),
+            short_tmp: None,
             repo_context,
             commit_reminder,
             commit_reminder_prompt,
@@ -123,10 +125,20 @@ impl ExecutionEnv {
         }
     }
 
-    /// Apply all environment variables to a Command
+    /// Set the validated workspace resource independently of profile overrides.
+    pub fn set_short_tmp(&mut self, path: Option<&std::path::Path>) {
+        self.short_tmp = path.map(std::path::Path::to_path_buf);
+    }
+
+    /// Apply ordinary variables first, then enforce the workspace resource.
     pub fn apply_to_command(&self, command: &mut Command) {
         for (key, value) in &self.vars {
             command.env(key, value);
+        }
+        if let Some(path) = &self.short_tmp {
+            command.env("BC_SHORT_TMP", path);
+        } else {
+            command.env_remove("BC_SHORT_TMP");
         }
     }
 
@@ -142,6 +154,49 @@ impl ExecutionEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_tmp_export_uses_the_validated_path_after_profile_overrides() {
+        let mut env = ExecutionEnv::new(RepoContext::default(), false, String::new());
+        env.set_short_tmp(Some(std::path::Path::new("/fixture/private-short")));
+        let profile = HashMap::from([
+            ("BC_SHORT_TMP".to_string(), "/fixture/unsafe".to_string()),
+            ("TMPDIR".to_string(), "/fixture/existing-temp".to_string()),
+        ]);
+        let mut command = Command::new("unused-test-program");
+        env.with_overrides(&profile).apply_to_command(&mut command);
+        let values = command.as_std().get_envs().collect::<HashMap<_, _>>();
+        assert_eq!(
+            values.get(std::ffi::OsStr::new("BC_SHORT_TMP")),
+            Some(&Some(std::ffi::OsStr::new("/fixture/private-short")))
+        );
+        assert_eq!(
+            values.get(std::ffi::OsStr::new("TMPDIR")),
+            Some(&Some(std::ffi::OsStr::new("/fixture/existing-temp")))
+        );
+    }
+
+    #[test]
+    fn unavailable_short_tmp_removes_inherited_and_profile_values() {
+        let mut env = ExecutionEnv::new(RepoContext::default(), false, String::new());
+        env.set_short_tmp(None);
+        let profile = HashMap::from([
+            ("BC_SHORT_TMP".to_string(), "/fixture/unsafe".to_string()),
+            ("TMPDIR".to_string(), "/fixture/existing-temp".to_string()),
+        ]);
+        let mut command = Command::new("unused-test-program");
+        command.env("BC_SHORT_TMP", "/fixture/inherited");
+        env.with_overrides(&profile).apply_to_command(&mut command);
+        let values = command.as_std().get_envs().collect::<HashMap<_, _>>();
+        assert_eq!(
+            values.get(std::ffi::OsStr::new("BC_SHORT_TMP")),
+            Some(&None)
+        );
+        assert_eq!(
+            values.get(std::ffi::OsStr::new("TMPDIR")),
+            Some(&Some(std::ffi::OsStr::new("/fixture/existing-temp")))
+        );
+    }
 
     #[test]
     fn profile_overrides_runtime_env() {

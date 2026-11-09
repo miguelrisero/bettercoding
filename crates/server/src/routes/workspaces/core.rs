@@ -85,6 +85,60 @@ pub async fn get_workspace(
     Ok(ResponseJson(ApiResponse::success(workspace)))
 }
 
+#[cfg(all(test, unix))]
+mod short_tmp_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn short_tmp_discovery_reports_only_existing_private_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap();
+        let path = root.path().join("bc-0123456789abcdef0123456789abcdef");
+        assert!(workspace_short_tmp_response(root.path(), id).is_err());
+        assert!(!path.exists());
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(path.join("active"), "preserved").unwrap();
+        let response = workspace_short_tmp_response(root.path(), id).unwrap();
+        assert_eq!(
+            serde_json::to_value(response.0).unwrap()["data"],
+            path.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("active")).unwrap(),
+            "preserved"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(workspace_short_tmp_response(root.path(), id).is_err());
+        assert_eq!(
+            std::fs::read_to_string(path.join("active")).unwrap(),
+            "preserved"
+        );
+    }
+}
+
+/// Discovery validates an existing directory without provisioning or touching the record.
+pub async fn get_workspace_short_tmp(
+    Extension(workspace): Extension<Workspace>,
+) -> Result<ResponseJson<ApiResponse<String>>, ApiError> {
+    Ok(workspace_short_tmp_response(
+        std::path::Path::new("/tmp"),
+        workspace.id,
+    )?)
+}
+
+fn workspace_short_tmp_response(
+    root: &std::path::Path,
+    workspace_id: Uuid,
+) -> std::io::Result<ResponseJson<ApiResponse<String>>> {
+    let path = utils::workspace_tmp::validate_in(root, workspace_id)?;
+    Ok(ResponseJson(ApiResponse::success(
+        path.to_string_lossy().into_owned(),
+    )))
+}
+
 pub async fn update_workspace(
     Extension(workspace): Extension<Workspace>,
     State(deployment): State<DeploymentImpl>,

@@ -70,6 +70,8 @@ pub struct CliLaunchSpec {
     /// placed right after the program (e.g. `codex <session_args> resume <id>`).
     /// For per-session plumbing such as activity hooks, never agent settings.
     pub session_args: Vec<String>,
+    /// Workspace-owned short temporary directory, independent of TMPDIR.
+    pub short_tmp: Option<std::path::PathBuf>,
     /// How to resume a prior session by id (handover from the chat UI).
     pub resume: CliResume,
     /// How the workspace's initial prompt is delivered (CLI-first creation).
@@ -85,6 +87,7 @@ impl CliLaunchSpec {
             program: program.into(),
             base_args,
             session_args: Vec::new(),
+            short_tmp: None,
             resume: CliResume::Unsupported,
             prompt_arg: CliPromptArg::Positional,
             continue_fallback: CliContinue::Fresh,

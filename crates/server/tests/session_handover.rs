@@ -639,7 +639,8 @@ async fn adoption_contract(
     )
     .await
     .unwrap();
-    let cwd = root.join("worktrees/adoption");
+    // Synthetic adoption evidence lives outside the managed orphan-sweep root.
+    let cwd = root.join("adoption");
     fs::create_dir(&cwd).unwrap();
     Workspace::update_container_ref(pool, workspace.id, cwd.to_str().unwrap())
         .await
@@ -694,8 +695,10 @@ async fn adoption_contract(
     .await
     .unwrap();
     let name = local_deployment::pty::cli_tmux_session_name(workspace.id);
+    let launch_stderr = root.join("adoption-launch.stderr");
     let command = format!(
-        "exec 9<'{}'; exec claude --dangerously-skip-permissions",
+        "exec 2>'{}'; exec 9<'{}'; exec claude --dangerously-skip-permissions",
+        launch_stderr.display(),
         task_dir.display()
     );
     assert!(
@@ -713,7 +716,23 @@ async fn adoption_contract(
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|error| {
+        let fake = root.join("bin/claude");
+        let stderr = fs::read_to_string(&launch_stderr)
+            .map(|output| output.chars().take(4096).collect::<String>());
+        panic!(
+            "adoption launch timed out: {error}; cwd_exists={}; task_dir_exists={}; \
+             fake_exists={}; fake_mode={:?}; args_exists={}; token_exists={}; \
+             agent_pid_exists={}; fixture_stderr={stderr:?}",
+            cwd.exists(),
+            task_dir.exists(),
+            fake.exists(),
+            fs::metadata(&fake).map(|metadata| metadata.permissions().mode() & 0o7777),
+            cwd.join("args").exists(),
+            cwd.join("token").exists(),
+            cwd.join("agent-pid").exists(),
+        );
+    });
     let pid: u32 = fs::read_to_string(cwd.join("agent-pid"))
         .unwrap()
         .parse()
