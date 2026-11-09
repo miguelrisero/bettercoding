@@ -350,7 +350,7 @@ async fn verify(
 /// Readable defaults for agent-written Input pages. The styles sit in a
 /// cascade layer, so any style the page sets itself wins over them. They go
 /// at the end of the document so a leading doctype keeps standards mode.
-const INPUT_BASE_STYLE: &str = "<style>@layer bc-base{:root{color-scheme:light;background:#fff;color:#1f2328;font:16px/1.65 \"IBM Plex Sans\",system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif;-webkit-text-size-adjust:100%}body{max-width:46rem;margin:0 auto;padding:2rem 1.5rem 4rem;overflow-wrap:break-word}h1,h2,h3,h4{color:#0d1117;font-weight:600;line-height:1.3;margin:2em 0 .5em;text-wrap:balance}h1{font-size:1.6rem}h2{font-size:1.3rem}h3{font-size:1.1rem}h4{font-size:1rem}body>:first-child{margin-top:0}p,ul,ol,dl,table,pre,blockquote{margin:0 0 1em}p,li{text-wrap:pretty}ul,ol{padding-left:1.4em}li{margin:.3em 0}li::marker{color:#8c959f}b,strong{color:#0d1117;font-weight:600}a{color:#b4530a;text-decoration-thickness:1px;text-underline-offset:2px}a:hover{color:#8a3d06}code,kbd,pre{font-family:\"IBM Plex Mono\",ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.875em}:not(pre)>code{background:#f2f3f5;border-radius:4px;padding:.1em .35em;overflow-wrap:anywhere}pre{background:#f6f8fa;border:1px solid #e4e7eb;border-radius:6px;padding:.85em 1em;overflow-x:auto;line-height:1.5}table{display:block;width:max-content;max-width:100%;overflow-x:auto;border:1px solid #e4e7eb;border-radius:6px;border-collapse:separate;border-spacing:0;font-size:.9rem;line-height:1.45}th,td{border:0;border-bottom:1px solid #e4e7eb;padding:.55em .8em;text-align:left;vertical-align:top}th{background:#f6f8fa;color:#0d1117;font-weight:600}tr:last-child>td{border-bottom:0}blockquote{border-left:3px solid #e4e7eb;padding-left:1em;color:#57606a}hr{border:0;border-top:1px solid #e4e7eb;margin:2em 0}img,video,svg{max-width:100%;height:auto}}</style>";
+const INPUT_BASE_STYLE: &str = "<style>@layer bc-base{:root{color-scheme:light;background:#fff;color:#1f2328;font:16px/1.65 \"IBM Plex Sans\",system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif;-webkit-text-size-adjust:100%}body{overflow-wrap:break-word}h1,h2,h3,h4{font-weight:600;line-height:1.3;margin:2em 0 .5em;text-wrap:balance}h1{font-size:1.6rem}h2{font-size:1.3rem}h3{font-size:1.1rem}h4{font-size:1rem}body>:first-child{margin-top:0}p,ul,ol,dl,table,pre,blockquote{margin:0 0 1em}p,li{text-wrap:pretty}ul,ol{padding-left:1.4em}li{margin:.3em 0}li::marker{color:#8c959f}b,strong{font-weight:600}a{color:#b4530a;text-decoration-thickness:1px;text-underline-offset:2px}a:hover{color:#8a3d06}code,kbd,pre{font-family:\"IBM Plex Mono\",ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.875em}:not(pre)>code{background:#f2f3f5;border-radius:4px;padding:.1em .35em;overflow-wrap:anywhere}pre{background:#f6f8fa;border:1px solid #e4e7eb;border-radius:6px;padding:.85em 1em;overflow-x:auto;line-height:1.5}table{display:block;width:max-content;max-width:100%;overflow-x:auto;border:1px solid #e4e7eb;border-radius:6px;border-collapse:separate;border-spacing:0;font-size:.9rem;line-height:1.45}th,td{border:0;border-bottom:1px solid #e4e7eb;padding:.55em .8em;text-align:left;vertical-align:top}th{background:#f6f8fa;color:#0d1117;font-weight:600}tr:last-child>td{border-bottom:0}blockquote{border-left:3px solid #e4e7eb;padding-left:1em;color:#57606a}hr{border:0;border-top:1px solid #e4e7eb;margin:2em 0}img,video,svg{max-width:100%;height:auto}}</style>";
 
 fn content_response(html: String) -> Response {
     Response::builder()
@@ -515,6 +515,83 @@ mod tests {
         assert!(body.ends_with("</script>"));
         assert!(body.contains(include_str!("input-rich-content.js")));
         assert!(body[page.len()..].starts_with("<style>@layer bc-base{"));
+    }
+
+    #[tokio::test]
+    async fn input_content_preserves_authored_full_width_layout() {
+        let page = "<!doctype html><html><head><style>html,body{margin:0;width:100%}main{width:100%}</style></head><body><main>Full-width Input</main></body></html>";
+        let body = axum::body::to_bytes(content_response(page.into()).into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        let appended = body
+            .strip_prefix(page)
+            .expect("authored HTML stays verbatim");
+        let (base_style, _) = appended
+            .strip_prefix("<style>@layer bc-base{")
+            .unwrap()
+            .split_once("</style>")
+            .unwrap();
+        for rule in base_style.split('}') {
+            let Some((selectors, declarations)) = rule.rsplit_once('{') else {
+                continue;
+            };
+            if !selectors
+                .split(',')
+                .any(|selector| selector.trim() == "body")
+            {
+                continue;
+            }
+            for declaration in declarations.split(';') {
+                let Some((property, _)) = declaration.split_once(':') else {
+                    continue;
+                };
+                let property = property.trim();
+                assert!(
+                    property != "max-width"
+                        && property != "padding"
+                        && !property.starts_with("padding-"),
+                    "base body rule constrains the authored layout: {declaration}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn input_content_preserves_authored_heading_color_inheritance() {
+        let page = "<!doctype html><html><head><style>header{background:navy;color:white}</style></head><body><header><h1>White heading</h1><h2>White subheading</h2><h3>White section</h3><h4>White detail</h4><b>White bold</b><strong>White emphasis</strong></header></body></html>";
+        let body = axum::body::to_bytes(content_response(page.into()).into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        let appended = body
+            .strip_prefix(page)
+            .expect("authored HTML stays verbatim");
+        let (base_style, _) = appended
+            .strip_prefix("<style>@layer bc-base{")
+            .unwrap()
+            .split_once("</style>")
+            .unwrap();
+        for rule in base_style.split('}') {
+            let Some((selectors, declarations)) = rule.rsplit_once('{') else {
+                continue;
+            };
+            if !selectors.split(',').any(|selector| {
+                matches!(selector.trim(), "h1" | "h2" | "h3" | "h4" | "b" | "strong")
+            }) {
+                continue;
+            }
+            for declaration in declarations.split(';') {
+                let Some((property, _)) = declaration.split_once(':') else {
+                    continue;
+                };
+                assert_ne!(
+                    property.trim(),
+                    "color",
+                    "base {selectors} rule overrides the authored color inheritance: {declaration}"
+                );
+            }
+        }
     }
 
     async fn test_app() -> (axum::Router, Uuid, SqlitePool) {
