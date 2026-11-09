@@ -517,6 +517,76 @@ mod tests {
         assert!(body[page.len()..].starts_with("<style>@layer bc-base{"));
     }
 
+    #[tokio::test]
+    async fn input_content_preserves_authored_full_width_layout() {
+        let page = "<!doctype html><html><head><style>html,body{margin:0;width:100%}main{width:100%}</style></head><body><main>Full-width Input</main></body></html>";
+        let body = axum::body::to_bytes(content_response(page.into()).into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        let appended = body.strip_prefix(page).expect("authored HTML stays verbatim");
+        let (base_style, _) = appended
+            .strip_prefix("<style>@layer bc-base{")
+            .unwrap()
+            .split_once("</style>")
+            .unwrap();
+        for rule in base_style.split('}') {
+            let Some((selectors, declarations)) = rule.rsplit_once('{') else {
+                continue;
+            };
+            if !selectors.split(',').any(|selector| selector.trim() == "body") {
+                continue;
+            }
+            for declaration in declarations.split(';') {
+                let Some((property, _)) = declaration.split_once(':') else {
+                    continue;
+                };
+                let property = property.trim();
+                assert!(
+                    property != "max-width"
+                        && property != "padding"
+                        && !property.starts_with("padding-"),
+                    "base body rule constrains the authored layout: {declaration}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn input_content_preserves_authored_heading_color_inheritance() {
+        let page = "<!doctype html><html><head><style>header{background:navy;color:white}</style></head><body><header><h1>White heading</h1><h2>White subheading</h2><h3>White section</h3><h4>White detail</h4><b>White bold</b><strong>White emphasis</strong></header></body></html>";
+        let body = axum::body::to_bytes(content_response(page.into()).into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        let appended = body.strip_prefix(page).expect("authored HTML stays verbatim");
+        let (base_style, _) = appended
+            .strip_prefix("<style>@layer bc-base{")
+            .unwrap()
+            .split_once("</style>")
+            .unwrap();
+        for rule in base_style.split('}') {
+            let Some((selectors, declarations)) = rule.rsplit_once('{') else {
+                continue;
+            };
+            if !selectors.split(',').any(|selector| {
+                matches!(selector.trim(), "h1" | "h2" | "h3" | "h4" | "b" | "strong")
+            }) {
+                continue;
+            }
+            for declaration in declarations.split(';') {
+                let Some((property, _)) = declaration.split_once(':') else {
+                    continue;
+                };
+                assert_ne!(
+                    property.trim(),
+                    "color",
+                    "base {selectors} rule overrides the authored color inheritance: {declaration}"
+                );
+            }
+        }
+    }
+
     async fn test_app() -> (axum::Router, Uuid, SqlitePool) {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
