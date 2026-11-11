@@ -213,7 +213,8 @@ jobs:
 
       - name: Retain formatted Input test sources
         if: failure()
-        run: pnpm exec prettier --write packages/web-core/src/pages/workspaces/inputClose.test.ts packages/web-core/src/pages/workspaces/inputRichContent.test.ts
+        working-directory: packages/web-core
+        run: pnpm exec prettier --write src/pages/workspaces/inputClose.test.ts src/pages/workspaces/inputRichContent.test.ts
 
       - name: Upload formatted Input test sources
         if: failure()
@@ -240,22 +241,35 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          printf 'Runner: %s; image: %s %s\n' "${RUNNER_ENVIRONMENT:-unset}" "${ImageOS:-unset}" "${ImageVersion:-unset}"
+          df -h /
+          for tool in bwrap google-chrome google-chrome-stable chromium unshare systemd-run prlimit node; do
+            command -v "$tool" || true
+          done
+          dpkg-query -W bubblewrap google-chrome-stable 2>/dev/null || true
           test "$GITHUB_ACTIONS" = true
           test "$RUNNER_ENVIRONMENT" = github-hosted
-          test -x /usr/bin/bwrap
-          test -x /opt/google/chrome/chrome
-          df -h /
+          if ! command -v bwrap; then
+            echo '::error::The runner lacks bubblewrap; browser execution requires an OS sandbox.'
+            exit 1
+          fi
+          chrome_launcher=$(command -v google-chrome || command -v google-chrome-stable)
+          chrome_launcher=$(readlink -f "$chrome_launcher")
+          chrome_root=$(dirname "$chrome_launcher")
+          printf 'Chrome launcher: %s; payload: %s/chrome\n' "$chrome_launcher" "$chrome_root"
+          test -x "$chrome_root/chrome"
           fixture_root="$GITHUB_WORKSPACE"
           scratch=$(mktemp -d "$RUNNER_TEMP/input-links.XXXXXX")
           node_binary=$(readlink -f "$(command -v node)")
           # The private mount namespace keeps the bounded tmpfs inside this step.
           sudo /usr/bin/timeout --kill-after=5s 180s \
             /usr/bin/unshare --mount --propagation private /bin/bash -s -- \
-            "$scratch" "$fixture_root" "$node_binary" <<'SANDBOX'
+            "$scratch" "$fixture_root" "$node_binary" "$chrome_root" <<'SANDBOX'
           set -euo pipefail
           scratch=$1
           source=$2
           node_binary=$3
+          chrome_root=$4
           mount -t tmpfs -o size=256m,nr_inodes=8192,nosuid,nodev,mode=0700 tmpfs "$scratch"
           trap 'umount "$scratch"' EXIT
           mkdir "$scratch/home" "$scratch/tmp" "$scratch/cache"
@@ -267,7 +281,7 @@ jobs:
             /usr/bin/bwrap --unshare-all --die-with-parent --new-session \
             --disable-userns --cap-drop ALL --clearenv \
             --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
-            --ro-bind /opt/google/chrome /opt/google/chrome \
+            --ro-bind "$chrome_root" /opt/google/chrome \
             --ro-bind "$node_binary" /fixture/node \
             --ro-bind "$source/scripts/test-input-links-browser.mjs" /fixture/test.mjs \
             --ro-bind "$source/crates/server/src/routes/workspaces/input-rich-content.js" /fixture/runtime.js \
