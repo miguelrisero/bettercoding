@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::{DeploymentImpl, error::ApiError, routes::terminal::send_text_to_cli_agent};
 
-pub const INPUT_CONTENT_CSP: &str = "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'; navigate-to 'none'; frame-ancestors *";
+pub const INPUT_CONTENT_CSP: &str = "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'; navigate-to 'none'; frame-ancestors *";
 
 struct RouteError(InputError);
 impl From<InputError> for RouteError {
@@ -499,6 +499,11 @@ mod tests {
         assert_eq!(
             response.headers()[header::CONTENT_TYPE],
             "text/html; charset=utf-8"
+        );
+        let sandbox = INPUT_CONTENT_CSP.split(';').next().unwrap();
+        assert_eq!(
+            sandbox,
+            "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox"
         );
         assert!(!INPUT_CONTENT_CSP.contains("allow-same-origin"));
         assert!(!INPUT_CONTENT_CSP.contains("allow-modals"));

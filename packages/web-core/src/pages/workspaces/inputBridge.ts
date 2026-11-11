@@ -106,7 +106,7 @@ export function inputEmbeddingDocument(
   return `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; frame-src ${frameSource}; connect-src 'none'; base-uri 'none'; form-action 'none'"><meta name="referrer" content="no-referrer"><style>html,body,iframe{margin:0;width:100%;height:100%;border:0;display:block}body{background:white}</style></head><body><script nonce="${nonce}">
 const config=${config};
 const frame=document.createElement('iframe');
-frame.sandbox='allow-scripts'; frame.title='Input page'; frame.referrerPolicy='no-referrer';
+frame.sandbox='allow-scripts allow-popups allow-popups-to-escape-sandbox'; frame.title='Input page'; frame.referrerPolicy='no-referrer';
 let loads=0, valid=true;
 frame.addEventListener('load',()=>{
   loads++;

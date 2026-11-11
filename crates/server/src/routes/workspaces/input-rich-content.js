@@ -2,6 +2,52 @@
 (() => {
   let config;
   let images = [];
+  const linkActivated = (event) => {
+    if (event.type === "auxclick" && event.button !== 1) return;
+    const target = event.target?.closest
+      ? event.target
+      : event.target?.parentElement;
+    const anchor = target?.closest("a[href], area[href], a[*|href]");
+    if (!anchor) return;
+    const href =
+      anchor.getAttribute("href") ?? anchor.getAttribute("xlink:href") ?? "";
+    if (anchor.getAttribute("xlink:href") != null)
+      anchor.removeAttribute("xlink:href");
+    if (
+      !event.isTrusted ||
+      href.length > 8192 ||
+      /[\s\\\u0000-\u001f\u007f]/.test(href)
+    ) {
+      event.preventDefault();
+      return;
+    }
+    if (href.startsWith("#")) {
+      anchor.setAttribute("href", href);
+      anchor.setAttribute("target", "_self");
+      return;
+    }
+    try {
+      const url = new URL(href);
+      if (
+        !/^https?:\/\//i.test(href) ||
+        !/^https?:$/.test(url.protocol) ||
+        !url.hostname ||
+        url.username ||
+        url.password ||
+        url.href.length > 8192
+      ) {
+        event.preventDefault();
+        return;
+      }
+      anchor.setAttribute("href", url.href);
+      anchor.setAttribute("target", "_blank");
+      anchor.setAttribute("rel", "noopener noreferrer");
+    } catch {
+      event.preventDefault();
+    }
+  };
+  document.addEventListener("click", linkActivated, true);
+  document.addEventListener("auxclick", linkActivated, true);
   window.addEventListener("message", async (event) => {
     if (event.source !== parent) return;
     const data = event.data;
