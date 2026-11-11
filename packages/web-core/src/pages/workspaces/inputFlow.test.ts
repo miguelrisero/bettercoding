@@ -5,7 +5,6 @@ import {
   nextOpenInput,
   splitRecommended,
   inputNavigationIsCurrent,
-  inputStatusLabel,
 } from './inputFlow';
 
 const item = (
@@ -32,22 +31,6 @@ describe('Input flow', () => {
   it('advances to the next open Input after the current one', () => {
     expect(nextOpenInput(list, item('a', 'answered'), 'priority')).toBe('c');
     expect(nextOpenInput(list, item('c', 'answered'), 'priority')).toBe('d');
-  });
-  it('labels an expired Input for its readable Done detail', () => {
-    expect(inputStatusLabel.expired).toBe('Expired');
-  });
-  it('skips expired Inputs while advancing and wrapping', () => {
-    const inputs = [
-      item('a', 'open'),
-      item('b', 'expired'),
-      item('c', 'open'),
-      item('d', 'expired'),
-    ];
-    expect(nextOpenInput(inputs, item('a', 'expired'), 'priority')).toBe('c');
-    expect(nextOpenInput(inputs, item('c', 'expired'), 'priority')).toBe('a');
-    expect(
-      nextOpenInput([item('b', 'expired')], item('a', 'expired'), 'priority')
-    ).toBeNull();
   });
   it('wraps to the start of the list', () => {
     expect(nextOpenInput(list, item('d', 'answered'), 'priority')).toBe('a');

@@ -190,36 +190,122 @@ function runtime(blocks: string[], source = '') {
 }
 
 describe('trusted Input rich content runtime', () => {
-  it('prevents anchor navigation and forwards dynamic nested HTTP links', () => {
+  it('opens dynamic nested HTTP links through the native user activation', () => {
     const page = runtime([]);
-    page.listeners.message({ source: page.parent, data: page.init });
     for (const type of ['click', 'auxclick']) {
-      const preventDefault = vi.fn();
-      const anchor = { getAttribute: () => 'https://example.com/report' };
-      page.listeners[type]({
-        button: type === 'auxclick' ? 1 : 0,
-        target: { closest: () => anchor },
-        preventDefault,
-      });
-      expect(preventDefault).toHaveBeenCalledOnce();
-      expect(page.parent.postMessage).toHaveBeenLastCalledWith({
-        type: 'bc.input.link', protocol: 1, bridge_id: 'b', input_id: 'i',
-        version: 1, href: 'https://example.com/report',
-      }, '*');
-    }
-  });
-  it('blocks unsupported destinations and preserves local fragments', () => {
-    const page = runtime([]);
-    page.listeners.message({ source: page.parent, data: page.init });
-    for (const href of ['javascript:alert(1)', 'data:text/html,x', '/report', '//example.com', 'https://user:secret@example.com', '']) {
-      const preventDefault = vi.fn();
-      page.listeners.click({ target: { closest: () => ({ getAttribute: () => href }) }, preventDefault });
-      expect(preventDefault).toHaveBeenCalledOnce();
+      for (const href of ['https://example.com/report', 'http://example.com/']) {
+        const preventDefault = vi.fn();
+        const attributes: Record<string, string> = { href, target: '_top' };
+        const anchor = {
+          getAttribute: (name: string) => attributes[name],
+          setAttribute: (name: string, value: string) => {
+            attributes[name] = value;
+          },
+        };
+        page.listeners[type]({
+          type,
+          button: type === 'auxclick' ? 1 : 0,
+          isTrusted: true,
+          target: { parentElement: { closest: () => anchor } },
+          preventDefault,
+        });
+        expect(preventDefault).not.toHaveBeenCalled();
+        expect(attributes.target).toBe('_blank');
+        expect(attributes.rel).toBe('noopener noreferrer');
+      }
     }
     expect(page.parent.postMessage).not.toHaveBeenCalled();
+  });
+  it.each([
+    'javascript:alert(1)',
+    'data:text/html,x',
+    'mailto:owner@example.com',
+    '/report',
+    '//example.com',
+    'report.html',
+    'https://user:secret@example.com',
+    'https://example.com/\\path',
+    'https://example.com/\npath',
+    'https://example.com/\u007fpath',
+    'https://example.com/' + 'x'.repeat(8192),
+    '#section\n',
+    '',
+  ])('blocks the unsupported link destination %s', (href) => {
+    const page = runtime([]);
     const preventDefault = vi.fn();
-    page.listeners.click({ target: { closest: () => ({ getAttribute: () => '#section', removeAttribute() {} }) }, preventDefault });
+    page.listeners.click({
+      type: 'click',
+      isTrusted: true,
+      target: { closest: () => ({ getAttribute: () => href }) },
+      preventDefault,
+    });
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(page.parent.postMessage).not.toHaveBeenCalled();
+  });
+  it('keeps fragments in the same frame despite an authored base target', () => {
+    const page = runtime([]);
+    const attributes: Record<string, string> = {
+      href: '#section',
+      target: '_blank',
+    };
+    const preventDefault = vi.fn();
+    page.listeners.click({
+      type: 'click',
+      isTrusted: true,
+      target: {
+        closest: () => ({
+          getAttribute: (name: string) => attributes[name],
+          setAttribute: (name: string, value: string) => {
+            attributes[name] = value;
+          },
+          removeAttribute: (name: string) => {
+            delete attributes[name];
+          },
+        }),
+      },
+      preventDefault,
+    });
     expect(preventDefault).not.toHaveBeenCalled();
+    expect(attributes.target).toBe('_self');
+  });
+  it('accepts a bounded link and blocks an oversized normalized URL', () => {
+    const page = runtime([]);
+    for (const [href, blocked] of [
+      ['https://example.com/' + 'x'.repeat(8172), false],
+      ['https://example.com/' + 'é'.repeat(2000), true],
+    ] as const) {
+      const preventDefault = vi.fn();
+      const attributes: Record<string, string> = { href };
+      page.listeners.click({
+        type: 'click',
+        isTrusted: true,
+        target: {
+          closest: () => ({
+            getAttribute: (name: string) => attributes[name],
+            setAttribute: (name: string, value: string) => {
+              attributes[name] = value;
+            },
+          }),
+        },
+        preventDefault,
+      });
+      expect(preventDefault.mock.calls.length).toBe(blocked ? 1 : 0);
+      if (!blocked) expect(attributes.target).toBe('_blank');
+    }
+  });
+  it('blocks script-generated link activation', () => {
+    const page = runtime([]);
+    const preventDefault = vi.fn();
+    page.listeners.click({
+      type: 'click',
+      isTrusted: false,
+      target: {
+        closest: () => ({ getAttribute: () => 'https://example.com/' }),
+      },
+      preventDefault,
+    });
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(page.parent.postMessage).not.toHaveBeenCalled();
   });
   it('renders HTML and fenced Mermaid blocks while preserving malformed source', async () => {
     const page = runtime([

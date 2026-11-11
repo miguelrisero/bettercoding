@@ -4,25 +4,42 @@
   let images = [];
   const linkActivated = (event) => {
     if (event.type === "auxclick" && event.button !== 1) return;
-    const target = event.target?.closest ? event.target : event.target?.parentElement;
+    const target = event.target?.closest
+      ? event.target
+      : event.target?.parentElement;
     const anchor = target?.closest("a[href]");
     if (!anchor) return;
     const href = anchor.getAttribute("href") || "";
-    if (href.startsWith("#")) {
-      anchor.removeAttribute("target");
+    if (
+      !event.isTrusted ||
+      href.length > 8192 ||
+      /[\s\\\u0000-\u001f\u007f]/.test(href)
+    ) {
+      event.preventDefault();
       return;
     }
-    event.preventDefault();
-    if (!config || href.length > 8192 || /[\s\\\u0000-\u001f\u007f]/.test(href)) return;
+    if (href.startsWith("#")) {
+      anchor.setAttribute("target", "_self");
+      return;
+    }
     try {
       const url = new URL(href);
-      if (!/^https?:$/.test(url.protocol) || !url.hostname || url.username || url.password) return;
-      parent.postMessage({
-        type: "bc.input.link", protocol: 1, bridge_id: config.bridge_id,
-        input_id: config.input_id, version: config.version, href: url.href,
-      }, "*");
+      if (
+        !/^https?:\/\//i.test(href) ||
+        !/^https?:$/.test(url.protocol) ||
+        !url.hostname ||
+        url.username ||
+        url.password ||
+        url.href.length > 8192
+      ) {
+        event.preventDefault();
+        return;
+      }
+      anchor.setAttribute("href", url.href);
+      anchor.setAttribute("target", "_blank");
+      anchor.setAttribute("rel", "noopener noreferrer");
     } catch {
-      // Relative and active destinations stay inside the existing sandbox boundary.
+      event.preventDefault();
     }
   };
   document.addEventListener("click", linkActivated, true);

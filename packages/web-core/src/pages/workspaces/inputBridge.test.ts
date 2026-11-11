@@ -5,7 +5,6 @@ import {
   inputFrameLoaded,
   createInputBridge,
   readInputProposal,
-  readInputLink,
   validateInputAnswer,
   type InputBridge,
 } from './inputBridge';
@@ -32,24 +31,6 @@ const message = {
 };
 
 describe('Input proposal bridge', () => {
-  it('accepts only a current bounded HTTP link for a trusted host action', () => {
-    const source = {} as Window;
-    const link = { ...message, type: 'bc.input.link', href: 'https://example.com/report' };
-    expect(readInputLink({ source, data: link }, source, makeBridge())).toBe(link.href);
-    for (const invalid of [
-      { ...link, href: 'javascript:alert(1)' },
-      { ...link, href: 'data:text/html,hello' },
-      { ...link, href: 'https://user:secret@example.com/' },
-      { ...link, href: '/api/workspaces/w' },
-      { ...link, href: 'https://example.com/' + 'x'.repeat(8192) },
-      { ...link, bridge_id: 'stale' },
-      { ...link, input_id: 'other' },
-      { ...link, version: 2 },
-      { ...link, protocol: 2 },
-    ]) expect(readInputLink({ source, data: invalid }, source, makeBridge())).toBeNull();
-    expect(readInputLink({ source: {} as Window, data: link }, source, makeBridge())).toBeNull();
-    expect(readInputLink({ source, data: link }, source, { ...makeBridge(), valid: false })).toBeNull();
-  });
   it('issues a new bridge for a trusted retry and rejects the prior page', () => {
     const first = createInputBridge('input', 1);
     const retry = createInputBridge('input', 1);
@@ -155,6 +136,7 @@ describe('Input proposal bridge', () => {
       },
     };
     const frame = {
+      sandbox: '',
       contentWindow: child,
       addEventListener(type: string, fn: () => void) {
         listeners[type] = fn;
@@ -181,6 +163,9 @@ describe('Input proposal bridge', () => {
         },
         parent,
       }
+    );
+    expect(frame.sandbox).toBe(
+      'allow-scripts allow-popups allow-popups-to-escape-sandbox'
     );
     listeners.load();
     expect(sent[0]).toMatchObject({
@@ -209,11 +194,15 @@ describe('Input proposal bridge', () => {
     };
     listeners.message({ source: parent, data: reply });
     expect(sent.at(-1)).toEqual(reply);
-    const link = { ...message, type: 'bc.input.link', href: 'https://example.com/report' };
-    listeners.message({ source: child, data: link });
-    expect(sent.at(-1)).toEqual(link);
     const count = sent.length;
-    listeners.message({ source: child, data: { ...link, bridge_id: 'stale' } });
+    listeners.message({
+      source: child,
+      data: { ...message, type: 'bc.input.link', href: 'https://example.com/' },
+    });
+    listeners.message({
+      source: child,
+      data: { ...message, bridge_id: 'stale' },
+    });
     listeners.message({ source: {}, data: message });
     expect(sent).toHaveLength(count);
     vi.unstubAllGlobals();
@@ -225,7 +214,9 @@ describe('Input proposal bridge', () => {
     const route = '/api/workspaces/w/inputs/i/versions/1/content';
     const document = inputEmbeddingDocument(route, makeBridge(), 'hash');
     expect(document).toContain(`frame-src https://app.test${route};`);
-    expect(document).toContain("frame.sandbox='allow-scripts'");
+    expect(document).toContain(
+      "frame.sandbox='allow-scripts allow-popups allow-popups-to-escape-sandbox'"
+    );
     expect(document).toContain('event.source!==frame.contentWindow');
     expect(document).toContain('loads>1');
     expect(document).toContain('frame.remove()');
