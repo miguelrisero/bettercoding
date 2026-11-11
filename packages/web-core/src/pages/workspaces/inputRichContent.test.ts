@@ -233,7 +233,10 @@ describe('trusted Input rich content runtime', () => {
     ],
     [
       'a',
-      { href: 'javascript:bad()', 'xlink:href': 'https://example.com/fallback' },
+      {
+        href: 'javascript:bad()',
+        'xlink:href': 'https://example.com/fallback',
+      },
       null,
     ],
     ['a', { href: '', 'xlink:href': 'https://example.com/fallback' }, null],
@@ -268,7 +271,9 @@ describe('trusted Input rich content runtime', () => {
       target: { closest },
       preventDefault,
     });
-    expect(closest).toHaveBeenCalledWith('a[href], area[href], a[xlink\\:href]');
+    expect(closest).toHaveBeenCalledWith(
+      'a[href], area[href], a[xlink\\:href]'
+    );
     if (target === null) {
       expect(preventDefault).toHaveBeenCalledOnce();
     } else {
@@ -276,7 +281,8 @@ describe('trusted Input rich content runtime', () => {
       expect(attributes.target).toBe(target);
       expect(attributes.href).toBe(original.href ?? original['xlink:href']);
       expect(attributes).not.toHaveProperty('xlink:href');
-      if (target === '_blank') expect(attributes.rel).toBe('noopener noreferrer');
+      if (target === '_blank')
+        expect(attributes.rel).toBe('noopener noreferrer');
     }
   });
   it.each([

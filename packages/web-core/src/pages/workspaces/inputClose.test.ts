@@ -19,7 +19,10 @@ function closeFlow() {
     .replace('let inputs: InputDetail[];', 'let inputs;')
     .replace('getQueryData<InputDetail>', 'getQueryData');
   const statusSource = source
-    .slice(source.indexOf('  const status ='), source.indexOf('  const schedule ='))
+    .slice(
+      source.indexOf('  const status ='),
+      source.indexOf('  const schedule =')
+    )
     .replace('undo: boolean', 'undo')
     .replace('undoSequence!', 'undoSequence');
   const current = {
