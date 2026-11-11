@@ -33,7 +33,6 @@ import {
   inputFrameLoaded,
   createInputBridge,
   readInputProposal,
-  readInputLink,
   validateInputAnswer,
   type InputBridge,
 } from './inputBridge';
@@ -696,9 +695,6 @@ function InputBody({
   const [pageAttempt, setPageAttempt] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [navigated, setNavigated] = useState(false);
-  const [pendingExternalLink, setPendingExternalLink] = useState<string | null>(
-    null
-  );
   const [busy, setBusy] = useState(false);
   const [undoSequence, setUndoSequence] = useState<number | null>(null);
   const answerRequest = useRef<AnswerInput | null>(null);
@@ -733,7 +729,6 @@ function InputBody({
     }
   }, [key, draft]);
   useEffect(() => {
-    setPendingExternalLink(null);
     let active = true;
     const snapshot = {
       input: { id: detail.input.id },
@@ -795,17 +790,7 @@ function InputBody({
         return;
       if (event.data?.type === 'bc.input.navigated') {
         bridge.current.valid = false;
-        setPendingExternalLink(null);
         setNavigated(true);
-        return;
-      }
-      const link = readInputLink(
-        event,
-        frame.current?.contentWindow ?? null,
-        bridge.current
-      );
-      if (link) {
-        setPendingExternalLink(link);
         return;
       }
       const image = readInputImageRequest(event.data, bridge.current);
@@ -1002,7 +987,6 @@ function InputBody({
   const retryPage = () => {
     bridge.current = createInputBridge(detail.input.id, detail.version.version);
     setDocument('');
-    setPendingExternalLink(null);
     setNavigated(false);
     setPageAttempt((attempt) => attempt + 1);
   };
@@ -1024,10 +1008,7 @@ function InputBody({
               srcDoc={document}
               className="absolute inset-0 w-full h-full border-0"
               onLoad={() => {
-                if (!inputFrameLoaded(bridge.current)) {
-                  setPendingExternalLink(null);
-                  setNavigated(true);
-                }
+                if (!inputFrameLoaded(bridge.current)) setNavigated(true);
               }}
             />
           )
@@ -1049,32 +1030,6 @@ function InputBody({
         }}
       >
         <div className="flex-1 p-base md:p-double space-y-double">
-          {pendingExternalLink && (
-            <section
-              aria-label="Link destination"
-              className="rounded-md border p-base space-y-half text-sm"
-            >
-              <p role="status" className="break-all text-high">
-                {pendingExternalLink}
-              </p>
-              <div className="flex flex-wrap items-center gap-base">
-                <a
-                  href={pendingExternalLink}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className={cn(quietButton, 'inline-flex min-h-9 items-center')}
-                >
-                  Open in new tab
-                </a>
-                <button
-                  className={cn(quietButton, 'min-h-9')}
-                  onClick={() => setPendingExternalLink(null)}
-                >
-                  Dismiss link
-                </button>
-              </div>
-            </section>
-          )}
           {detail.input.status === 'open' && (
             <section
               aria-label="Input schedule"

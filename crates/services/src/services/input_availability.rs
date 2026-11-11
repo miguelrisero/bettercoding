@@ -101,6 +101,7 @@ mod tests {
             include_str!("../../../db/migrations/20261027090000_workspace_inputs.sql"),
             include_str!("../../../db/migrations/20261028120000_workspace_input_priority.sql"),
             include_str!("../../../db/migrations/20261030120000_workspace_input_schedule.sql"),
+            include_str!("../../../db/migrations/20261111090000_workspace_input_expiry.sql"),
         ] {
             sqlx::raw_sql(migration).execute(&pool).await.unwrap();
         }
@@ -120,9 +121,11 @@ mod tests {
         for (key, show_at) in [
             ("immediate", serde_json::Value::Null),
             ("due", serde_json::json!("2099-01-01T00:00:00Z")),
+            ("expired", serde_json::Value::Null),
         ] {
             let request: CreateInput = serde_json::from_value(serde_json::json!({
                 "external_key":key,"request_id":key,"expected_sequence":0,"show_at":show_at,
+                "expires_at": if key == "expired" { serde_json::json!("2000-01-01T00:00:00Z") } else { serde_json::Value::Null },
                 "content":{"title":"private title","html":"private body","contract":{"choices":[],"allow_text":true,"allow_no_answer_yet":false}}
             })).unwrap();
             WorkspaceInput::write(
@@ -149,6 +152,18 @@ mod tests {
                 "An Input is ready for your review.".into(),
                 Some(workspace)
             )));
+        let expired = WorkspaceInput::list(&pool, workspace, Some("expired"), "", 100)
+            .await
+            .unwrap();
+        assert_eq!(expired.inputs.len(), 1);
+        assert_eq!(expired.inputs[0].input.current_version, 1);
+        let events =
+            WorkspaceInput::events(&pool, workspace, Some(&expired.inputs[0].input.id), 0, 100)
+                .await
+                .unwrap()
+                .events;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].event_type, "expired");
         config.write().await.notifications.push_enabled = false;
         notifications
             .notify("disabled", "disabled", Some(workspace))

@@ -66,6 +66,16 @@ pub struct InputContent {
 #[derive(Debug, Clone, Serialize, Deserialize, TS, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateInput {
+    /// Omit or null for no deadline. Requires timezone-bearing RFC3339.
+    #[serde(
+        default,
+        with = "serde_with::rust::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Option<String>")]
+    #[ts(optional, type = "string | null")]
+    pub expires_at: Option<Option<String>>,
+
     /// Omit to preserve the schedule; null clears it. Timestamps require RFC3339 with a timezone.
     #[serde(
         default,
@@ -87,6 +97,16 @@ pub struct CreateInput {
 #[derive(Debug, Clone, Serialize, Deserialize, TS, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublishInput {
+    /// Omit to preserve the deadline; null clears it. Requires timezone-bearing RFC3339.
+    #[serde(
+        default,
+        with = "serde_with::rust::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Option<String>")]
+    #[ts(optional, type = "string | null")]
+    pub expires_at: Option<Option<String>>,
+
     /// Omit to preserve the schedule; null clears it. Timestamps require RFC3339 with a timezone.
     #[serde(
         default,
@@ -138,6 +158,7 @@ pub struct InputStatusWrite {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 pub struct WorkspaceInput {
+    pub expires_at: Option<String>,
     pub show_at: Option<String>,
     pub priority: String,
     pub id: String,
@@ -385,6 +406,7 @@ impl WorkspaceInput {
         id: &str,
         priority: &str,
     ) -> Result<Self> {
+        Self::reconcile_expiry(pool, Some(workspace), Some(id)).await?;
         validate_priority(priority)?;
         let input = sqlx::query_as("UPDATE workspace_inputs SET priority=? WHERE workspace_id=? AND id=? AND status IN ('open','answered') RETURNING *")
             .bind(priority).bind(workspace).bind(id).fetch_optional(pool).await?;
@@ -398,6 +420,7 @@ impl WorkspaceInput {
     }
 
     pub async fn get(pool: &SqlitePool, workspace: Uuid, id: &str) -> Result<Self> {
+        Self::reconcile_expiry(pool, Some(workspace), Some(id)).await?;
         sqlx::query_as("SELECT * FROM workspace_inputs WHERE workspace_id=? AND id=?")
             .bind(workspace)
             .bind(id)
@@ -412,7 +435,8 @@ impl WorkspaceInput {
         version: Option<i64>,
         html: bool,
     ) -> Result<InputDetail> {
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        expire_on(&mut tx, Some(workspace), Some(id), &utc_string(Utc::now())).await?;
         let input = sqlx::query_as("SELECT * FROM workspace_inputs WHERE workspace_id=? AND id=?")
             .bind(workspace)
             .bind(id)
@@ -461,13 +485,14 @@ impl WorkspaceInput {
         let statuses: Vec<_> = status.map(|s| s.split(',').collect()).unwrap_or_default();
         if statuses
             .iter()
-            .any(|s| !["open", "answered", "closed", "cancelled"].contains(s))
+            .any(|s| !["open", "answered", "closed", "cancelled", "expired"].contains(s))
         {
             return Err(InputError::Code("INVALID_TRANSITION"));
         }
         let filter = statuses.join(",");
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let now = utc_string(Utc::now());
-        let mut tx = pool.begin().await?;
+        expire_on(&mut tx, Some(workspace), None, &now).await?;
         let rows: Vec<WorkspaceInput> = sqlx::query_as("SELECT * FROM workspace_inputs WHERE workspace_id=? AND id>? AND (?='' OR instr(','||?||',', ','||status||',')>0) AND (status!='open' OR show_at IS NULL OR show_at<=?) ORDER BY id LIMIT ?")
             .bind(workspace).bind(cursor).bind(&filter).bind(&filter).bind(&now).bind(limit.clamp(1, 100)+1).fetch_all(&mut *tx).await?;
         let more = rows.len() > limit.clamp(1, 100) as usize;
@@ -497,6 +522,7 @@ impl WorkspaceInput {
         cursor: i64,
         limit: i64,
     ) -> Result<InputEventPage> {
+        Self::reconcile_expiry(pool, Some(workspace), id).await?;
         let events: Vec<InputEvent> = sqlx::query_as("SELECT * FROM workspace_input_events WHERE workspace_id=? AND cursor>? AND (? IS NULL OR input_id=?) ORDER BY cursor LIMIT ?")
             .bind(workspace).bind(cursor).bind(id).bind(id).bind(limit.clamp(1,100)).fetch_all(pool).await?;
         let next_cursor = events.last().map_or(cursor, |e| e.cursor);
@@ -603,6 +629,9 @@ impl WorkspaceInput {
                 }
                 new_generation = true;
                 let input = Self {
+                    expires_at: normalize_show_at(
+                        request.expires_at.as_ref().and_then(|v| v.as_deref()),
+                    )?,
                     show_at: normalize_show_at(
                         request.show_at.as_ref().and_then(|v| v.as_deref()),
                     )?,
@@ -621,8 +650,8 @@ impl WorkspaceInput {
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 };
-                sqlx::query("INSERT INTO workspace_inputs (id,workspace_id,external_key,creator,current_version,status,sequence,created_at,updated_at,priority,show_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
-                    .bind(&input.id).bind(workspace).bind(&input.external_key).bind(actor).bind(1).bind("open").bind(0).bind(&now).bind(&now).bind(&input.priority).bind(&input.show_at).execute(&mut *tx).await?;
+                sqlx::query("INSERT INTO workspace_inputs (id,workspace_id,external_key,creator,current_version,status,sequence,created_at,updated_at,priority,show_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+                    .bind(&input.id).bind(workspace).bind(&input.external_key).bind(actor).bind(1).bind("open").bind(0).bind(&now).bind(&now).bind(&input.priority).bind(&input.show_at).bind(&input.expires_at).execute(&mut *tx).await?;
                 content = Some(request.content.clone());
                 (
                     input,
@@ -639,6 +668,10 @@ impl WorkspaceInput {
                         .fetch_optional(&mut *tx)
                         .await?
                         .ok_or(InputError::Code("NOT_FOUND"))?;
+                if expire_on(&mut tx, Some(workspace), Some(id), &now).await? > 0 {
+                    tx.commit().await?;
+                    return Err(InputError::Code("INVALID_TRANSITION"));
+                }
                 if input.sequence != expected {
                     return Err(InputError::Sequence(input.sequence));
                 }
@@ -661,6 +694,9 @@ impl WorkspaceInput {
                         {
                             validate_priority(&priority)?;
                             input.priority = priority;
+                        }
+                        if let Some(expires_at) = &request.expires_at {
+                            input.expires_at = normalize_show_at(expires_at.as_deref())?;
                         }
                         if let Some(show_at) = &request.show_at {
                             input.show_at = normalize_show_at(show_at.as_deref())?;
@@ -745,6 +781,14 @@ impl WorkspaceInput {
                             return Err(InputError::Code("FORBIDDEN"));
                         }
                         let payload = last.payload;
+                        if payload["prior_status"] == "open"
+                            && input
+                                .expires_at
+                                .as_deref()
+                                .is_some_and(|deadline| deadline <= now.as_str())
+                        {
+                            return Err(InputError::Code("INVALID_TRANSITION"));
+                        }
                         input.status = payload["prior_status"]
                             .as_str()
                             .filter(|s| ["open", "answered"].contains(s))
@@ -771,7 +815,18 @@ impl WorkspaceInput {
         };
         input.sequence += 1;
         let mut payload = payload;
-        payload["status"] = json!(input.status);
+        let expires_now = input.status == "open"
+            && input
+                .expires_at
+                .as_deref()
+                .is_some_and(|deadline| deadline <= now.as_str());
+        let receipt_status = if expires_now {
+            "expired".to_string()
+        } else {
+            input.status.clone()
+        };
+        payload["status"] = json!(receipt_status);
+        payload["expires_at"] = json!(input.expires_at);
         payload["show_at"] = json!(input.show_at);
         if let Some(content) = content {
             let hash = digest(&canonical(&serde_json::to_value(&content)?));
@@ -797,8 +852,8 @@ impl WorkspaceInput {
             hash: String::new(),
         };
         insert_event(&mut tx, &mut event).await?;
-        sqlx::query("UPDATE workspace_inputs SET current_version=?,status=?,sequence=?,updated_at=?,priority=?,show_at=? WHERE workspace_id=? AND id=?")
-            .bind(input.current_version).bind(&input.status).bind(input.sequence).bind(&now).bind(&input.priority).bind(&input.show_at).bind(workspace).bind(&input.id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE workspace_inputs SET current_version=?,status=?,sequence=?,updated_at=?,priority=?,show_at=?,expires_at=? WHERE workspace_id=? AND id=?")
+            .bind(input.current_version).bind(&input.status).bind(input.sequence).bind(&now).bind(&input.priority).bind(&input.show_at).bind(&input.expires_at).bind(workspace).bind(&input.id).execute(&mut *tx).await?;
         if new_generation || input.status != "open" {
             sqlx::query("UPDATE workspace_input_availability SET finished_at=? WHERE workspace_id=? AND input_id=? AND finished_at IS NULL")
                 .bind(&now).bind(workspace).bind(&input.id).execute(&mut *tx).await?;
@@ -815,8 +870,9 @@ impl WorkspaceInput {
                     .bind(&event.id).bind(workspace).bind(&input.id).bind(available.then_some(&event.id)).execute(&mut *tx).await?;
             }
         }
+        expire_on(&mut tx, Some(workspace), Some(&input.id), &now).await?;
         tx.commit().await?;
-        Ok(receipt(event, input.status))
+        Ok(receipt(event, receipt_status))
     }
 }
 #[derive(Debug, FromRow)]
@@ -836,13 +892,65 @@ async fn insert_event(
     Ok(())
 }
 
+// Call inside the caller's write transaction so a due record cannot race a write.
+async fn expire_on(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workspace: Option<Uuid>,
+    id: Option<&str>,
+    now: &str,
+) -> Result<usize> {
+    let due: Vec<WorkspaceInput> = sqlx::query_as("SELECT * FROM workspace_inputs WHERE status='open' AND expires_at<=? AND (? IS NULL OR workspace_id=?) AND (? IS NULL OR id=?) ORDER BY expires_at,id")
+        .bind(now).bind(workspace).bind(workspace).bind(id).bind(id).fetch_all(&mut **tx).await?;
+    for input in &due {
+        let (previous,): (String,) = sqlx::query_as("SELECT hash FROM workspace_input_events WHERE workspace_id=? AND input_id=? ORDER BY sequence DESC LIMIT 1")
+            .bind(input.workspace_id).bind(&input.id).fetch_one(&mut **tx).await?;
+        let mut event = InputEvent {
+            cursor: 0,
+            id: Uuid::new_v4().to_string(),
+            workspace_id: input.workspace_id,
+            input_id: input.id.clone(),
+            sequence: input.sequence + 1,
+            actor_kind: "system".into(),
+            actor: "input_expiry".into(),
+            event_type: "expired".into(),
+            version: input.current_version,
+            payload: json!({"status":"expired", "expires_at":input.expires_at}),
+            request_id: format!("expiry:{}", Uuid::new_v4()),
+            request_hash: digest(&canonical(
+                &json!({"input_id":input.id, "expires_at":input.expires_at}),
+            )),
+            created_at: now.into(),
+            prev_hash: previous,
+            hash: String::new(),
+        };
+        insert_event(tx, &mut event).await?;
+        sqlx::query("UPDATE workspace_inputs SET status='expired',sequence=?,updated_at=? WHERE workspace_id=? AND id=?")
+            .bind(event.sequence).bind(now).bind(input.workspace_id).bind(&input.id).execute(&mut **tx).await?;
+        sqlx::query("UPDATE workspace_input_availability SET finished_at=? WHERE workspace_id=? AND input_id=? AND finished_at IS NULL")
+            .bind(now).bind(input.workspace_id).bind(&input.id).execute(&mut **tx).await?;
+    }
+    Ok(due.len())
+}
+
 impl WorkspaceInput {
+    async fn reconcile_expiry(
+        pool: &SqlitePool,
+        workspace: Option<Uuid>,
+        id: Option<&str>,
+    ) -> Result<usize> {
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let count = expire_on(&mut tx, workspace, id, &utc_string(Utc::now())).await?;
+        tx.commit().await?;
+        Ok(count)
+    }
+
     /// Release at most 100 generations per tick, including overdue work after restart.
     pub async fn release_due(pool: &SqlitePool) -> Result<usize> {
         let now = utc_string(Utc::now());
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        let due: Vec<(String, Uuid, String, i64, i64)> = sqlx::query_as("SELECT a.generation,i.workspace_id,i.id,i.sequence,i.current_version FROM workspace_input_availability a JOIN workspace_inputs i ON i.id=a.input_id AND i.workspace_id=a.workspace_id JOIN workspaces w ON w.id=i.workspace_id WHERE a.generation=i.availability_generation AND a.available_event_id IS NULL AND a.finished_at IS NULL AND i.status='open' AND (i.show_at IS NULL OR i.show_at<=?) ORDER BY i.show_at,i.id LIMIT 100")
-            .bind(&now).fetch_all(&mut *tx).await?;
+        expire_on(&mut tx, None, None, &now).await?;
+        let due: Vec<(String, Uuid, String, i64, i64)> = sqlx::query_as("SELECT a.generation,i.workspace_id,i.id,i.sequence,i.current_version FROM workspace_input_availability a JOIN workspace_inputs i ON i.id=a.input_id AND i.workspace_id=a.workspace_id JOIN workspaces w ON w.id=i.workspace_id WHERE a.generation=i.availability_generation AND a.available_event_id IS NULL AND a.finished_at IS NULL AND i.status='open' AND (i.expires_at IS NULL OR i.expires_at>?) AND (i.show_at IS NULL OR i.show_at<=?) ORDER BY i.show_at,i.id LIMIT 100")
+            .bind(&now).bind(&now).fetch_all(&mut *tx).await?;
         for (generation, workspace, id, sequence, version) in &due {
             let (previous,): (String,) = sqlx::query_as("SELECT hash FROM workspace_input_events WHERE workspace_id=? AND input_id=? ORDER BY sequence DESC LIMIT 1")
                 .bind(workspace).bind(id).fetch_one(&mut *tx).await?;
@@ -887,12 +995,13 @@ impl WorkspaceInput {
 
     /// One atomic, expiring claim. Competing workers cannot own the same token.
     pub async fn claim_notification(pool: &SqlitePool) -> Result<Option<InputNotificationClaim>> {
+        Self::reconcile_expiry(pool, None, None).await?;
         let time = Utc::now();
         let now = utc_string(time);
         let until = utc_string(time + chrono::Duration::seconds(60));
         let token = Uuid::new_v4().to_string();
-        let claim = sqlx::query_as("UPDATE workspace_input_availability SET claim_token=?,claim_until=? WHERE generation=(SELECT a.generation FROM workspace_input_availability a JOIN workspace_inputs i ON i.id=a.input_id AND i.workspace_id=a.workspace_id JOIN workspaces w ON w.id=i.workspace_id WHERE a.generation=i.availability_generation AND a.available_event_id IS NOT NULL AND a.finished_at IS NULL AND (a.claim_until IS NULL OR a.claim_until<=?) AND i.status='open' AND (i.show_at IS NULL OR i.show_at<=?) ORDER BY a.generation LIMIT 1) RETURNING generation,workspace_id,claim_token AS token")
-            .bind(&token).bind(until).bind(&now).bind(&now).fetch_optional(pool).await?;
+        let claim = sqlx::query_as("UPDATE workspace_input_availability SET claim_token=?,claim_until=? WHERE generation=(SELECT a.generation FROM workspace_input_availability a JOIN workspace_inputs i ON i.id=a.input_id AND i.workspace_id=a.workspace_id JOIN workspaces w ON w.id=i.workspace_id WHERE a.generation=i.availability_generation AND a.available_event_id IS NOT NULL AND a.finished_at IS NULL AND (a.claim_until IS NULL OR a.claim_until<=?) AND i.status='open' AND (i.expires_at IS NULL OR i.expires_at>?) AND (i.show_at IS NULL OR i.show_at<=?) ORDER BY a.generation LIMIT 1) RETURNING generation,workspace_id,claim_token AS token")
+            .bind(&token).bind(until).bind(&now).bind(&now).bind(&now).fetch_optional(pool).await?;
         Ok(claim)
     }
 
@@ -901,9 +1010,10 @@ impl WorkspaceInput {
         pool: &SqlitePool,
         claim: &InputNotificationClaim,
     ) -> Result<bool> {
+        Self::reconcile_expiry(pool, Some(claim.workspace_id), None).await?;
         let now = utc_string(Utc::now());
-        let live: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM workspace_input_availability a JOIN workspace_inputs i ON i.id=a.input_id AND i.workspace_id=a.workspace_id JOIN workspaces w ON w.id=i.workspace_id WHERE a.generation=? AND a.claim_token=? AND a.claim_until>? AND a.finished_at IS NULL AND a.available_event_id IS NOT NULL AND a.generation=i.availability_generation AND i.status='open' AND (i.show_at IS NULL OR i.show_at<=?)")
-            .bind(&claim.generation).bind(&claim.token).bind(&now).bind(&now).fetch_optional(pool).await?;
+        let live: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM workspace_input_availability a JOIN workspace_inputs i ON i.id=a.input_id AND i.workspace_id=a.workspace_id JOIN workspaces w ON w.id=i.workspace_id WHERE a.generation=? AND a.claim_token=? AND a.claim_until>? AND a.finished_at IS NULL AND a.available_event_id IS NOT NULL AND a.generation=i.availability_generation AND i.status='open' AND (i.expires_at IS NULL OR i.expires_at>?) AND (i.show_at IS NULL OR i.show_at<=?)")
+            .bind(&claim.generation).bind(&claim.token).bind(&now).bind(&now).bind(&now).fetch_optional(pool).await?;
         Ok(live.is_some())
     }
 
@@ -934,6 +1044,569 @@ fn receipt(event: InputEvent, status: String) -> InputReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expiry_presence_preserves_legacy_hashes_and_null() {
+        let legacy =
+            json!({"external_key":"k","request_id":"r","expected_sequence":0,"content":content()});
+        let parsed: CreateInput = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), legacy);
+        for value in [Value::Null, json!("2026-11-11T09:00:00+01:00")] {
+            let mut body = legacy.clone();
+            body["expires_at"] = value;
+            let parsed: CreateInput = serde_json::from_value(body.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), body);
+        }
+    }
+
+    #[tokio::test]
+    async fn expiry_rejects_late_writes_and_preserves_exact_retry_and_history() {
+        let (pool, workspace) = setup().await;
+        let original = seed(&pool, workspace).await;
+        sqlx::query("UPDATE workspace_inputs SET expires_at='2000-01-01T00:00:00.000000000Z'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retry = seed(&pool, workspace).await;
+        assert_eq!(
+            serde_json::to_value(&original).unwrap(),
+            serde_json::to_value(retry).unwrap()
+        );
+        assert!(
+            WorkspaceInput::write(
+                &pool,
+                workspace,
+                Some(&original.input_id),
+                InputActorKind::OwnerUi,
+                "owner",
+                answer(1, 1)
+            )
+            .await
+            .is_err()
+        );
+        let detail = WorkspaceInput::detail(&pool, workspace, &original.input_id, None, true)
+            .await
+            .unwrap();
+        assert_eq!(detail.input.status, "expired");
+        assert_eq!(detail.input.current_version, 1);
+        assert_eq!(detail.input.sequence, 2);
+        assert_eq!(
+            detail.version.html.as_deref(),
+            Some(content().html.as_str())
+        );
+        assert!(detail.answers.is_empty());
+        for write in [
+            publish(2),
+            status(2, "closed"),
+            InputWrite::Undo(InputStatusWrite {
+                request_id: "undo".into(),
+                expected_sequence: 2,
+                status: "open".into(),
+                reason: None,
+            }),
+        ] {
+            assert!(
+                WorkspaceInput::write(
+                    &pool,
+                    workspace,
+                    Some(&original.input_id),
+                    InputActorKind::AgentMcp,
+                    "requester",
+                    write
+                )
+                .await
+                .is_err()
+            );
+        }
+        let events = WorkspaceInput::events(&pool, workspace, Some(&original.input_id), 0, 100)
+            .await
+            .unwrap()
+            .events;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].actor_kind, "system");
+        assert_eq!(events[1].event_type, "expired");
+        assert_eq!(
+            events[1].payload["expires_at"],
+            "2000-01-01T00:00:00.000000000Z"
+        );
+        assert!(
+            WorkspaceInput::verify(&pool, workspace, &original.input_id)
+                .await
+                .unwrap()
+                .valid
+        );
+        assert!(
+            WorkspaceInput::list(&pool, workspace, Some("open"), "", 1)
+                .await
+                .unwrap()
+                .inputs
+                .is_empty()
+        );
+        assert_eq!(
+            WorkspaceInput::list(&pool, workspace, Some("expired"), "", 1)
+                .await
+                .unwrap()
+                .inputs
+                .len(),
+            1
+        );
+        assert!(
+            WorkspaceInput::claim_notification(&pool)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn expiry_migration_preserves_family_foreign_keys_history_and_cursor_high_water() {
+        for retain_rows in [true, false] {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            sqlx::raw_sql("PRAGMA foreign_keys=ON; CREATE TABLE workspaces(id BLOB PRIMARY KEY); INSERT INTO workspaces VALUES (X'01');").execute(&pool).await.unwrap();
+            for migration in [
+                include_str!("../../migrations/20261027090000_workspace_inputs.sql"),
+                include_str!("../../migrations/20261028120000_workspace_input_priority.sql"),
+                include_str!("../../migrations/20261030120000_workspace_input_schedule.sql"),
+            ] {
+                sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+            }
+            if retain_rows {
+                sqlx::raw_sql("INSERT INTO workspace_inputs VALUES ('legacy',X'01','key','agent',1,'open',1,'old','old','P2',NULL,'event'); INSERT INTO workspace_input_versions VALUES (X'01','legacy',1,'title','html','{}','content-hash'); INSERT INTO workspace_input_events VALUES (7,'event',X'01','legacy',1,'agent_mcp','agent','created',1,'{}','request','request-hash','old','','hash'); INSERT INTO workspace_input_availability VALUES ('event',X'01','legacy','event','token','until','finished');").execute(&pool).await.unwrap();
+            }
+            sqlx::raw_sql("DELETE FROM sqlite_sequence WHERE name='workspace_input_events'; INSERT INTO sqlite_sequence(name,seq) VALUES ('workspace_input_events',77);").execute(&pool).await.unwrap();
+            let tables = [
+                "workspace_inputs",
+                "workspace_input_versions",
+                "workspace_input_events",
+                "workspace_input_availability",
+            ];
+            let mut before = Vec::new();
+            for table in tables {
+                let (rows,): (String,) = sqlx::query_as(&format!("SELECT json_group_array(json_object({})) FROM {table}", match table {
+                    "workspace_inputs" => "'id',id,'status',status,'sequence',sequence,'priority',priority,'show_at',show_at,'generation',availability_generation",
+                    "workspace_input_versions" => "'input_id',input_id,'version',version,'title',title,'html',html,'contract',contract,'hash',content_hash",
+                    "workspace_input_events" => "'cursor',cursor,'id',id,'payload',payload,'request_hash',request_hash,'hash',hash,'prev_hash',prev_hash",
+                    _ => "'generation',generation,'available',available_event_id,'token',claim_token,'until',claim_until,'finished',finished_at",
+                })).fetch_one(&pool).await.unwrap();
+                before.push(rows);
+            }
+            let objects: Vec<(String,)> = sqlx::query_as("SELECT name FROM sqlite_master WHERE (name LIKE 'workspace_input%') AND type IN ('index','trigger') ORDER BY name").fetch_all(&pool).await.unwrap();
+            let mut tx = pool.begin().await.unwrap();
+            sqlx::raw_sql(include_str!(
+                "../../migrations/20261111090000_workspace_input_expiry.sql"
+            ))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            for (table, before) in tables.into_iter().zip(before) {
+                let (rows,): (String,) = sqlx::query_as(&format!("SELECT json_group_array(json_object({})) FROM {table}", match table {
+                    "workspace_inputs" => "'id',id,'status',status,'sequence',sequence,'priority',priority,'show_at',show_at,'generation',availability_generation",
+                    "workspace_input_versions" => "'input_id',input_id,'version',version,'title',title,'html',html,'contract',contract,'hash',content_hash",
+                    "workspace_input_events" => "'cursor',cursor,'id',id,'payload',payload,'request_hash',request_hash,'hash',hash,'prev_hash',prev_hash",
+                    _ => "'generation',generation,'available',available_event_id,'token',claim_token,'until',claim_until,'finished',finished_at",
+                })).fetch_one(&pool).await.unwrap();
+                assert_eq!(before, rows, "{table}");
+            }
+            let after: Vec<(String,)> = sqlx::query_as("SELECT name FROM sqlite_master WHERE (name LIKE 'workspace_input%') AND type IN ('index','trigger') ORDER BY name").fetch_all(&pool).await.unwrap();
+            assert!(objects.iter().all(|object| after.contains(object)));
+            assert!(
+                sqlx::query("PRAGMA foreign_key_check")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let (high_water,): (i64,) = sqlx::query_as(
+                "SELECT max(seq) FROM sqlite_sequence WHERE name='workspace_input_events'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(high_water, 77);
+            let (deadlines,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM workspace_inputs WHERE expires_at IS NOT NULL",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(deadlines, 0);
+            if retain_rows {
+                for query in [
+                    "DELETE FROM workspace_input_events",
+                    "UPDATE workspace_input_events SET hash='bad'",
+                    "DELETE FROM workspace_input_versions",
+                    "UPDATE workspace_input_versions SET html='bad'",
+                    "UPDATE workspace_inputs SET status='bad'",
+                    "UPDATE workspace_inputs SET priority='P9'",
+                    "UPDATE workspace_inputs SET id='other'",
+                ] {
+                    assert!(sqlx::query(query).execute(&pool).await.is_err(), "{query}");
+                }
+                sqlx::query("UPDATE workspace_inputs SET status='expired'")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                let inserted = sqlx::query("INSERT INTO workspace_input_events(id,workspace_id,input_id,sequence,actor_kind,actor,event_type,version,payload,request_id,request_hash,created_at,prev_hash,hash) VALUES ('expiry',X'01','legacy',2,'system','input_expiry','expired',1,'{}','expiry','rh','now','hash','h2')").execute(&pool).await.unwrap();
+                assert_eq!(inserted.last_insert_rowid(), 78);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn expiry_boundary_and_terminal_states_keep_versions_and_answers() {
+        let (pool, workspace) = setup().await;
+        let open = seed(&pool, workspace).await;
+        let no_answer = InputWrite::Answer(AnswerInput {
+            request_id: "wait".into(),
+            expected_sequence: 1,
+            version: 1,
+            answer: InputAnswer::default(),
+        });
+        WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&open.input_id),
+            InputActorKind::OwnerUi,
+            "owner",
+            no_answer,
+        )
+        .await
+        .unwrap();
+        let deadline = "2099-01-01T00:00:00.000000000Z";
+        sqlx::query("UPDATE workspace_inputs SET expires_at=?")
+            .bind(deadline)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(
+            expire_on(
+                &mut tx,
+                Some(workspace),
+                None,
+                "2098-12-31T23:59:59.999999999Z"
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            expire_on(&mut tx, Some(workspace), None, deadline)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            expire_on(&mut tx, Some(workspace), None, deadline)
+                .await
+                .unwrap(),
+            0
+        );
+        tx.commit().await.unwrap();
+        let detail = WorkspaceInput::detail(&pool, workspace, &open.input_id, None, true)
+            .await
+            .unwrap();
+        assert_eq!(detail.input.sequence, 3);
+        assert_eq!(detail.input.current_version, 1);
+        assert_eq!(detail.answers.len(), 1);
+        for terminal in ["answered", "closed", "cancelled"] {
+            let mut request = match create() {
+                InputWrite::Create(r) => r,
+                _ => unreachable!(),
+            };
+            request.external_key = terminal.into();
+            request.request_id = terminal.into();
+            let created = WorkspaceInput::write(
+                &pool,
+                workspace,
+                None,
+                InputActorKind::AgentMcp,
+                "requester",
+                InputWrite::Create(request),
+            )
+            .await
+            .unwrap();
+            let (actor_kind, actor, write) = match terminal {
+                "answered" => (InputActorKind::OwnerUi, "owner", answer(1, 1)),
+                "closed" => (InputActorKind::OwnerUi, "owner", status(1, "closed")),
+                _ => (
+                    InputActorKind::AgentMcp,
+                    "requester",
+                    status(1, "cancelled"),
+                ),
+            };
+            WorkspaceInput::write(
+                &pool,
+                workspace,
+                Some(&created.input_id),
+                actor_kind,
+                actor,
+                write,
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE workspace_inputs SET expires_at='2000-01-01T00:00:00.000000000Z' WHERE id=?").bind(&created.input_id).execute(&pool).await.unwrap();
+            let detail = WorkspaceInput::detail(&pool, workspace, &created.input_id, None, true)
+                .await
+                .unwrap();
+            assert_eq!(detail.input.status, terminal);
+            assert_eq!(detail.input.sequence, 2);
+            if terminal == "closed" {
+                let undo = InputWrite::Undo(InputStatusWrite {
+                    request_id: "undo-closed".into(),
+                    expected_sequence: 2,
+                    status: "open".into(),
+                    reason: None,
+                });
+                assert!(
+                    WorkspaceInput::write(
+                        &pool,
+                        workspace,
+                        Some(&created.input_id),
+                        InputActorKind::OwnerUi,
+                        "owner",
+                        undo
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+            assert!(
+                WorkspaceInput::verify(&pool, workspace, &created.input_id)
+                    .await
+                    .unwrap()
+                    .valid
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expiry_create_publish_normalize_preserve_clear_replace_and_suppress_notifications() {
+        let (pool, workspace) = setup().await;
+        let mut request = match create() {
+            InputWrite::Create(r) => r,
+            _ => unreachable!(),
+        };
+        request.expires_at = Some(Some("2099-01-01T01:00:00+01:00".into()));
+        let created = WorkspaceInput::write(
+            &pool,
+            workspace,
+            None,
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Create(request),
+        )
+        .await
+        .unwrap();
+        let id = &created.input_id;
+        assert_eq!(
+            WorkspaceInput::get(&pool, workspace, id)
+                .await
+                .unwrap()
+                .expires_at
+                .as_deref(),
+            Some("2099-01-01T00:00:00.000000000Z")
+        );
+        WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(id),
+            InputActorKind::AgentMcp,
+            "requester",
+            publish(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            WorkspaceInput::get(&pool, workspace, id)
+                .await
+                .unwrap()
+                .expires_at
+                .as_deref(),
+            Some("2099-01-01T00:00:00.000000000Z")
+        );
+        let mut request = match publish(2) {
+            InputWrite::Publish(r) => r,
+            _ => unreachable!(),
+        };
+        request.expires_at = Some(None);
+        WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(id),
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Publish(request),
+        )
+        .await
+        .unwrap();
+        assert!(
+            WorkspaceInput::get(&pool, workspace, id)
+                .await
+                .unwrap()
+                .expires_at
+                .is_none()
+        );
+        let claim = WorkspaceInput::claim_notification(&pool)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut request = match publish(3) {
+            InputWrite::Publish(r) => r,
+            _ => unreachable!(),
+        };
+        request.expires_at = Some(Some("2000-01-01T01:00:00+01:00".into()));
+        let receipt = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(id),
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Publish(request.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.status, "expired");
+        let retry = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(id),
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Publish(request),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(receipt).unwrap(),
+            serde_json::to_value(retry).unwrap()
+        );
+        assert!(
+            !WorkspaceInput::notification_is_current(&pool, &claim)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            WorkspaceInput::get(&pool, workspace, id)
+                .await
+                .unwrap()
+                .sequence,
+            5
+        );
+        assert!(
+            WorkspaceInput::verify(&pool, workspace, id)
+                .await
+                .unwrap()
+                .valid
+        );
+        for (index, value) in [
+            None,
+            Some("2000-01-01T00:00:00Z"),
+            Some("invalid"),
+            Some("2026-11-11T00:00:00"),
+            Some("2026-11-11T00:00:60Z"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut request = match create() {
+                InputWrite::Create(r) => r,
+                _ => unreachable!(),
+            };
+            request.external_key = format!("expiry-{index}");
+            request.request_id = request.external_key.clone();
+            request.expires_at = Some(value.map(str::to_string));
+            let result = WorkspaceInput::write(
+                &pool,
+                workspace,
+                None,
+                InputActorKind::AgentMcp,
+                "requester",
+                InputWrite::Create(request),
+            )
+            .await;
+            if index < 2 {
+                assert_eq!(
+                    result.unwrap().status,
+                    if index == 1 { "expired" } else { "open" }
+                );
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn expiry_reconciles_before_pagination_worker_release_and_final_notification_check() {
+        let (pool, workspace) = setup().await;
+        for index in 0..4 {
+            let mut request = match create() {
+                InputWrite::Create(r) => r,
+                _ => unreachable!(),
+            };
+            request.external_key = format!("row-{index}");
+            request.request_id = request.external_key.clone();
+            let created = WorkspaceInput::write(
+                &pool,
+                workspace,
+                None,
+                InputActorKind::AgentMcp,
+                "requester",
+                InputWrite::Create(request),
+            )
+            .await
+            .unwrap();
+            if index < 2 {
+                sqlx::query("UPDATE workspace_inputs SET expires_at='2000-01-01T00:00:00.000000000Z' WHERE id=?").bind(&created.input_id).execute(&pool).await.unwrap();
+            }
+        }
+        let page = WorkspaceInput::list(&pool, workspace, Some("open"), "", 1)
+            .await
+            .unwrap();
+        assert_eq!(page.pending_count, 2);
+        assert_eq!(page.inputs.len(), 1);
+        let page = WorkspaceInput::list(
+            &pool,
+            workspace,
+            Some("open"),
+            page.next_cursor.as_deref().unwrap(),
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.pending_count, 2);
+        assert!(page.next_cursor.is_none());
+        let claim = WorkspaceInput::claim_notification(&pool)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE workspace_inputs SET expires_at='2000-01-01T00:00:00.000000000Z' WHERE status='open'").execute(&pool).await.unwrap();
+        assert!(
+            !WorkspaceInput::notification_is_current(&pool, &claim)
+                .await
+                .unwrap()
+        );
+        assert_eq!(WorkspaceInput::release_due(&pool).await.unwrap(), 0);
+        assert!(
+            WorkspaceInput::claim_notification(&pool)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            WorkspaceInput::list(&pool, workspace, Some("expired"), "", 100)
+                .await
+                .unwrap()
+                .inputs
+                .len(),
+            4
+        );
+    }
 
     #[test]
     fn schedule_presence_and_timestamp_contract() {
@@ -1598,6 +2271,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20261111090000_workspace_input_expiry.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         assert_eq!(WorkspaceInput::release_due(&pool).await.unwrap(), 0);
         assert!(
             WorkspaceInput::claim_notification(&pool)
@@ -1727,6 +2406,12 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20261111090000_workspace_input_expiry.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         let workspace = Uuid::new_v4();
         sqlx::query("INSERT INTO workspaces (id) VALUES (?)")
             .bind(workspace)
@@ -1745,6 +2430,7 @@ mod tests {
             let mut content = content();
             content.title = title.into();
             InputWrite::Create(CreateInput {
+                expires_at: None,
                 show_at: None,
                 priority: priority.map(Into::into),
                 external_key: key.into(),
@@ -1787,6 +2473,7 @@ mod tests {
             InputActorKind::AgentMcp,
             "requester",
             InputWrite::Publish(PublishInput {
+                expires_at: None,
                 show_at: None,
                 priority: None,
                 request_id: "republish".into(),
@@ -1986,6 +2673,7 @@ mod tests {
     }
     fn create() -> InputWrite {
         InputWrite::Create(CreateInput {
+            expires_at: None,
             show_at: None,
             priority: None,
             external_key: "rollout".into(),
@@ -2027,6 +2715,7 @@ mod tests {
     }
     fn publish(sequence: i64) -> InputWrite {
         InputWrite::Publish(PublishInput {
+            expires_at: None,
             show_at: None,
             priority: None,
             request_id: format!("publish-{sequence}"),

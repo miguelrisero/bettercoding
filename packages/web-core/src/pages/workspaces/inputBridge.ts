@@ -1,6 +1,5 @@
 import type { InputAnswer, InputContract } from 'shared/types';
 import mermaidSource from 'mermaid/dist/mermaid.min.js?raw';
-import { reportLink } from './workspaceReports';
 
 export type InputBridge = {
   id: string;
@@ -78,28 +77,6 @@ export function readInputProposal(
   };
 }
 
-export function readInputLink(
-  event: Pick<MessageEvent, 'source' | 'data'>,
-  frameWindow: Window | null,
-  bridge: InputBridge
-): string | null {
-  if (!bridge.valid || !frameWindow || event.source !== frameWindow)
-    return null;
-  const data = event.data;
-  if (
-    !data ||
-    data.type !== 'bc.input.link' ||
-    data.protocol !== 1 ||
-    data.bridge_id !== bridge.id ||
-    data.input_id !== bridge.inputId ||
-    data.version !== bridge.version ||
-    typeof data.href !== 'string' ||
-    data.href.length > 8192
-  )
-    return null;
-  return reportLink(data.href) ?? null;
-}
-
 // The trusted embedding document applies frame-src to the inner frame's navigations.
 // The application shell also contains terminals and previews with separate policies.
 export function inputEmbeddingDocument(
@@ -129,7 +106,7 @@ export function inputEmbeddingDocument(
   return `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; frame-src ${frameSource}; connect-src 'none'; base-uri 'none'; form-action 'none'"><meta name="referrer" content="no-referrer"><style>html,body,iframe{margin:0;width:100%;height:100%;border:0;display:block}body{background:white}</style></head><body><script nonce="${nonce}">
 const config=${config};
 const frame=document.createElement('iframe');
-frame.sandbox='allow-scripts'; frame.title='Input page'; frame.referrerPolicy='no-referrer';
+frame.sandbox='allow-scripts allow-popups allow-popups-to-escape-sandbox'; frame.title='Input page'; frame.referrerPolicy='no-referrer';
 let loads=0, valid=true;
 frame.addEventListener('load',()=>{
   loads++;
@@ -143,7 +120,7 @@ window.addEventListener('message',event=>{
   if(!d || d.protocol!==1 || d.bridge_id!==config.bridge_id || d.input_id!==config.input_id || d.version!==config.version) return;
   if(event.source===parent && d.type==='bc.input.image') { frame.contentWindow.postMessage(d,'*'); return; }
   if(event.source!==frame.contentWindow) return;
-  if(d.type!=='bc.input.propose' && d.type!=='bc.input.image.request' && d.type!=='bc.input.link') return;
+  if(d.type!=='bc.input.propose' && d.type!=='bc.input.image.request') return;
   try{if(JSON.stringify(d).length>262144)return;}catch{return;}
   parent.postMessage(d,'*');
 });
