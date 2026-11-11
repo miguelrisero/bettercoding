@@ -211,6 +211,21 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+      - name: Retain formatted Input test sources
+        if: failure()
+        run: pnpm exec prettier --write packages/web-core/src/pages/workspaces/inputClose.test.ts packages/web-core/src/pages/workspaces/inputRichContent.test.ts
+
+      - name: Upload formatted Input test sources
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: input-test-format-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            packages/web-core/src/pages/workspaces/inputClose.test.ts
+            packages/web-core/src/pages/workspaces/inputRichContent.test.ts
+          retention-days: 1
+          if-no-files-found: error
+
   input-links-browser:
     runs-on: *runner_label
     timeout-minutes: 5
