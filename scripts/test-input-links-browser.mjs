@@ -37,7 +37,7 @@ const server = createServer((req, res) => {
     return res.end(`const mermaidSource = '';\n${bridge}`);
   }
   if (req.url === '/') {
-    return res.end(`<!doctype html><style>html,body{margin:0}iframe{border:0;width:100vw;height:100vh}</style>
+    return res.end(`<!doctype html><style>html,body{margin:0}iframe{display:block;border:0;width:100vw;height:100vh}</style>
 <script>window.state={outerLoads:0,loaded:0,navigated:0,unloads:0};
 addEventListener('message',e=>{if(e.data.type==='bc.input.loaded')state.loaded++;
 if(e.data.type==='bc.input.navigated')state.navigated++;
@@ -260,11 +260,23 @@ try {
     const point = await evaluate(`(()=>{const a=document.getElementById(${JSON.stringify(id)});
       a.scrollIntoView({block:'center'});const r=(a.tagName==='AREA'?document.querySelector('img[usemap]'):a).getBoundingClientRect();
       return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
-    assert.ok(point.x > 0 && point.y > 0 && point.x < 420 && point.y < 800);
-    assert.deepEqual(await page.evaluate(`(()=>{const outer=document.querySelector('iframe');
+    const geometry = await page.evaluate(`(()=>{const outer=document.querySelector('iframe');
       const inner=outer.contentDocument.querySelector('iframe');
-      return [outer,inner].map(f=>{const r=f.getBoundingClientRect();return [r.x,r.y];});})()`),
-      [[0, 0], [0, 0]], 'Frame coordinates match the top-level viewport');
+      return {viewport:{width:innerWidth,height:innerHeight},frames:[outer,inner].map(f=>{
+        const r=f.getBoundingClientRect();return {x:r.x+f.clientLeft,y:r.y+f.clientTop,
+          width:f.clientWidth,height:f.clientHeight,rectWidth:r.width,rectHeight:r.height};})};})()`);
+    for (const frame of [...geometry.frames].reverse()) {
+      assert.ok(point.x > 0 && point.y > 0 && point.x < frame.width && point.y < frame.height,
+        'The activation point lies inside each ancestor frame');
+      assert.equal(frame.rectWidth, frame.width, 'Fixture frames have zero border and unit scale');
+      assert.equal(frame.rectHeight, frame.height);
+      point.x += frame.x;
+      point.y += frame.y;
+    }
+    assert.ok(point.x > 0 && point.y > 0 && point.x < geometry.viewport.width && point.y < geometry.viewport.height,
+      'The translated activation point lies inside the top-level viewport');
+    assert.equal(await page.evaluate(`document.elementFromPoint(${point.x},${point.y})===document.querySelector('iframe')`), true,
+      'The top-level hit test reaches the Input embedding');
     await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...point, button, clickCount: 1 });
     await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, button, clickCount: 1 });
   }
