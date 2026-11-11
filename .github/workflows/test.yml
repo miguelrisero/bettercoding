@@ -259,20 +259,26 @@ jobs:
           printf 'Chrome launcher: %s; payload: %s/chrome\n' "$chrome_launcher" "$chrome_root"
           test -x "$chrome_root/chrome"
           fixture_root="$GITHUB_WORKSPACE"
-          scratch=$(mktemp -d "$RUNNER_TEMP/input-links.XXXXXX")
           node_binary=$(readlink -f "$(command -v node)")
           # The private mount namespace keeps the bounded tmpfs inside this step.
           sudo /usr/bin/timeout --kill-after=5s 180s \
             /usr/bin/unshare --mount --propagation private /bin/bash -s -- \
-            "$scratch" "$fixture_root" "$node_binary" "$chrome_root" <<'SANDBOX'
+            "$fixture_root" "$node_binary" "$chrome_root" <<'SANDBOX'
           set -euo pipefail
-          scratch=$1
-          source=$2
-          node_binary=$3
-          chrome_root=$4
-          mount -t tmpfs -o size=256m,nr_inodes=8192,nosuid,nodev,mode=0700 tmpfs "$scratch"
+          source=$1
+          node_binary=$2
+          chrome_root=$3
+          # A root-owned path avoids traversing the runner's private home after cap-drop.
+          scratch=$(mktemp -d /run/input-links.XXXXXX)
           trap 'umount "$scratch"' EXIT
-          mkdir "$scratch/home" "$scratch/tmp" "$scratch/cache"
+          mount -t tmpfs -o size=256m,nr_inodes=8192,nosuid,nodev,mode=0700 tmpfs "$scratch"
+          mkdir "$scratch/fixtures" "$scratch/data"
+          mkdir "$scratch/data/home" "$scratch/data/tmp" "$scratch/data/cache"
+          install -m 0444 "$source/scripts/test-input-links-browser.mjs" "$scratch/fixtures/test.mjs"
+          install -m 0444 "$source/crates/server/src/routes/workspaces/input-rich-content.js" "$scratch/fixtures/runtime.js"
+          install -m 0444 "$source/packages/web-core/src/pages/workspaces/inputBridge.ts" "$scratch/fixtures/bridge.ts"
+          install -m 0444 "$source/crates/server/src/routes/workspaces/inputs.rs" "$scratch/fixtures/inputs.rs"
+          sha256sum "$scratch/fixtures/"*
           # systemd applies aggregate limits to the supervisor, Node, and Chrome.
           /usr/bin/systemd-run --scope --quiet \
             -p MemoryMax=1G -p MemorySwapMax=0 -p TasksMax=128 -p CPUQuota=100% \
@@ -283,11 +289,11 @@ jobs:
             --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
             --ro-bind "$chrome_root" /opt/google/chrome \
             --ro-bind "$node_binary" /fixture/node \
-            --ro-bind "$source/scripts/test-input-links-browser.mjs" /fixture/test.mjs \
-            --ro-bind "$source/crates/server/src/routes/workspaces/input-rich-content.js" /fixture/runtime.js \
-            --ro-bind "$source/packages/web-core/src/pages/workspaces/inputBridge.ts" /fixture/bridge.ts \
-            --ro-bind "$source/crates/server/src/routes/workspaces/inputs.rs" /fixture/inputs.rs \
-            --bind "$scratch" /scratch --proc /proc --dev /dev \
+            --ro-bind "$scratch/fixtures/test.mjs" /fixture/test.mjs \
+            --ro-bind "$scratch/fixtures/runtime.js" /fixture/runtime.js \
+            --ro-bind "$scratch/fixtures/bridge.ts" /fixture/bridge.ts \
+            --ro-bind "$scratch/fixtures/inputs.rs" /fixture/inputs.rs \
+            --bind "$scratch/data" /scratch --proc /proc --dev /dev \
             --symlink /scratch/tmp /tmp \
             --remount-ro /proc --remount-ro /dev --remount-ro / \
             --setenv HOME /scratch/home --setenv TMPDIR /scratch/tmp \
