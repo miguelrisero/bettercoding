@@ -256,10 +256,16 @@ try {
     assert.equal(current?.loaderId, inner.loaderId, 'The Input has one document load');
     assert.equal(requests.filter((url) => url === contentPath).length, 1);
   }
+  let activationDiagnostics;
   async function click(id, button = 'left') {
-    const point = await evaluate(`(()=>{const a=document.getElementById(${JSON.stringify(id)});
+    const local = await evaluate(`(()=>{const a=document.getElementById(${JSON.stringify(id)});
       a.scrollIntoView({block:'center'});const r=(a.tagName==='AREA'?document.querySelector('img[usemap]'):a).getBoundingClientRect();
-      return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
+      const point={x:r.x+r.width/2,y:r.y+r.height/2};const hit=document.elementFromPoint(point.x,point.y);
+      return {point,hit:{tag:hit?.tagName,id:hit?.id,anchor:hit?.closest('a,area')?.id},
+        anchor:{tag:a.tagName,id:a.id,attrs:Object.fromEntries(Array.from(a.attributes,x=>[x.name,x.value])),
+          rect:{x:r.x,y:r.y,width:r.width,height:r.height}}};})()`);
+    activationDiagnostics = { id, button, local };
+    const point = { ...local.point };
     const geometry = await page.evaluate(`(()=>{const outer=document.querySelector('iframe');
       const inner=outer.contentDocument.querySelector('iframe');
       return {viewport:{width:innerWidth,height:innerHeight},frames:[outer,inner].map(f=>{
@@ -277,6 +283,7 @@ try {
       'The translated activation point lies inside the top-level viewport');
     assert.equal(await page.evaluate(`document.elementFromPoint(${point.x},${point.y})===document.querySelector('iframe')`), true,
       'The top-level hit test reaches the Input embedding');
+    activationDiagnostics = { ...activationDiagnostics, geometry, dispatchedPoint: { ...point } };
     await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...point, button, clickCount: 1 });
     await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, button, clickCount: 1 });
   }
@@ -286,8 +293,24 @@ try {
     const before = (await list()).filter((t) => t.type === 'page');
     assert.equal(before.length, 1);
     await page.send('Page.bringToFront');
+    activationDiagnostics = { id, method: 'keyboard' };
     await activate();
-    const target = await until(async () => (await list()).find((t) => t.type === 'page' && t.id !== initial.id && t.url === `${origin}/target?${id}`), `${id} popup`);
+    let target;
+    try {
+      target = await until(async () => (await list()).find((t) => t.type === 'page' && t.id !== initial.id && t.url === `${origin}/target?${id}`), `${id} popup`);
+    } catch (error) {
+      try {
+        const innerState = await evaluate(`(()=>{const a=document.getElementById(${JSON.stringify(id)});return {
+          location:location.href,mountId:window.__mountId,events:__events.slice(-20),
+          anchor:a?{tag:a.tagName,id:a.id,attrs:Object.fromEntries(Array.from(a.attributes,x=>[x.name,x.value]))}:null};})()`);
+        const targets = (await list()).map(({ type, url }) => ({ type, url }));
+        const parentState = await page.evaluate('state');
+        stage(`popup-diagnostics ${JSON.stringify({ activation:activationDiagnostics,innerState,targets,parentState }).slice(0,12000)}`);
+      } catch (diagnosticError) {
+        stage(`popup-diagnostics-unavailable ${diagnosticError.message}`);
+      }
+      throw error;
+    }
     await delay(200);
     const after = (await list()).filter((t) => t.type === 'page');
     assert.equal(after.length, before.length + 1, 'Exactly one new browsing context');
