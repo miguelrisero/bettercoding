@@ -2,12 +2,14 @@
 // CI-only: the workflow supplies the OS sandbox and aggregate resource limits.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { stripTypeScriptTypes } from 'node:module';
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 
+const stage = (name) => writeSync(2, `[input-browser] ${name}\n`);
+stage('node-entry');
 assert.equal(process.env.INPUT_BROWSER_SANDBOX, '1', 'Use the isolated CI job');
 assert.equal(process.cwd(), '/scratch');
 const sources = Object.fromEntries(
@@ -18,9 +20,11 @@ const sources = Object.fromEntries(
 );
 const csp = sources['inputs.rs'].match(/pub const INPUT_CONTENT_CSP: &str = "([^"]+)";/)?.[1];
 assert.ok(csp, 'Read the exact backend CSP');
+stage('source-read');
 const bridge = stripTypeScriptTypes(
   sources['bridge.ts'].replace(/^import .*;\r?\n/gm, ''),
 );
+stage('typescript-stripped');
 const contentPath = '/api/workspaces/synthetic/inputs/links/versions/1/content';
 const requests = [];
 let origin;
@@ -165,11 +169,17 @@ async function until(check, label) {
 }
 
 let chrome;
+let chromeStderr = '';
 let page;
 const clients = [];
 try {
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  stage('fixture-listen-start');
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
   origin = `http://127.0.0.1:${server.address().port}`;
+  stage(`fixture-listening ${origin}`);
   const flags = [
     '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
     '--no-first-run', '--no-default-browser-check', '--disable-background-networking',
@@ -179,16 +189,29 @@ try {
     '--disk-cache-size=1048576', '--remote-debugging-address=127.0.0.1',
     '--remote-debugging-port=0', '--window-size=420,800', 'about:blank',
   ];
+  stage('chrome-spawn-start');
   chrome = spawn('/opt/google/chrome/chrome', flags, { stdio: ['ignore', 'ignore', 'pipe'] });
-  let stderr = '';
-  chrome.stderr.on('data', (data) => { stderr = (stderr + data).slice(-16000); });
+  stage(`chrome-spawned pid=${chrome.pid}`);
+  let spawnError;
+  chrome.once('error', (error) => { spawnError = error; stage(`chrome-spawn-error ${error.message}`); });
+  chrome.once('exit', (code, signal) => stage(`chrome-exit code=${code} signal=${signal}`));
+  chrome.stderr.on('data', (data) => {
+    const text = data.toString();
+    const remaining = Math.max(0, 16000 - chromeStderr.length);
+    if (remaining) writeSync(2, text.slice(0, remaining));
+    chromeStderr = (chromeStderr + text).slice(-16000);
+  });
   const endpoint = await until(() => {
-    assert.equal(chrome.exitCode, null, stderr);
-    return stderr.match(/DevTools listening on (ws:\/\/[^\s]+)/)?.[1];
+    if (spawnError) throw spawnError;
+    assert.equal(chrome.exitCode, null, chromeStderr);
+    assert.equal(chrome.signalCode, null, chromeStderr);
+    return chromeStderr.match(/DevTools listening on (ws:\/\/[^\s]+)/)?.[1];
   }, 'Chrome CDP endpoint');
+  stage('chrome-cdp-ready');
   const browser = new CDP(endpoint);
   clients.push(browser);
   const version = await browser.send('Browser.getVersion');
+  stage(`browser-version ${version.product}`);
   const port = new URL(endpoint).port;
   const list = () => fetch(`http://127.0.0.1:${port}/json/list`).then((r) => r.json());
   const initial = (await list()).find((target) => target.type === 'page');
@@ -196,9 +219,11 @@ try {
   page = new CDP(initial.webSocketDebuggerUrl);
   clients.push(page);
   await page.enableFrames();
+  stage('page-sessions-ready');
   await page.send('Emulation.setDeviceMetricsOverride', { width: 420, height: 800, deviceScaleFactor: 1, mobile: false });
   await page.send('Page.navigate', { url: origin });
   await until(async () => (await page.evaluate('window.state?.loaded')) === 1, 'Input mount');
+  stage('input-mounted');
   async function inputFrame() {
     if (page.attachmentError) throw page.attachmentError;
     for (const sessionId of [undefined, ...page.sessions]) {
@@ -242,6 +267,7 @@ try {
   }
   const results = [];
   async function popup(id, activate) {
+    stage(`acceptance ${id}`);
     const before = (await list()).filter((t) => t.type === 'page');
     assert.equal(before.length, 1);
     await page.send('Page.bringToFront');
@@ -292,7 +318,13 @@ try {
     csp, viewport: { width: 420, height: 800 }, flags,
     environment: process.env, requests, results,
   }, null, 2));
+} catch (error) {
+  stage(`failure ${error.stack ?? error}`);
+  stage(`chrome-state exit=${chrome?.exitCode} signal=${chrome?.signalCode}`);
+  if (chromeStderr) writeSync(2, `[input-browser] Chrome stderr tail\n${chromeStderr}\n`);
+  throw error;
 } finally {
+  stage('cleanup-start');
   for (const client of clients) client.close();
   chrome?.kill('SIGTERM');
   server.closeAllConnections();

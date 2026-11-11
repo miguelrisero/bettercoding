@@ -280,8 +280,23 @@ jobs:
           install -m 0444 "$source/crates/server/src/routes/workspaces/inputs.rs" "$scratch/fixtures/inputs.rs"
           sha256sum "$scratch/fixtures/"*
           # systemd applies aggregate limits to the supervisor, Node, and Chrome.
+          echo '[input-browser] scope-start'
+          set +e
           /usr/bin/systemd-run --scope --quiet \
             -p MemoryMax=1G -p MemorySwapMax=0 -p TasksMax=128 -p CPUQuota=100% \
+            /bin/bash -c '
+              "$@"
+              status=$?
+              printf "[input-browser] sandbox-exit=%s\n" "$status"
+              group=$(sed -n "s/^0:://p" /proc/self/cgroup)
+              printf "[input-browser] cgroup=%s\n" "$group"
+              for counter in memory.peak memory.events memory.events.local pids.peak pids.events cpu.stat; do
+                echo "[input-browser] $counter"
+                cat "/sys/fs/cgroup$group/$counter" 2>&1 || true
+              done
+              systemctl show "$(basename "$group")" -p MemoryPeak -p MemoryCurrent -p TasksCurrent -p Result 2>&1 || true
+              exit "$status"
+            ' bash \
             /usr/bin/prlimit --cpu=120:120 --fsize=16777216:16777216 \
             --nofile=512:512 --core=0:0 -- \
             /usr/bin/bwrap --unshare-all --unshare-user --die-with-parent --new-session \
@@ -300,6 +315,11 @@ jobs:
             --setenv XDG_CACHE_HOME /scratch/cache --setenv PATH /usr/bin \
             --setenv INPUT_BROWSER_SANDBOX 1 --chdir /scratch \
             /fixture/node /fixture/test.mjs
+          status=$?
+          set -e
+          printf '[input-browser] scope-exit=%s\n' "$status"
+          df -h "$scratch"
+          exit "$status"
           SANDBOX
 
   backend-schema-checks:
