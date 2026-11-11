@@ -278,7 +278,7 @@ jobs:
             -p MemoryMax=1G -p MemorySwapMax=0 -p TasksMax=128 -p CPUQuota=100% \
             /usr/bin/prlimit --cpu=120:120 --fsize=16777216:16777216 \
             --nofile=512:512 --core=0:0 -- \
-            /usr/bin/bwrap --unshare-all --die-with-parent --new-session \
+            /usr/bin/bwrap --unshare-all --unshare-user --die-with-parent --new-session \
             --disable-userns --cap-drop ALL --clearenv \
             --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
             --ro-bind "$chrome_root" /opt/google/chrome \
