@@ -38,8 +38,9 @@ const server = createServer((req, res) => {
   }
   if (req.url === '/') {
     return res.end(`<!doctype html><style>html,body{margin:0}iframe{display:block;border:0;width:100vw;height:100vh}</style>
-<script>window.state={outerLoads:0,loaded:0,navigated:0,unloads:0};
-addEventListener('message',e=>{if(e.data.type==='bc.input.loaded')state.loaded++;
+<script>window.state={outerLoads:0,loaded:0,navigated:0,unloads:0};window.fixtureEvents=[];
+addEventListener('message',e=>{if(e.data.type==='fixture.event'){fixtureEvents.push(e.data.event);if(fixtureEvents.length>20)fixtureEvents.shift();}
+if(e.data.type==='bc.input.loaded')state.loaded++;
 if(e.data.type==='bc.input.navigated')state.navigated++;
 if(e.data.type==='fixture.unload')state.unloads++;});</script>
 <script type="module">import {createInputBridge,inputEmbeddingDocument} from '/bridge.js';
@@ -71,7 +72,9 @@ body{margin:8px}a{display:block;padding:5px}svg a{display:inline}svg{display:blo
 addEventListener('pagehide',()=>top.postMessage({type:'fixture.unload'},'*'));</script>
 <script>${sources['runtime.js']}</script>
 <script>for(const type of ['click','auxclick'])document.addEventListener(type,e=>{
-const a=e.target.closest?.('a,area');if(a)__events.push({id:a.id,type:e.type,trusted:e.isTrusted,prevented:e.defaultPrevented});});</script>
+const a=e.target.closest?.('a,area');if(a){const record={id:a.id,type:e.type,trusted:e.isTrusted,prevented:e.defaultPrevented,
+attrs:Object.fromEntries(Array.from(a.attributes,x=>[x.name,x.value]))};
+__events.push(record);top.postMessage({type:'fixture.event',event:record},'*');}});</script>
 </body></html>`);
   }
   if (req.url?.startsWith('/target?')) return res.end('<!doctype html><title>Synthetic target</title>Target');
@@ -84,6 +87,7 @@ class CDP {
     this.pending = new Map();
     this.contexts = new Map();
     this.sessions = new Set();
+    this.frameEvents = [];
     this.attachmentError = null;
     this.id = 0;
     this.socket = new WebSocket(url);
@@ -102,6 +106,11 @@ class CDP {
         else pending.resolve(message.result);
       }
       const sessionId = message.sessionId;
+      if (['Page.frameNavigated', 'Page.frameDetached', 'Page.frameRequestedNavigation',
+        'Page.frameScheduledNavigation', 'Target.detachedFromTarget'].includes(message.method)) {
+        this.frameEvents.push({ method: message.method, sessionId, params: message.params });
+        if (this.frameEvents.length > 30) this.frameEvents.shift();
+      }
       if (message.method === 'Target.attachedToTarget') {
         const attached = message.params.sessionId;
         this.sessions.add(attached);
@@ -284,6 +293,7 @@ try {
     assert.equal(await page.evaluate(`document.elementFromPoint(${point.x},${point.y})===document.querySelector('iframe')`), true,
       'The top-level hit test reaches the Input embedding');
     activationDiagnostics = { ...activationDiagnostics, geometry, dispatchedPoint: { ...point } };
+    stage(`activation-before-dispatch ${JSON.stringify(activationDiagnostics).slice(0,6000)}`);
     await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...point, button, clickCount: 1 });
     await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, button, clickCount: 1 });
   }
@@ -299,15 +309,17 @@ try {
     try {
       target = await until(async () => (await list()).find((t) => t.type === 'page' && t.id !== initial.id && t.url === `${origin}/target?${id}`), `${id} popup`);
     } catch (error) {
-      try {
-        const innerState = await evaluate(`(()=>{const a=document.getElementById(${JSON.stringify(id)});return {
+      stage(`popup-activation ${JSON.stringify(activationDiagnostics).slice(0,6000)}`);
+      stage(`popup-frame-events ${JSON.stringify(page.frameEvents).slice(0,12000)}`);
+      for (const [label, read] of [
+        ['parent', () => page.evaluate('({state,fixtureEvents})')],
+        ['targets', async () => (await list()).map(({ type, url }) => ({ type, url }))],
+        ['inner', () => evaluate(`(()=>{const a=document.getElementById(${JSON.stringify(id)});return {
           location:location.href,mountId:window.__mountId,events:__events.slice(-20),
-          anchor:a?{tag:a.tagName,id:a.id,attrs:Object.fromEntries(Array.from(a.attributes,x=>[x.name,x.value]))}:null};})()`);
-        const targets = (await list()).map(({ type, url }) => ({ type, url }));
-        const parentState = await page.evaluate('state');
-        stage(`popup-diagnostics ${JSON.stringify({ activation:activationDiagnostics,innerState,targets,parentState }).slice(0,12000)}`);
-      } catch (diagnosticError) {
-        stage(`popup-diagnostics-unavailable ${diagnosticError.message}`);
+          anchor:a?{tag:a.tagName,id:a.id,attrs:Object.fromEntries(Array.from(a.attributes,x=>[x.name,x.value]))}:null};})()`)],
+      ]) {
+        try { stage(`popup-${label} ${JSON.stringify(await read()).slice(0,12000)}`); }
+        catch (diagnosticError) { stage(`popup-${label}-unavailable ${diagnosticError.message}`); }
       }
       throw error;
     }
