@@ -37,9 +37,10 @@ const server = createServer((req, res) => {
     return res.end(`const mermaidSource = '';\n${bridge}`);
   }
   if (req.url === '/') {
-    return res.end(`<!doctype html><style>html,body{margin:0}iframe{border:0;width:100vw;height:100vh}</style>
-<script>window.state={outerLoads:0,loaded:0,navigated:0,unloads:0};
-addEventListener('message',e=>{if(e.data.type==='bc.input.loaded')state.loaded++;
+    return res.end(`<!doctype html><style>html,body{margin:0}iframe{display:block;border:0;width:100vw;height:100vh}</style>
+<script>window.state={outerLoads:0,loaded:0,navigated:0,unloads:0};window.fixtureEvents=[];
+addEventListener('message',e=>{if(e.data.type==='fixture.event'){fixtureEvents.push(e.data.event);if(fixtureEvents.length>20)fixtureEvents.shift();}
+if(e.data.type==='bc.input.loaded')state.loaded++;
 if(e.data.type==='bc.input.navigated')state.navigated++;
 if(e.data.type==='fixture.unload')state.unloads++;});</script>
 <script type="module">import {createInputBridge,inputEmbeddingDocument} from '/bridge.js';
@@ -71,7 +72,9 @@ body{margin:8px}a{display:block;padding:5px}svg a{display:inline}svg{display:blo
 addEventListener('pagehide',()=>top.postMessage({type:'fixture.unload'},'*'));</script>
 <script>${sources['runtime.js']}</script>
 <script>for(const type of ['click','auxclick'])document.addEventListener(type,e=>{
-const a=e.target.closest?.('a,area');if(a)__events.push({id:a.id,type:e.type,trusted:e.isTrusted,prevented:e.defaultPrevented});});</script>
+const a=e.target.closest?.('a,area');if(a){const record={id:a.id,type:e.type,trusted:e.isTrusted,prevented:e.defaultPrevented,
+attrs:Object.fromEntries(Array.from(a.attributes,x=>[x.name,x.value]))};
+__events.push(record);top.postMessage({type:'fixture.event',event:record},'*');}});</script>
 </body></html>`);
   }
   if (req.url?.startsWith('/target?')) return res.end('<!doctype html><title>Synthetic target</title>Target');
@@ -84,6 +87,7 @@ class CDP {
     this.pending = new Map();
     this.contexts = new Map();
     this.sessions = new Set();
+    this.frameEvents = [];
     this.attachmentError = null;
     this.id = 0;
     this.socket = new WebSocket(url);
@@ -102,6 +106,11 @@ class CDP {
         else pending.resolve(message.result);
       }
       const sessionId = message.sessionId;
+      if (['Page.frameNavigated', 'Page.frameDetached', 'Page.frameRequestedNavigation',
+        'Page.frameScheduledNavigation', 'Target.detachedFromTarget'].includes(message.method)) {
+        this.frameEvents.push({ method: message.method, sessionId, params: message.params });
+        if (this.frameEvents.length > 30) this.frameEvents.shift();
+      }
       if (message.method === 'Target.attachedToTarget') {
         const attached = message.params.sessionId;
         this.sessions.add(attached);
@@ -256,15 +265,35 @@ try {
     assert.equal(current?.loaderId, inner.loaderId, 'The Input has one document load');
     assert.equal(requests.filter((url) => url === contentPath).length, 1);
   }
+  let activationDiagnostics;
   async function click(id, button = 'left') {
-    const point = await evaluate(`(()=>{const a=document.getElementById(${JSON.stringify(id)});
+    const local = await evaluate(`(()=>{const a=document.getElementById(${JSON.stringify(id)});
       a.scrollIntoView({block:'center'});const r=(a.tagName==='AREA'?document.querySelector('img[usemap]'):a).getBoundingClientRect();
-      return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
-    assert.ok(point.x > 0 && point.y > 0 && point.x < 420 && point.y < 800);
-    assert.deepEqual(await page.evaluate(`(()=>{const outer=document.querySelector('iframe');
+      const point={x:r.x+r.width/2,y:r.y+r.height/2};const hit=document.elementFromPoint(point.x,point.y);
+      return {point,hit:{tag:hit?.tagName,id:hit?.id,anchor:hit?.closest('a,area')?.id},
+        anchor:{tag:a.tagName,id:a.id,attrs:Object.fromEntries(Array.from(a.attributes,x=>[x.name,x.value])),
+          rect:{x:r.x,y:r.y,width:r.width,height:r.height}}};})()`);
+    activationDiagnostics = { id, button, local };
+    const point = { ...local.point };
+    const geometry = await page.evaluate(`(()=>{const outer=document.querySelector('iframe');
       const inner=outer.contentDocument.querySelector('iframe');
-      return [outer,inner].map(f=>{const r=f.getBoundingClientRect();return [r.x,r.y];});})()`),
-      [[0, 0], [0, 0]], 'Frame coordinates match the top-level viewport');
+      return {viewport:{width:innerWidth,height:innerHeight},frames:[outer,inner].map(f=>{
+        const r=f.getBoundingClientRect();return {x:r.x+f.clientLeft,y:r.y+f.clientTop,
+          width:f.clientWidth,height:f.clientHeight,rectWidth:r.width,rectHeight:r.height};})};})()`);
+    for (const frame of [...geometry.frames].reverse()) {
+      assert.ok(point.x > 0 && point.y > 0 && point.x < frame.width && point.y < frame.height,
+        'The activation point lies inside each ancestor frame');
+      assert.equal(frame.rectWidth, frame.width, 'Fixture frames have zero border and unit scale');
+      assert.equal(frame.rectHeight, frame.height);
+      point.x += frame.x;
+      point.y += frame.y;
+    }
+    assert.ok(point.x > 0 && point.y > 0 && point.x < geometry.viewport.width && point.y < geometry.viewport.height,
+      'The translated activation point lies inside the top-level viewport');
+    assert.equal(await page.evaluate(`document.elementFromPoint(${point.x},${point.y})===document.querySelector('iframe')`), true,
+      'The top-level hit test reaches the Input embedding');
+    activationDiagnostics = { ...activationDiagnostics, geometry, dispatchedPoint: { ...point } };
+    stage(`activation-before-dispatch ${JSON.stringify(activationDiagnostics).slice(0,6000)}`);
     await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...point, button, clickCount: 1 });
     await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, button, clickCount: 1 });
   }
@@ -274,8 +303,26 @@ try {
     const before = (await list()).filter((t) => t.type === 'page');
     assert.equal(before.length, 1);
     await page.send('Page.bringToFront');
+    activationDiagnostics = { id, method: 'keyboard' };
     await activate();
-    const target = await until(async () => (await list()).find((t) => t.type === 'page' && t.id !== initial.id && t.url === `${origin}/target?${id}`), `${id} popup`);
+    let target;
+    try {
+      target = await until(async () => (await list()).find((t) => t.type === 'page' && t.id !== initial.id && t.url === `${origin}/target?${id}`), `${id} popup`);
+    } catch (error) {
+      stage(`popup-activation ${JSON.stringify(activationDiagnostics).slice(0,6000)}`);
+      stage(`popup-frame-events ${JSON.stringify(page.frameEvents).slice(0,12000)}`);
+      for (const [label, read] of [
+        ['parent', () => page.evaluate('({state,fixtureEvents})')],
+        ['targets', async () => (await list()).map(({ type, url }) => ({ type, url }))],
+        ['inner', () => evaluate(`(()=>{const a=document.getElementById(${JSON.stringify(id)});return {
+          location:location.href,mountId:window.__mountId,events:__events.slice(-20),
+          anchor:a?{tag:a.tagName,id:a.id,attrs:Object.fromEntries(Array.from(a.attributes,x=>[x.name,x.value]))}:null};})()`)],
+      ]) {
+        try { stage(`popup-${label} ${JSON.stringify(await read()).slice(0,12000)}`); }
+        catch (diagnosticError) { stage(`popup-${label}-unavailable ${diagnosticError.message}`); }
+      }
+      throw error;
+    }
     await delay(200);
     const after = (await list()).filter((t) => t.type === 'page');
     assert.equal(after.length, before.length + 1, 'Exactly one new browsing context');

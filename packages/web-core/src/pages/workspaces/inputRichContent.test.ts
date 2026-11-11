@@ -259,7 +259,9 @@ describe('trusted Input rich content runtime', () => {
         .split(', ')
         .some((part) =>
           Object.keys(initial).some(
-            (name) => part === `${tag}[${name.replace(':', '\\:')}]`
+            (name) =>
+              part === `${tag}[${name.replace(':', '\\:')}]` ||
+              part === `${tag}[*|${name.split(':').at(-1)}]`
           )
         )
         ? anchor
@@ -271,9 +273,7 @@ describe('trusted Input rich content runtime', () => {
       target: { closest },
       preventDefault,
     });
-    expect(closest).toHaveBeenCalledWith(
-      'a[href], area[href], a[xlink\\:href]'
-    );
+    expect(closest).toHaveBeenCalledWith('a[href], area[href], a[*|href]');
     if (target === null) {
       expect(preventDefault).toHaveBeenCalledOnce();
     } else {

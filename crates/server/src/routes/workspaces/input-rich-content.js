@@ -7,7 +7,7 @@
     const target = event.target?.closest
       ? event.target
       : event.target?.parentElement;
-    const anchor = target?.closest("a[href], area[href], a[xlink\\:href]");
+    const anchor = target?.closest("a[href], area[href], a[*|href]");
     if (!anchor) return;
     const href =
       anchor.getAttribute("href") ?? anchor.getAttribute("xlink:href") ?? "";
