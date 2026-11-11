@@ -453,7 +453,7 @@ jobs:
           rev: 6e4a9d6f2c4964f30ff54a8cd5466f8869267daa # cargo-nextest-0.9.132
 
       - name: Test Input expiry notification boundary
-        run: cargo nextest run -p services expiry_during_notification_config_wait_suppresses_delivery
+        run: cargo nextest run -p services expiry_
 
       - name: Run Cargo tests
         if: success() || failure()
