@@ -121,7 +121,12 @@ describe('Close Input navigation', () => {
     const flow = closeFlow();
     flow.refresh.mockImplementation(async () => {
       expect(flow.persist).toHaveBeenCalledWith(
-        'workspace', null, 'a', 1, false, 'request-id'
+        'workspace',
+        null,
+        'a',
+        1,
+        false,
+        'request-id'
       );
       expect(flow.onClosed).not.toHaveBeenCalled();
     });
@@ -148,7 +153,12 @@ describe('Close Input navigation', () => {
     const flow = closeFlow();
     await flow.status(true);
     expect(flow.persist).toHaveBeenCalledWith(
-      'workspace', null, 'a', 2, true, 'request-id'
+      'workspace',
+      null,
+      'a',
+      2,
+      true,
+      'request-id'
     );
     expect(flow.refresh).toHaveBeenCalledOnce();
     expect(flow.setUndoSequence).toHaveBeenCalledWith(null);
