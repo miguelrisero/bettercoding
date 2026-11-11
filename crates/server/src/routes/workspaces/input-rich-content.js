@@ -2,6 +2,31 @@
 (() => {
   let config;
   let images = [];
+  const linkActivated = (event) => {
+    if (event.type === "auxclick" && event.button !== 1) return;
+    const target = event.target?.closest ? event.target : event.target?.parentElement;
+    const anchor = target?.closest("a[href]");
+    if (!anchor) return;
+    const href = anchor.getAttribute("href") || "";
+    if (href.startsWith("#")) {
+      anchor.removeAttribute("target");
+      return;
+    }
+    event.preventDefault();
+    if (!config || href.length > 8192 || /[\s\\\u0000-\u001f\u007f]/.test(href)) return;
+    try {
+      const url = new URL(href);
+      if (!/^https?:$/.test(url.protocol) || !url.hostname || url.username || url.password) return;
+      parent.postMessage({
+        type: "bc.input.link", protocol: 1, bridge_id: config.bridge_id,
+        input_id: config.input_id, version: config.version, href: url.href,
+      }, "*");
+    } catch {
+      // Relative and active destinations stay inside the existing sandbox boundary.
+    }
+  };
+  document.addEventListener("click", linkActivated, true);
+  document.addEventListener("auxclick", linkActivated, true);
   window.addEventListener("message", async (event) => {
     if (event.source !== parent) return;
     const data = event.data;

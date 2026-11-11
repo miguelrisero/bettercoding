@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   inputImagePath,
   readInputImage,
@@ -140,8 +140,11 @@ function runtime(blocks: string[], source = '') {
       this.innerHTML = String(value);
     },
   }));
-  const parent = { postMessage() {} };
+  const parent = { postMessage: vi.fn() };
   const doc = {
+    addEventListener(type: string, fn: (event: unknown) => void) {
+      listeners[type] = fn;
+    },
     querySelectorAll(selector: string) {
       return selector === 'img' ? images : nodes;
     },
@@ -171,6 +174,7 @@ function runtime(blocks: string[], source = '') {
       },
     },
     document: doc,
+    URL,
     parent,
     mermaid,
   });
@@ -186,6 +190,37 @@ function runtime(blocks: string[], source = '') {
 }
 
 describe('trusted Input rich content runtime', () => {
+  it('prevents anchor navigation and forwards dynamic nested HTTP links', () => {
+    const page = runtime([]);
+    page.listeners.message({ source: page.parent, data: page.init });
+    for (const type of ['click', 'auxclick']) {
+      const preventDefault = vi.fn();
+      const anchor = { getAttribute: () => 'https://example.com/report' };
+      page.listeners[type]({
+        button: type === 'auxclick' ? 1 : 0,
+        target: { closest: () => anchor },
+        preventDefault,
+      });
+      expect(preventDefault).toHaveBeenCalledOnce();
+      expect(page.parent.postMessage).toHaveBeenLastCalledWith({
+        type: 'bc.input.link', protocol: 1, bridge_id: 'b', input_id: 'i',
+        version: 1, href: 'https://example.com/report',
+      }, '*');
+    }
+  });
+  it('blocks unsupported destinations and preserves local fragments', () => {
+    const page = runtime([]);
+    page.listeners.message({ source: page.parent, data: page.init });
+    for (const href of ['javascript:alert(1)', 'data:text/html,x', '/report', '//example.com', 'https://user:secret@example.com', '']) {
+      const preventDefault = vi.fn();
+      page.listeners.click({ target: { closest: () => ({ getAttribute: () => href }) }, preventDefault });
+      expect(preventDefault).toHaveBeenCalledOnce();
+    }
+    expect(page.parent.postMessage).not.toHaveBeenCalled();
+    const preventDefault = vi.fn();
+    page.listeners.click({ target: { closest: () => ({ getAttribute: () => '#section', removeAttribute() {} }) }, preventDefault });
+    expect(preventDefault).not.toHaveBeenCalled();
+  });
   it('renders HTML and fenced Mermaid blocks while preserving malformed source', async () => {
     const page = runtime([
       'flowchart TD\nA-->B',

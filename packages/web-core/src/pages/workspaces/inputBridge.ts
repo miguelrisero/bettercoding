@@ -1,5 +1,6 @@
 import type { InputAnswer, InputContract } from 'shared/types';
 import mermaidSource from 'mermaid/dist/mermaid.min.js?raw';
+import { reportLink } from './workspaceReports';
 
 export type InputBridge = {
   id: string;
@@ -77,6 +78,28 @@ export function readInputProposal(
   };
 }
 
+export function readInputLink(
+  event: Pick<MessageEvent, 'source' | 'data'>,
+  frameWindow: Window | null,
+  bridge: InputBridge
+): string | null {
+  if (!bridge.valid || !frameWindow || event.source !== frameWindow)
+    return null;
+  const data = event.data;
+  if (
+    !data ||
+    data.type !== 'bc.input.link' ||
+    data.protocol !== 1 ||
+    data.bridge_id !== bridge.id ||
+    data.input_id !== bridge.inputId ||
+    data.version !== bridge.version ||
+    typeof data.href !== 'string' ||
+    data.href.length > 8192
+  )
+    return null;
+  return reportLink(data.href) ?? null;
+}
+
 // The trusted embedding document applies frame-src to the inner frame's navigations.
 // The application shell also contains terminals and previews with separate policies.
 export function inputEmbeddingDocument(
@@ -120,7 +143,7 @@ window.addEventListener('message',event=>{
   if(!d || d.protocol!==1 || d.bridge_id!==config.bridge_id || d.input_id!==config.input_id || d.version!==config.version) return;
   if(event.source===parent && d.type==='bc.input.image') { frame.contentWindow.postMessage(d,'*'); return; }
   if(event.source!==frame.contentWindow) return;
-  if(d.type!=='bc.input.propose' && d.type!=='bc.input.image.request') return;
+  if(d.type!=='bc.input.propose' && d.type!=='bc.input.image.request' && d.type!=='bc.input.link') return;
   try{if(JSON.stringify(d).length>262144)return;}catch{return;}
   parent.postMessage(d,'*');
 });

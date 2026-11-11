@@ -47,6 +47,7 @@ export const inputStatusLabel: Record<string, string> = {
   answered: 'Answered',
   closed: 'Closed',
   cancelled: 'Cancelled',
+  expired: 'Expired',
 };
 
 // The selection epoch also detects closing and reopening the same Input.

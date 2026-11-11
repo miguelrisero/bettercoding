@@ -179,7 +179,7 @@ jobs:
         run: pnpm exec vitest run packages/web-core/src/pages/workspaces/workspaceSidebarWidths.test.ts --no-file-parallelism --maxWorkers 1
 
       - name: Test Input scheduling and navigation
-        run: pnpm exec vitest run packages/web-core/src/pages/workspaces/inputsApi.test.ts packages/web-core/src/pages/workspaces/inputSchedule.test.ts packages/web-core/src/pages/workspaces/inputFlow.test.ts --no-file-parallelism --maxWorkers 1
+        run: pnpm exec vitest run packages/web-core/src/pages/workspaces/inputsApi.test.ts packages/web-core/src/pages/workspaces/inputSchedule.test.ts packages/web-core/src/pages/workspaces/inputFlow.test.ts packages/web-core/src/pages/workspaces/inputBridge.test.ts packages/web-core/src/pages/workspaces/inputRichContent.test.ts --no-file-parallelism --maxWorkers 1
 
       - name: Run frontend checks
         env:
@@ -202,6 +202,14 @@ jobs:
             "GITHUB_BASE_REF=${{ github.base_ref || 'main' }} ./scripts/check-i18n.sh" \
             "node scripts/check-unused-i18n-keys.mjs" \
             "./scripts/check-legacy-frontend-paths.sh"
+
+      - name: Retain local frontend build
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-web-dist-${{ github.event.pull_request.head.sha || github.sha }}
+          path: packages/local-web/dist
+          retention-days: 7
+          if-no-files-found: error
 
   backend-schema-checks:
     needs: changes
