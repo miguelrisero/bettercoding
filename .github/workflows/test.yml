@@ -283,7 +283,7 @@ jobs:
           echo '[input-browser] scope-start'
           set +e
           /usr/bin/systemd-run --scope --quiet \
-            -p MemoryMax=1G -p MemorySwapMax=0 -p TasksMax=128 -p CPUQuota=100% \
+            -p MemoryMax=1G -p MemorySwapMax=0 -p TasksMax=256 -p CPUQuota=100% \
             /bin/bash -c '
               "$@"
               status=$?
