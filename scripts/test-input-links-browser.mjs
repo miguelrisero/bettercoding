@@ -158,8 +158,8 @@ class CDP {
   close() { this.socket.close(); }
 }
 
-async function until(check, label) {
-  const deadline = Date.now() + 5000;
+async function until(check, label, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const value = await check();
     if (value) return value;
@@ -201,12 +201,15 @@ try {
     if (remaining) writeSync(2, text.slice(0, remaining));
     chromeStderr = (chromeStderr + text).slice(-16000);
   });
+  // Cold Chrome startup receives a separate bound inside the 180-second OS timeout.
+  const chromeStartupTimeoutMs = 30000;
+  stage(`chrome-cdp-wait timeoutMs=${chromeStartupTimeoutMs}`);
   const endpoint = await until(() => {
     if (spawnError) throw spawnError;
     assert.equal(chrome.exitCode, null, chromeStderr);
     assert.equal(chrome.signalCode, null, chromeStderr);
     return chromeStderr.match(/DevTools listening on (ws:\/\/[^\s]+)/)?.[1];
-  }, 'Chrome CDP endpoint');
+  }, 'Chrome CDP endpoint', chromeStartupTimeoutMs);
   stage('chrome-cdp-ready');
   const browser = new CDP(endpoint);
   clients.push(browser);
