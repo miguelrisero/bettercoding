@@ -60,7 +60,7 @@ export const inputsApi = {
     inputRequest<InputPage>(
       workspace,
       host,
-      `?limit=50&status=${showDone ? 'answered,closed,cancelled' : 'open'}&cursor=${encodeURIComponent(cursor)}`
+      `?limit=50&status=${showDone ? 'answered,closed,cancelled,expired' : 'open'}&cursor=${encodeURIComponent(cursor)}`
     ),
   get: (workspace: string, host: string | null, id: string) =>
     inputRequest<InputDetail>(workspace, host, `/${id}`),

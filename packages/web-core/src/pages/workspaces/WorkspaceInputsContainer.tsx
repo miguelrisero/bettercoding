@@ -385,6 +385,7 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
               }
               onAnswered={() => advance(selected)}
               onScheduled={() => advance(selected, 'Input scheduled')}
+              onClosed={() => advance(selected, 'Input closed')}
             />
           ) : (
             <InputsDone />
@@ -442,6 +443,7 @@ function InputViewer({
   position,
   onAnswered,
   onScheduled,
+  onClosed,
 }: {
   workspaceId: string;
   inputId: string;
@@ -453,6 +455,7 @@ function InputViewer({
   } | null;
   onAnswered: () => Promise<void>;
   onScheduled: () => Promise<void>;
+  onClosed: () => Promise<void>;
 }) {
   const host = useHostId();
   const queryClient = useQueryClient();
@@ -634,6 +637,7 @@ function InputViewer({
           detail={detail.data}
           onAnswered={onAnswered}
           onScheduled={onScheduled}
+          onClosed={onClosed}
           refreshAfterConflict={async () => {
             const result = await detail.refetch();
             if (result.error) throw result.error;
@@ -662,6 +666,7 @@ function InputBody({
   refreshAfterConflict,
   onAnswered,
   onScheduled,
+  onClosed,
 }: {
   workspaceId: string;
   detail: InputDetail;
@@ -669,6 +674,7 @@ function InputBody({
   refreshAfterConflict: () => Promise<void>;
   onAnswered: () => Promise<void>;
   onScheduled: () => Promise<void>;
+  onClosed: () => Promise<void>;
 }) {
   const host = useHostId();
   const queryClient = useQueryClient();
@@ -906,6 +912,7 @@ function InputBody({
       statusRequest.current.sequence !== sequence
     )
       statusRequest.current = { undo, sequence, id: crypto.randomUUID() };
+    let closed = false;
     try {
       const receipt = await inputsApi.status(
         workspaceId,
@@ -918,6 +925,7 @@ function InputBody({
       setUndoSequence(undo ? null : receipt.sequence);
       statusRequest.current = null;
       await refresh();
+      closed = !undo;
     } catch (e) {
       try {
         if (await refreshInputAfterConflict(e, refreshAfterConflict))
@@ -929,6 +937,7 @@ function InputBody({
     } finally {
       setBusy(false);
     }
+    if (closed && mounted.current) await onClosed();
   };
   const schedule = async (showNow: boolean) => {
     setError(null);
@@ -1211,6 +1220,12 @@ function InputBody({
           {detail.input.status === 'answered' && (
             <p className="text-high">
               Answer recorded. Close this Input when the work is complete.
+            </p>
+          )}
+          {detail.input.status === 'expired' && (
+            <p className="text-high">
+              This Input expired. Its deadline has passed. The page remains
+              available to read.
             </p>
           )}
           {['closed', 'cancelled'].includes(detail.input.status) && (

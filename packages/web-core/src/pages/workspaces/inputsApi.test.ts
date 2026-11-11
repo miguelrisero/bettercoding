@@ -193,7 +193,7 @@ describe('Input status actions', () => {
       expect.anything()
     );
   });
-  it('requests only open Inputs for Pending and keeps answered Inputs in Done', async () => {
+  it('requests only open Inputs for Pending and all terminal statuses for Done', async () => {
     const request = vi.fn(
       async () => new Response(JSON.stringify({ success: true, data: {} }))
     );
@@ -205,7 +205,7 @@ describe('Input status actions', () => {
     );
     await inputsApi.list('workspace', null, true, 'next');
     expect(request).toHaveBeenLastCalledWith(
-      '/api/workspaces/workspace/inputs?limit=50&status=answered,closed,cancelled&cursor=next',
+      '/api/workspaces/workspace/inputs?limit=50&status=answered,closed,cancelled,expired&cursor=next',
       expect.anything()
     );
   });

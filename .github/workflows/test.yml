@@ -179,7 +179,7 @@ jobs:
         run: pnpm exec vitest run packages/web-core/src/pages/workspaces/workspaceSidebarWidths.test.ts --no-file-parallelism --maxWorkers 1
 
       - name: Test Input scheduling and navigation
-        run: pnpm exec vitest run packages/web-core/src/pages/workspaces/inputsApi.test.ts packages/web-core/src/pages/workspaces/inputSchedule.test.ts packages/web-core/src/pages/workspaces/inputFlow.test.ts --no-file-parallelism --maxWorkers 1
+        run: pnpm exec vitest run packages/web-core/src/pages/workspaces/inputsApi.test.ts packages/web-core/src/pages/workspaces/inputSchedule.test.ts packages/web-core/src/pages/workspaces/inputFlow.test.ts packages/web-core/src/pages/workspaces/inputClose.test.ts packages/web-core/src/pages/workspaces/inputBridge.test.ts packages/web-core/src/pages/workspaces/inputRichContent.test.ts --no-file-parallelism --maxWorkers 1
 
       - name: Run frontend checks
         env:
@@ -202,6 +202,125 @@ jobs:
             "GITHUB_BASE_REF=${{ github.base_ref || 'main' }} ./scripts/check-i18n.sh" \
             "node scripts/check-unused-i18n-keys.mjs" \
             "./scripts/check-legacy-frontend-paths.sh"
+
+      - name: Retain local frontend build
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-web-dist-${{ github.event.pull_request.head.sha || github.sha }}
+          path: packages/local-web/dist
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Retain formatted Input test sources
+        if: failure()
+        working-directory: packages/web-core
+        run: pnpm exec prettier --write src/pages/workspaces/inputClose.test.ts src/pages/workspaces/inputRichContent.test.ts
+
+      - name: Upload formatted Input test sources
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: input-test-format-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            packages/web-core/src/pages/workspaces/inputClose.test.ts
+            packages/web-core/src/pages/workspaces/inputRichContent.test.ts
+          retention-days: 1
+          if-no-files-found: error
+
+  input-links-browser:
+    runs-on: *runner_label
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Test native Input links in an OS sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'Runner: %s; image: %s %s\n' "${RUNNER_ENVIRONMENT:-unset}" "${ImageOS:-unset}" "${ImageVersion:-unset}"
+          df -h /
+          for tool in bwrap google-chrome google-chrome-stable chromium unshare systemd-run prlimit node; do
+            command -v "$tool" || true
+          done
+          dpkg-query -W bubblewrap google-chrome-stable 2>/dev/null || true
+          test "$GITHUB_ACTIONS" = true
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          if ! command -v bwrap; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y bubblewrap
+          fi
+          chrome_launcher=$(command -v google-chrome || command -v google-chrome-stable)
+          chrome_launcher=$(readlink -f "$chrome_launcher")
+          chrome_root=$(dirname "$chrome_launcher")
+          printf 'Chrome launcher: %s; payload: %s/chrome\n' "$chrome_launcher" "$chrome_root"
+          test -x "$chrome_root/chrome"
+          fixture_root="$GITHUB_WORKSPACE"
+          node_binary=$(readlink -f "$(command -v node)")
+          # The private mount namespace keeps the bounded tmpfs inside this step.
+          sudo /usr/bin/timeout --kill-after=5s 180s \
+            /usr/bin/unshare --mount --propagation private /bin/bash -s -- \
+            "$fixture_root" "$node_binary" "$chrome_root" <<'SANDBOX'
+          set -euo pipefail
+          source=$1
+          node_binary=$2
+          chrome_root=$3
+          # A root-owned path avoids traversing the runner's private home after cap-drop.
+          scratch=$(mktemp -d /run/input-links.XXXXXX)
+          trap 'umount "$scratch"' EXIT
+          mount -t tmpfs -o size=256m,nr_inodes=8192,nosuid,nodev,mode=0700 tmpfs "$scratch"
+          mkdir "$scratch/fixtures" "$scratch/data"
+          mkdir "$scratch/data/home" "$scratch/data/tmp" "$scratch/data/cache"
+          install -m 0444 "$source/scripts/test-input-links-browser.mjs" "$scratch/fixtures/test.mjs"
+          install -m 0444 "$source/crates/server/src/routes/workspaces/input-rich-content.js" "$scratch/fixtures/runtime.js"
+          install -m 0444 "$source/packages/web-core/src/pages/workspaces/inputBridge.ts" "$scratch/fixtures/bridge.ts"
+          install -m 0444 "$source/crates/server/src/routes/workspaces/inputs.rs" "$scratch/fixtures/inputs.rs"
+          sha256sum "$scratch/fixtures/"*
+          # systemd applies aggregate limits to the supervisor, Node, and Chrome.
+          echo '[input-browser] scope-start'
+          set +e
+          /usr/bin/systemd-run --scope --quiet \
+            -p MemoryMax=1G -p MemorySwapMax=0 -p TasksMax=256 -p CPUQuota=100% \
+            /bin/bash -c '
+              "$@"
+              status=$?
+              printf "[input-browser] sandbox-exit=%s\n" "$status"
+              group=$(sed -n "s/^0:://p" /proc/self/cgroup)
+              printf "[input-browser] cgroup=%s\n" "$group"
+              for counter in memory.peak memory.events memory.events.local pids.peak pids.events cpu.stat; do
+                echo "[input-browser] $counter"
+                cat "/sys/fs/cgroup$group/$counter" 2>&1 || true
+              done
+              systemctl show "$(basename "$group")" -p MemoryPeak -p MemoryCurrent -p TasksCurrent -p Result 2>&1 || true
+              exit "$status"
+            ' bash \
+            /usr/bin/prlimit --cpu=120:120 --fsize=16777216:16777216 \
+            --nofile=512:512 --core=0:0 -- \
+            /usr/bin/bwrap --unshare-all --unshare-user --die-with-parent --new-session \
+            --disable-userns --cap-drop ALL --clearenv \
+            --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
+            --ro-bind "$chrome_root" /opt/google/chrome \
+            --ro-bind "$node_binary" /fixture/node \
+            --ro-bind "$scratch/fixtures/test.mjs" /fixture/test.mjs \
+            --ro-bind "$scratch/fixtures/runtime.js" /fixture/runtime.js \
+            --ro-bind "$scratch/fixtures/bridge.ts" /fixture/bridge.ts \
+            --ro-bind "$scratch/fixtures/inputs.rs" /fixture/inputs.rs \
+            --bind "$scratch/data" /scratch --proc /proc --dev /dev \
+            --symlink /scratch/tmp /tmp \
+            --remount-ro /proc --remount-ro /dev --remount-ro / \
+            --setenv HOME /scratch/home --setenv TMPDIR /scratch/tmp \
+            --setenv XDG_CACHE_HOME /scratch/cache --setenv PATH /usr/bin \
+            --setenv INPUT_BROWSER_SANDBOX 1 --chdir /scratch \
+            /fixture/node /fixture/test.mjs
+          status=$?
+          set -e
+          printf '[input-browser] scope-exit=%s\n' "$status"
+          df -h "$scratch"
+          exit "$status"
+          SANDBOX
 
   backend-schema-checks:
     needs: changes
@@ -333,8 +452,12 @@ jobs:
           git: https://github.com/nextest-rs/nextest
           rev: 6e4a9d6f2c4964f30ff54a8cd5466f8869267daa # cargo-nextest-0.9.132
 
+      - name: Test Input expiry notification boundary
+        run: cargo nextest run -p services expiry_
+
       - name: Run Cargo tests
-        run: cargo nextest run --workspace --exclude bettercoding-tauri
+        if: success() || failure()
+        run: cargo nextest run --workspace --exclude bettercoding-tauri --no-fail-fast
 
   tauri-checks:
     needs: changes
