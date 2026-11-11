@@ -250,8 +250,8 @@ jobs:
           test "$GITHUB_ACTIONS" = true
           test "$RUNNER_ENVIRONMENT" = github-hosted
           if ! command -v bwrap; then
-            echo '::error::The runner lacks bubblewrap; browser execution requires an OS sandbox.'
-            exit 1
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y bubblewrap
           fi
           chrome_launcher=$(command -v google-chrome || command -v google-chrome-stable)
           chrome_launcher=$(readlink -f "$chrome_launcher")

@@ -79,6 +79,8 @@ class CDP {
   constructor(url) {
     this.pending = new Map();
     this.contexts = new Map();
+    this.sessions = new Set();
+    this.attachmentError = null;
     this.id = 0;
     this.socket = new WebSocket(url);
     this.ready = new Promise((resolve, reject) => {
@@ -95,16 +97,42 @@ class CDP {
         if (message.error) pending.reject(new Error(JSON.stringify(message.error)));
         else pending.resolve(message.result);
       }
+      const sessionId = message.sessionId;
+      if (message.method === 'Target.attachedToTarget') {
+        const attached = message.params.sessionId;
+        this.sessions.add(attached);
+        if (this.sessions.size > 16) this.attachmentError = new Error('CDP session limit');
+        else this.enableFrames(attached).catch((error) => { this.attachmentError = error; });
+      }
+      if (message.method === 'Target.detachedFromTarget') {
+        this.sessions.delete(message.params.sessionId);
+        for (const [key, context] of this.contexts) {
+          if (context.sessionId === message.params.sessionId) this.contexts.delete(key);
+        }
+      }
       if (message.method === 'Runtime.executionContextCreated') {
-        this.contexts.set(message.params.context.id, message.params.context);
+        const context = { ...message.params.context, sessionId };
+        this.contexts.set(`${sessionId ?? ''}:${context.id}`, context);
       }
       if (message.method === 'Runtime.executionContextDestroyed') {
-        this.contexts.delete(message.params.executionContextId);
+        this.contexts.delete(`${sessionId ?? ''}:${message.params.executionContextId}`);
       }
-      if (message.method === 'Runtime.executionContextsCleared') this.contexts.clear();
+      if (message.method === 'Runtime.executionContextsCleared') {
+        for (const [key, context] of this.contexts) {
+          if (context.sessionId === sessionId) this.contexts.delete(key);
+        }
+      }
     });
   }
-  async send(method, params = {}) {
+  async enableFrames(sessionId) {
+    await this.send('Page.enable', {}, sessionId);
+    await this.send('Runtime.enable', {}, sessionId);
+    await this.send('Target.setAutoAttach', {
+      autoAttach: true, waitForDebuggerOnStart: false, flatten: true,
+      filter: [{ type: 'iframe', exclude: false }, { exclude: true }],
+    }, sessionId);
+  }
+  async send(method, params = {}, sessionId) {
     await this.ready;
     const id = ++this.id;
     return new Promise((resolve, reject) => {
@@ -113,11 +141,13 @@ class CDP {
         reject(new Error(`CDP timeout: ${method}`));
       }, 5000);
       this.pending.set(id, { resolve, reject, timer });
-      this.socket.send(JSON.stringify({ id, method, params }));
+      this.socket.send(JSON.stringify({ id, method, params, sessionId }));
     });
   }
-  async evaluate(expression, contextId) {
-    const result = await this.send('Runtime.evaluate', { expression, contextId, returnByValue: true });
+  async evaluate(expression, context) {
+    const result = await this.send('Runtime.evaluate', {
+      expression, contextId: context?.id, returnByValue: true,
+    }, context?.sessionId);
     assert.ok(!result.exceptionDetails, JSON.stringify(result.exceptionDetails));
     return result.result.value;
   }
@@ -165,23 +195,35 @@ try {
   assert.ok(initial);
   page = new CDP(initial.webSocketDebuggerUrl);
   clients.push(page);
-  await page.send('Page.enable');
-  await page.send('Runtime.enable');
+  await page.enableFrames();
   await page.send('Emulation.setDeviceMetricsOverride', { width: 420, height: 800, deviceScaleFactor: 1, mobile: false });
   await page.send('Page.navigate', { url: origin });
   await until(async () => (await page.evaluate('window.state?.loaded')) === 1, 'Input mount');
-  const tree = await page.send('Page.getFrameTree');
-  const inner = tree.frameTree.childFrames?.[0]?.childFrames?.[0]?.frame;
-  assert.ok(inner, 'The actual embedding contains the Input frame');
-  const context = await until(() => [...page.contexts.values()].find((c) => c.auxData?.frameId === inner.id && c.auxData.isDefault), 'Input execution context');
-  const evaluate = (expression) => page.evaluate(expression, context.id);
+  async function inputFrame() {
+    if (page.attachmentError) throw page.attachmentError;
+    for (const sessionId of [undefined, ...page.sessions]) {
+      const { frameTree } = await page.send('Page.getFrameTree', {}, sessionId);
+      const frames = [frameTree];
+      while (frames.length) {
+        const entry = frames.pop();
+        if (entry.frame.url.split('#')[0] === origin + contentPath) return entry.frame;
+        frames.push(...(entry.childFrames ?? []));
+      }
+    }
+  }
+  const inner = await until(inputFrame, 'Input frame in the actual embedding');
+  const context = await until(() => {
+    if (page.attachmentError) throw page.attachmentError;
+    return [...page.contexts.values()].find((c) => c.auxData?.frameId === inner.id && c.auxData.isDefault);
+  }, 'Input execution context');
+  const evaluate = (expression) => page.evaluate(expression, context);
   const mountId = await evaluate('window.__mountId');
   assert.ok(mountId);
   async function mounted() {
     assert.deepEqual(await page.evaluate('state'), { outerLoads: 1, loaded: 1, navigated: 0, unloads: 0 });
     assert.equal(await evaluate('window.__mountId'), mountId);
     assert.equal(await evaluate('window.__unsafeExecuted === true'), false);
-    const current = (await page.send('Page.getFrameTree')).frameTree.childFrames?.[0]?.childFrames?.[0]?.frame;
+    const current = await inputFrame();
     assert.equal(current?.id, inner.id);
     assert.equal(current?.loaderId, inner.loaderId, 'The Input has one document load');
     assert.equal(requests.filter((url) => url === contentPath).length, 1);
@@ -190,7 +232,11 @@ try {
     const point = await evaluate(`(()=>{const a=document.getElementById(${JSON.stringify(id)});
       a.scrollIntoView({block:'center'});const r=(a.tagName==='AREA'?document.querySelector('img[usemap]'):a).getBoundingClientRect();
       return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
-    assert.ok(point.x > 0 && point.y > 0);
+    assert.ok(point.x > 0 && point.y > 0 && point.x < 420 && point.y < 800);
+    assert.deepEqual(await page.evaluate(`(()=>{const outer=document.querySelector('iframe');
+      const inner=outer.contentDocument.querySelector('iframe');
+      return [outer,inner].map(f=>{const r=f.getBoundingClientRect();return [r.x,r.y];});})()`),
+      [[0, 0], [0, 0]], 'Frame coordinates match the top-level viewport');
     await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...point, button, clickCount: 1 });
     await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, button, clickCount: 1 });
   }
