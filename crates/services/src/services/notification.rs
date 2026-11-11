@@ -282,10 +282,10 @@ async fn send_prepared_input<T>(
     preparation: impl std::future::Future<Output = Option<T>>,
     send: impl FnOnce(T),
 ) -> Result<(), InputError> {
-    if !WorkspaceInput::notification_is_current(pool, claim).await? {
-        return Ok(());
-    }
     if let Some(prepared) = preparation.await {
+        if !WorkspaceInput::notification_is_current(pool, claim).await? {
+            return Ok(());
+        }
         send(prepared);
     }
     Ok(())
