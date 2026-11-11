@@ -7,9 +7,12 @@
     const target = event.target?.closest
       ? event.target
       : event.target?.parentElement;
-    const anchor = target?.closest("a[href]");
+    const anchor = target?.closest("a[href], area[href], a[xlink\\:href]");
     if (!anchor) return;
-    const href = anchor.getAttribute("href") || "";
+    const href =
+      anchor.getAttribute("href") ?? anchor.getAttribute("xlink:href") ?? "";
+    if (anchor.getAttribute("xlink:href") != null)
+      anchor.removeAttribute("xlink:href");
     if (
       !event.isTrusted ||
       href.length > 8192 ||
@@ -19,6 +22,7 @@
       return;
     }
     if (href.startsWith("#")) {
+      anchor.setAttribute("href", href);
       anchor.setAttribute("target", "_self");
       return;
     }
