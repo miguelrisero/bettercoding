@@ -211,6 +211,62 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  input-links-browser:
+    runs-on: *runner_label
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Test native Input links in an OS sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_ACTIONS" = true
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test -x /usr/bin/bwrap
+          test -x /opt/google/chrome/chrome
+          df -h /
+          fixture_root="$GITHUB_WORKSPACE"
+          scratch=$(mktemp -d "$RUNNER_TEMP/input-links.XXXXXX")
+          node_binary=$(readlink -f "$(command -v node)")
+          # The private mount namespace keeps the bounded tmpfs inside this step.
+          sudo /usr/bin/timeout --kill-after=5s 180s \
+            /usr/bin/unshare --mount --propagation private /bin/bash -s -- \
+            "$scratch" "$fixture_root" "$node_binary" <<'SANDBOX'
+          set -euo pipefail
+          scratch=$1
+          source=$2
+          node_binary=$3
+          mount -t tmpfs -o size=256m,nr_inodes=8192,nosuid,nodev,mode=0700 tmpfs "$scratch"
+          trap 'umount "$scratch"' EXIT
+          mkdir "$scratch/home" "$scratch/tmp" "$scratch/cache"
+          # systemd applies aggregate limits to the supervisor, Node, and Chrome.
+          /usr/bin/systemd-run --scope --quiet \
+            -p MemoryMax=1G -p MemorySwapMax=0 -p TasksMax=128 -p CPUQuota=100% \
+            /usr/bin/prlimit --cpu=120:120 --fsize=16777216:16777216 \
+            --nofile=512:512 --core=0:0 -- \
+            /usr/bin/bwrap --unshare-all --die-with-parent --new-session \
+            --disable-userns --cap-drop ALL --clearenv \
+            --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
+            --ro-bind /opt/google/chrome /opt/google/chrome \
+            --ro-bind "$node_binary" /fixture/node \
+            --ro-bind "$source/scripts/test-input-links-browser.mjs" /fixture/test.mjs \
+            --ro-bind "$source/crates/server/src/routes/workspaces/input-rich-content.js" /fixture/runtime.js \
+            --ro-bind "$source/packages/web-core/src/pages/workspaces/inputBridge.ts" /fixture/bridge.ts \
+            --ro-bind "$source/crates/server/src/routes/workspaces/inputs.rs" /fixture/inputs.rs \
+            --bind "$scratch" /scratch --proc /proc --dev /dev \
+            --symlink /scratch/tmp /tmp \
+            --remount-ro /proc --remount-ro /dev --remount-ro / \
+            --setenv HOME /scratch/home --setenv TMPDIR /scratch/tmp \
+            --setenv XDG_CACHE_HOME /scratch/cache --setenv PATH /usr/bin \
+            --setenv INPUT_BROWSER_SANDBOX 1 --chdir /scratch \
+            /fixture/node /fixture/test.mjs
+          SANDBOX
+
   backend-schema-checks:
     needs: changes
     if: always() && (needs.changes.outputs.backend == 'true' || needs.changes.result == 'skipped')
