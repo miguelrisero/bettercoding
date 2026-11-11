@@ -1,6 +1,11 @@
-use std::sync::{Arc, OnceLock};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
+};
 
 use async_trait::async_trait;
+use db::models::workspace_input::{InputError, InputNotificationClaim, WorkspaceInput};
+use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 use utils::{self, command_ext::NoWindowExt};
 use uuid::Uuid;
@@ -102,32 +107,71 @@ impl NotificationService {
         }
     }
 
+    /// Validate Input availability at each application handoff. OS display is best effort.
+    pub(crate) async fn notify_input(
+        &self,
+        pool: &SqlitePool,
+        claim: &InputNotificationClaim,
+        title: &str,
+        message: &str,
+    ) -> Result<(), InputError> {
+        let config = self.config.read().await.notifications.clone();
+        if config.sound_enabled {
+            if let Some(file_path) = Self::prepare_sound_notification(&config.sound_file).await {
+                if !WorkspaceInput::notification_is_current(pool, claim).await? {
+                    return Ok(());
+                }
+                Self::play_prepared_sound(&file_path);
+            }
+        }
+        if config.push_enabled && WorkspaceInput::notification_is_current(pool, claim).await? {
+            self.push_notifier
+                .send(title, message, Some(claim.workspace_id))
+                .await;
+        }
+        Ok(())
+    }
+
     /// Play a system sound notification across platforms
     async fn play_sound_notification(sound_file: &SoundFile) {
+        if let Some(file_path) = Self::prepare_sound_notification(sound_file).await {
+            Self::play_prepared_sound(&file_path);
+        }
+    }
+
+    async fn prepare_sound_notification(sound_file: &SoundFile) -> Option<PathBuf> {
         let file_path = match sound_file.get_path().await {
             Ok(path) => path,
             Err(e) => {
                 tracing::error!("Failed to create cached sound file: {}", e);
-                return;
+                return None;
             }
         };
+        if utils::is_wsl2() {
+            if let Some(windows_path) = wsl_to_windows_path(&file_path).await {
+                return Some(PathBuf::from(windows_path));
+            }
+        }
+        Some(file_path)
+    }
 
+    fn play_prepared_sound(file_path: &Path) {
         // Use platform-specific sound notification
         // Note: spawn() calls are intentionally not awaited - sound notifications should be fire-and-forget
         if cfg!(target_os = "macos") {
             let _ = tokio::process::Command::new("afplay")
-                .arg(&file_path)
+                .arg(file_path)
                 .spawn();
         } else if cfg!(target_os = "linux") && !utils::is_wsl2() {
             // Try different Linux audio players
             if tokio::process::Command::new("paplay")
-                .arg(&file_path)
+                .arg(file_path)
                 .spawn()
                 .is_ok()
             {
                 // Success with paplay
             } else if tokio::process::Command::new("aplay")
-                .arg(&file_path)
+                .arg(file_path)
                 .spawn()
                 .is_ok()
             {
@@ -140,17 +184,7 @@ impl NotificationService {
                     .spawn();
             }
         } else if cfg!(target_os = "windows") || (cfg!(target_os = "linux") && utils::is_wsl2()) {
-            // Convert WSL path to Windows path if in WSL2
-            let file_path = if utils::is_wsl2() {
-                if let Some(windows_path) = wsl_to_windows_path(&file_path).await {
-                    windows_path
-                } else {
-                    file_path.to_string_lossy().to_string()
-                }
-            } else {
-                file_path.to_string_lossy().to_string()
-            };
-
+            let file_path = file_path.to_string_lossy();
             let _ = tokio::process::Command::new("powershell.exe")
                 .arg("-c")
                 .arg(format!(

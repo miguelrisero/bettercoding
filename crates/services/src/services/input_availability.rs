@@ -46,15 +46,19 @@ async fn tick(pool: &SqlitePool, notifications: &NotificationService) -> Result<
         if WorkspaceInput::notification_is_current(pool, &claim).await? {
             let result = tokio::time::timeout_at(
                 deadline,
-                notifications.notify(
+                notifications.notify_input(
+                    pool,
+                    &claim,
                     "BetterCoding Input available",
                     "An Input is ready for your review.",
-                    Some(claim.workspace_id),
                 ),
             )
             .await;
-            if result.is_err() {
-                tracing::warn!(generation = %claim.generation, "Input notification attempt timed out");
+            match result {
+                Ok(result) => result?,
+                Err(_) => {
+                    tracing::warn!(generation = %claim.generation, "Input notification attempt timed out");
+                }
             }
         }
         WorkspaceInput::finish_notification(pool, &claim).await?;
@@ -130,19 +134,25 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(WorkspaceInput::notification_is_current(&pool, &claim).await.unwrap());
+        assert!(
+            WorkspaceInput::notification_is_current(&pool, &claim)
+                .await
+                .unwrap()
+        );
 
         let capture = Arc::new(Capture::default());
         let mut config = Config::default();
         config.notifications.sound_enabled = false;
         config.notifications.push_enabled = true;
         let config = Arc::new(RwLock::new(config));
-        let notifications = NotificationService::with_push_notifier(config.clone(), capture.clone());
+        let notifications =
+            NotificationService::with_push_notifier(config.clone(), capture.clone());
         let config_lock = config.write().await;
-        let mut delivery = std::pin::pin!(notifications.notify(
+        let mut delivery = std::pin::pin!(notifications.notify_input(
+            &pool,
+            &claim,
             "BetterCoding Input available",
             "An Input is ready for your review.",
-            Some(workspace),
         ));
         // Poll once while holding the write lock: delivery waits for configuration.
         std::future::poll_fn(|cx| {
@@ -150,21 +160,38 @@ mod tests {
             std::task::Poll::Ready(())
         })
         .await;
-        sqlx::query("UPDATE workspace_inputs SET expires_at='2000-01-01T00:00:00.000000000Z' WHERE id=?")
+        sqlx::query(
+            "UPDATE workspace_inputs SET expires_at='2000-01-01T00:00:00.000000000Z' WHERE id=?",
+        )
+        .bind(&created.input_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        drop(config_lock);
+        delivery.await.unwrap();
+        let (status,): (String,) = sqlx::query_as("SELECT status FROM workspace_inputs WHERE id=?")
             .bind(&created.input_id)
-            .execute(&pool)
+            .fetch_one(&pool)
             .await
             .unwrap();
-        drop(config_lock);
-        delivery.await;
+        assert_eq!(status, "expired");
 
         let events = WorkspaceInput::events(&pool, workspace, Some(&created.input_id), 0, 100)
             .await
             .unwrap()
             .events;
-        assert_eq!(events.iter().filter(|event| event.event_type == "expired").count(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "expired")
+                .count(),
+            1
+        );
         assert_eq!(events.last().unwrap().payload["status"], "expired");
-        assert!(capture.0.lock().unwrap().is_empty(), "expired Input emitted a push after waiting for configuration");
+        assert!(
+            capture.0.lock().unwrap().is_empty(),
+            "expired Input emitted a push after waiting for configuration"
+        );
     }
 
     #[tokio::test]
