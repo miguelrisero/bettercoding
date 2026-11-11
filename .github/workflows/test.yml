@@ -179,7 +179,7 @@ jobs:
         run: pnpm exec vitest run packages/web-core/src/pages/workspaces/workspaceSidebarWidths.test.ts --no-file-parallelism --maxWorkers 1
 
       - name: Test Input scheduling and navigation
-        run: pnpm exec vitest run packages/web-core/src/pages/workspaces/inputsApi.test.ts packages/web-core/src/pages/workspaces/inputSchedule.test.ts packages/web-core/src/pages/workspaces/inputFlow.test.ts packages/web-core/src/pages/workspaces/inputBridge.test.ts packages/web-core/src/pages/workspaces/inputRichContent.test.ts --no-file-parallelism --maxWorkers 1
+        run: pnpm exec vitest run packages/web-core/src/pages/workspaces/inputsApi.test.ts packages/web-core/src/pages/workspaces/inputSchedule.test.ts packages/web-core/src/pages/workspaces/inputFlow.test.ts packages/web-core/src/pages/workspaces/inputClose.test.ts packages/web-core/src/pages/workspaces/inputBridge.test.ts packages/web-core/src/pages/workspaces/inputRichContent.test.ts --no-file-parallelism --maxWorkers 1
 
       - name: Run frontend checks
         env:
