@@ -87,6 +87,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expiry_during_notification_config_wait_suppresses_delivery() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql("PRAGMA foreign_keys=ON; CREATE TABLE workspaces(id BLOB PRIMARY KEY);")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for migration in [
+            include_str!("../../../db/migrations/20261027090000_workspace_inputs.sql"),
+            include_str!("../../../db/migrations/20261028120000_workspace_input_priority.sql"),
+            include_str!("../../../db/migrations/20261030120000_workspace_input_schedule.sql"),
+            include_str!("../../../db/migrations/20261111090000_workspace_input_expiry.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+        }
+        let workspace = Uuid::new_v4();
+        sqlx::query("INSERT INTO workspaces VALUES (?)")
+            .bind(workspace)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let request: CreateInput = serde_json::from_value(serde_json::json!({
+            "external_key":"config-wait","request_id":"config-wait","expected_sequence":0,
+            "expires_at":"2099-01-01T00:00:00Z",
+            "content":{"title":"private title","html":"private body","contract":{"choices":[],"allow_text":true,"allow_no_answer_yet":false}}
+        })).unwrap();
+        let created = WorkspaceInput::write(
+            &pool,
+            workspace,
+            None,
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Create(request),
+        )
+        .await
+        .unwrap();
+        let claim = WorkspaceInput::claim_notification(&pool)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(WorkspaceInput::notification_is_current(&pool, &claim).await.unwrap());
+
+        let capture = Arc::new(Capture::default());
+        let mut config = Config::default();
+        config.notifications.sound_enabled = false;
+        config.notifications.push_enabled = true;
+        let config = Arc::new(RwLock::new(config));
+        let notifications = NotificationService::with_push_notifier(config.clone(), capture.clone());
+        let config_lock = config.write().await;
+        let mut delivery = std::pin::pin!(notifications.notify(
+            "BetterCoding Input available",
+            "An Input is ready for your review.",
+            Some(workspace),
+        ));
+        // Poll once while holding the write lock: delivery waits for configuration.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(delivery.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        sqlx::query("UPDATE workspace_inputs SET expires_at='2000-01-01T00:00:00.000000000Z' WHERE id=?")
+            .bind(&created.input_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        drop(config_lock);
+        delivery.await;
+
+        let events = WorkspaceInput::events(&pool, workspace, Some(&created.input_id), 0, 100)
+            .await
+            .unwrap()
+            .events;
+        assert_eq!(events.iter().filter(|event| event.event_type == "expired").count(), 1);
+        assert_eq!(events.last().unwrap().payload["status"], "expired");
+        assert!(capture.0.lock().unwrap().is_empty(), "expired Input emitted a push after waiting for configuration");
+    }
+
+    #[tokio::test]
     async fn immediate_and_due_use_the_same_preferences_and_destination() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
