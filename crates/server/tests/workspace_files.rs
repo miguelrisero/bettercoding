@@ -31,6 +31,8 @@ async fn workspace_files_routes_preserve_paths_conditionals_and_input_limits() {
         std::env::set_var("BC_DATA_DIR", &data);
         std::env::set_var("BC_WORKTREE_BASE", &worktrees);
         std::env::set_var("BC_ALLOWED_ORIGINS", "https://preview.example");
+        std::env::set_var("DISABLE_WORKTREE_CLEANUP", "1");
+        std::env::set_var("DISABLE_CLI_SESSION_REAP", "1");
         std::env::remove_var("BC_SHARED_API_BASE");
         std::env::remove_var("BC_SHARED_RELAY_API_BASE");
     }

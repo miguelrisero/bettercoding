@@ -5,6 +5,7 @@ import {
   nextOpenInput,
   splitRecommended,
   inputNavigationIsCurrent,
+  inputStatusLabel,
 } from './inputFlow';
 
 const item = (
@@ -32,8 +33,41 @@ describe('Input flow', () => {
     expect(nextOpenInput(list, item('a', 'answered'), 'priority')).toBe('c');
     expect(nextOpenInput(list, item('c', 'answered'), 'priority')).toBe('d');
   });
+  it('labels an expired Input for its readable Done detail', () => {
+    expect(inputStatusLabel.expired).toBe('Expired');
+  });
+  it('skips expired Inputs while advancing and wrapping', () => {
+    const inputs = [
+      item('a', 'open'),
+      item('b', 'expired'),
+      item('c', 'open'),
+      item('d', 'expired'),
+    ];
+    expect(nextOpenInput(inputs, item('a', 'expired'), 'priority')).toBe('c');
+    expect(nextOpenInput(inputs, item('c', 'expired'), 'priority')).toBe('a');
+    expect(
+      nextOpenInput([item('b', 'expired')], item('a', 'expired'), 'priority')
+    ).toBeNull();
+  });
   it('wraps to the start of the list', () => {
     expect(nextOpenInput(list, item('d', 'answered'), 'priority')).toBe('a');
+  });
+  it('selects the nearest earlier pending Input after closing the last', () => {
+    const pending = [item('a', 'open'), item('b', 'open')];
+    expect(nextOpenInput(pending, item('c', 'closed'), 'priority', [])).toBe(
+      'b'
+    );
+  });
+  it('keeps visible order and skips a neighbor that left Pending', () => {
+    const pending = [item('a', 'open'), item('d', 'open', 'P0')];
+    expect(
+      nextOpenInput(pending, item('b', 'open'), 'priority', [
+        'a',
+        'b',
+        'c',
+        'd',
+      ])
+    ).toBe('d');
   });
   it('skips the current Input and returns null when none are open', () => {
     expect(

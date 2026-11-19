@@ -14,11 +14,19 @@ export type InputContent = { title: string, html: string, contract: InputContrac
 
 export type CreateInput = { 
 /**
+ * Omit or null for no deadline. Requires timezone-bearing RFC3339.
+ */
+expires_at?: string | null, 
+/**
  * Omit to preserve the schedule; null clears it. Timestamps require RFC3339 with a timezone.
  */
 show_at?: string | null, priority?: string | null, external_key: string, request_id: string, expected_sequence: number, content: InputContent, };
 
 export type PublishInput = { 
+/**
+ * Omit to preserve the deadline; null clears it. Requires timezone-bearing RFC3339.
+ */
+expires_at?: string | null, 
 /**
  * Omit to preserve the schedule; null clears it. Timestamps require RFC3339 with a timezone.
  */
@@ -30,7 +38,7 @@ export type AnswerInput = { request_id: string, expected_sequence: number, versi
 
 export type InputStatusWrite = { request_id: string, expected_sequence: number, status: string, reason: string | null, };
 
-export type WorkspaceInput = { show_at: string | null, priority: string, id: string, workspace_id: string, external_key: string, creator: string, current_version: number, status: string, sequence: number, created_at: string, updated_at: string, };
+export type WorkspaceInput = { expires_at: string | null, show_at: string | null, priority: string, id: string, workspace_id: string, external_key: string, creator: string, current_version: number, status: string, sequence: number, created_at: string, updated_at: string, };
 
 export type InputVersion = { version: number, title: string, html: string | null, contract: InputContract, content_hash: string, };
 

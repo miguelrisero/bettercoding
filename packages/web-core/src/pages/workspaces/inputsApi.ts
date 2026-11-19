@@ -60,7 +60,7 @@ export const inputsApi = {
     inputRequest<InputPage>(
       workspace,
       host,
-      `?limit=50&status=${showDone ? 'answered,closed,cancelled' : 'open'}&cursor=${encodeURIComponent(cursor)}`
+      `?limit=50&status=${showDone ? 'answered,closed,cancelled,expired' : 'open'}&cursor=${encodeURIComponent(cursor)}`
     ),
   get: (workspace: string, host: string | null, id: string) =>
     inputRequest<InputDetail>(workspace, host, `/${id}`),
@@ -100,7 +100,8 @@ export const inputsApi = {
     id: string,
     sequence: number,
     undo: boolean,
-    requestId: string
+    requestId: string,
+    reason: 'marked_as_seen' | null = null
   ) =>
     inputRequest<InputReceipt>(
       workspace,
@@ -110,7 +111,7 @@ export const inputsApi = {
         expected_sequence: sequence,
         request_id: requestId,
         status: 'closed',
-        reason: null,
+        reason: undo ? null : reason,
       }
     ),
 };
