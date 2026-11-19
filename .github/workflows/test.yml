@@ -297,7 +297,7 @@ jobs:
               /usr/bin/systemd-run --scope --quiet \
               -p MemoryMax=1G -p MemorySwapMax=0 -p TasksMax=256 -p CPUQuota=100% \
               /usr/bin/prlimit --cpu=90:90 --fsize=16777216:16777216 \
-              --nofile=512:512 --core=0:0 -- \
+              --nofile=1024:1024 --core=0:0 -- \
               /usr/bin/bwrap --unshare-all --unshare-user --die-with-parent --new-session \
               --disable-userns --cap-drop ALL --clearenv \
               --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
