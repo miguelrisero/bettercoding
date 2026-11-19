@@ -35,6 +35,10 @@ describe('Input flow', () => {
   it('wraps to the start of the list', () => {
     expect(nextOpenInput(list, item('d', 'answered'), 'priority')).toBe('a');
   });
+  it('selects the nearest earlier pending Input after closing the last', () => {
+    const pending = [item('a', 'open'), item('b', 'open')];
+    expect(nextOpenInput(pending, item('c', 'closed'), 'priority')).toBe('b');
+  });
   it('skips the current Input and returns null when none are open', () => {
     expect(
       nextOpenInput(

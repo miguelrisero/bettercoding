@@ -7,6 +7,7 @@ import { createServer } from 'node:http';
 import { stripTypeScriptTypes } from 'node:module';
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
+import * as queue from './test-input-queue-browser.mjs';
 
 const stage = (name) => writeSync(2, `[input-browser] ${name}\n`);
 stage('node-entry');
@@ -29,8 +30,17 @@ const contentPath = '/api/workspaces/synthetic/inputs/links/versions/1/content';
 const requests = [];
 let origin;
 const server = createServer((req, res) => {
-  requests.push(req.url);
+  const path = new URL(req.url, 'http://127.0.0.1').pathname;
   res.setHeader('Cache-Control', 'no-store');
+  if (queue.matches(path) || req.method !== 'GET') {
+    void queue.respond(req, res, path, csp).catch((error) => {
+      stage(`queue-fixture-error ${error.message}`);
+      if (!res.headersSent) res.writeHead(500);
+      res.end('Synthetic queue fixture failed');
+    });
+    return;
+  }
+  requests.push(req.url);
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   if (req.url === '/bridge.js') {
     res.setHeader('Content-Type', 'text/javascript');
@@ -368,6 +378,9 @@ try {
     csp, viewport: { width: 420, height: 800 }, flags,
     environment: process.env, requests, results,
   }, null, 2));
+  if (process.env.INPUT_QUEUE_BROWSER === '1') {
+    await queue.verifyQueue({ page, origin, until });
+  }
 } catch (error) {
   stage(`failure ${error.stack ?? error}`);
   stage(`chrome-state exit=${chrome?.exitCode} signal=${chrome?.signalCode}`);
