@@ -22,6 +22,6 @@
       "shared/*": ["../../shared/*"]
     }
   },
-  "include": ["src"],
+  "include": ["src", "test-fixtures/input-queue/main.tsx"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

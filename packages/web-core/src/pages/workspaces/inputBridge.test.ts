@@ -136,6 +136,7 @@ describe('Input proposal bridge', () => {
       },
     };
     const frame = {
+      sandbox: '',
       contentWindow: child,
       addEventListener(type: string, fn: () => void) {
         listeners[type] = fn;
@@ -162,6 +163,9 @@ describe('Input proposal bridge', () => {
         },
         parent,
       }
+    );
+    expect(frame.sandbox).toBe(
+      'allow-scripts allow-popups allow-popups-to-escape-sandbox'
     );
     listeners.load();
     expect(sent[0]).toMatchObject({
@@ -191,6 +195,14 @@ describe('Input proposal bridge', () => {
     listeners.message({ source: parent, data: reply });
     expect(sent.at(-1)).toEqual(reply);
     const count = sent.length;
+    listeners.message({
+      source: child,
+      data: { ...message, type: 'bc.input.link', href: 'https://example.com/' },
+    });
+    listeners.message({
+      source: child,
+      data: { ...message, bridge_id: 'stale' },
+    });
     listeners.message({ source: {}, data: message });
     expect(sent).toHaveLength(count);
     vi.unstubAllGlobals();
@@ -202,7 +214,9 @@ describe('Input proposal bridge', () => {
     const route = '/api/workspaces/w/inputs/i/versions/1/content';
     const document = inputEmbeddingDocument(route, makeBridge(), 'hash');
     expect(document).toContain(`frame-src https://app.test${route};`);
-    expect(document).toContain("frame.sandbox='allow-scripts'");
+    expect(document).toContain(
+      "frame.sandbox='allow-scripts allow-popups allow-popups-to-escape-sandbox'"
+    );
     expect(document).toContain('event.source!==frame.contentWindow');
     expect(document).toContain('loads>1');
     expect(document).toContain('frame.remove()');

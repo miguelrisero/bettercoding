@@ -100,7 +100,8 @@ export const inputsApi = {
     id: string,
     sequence: number,
     undo: boolean,
-    requestId: string
+    requestId: string,
+    reason: 'marked_as_seen' | null = null
   ) =>
     inputRequest<InputReceipt>(
       workspace,
@@ -110,7 +111,7 @@ export const inputsApi = {
         expected_sequence: sequence,
         request_id: requestId,
         status: 'closed',
-        reason: null,
+        reason: undo ? null : reason,
       }
     ),
 };

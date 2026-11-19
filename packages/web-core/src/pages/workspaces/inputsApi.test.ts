@@ -294,6 +294,34 @@ describe('Input status actions', () => {
       })
     );
   });
+  it('records acknowledgment through the owner close route', async () => {
+    const request = vi.fn(
+      async () => new Response(JSON.stringify({ success: true, data: {} }))
+    );
+    setLocalApiTransport({ request, openWebSocket: vi.fn() });
+    await inputsApi.status(
+      'workspace',
+      null,
+      'input',
+      7,
+      false,
+      'seen-request',
+      'marked_as_seen'
+    );
+    expect(request).toHaveBeenCalledOnce();
+    expect(request).toHaveBeenCalledWith(
+      '/api/workspaces/workspace/inputs/input/close',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          expected_sequence: 7,
+          request_id: 'seen-request',
+          status: 'closed',
+          reason: 'marked_as_seen',
+        }),
+      })
+    );
+  });
   it('keeps conflict errors visible to the status caller', async () => {
     setLocalApiTransport({
       request: vi.fn(

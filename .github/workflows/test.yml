@@ -179,7 +179,7 @@ jobs:
         run: pnpm exec vitest run packages/web-core/src/pages/workspaces/workspaceSidebarWidths.test.ts --no-file-parallelism --maxWorkers 1
 
       - name: Test Input scheduling and navigation
-        run: pnpm exec vitest run packages/web-core/src/pages/workspaces/inputsApi.test.ts packages/web-core/src/pages/workspaces/inputSchedule.test.ts packages/web-core/src/pages/workspaces/inputFlow.test.ts --no-file-parallelism --maxWorkers 1
+        run: pnpm exec vitest run packages/web-core/src/pages/workspaces/inputsApi.test.ts packages/web-core/src/pages/workspaces/inputSchedule.test.ts packages/web-core/src/pages/workspaces/inputClose.test.ts packages/web-core/src/pages/workspaces/inputBridge.test.ts packages/web-core/src/pages/workspaces/inputRichContent.test.ts --no-file-parallelism --maxWorkers 1
 
       - name: Run frontend checks
         env:
@@ -202,6 +202,172 @@ jobs:
             "GITHUB_BASE_REF=${{ github.base_ref || 'main' }} ./scripts/check-i18n.sh" \
             "node scripts/check-unused-i18n-keys.mjs" \
             "./scripts/check-legacy-frontend-paths.sh"
+
+      - name: Retain local frontend build
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-web-dist-${{ github.event.pull_request.head.sha || github.sha }}
+          path: packages/local-web/dist
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Retain formatted Input test sources
+        if: failure()
+        working-directory: packages/web-core
+        run: pnpm exec prettier --write src/pages/workspaces/inputClose.test.ts src/pages/workspaces/inputRichContent.test.ts
+
+      - name: Upload formatted Input test sources
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: input-test-format-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            packages/web-core/src/pages/workspaces/inputClose.test.ts
+            packages/web-core/src/pages/workspaces/inputRichContent.test.ts
+          retention-days: 1
+          if-no-files-found: error
+
+  input-links-browser:
+    runs-on: *runner_label
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-node
+      - name: Stage locked dependencies for the synthetic fixture
+        if: runner.environment == 'github-hosted'
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Test native Input links and queue navigation in an OS sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'Runner: %s; image: %s %s\n' "${RUNNER_ENVIRONMENT:-unset}" "${ImageOS:-unset}" "${ImageVersion:-unset}"
+          df -h /
+          for tool in bwrap google-chrome google-chrome-stable chromium unshare systemd-run prlimit node; do
+            command -v "$tool" || true
+          done
+          dpkg-query -W bubblewrap google-chrome-stable 2>/dev/null || true
+          test "$GITHUB_ACTIONS" = true
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          if ! command -v bwrap; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y bubblewrap
+          fi
+          chrome_launcher=$(command -v google-chrome || command -v google-chrome-stable)
+          chrome_launcher=$(readlink -f "$chrome_launcher")
+          chrome_root=$(dirname "$chrome_launcher")
+          printf 'Chrome launcher: %s; payload: %s/chrome\n' "$chrome_launcher" "$chrome_root"
+          test -x "$chrome_root/chrome"
+          fixture_root="$GITHUB_WORKSPACE"
+          node_binary=$(readlink -f "$(command -v node)")
+          # The private mount namespace keeps the bounded tmpfs inside this step.
+          sudo /usr/bin/timeout --kill-after=5s 420s \
+            /usr/bin/unshare --mount --propagation private /bin/bash -s -- \
+            "$fixture_root" "$node_binary" "$chrome_root" <<'SANDBOX'
+          set -euo pipefail
+          source=$1
+          node_binary=$2
+          chrome_root=$3
+          # Root-owned staging avoids traversing the runner's home after cap-drop.
+          scratch=$(mktemp -d /run/input-links.XXXXXX)
+          trap 'umount -R "$scratch"' EXIT
+          mount -t tmpfs -o size=256m,nr_inodes=8192,nosuid,nodev,mode=0700 tmpfs "$scratch"
+          mkdir -p "$scratch/fixtures" "$scratch/build" "$scratch/data" \
+            "$scratch/checkout/node_modules" "$scratch/checkout/packages" "$scratch/checkout/shared"
+          for writable in "$scratch/build" "$scratch/data"; do
+            mkdir "$writable/home" "$writable/tmp" "$writable/cache"
+          done
+          for path in node_modules packages shared; do
+            mount --bind "$source/$path" "$scratch/checkout/$path"
+            mount -o remount,bind,ro,nosuid,nodev "$scratch/checkout/$path"
+          done
+          install -m 0444 "$source/scripts/test-input-links-browser.mjs" "$scratch/fixtures/test.mjs"
+          install -m 0444 "$source/scripts/test-input-queue-browser.mjs" "$scratch/fixtures/test-input-queue-browser.mjs"
+          install -m 0444 "$source/crates/server/src/routes/workspaces/input-rich-content.js" "$scratch/fixtures/runtime.js"
+          install -m 0444 "$source/packages/web-core/src/pages/workspaces/inputBridge.ts" "$scratch/fixtures/bridge.ts"
+          install -m 0444 "$source/crates/server/src/routes/workspaces/inputs.rs" "$scratch/fixtures/inputs.rs"
+          sha256sum "$scratch/fixtures/"*
+          printf '%s\n' 'export default { cacheDir: "/scratch/cache/vitest", test: { api: { host: "127.0.0.1" } } };' > "$scratch/build/vitest.config.mjs"
+
+          queue_node() {
+            local descriptors=$1
+            shift
+            /usr/bin/timeout --kill-after=5s 120s \
+              /usr/bin/systemd-run --scope --quiet \
+              -p MemoryMax=1G -p MemorySwapMax=0 -p TasksMax=256 -p CPUQuota=100% \
+              /usr/bin/prlimit --cpu=90:90 --fsize=16777216:16777216 \
+              --nofile="$descriptors:$descriptors" --core=0:0 -- \
+              /usr/bin/bwrap --unshare-all --unshare-user --die-with-parent --new-session \
+              --disable-userns --cap-drop ALL --clearenv \
+              --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
+              --ro-bind "$node_binary" /fixture/node \
+              --ro-bind "$scratch/checkout" /fixture/checkout \
+              --bind "$scratch/build" /scratch --proc /proc --dev /dev \
+              --symlink /scratch/tmp /tmp \
+              --remount-ro /proc --remount-ro /dev --remount-ro / \
+              --setenv HOME /scratch/home --setenv TMPDIR /scratch/tmp \
+              --setenv XDG_CACHE_HOME /scratch/cache --setenv PATH /usr/bin \
+              --chdir "$1" /fixture/node "${@:2}"
+          }
+          set +e
+          queue_node 512 /fixture/checkout node_modules/vitest/vitest.mjs run \
+            --config /scratch/vitest.config.mjs --no-file-parallelism --maxWorkers 1 \
+            packages/web-core/src/pages/workspaces/inputFlow.test.ts
+          queue_unit_status=$?
+          set -e
+          printf '[input-queue] unit-exit=%s\n' "$queue_unit_status"
+          # Tailwind scans the workspace while Rollup loads the module graph.
+          queue_node 4096 /fixture/checkout/packages/local-web test-fixtures/input-queue/build.mjs
+          test -f "$scratch/build/queue-dist/test-fixtures/input-queue/index.html"
+
+          # systemd applies aggregate limits to the supervisor, Node, and Chrome.
+          echo '[input-browser] scope-start'
+          set +e
+          /usr/bin/systemd-run --scope --quiet \
+            -p MemoryMax=1G -p MemorySwapMax=0 -p TasksMax=256 -p CPUQuota=100% \
+            /bin/bash -c '
+              "$@"
+              status=$?
+              printf "[input-browser] sandbox-exit=%s\n" "$status"
+              group=$(sed -n "s/^0:://p" /proc/self/cgroup)
+              printf "[input-browser] cgroup=%s\n" "$group"
+              for counter in memory.peak memory.events memory.events.local pids.peak pids.events cpu.stat; do
+                echo "[input-browser] $counter"
+                cat "/sys/fs/cgroup$group/$counter" 2>&1 || true
+              done
+              systemctl show "$(basename "$group")" -p MemoryPeak -p MemoryCurrent -p TasksCurrent -p Result 2>&1 || true
+              exit "$status"
+            ' bash \
+            /usr/bin/prlimit --cpu=120:120 --fsize=16777216:16777216 \
+            --nofile=512:512 --core=0:0 -- \
+            /usr/bin/bwrap --unshare-all --unshare-user --die-with-parent --new-session \
+            --disable-userns --cap-drop ALL --clearenv \
+            --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
+            --ro-bind "$chrome_root" /opt/google/chrome \
+            --ro-bind "$node_binary" /fixture/node \
+            --ro-bind "$scratch/fixtures/test.mjs" /fixture/test.mjs \
+            --ro-bind "$scratch/fixtures/runtime.js" /fixture/runtime.js \
+            --ro-bind "$scratch/fixtures/bridge.ts" /fixture/bridge.ts \
+            --ro-bind "$scratch/fixtures/inputs.rs" /fixture/inputs.rs \
+            --ro-bind "$scratch/fixtures/test-input-queue-browser.mjs" /fixture/test-input-queue-browser.mjs \
+            --ro-bind "$scratch/build/queue-dist" /fixture/queue-dist \
+            --bind "$scratch/data" /scratch --proc /proc --dev /dev \
+            --symlink /scratch/tmp /tmp \
+            --remount-ro /proc --remount-ro /dev --remount-ro / \
+            --setenv HOME /scratch/home --setenv TMPDIR /scratch/tmp \
+            --setenv XDG_CACHE_HOME /scratch/cache --setenv PATH /usr/bin \
+            --setenv INPUT_BROWSER_SANDBOX 1 --setenv INPUT_QUEUE_BROWSER 1 --chdir /scratch \
+            /fixture/node /fixture/test.mjs
+          status=$?
+          set -e
+          printf '[input-browser] scope-exit=%s\n' "$status"
+          df -h "$scratch"
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
+          exit "$queue_unit_status"
+          SANDBOX
 
   backend-schema-checks:
     needs: changes

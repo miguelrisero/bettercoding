@@ -1,4 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type RefObject,
+} from 'react';
 import { createPortal } from 'react-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import * as Dialog from '@radix-ui/react-dialog';
@@ -15,7 +21,10 @@ import type {
   InputDetail,
   SnoozeInput,
 } from 'shared/types';
-import { useUiPreferencesStore } from '@/shared/stores/useUiPreferencesStore';
+import {
+  useUiPreferencesStore,
+  type InputSort,
+} from '@/shared/stores/useUiPreferencesStore';
 import { useHostId } from '@/shared/providers/HostIdProvider';
 import { useVisualViewportGeometry } from '@/shared/hooks/useVisualViewportGeometry';
 import { useIsMobile } from '@/shared/hooks/useIsMobile';
@@ -57,6 +66,18 @@ import { fromUtcControl, toUtcControl } from './inputSchedule';
 const focusRing =
   'focus:outline-none focus-visible:ring-2 focus-visible:ring-brand';
 const iconButton = `inline-flex items-center justify-center size-9 shrink-0 rounded-md text-low hover:text-high hover:bg-secondary disabled:opacity-40 disabled:pointer-events-none ${focusRing}`;
+type CloseReason = 'marked_as_seen' | null;
+type PrepareClose = (
+  current: InputDetail
+) => (reason: CloseReason) => Promise<void>;
+
+type ClosingInput = {
+  started: number;
+  current: InputDetail;
+  sort: InputSort;
+  order: string[];
+};
+
 const selectControl = `min-h-9 rounded border bg-primary px-half text-high ${focusRing}`;
 const quietButton = `text-sm text-low hover:text-high underline-offset-2 hover:underline disabled:opacity-50 ${focusRing}`;
 
@@ -134,8 +155,10 @@ function Age({ date }: { date: string }) {
 
 export function WorkspaceInputsContainer({
   workspaceId,
+  listRef,
 }: {
   workspaceId: string;
+  listRef?: RefObject<HTMLElement>;
 }) {
   const host = useHostId();
   const sort = useUiPreferencesStore((s) => s.inputSort);
@@ -150,7 +173,12 @@ export function WorkspaceInputsContainer({
     refetchInterval: 10000,
   });
   return (
-    <section className="w-full p-base space-y-base" aria-label="Inputs">
+    <section
+      ref={listRef}
+      tabIndex={-1}
+      className="w-full p-base space-y-base"
+      aria-label="Inputs"
+    >
       <div className="flex items-center justify-between gap-base">
         <span className="text-sm text-low">
           <strong className="font-medium text-high tabular-nums">
@@ -241,7 +269,13 @@ export function WorkspaceInputsContainer({
   );
 }
 
-export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
+export function WorkspaceInputViewer({
+  workspaceId,
+  mobileListRef,
+}: {
+  workspaceId: string;
+  mobileListRef?: RefObject<HTMLElement>;
+}) {
   const host = useHostId();
   const queryClient = useQueryClient();
   const sort = useUiPreferencesStore((s) => s.inputSort);
@@ -251,6 +285,13 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
   const [done, setDone] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const content = useRef<HTMLDivElement>(null);
+  const focusDestination = useRef(false);
+  const focusList = useRef(false);
+  useLayoutEffect(() => {
+    if (!focusDestination.current) return;
+    focusDestination.current = false;
+    content.current?.querySelector<HTMLElement>('h2[tabindex="-1"]')?.focus();
+  }, [selected, done]);
   // Bumped whenever the owner closes or moves, so a late answer cannot advance.
   const session = useRef(0);
   useEffect(() => {
@@ -261,7 +302,10 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
       if (next) setDone(false);
     };
     window.addEventListener('hashchange', listener);
-    return () => window.removeEventListener('hashchange', listener);
+    return () => {
+      session.current += 1;
+      window.removeEventListener('hashchange', listener);
+    };
   }, []);
   useEffect(() => {
     if (!notice) return;
@@ -275,23 +319,29 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
   };
   const list = useQuery({ ...listQuery, enabled: selected !== null });
   if (!selected && !done) return null;
-  const open = (id: string) => {
+  const open = (id: string, focus = false) => {
+    focusDestination.current = focus;
     window.location.hash = `input=${id}`;
   };
   const close = () => {
+    focusDestination.current = false;
     session.current += 1;
     clearInputHash();
     setSelected(null);
     setDone(false);
   };
-  const advance = async (fromId: string, saved = 'Answer saved') => {
-    const started = session.current;
+  const advance = async (
+    fromId: string,
+    saved = 'Answer saved',
+    closing?: ClosingInput
+  ) => {
+    const started = closing?.started ?? session.current;
     let inputs: InputDetail[];
     try {
       const page = await queryClient.fetchQuery({ ...listQuery, staleTime: 0 });
       inputs = page.inputs;
     } catch {
-      return; // Stay on the answered Input; its receipt is already shown.
+      return; // Keep the current card and its saved status.
     }
     if (
       !inputNavigationIsCurrent(
@@ -302,27 +352,31 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
       )
     )
       return;
-    const current = queryClient.getQueryData<InputDetail>([
-      'input',
-      host,
-      workspaceId,
-      fromId,
-    ]);
+    const current =
+      closing?.current ??
+      queryClient.getQueryData<InputDetail>([
+        'input',
+        host,
+        workspaceId,
+        fromId,
+      ]);
     if (!current) return;
     const next = nextOpenInput(
       inputs,
       current,
-      useUiPreferencesStore.getState().inputSort
+      closing?.sort ?? useUiPreferencesStore.getState().inputSort,
+      closing?.order
     );
     const stillOpen = inputs.some((d) => d.input.id === fromId);
-    if (!next && stillOpen) {
+    if (!closing && !next && stillOpen) {
       setNotice('Saved');
       return; // "No answer yet" keeps the only open Input in view.
     }
     setNotice(saved);
     if (next) {
-      open(next);
+      open(next, !!closing);
     } else {
+      focusDestination.current = !!closing;
       clearInputHash();
       setSelected(null);
       setDone(true);
@@ -348,6 +402,12 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
             event.preventDefault();
             content.current?.focus();
           }}
+          onCloseAutoFocus={(event) => {
+            if (!focusList.current) return;
+            focusList.current = false;
+            event.preventDefault();
+            mobileListRef?.current?.focus();
+          }}
           style={
             isMobile && viewport.height !== null
               ? {
@@ -368,6 +428,18 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
               workspaceId={workspaceId}
               inputId={selected}
               notice={notice}
+              pendingCount={list.data?.pending_count}
+              onViewList={
+                mobileListRef
+                  ? () => {
+                      focusList.current = true;
+                      useUiPreferencesStore
+                        .getState()
+                        .setMobileActiveTab('inputs');
+                      close();
+                    }
+                  : undefined
+              }
               position={
                 position < 0
                   ? null
@@ -379,12 +451,27 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
                           openInputs[
                             (position + delta + openInputs.length) %
                               openInputs.length
-                          ].input.id
+                          ].input.id,
+                          true
                         ),
                     }
               }
               onAnswered={() => advance(selected)}
               onScheduled={() => advance(selected, 'Input scheduled')}
+              prepareClose={(current) => {
+                const closing = {
+                  current,
+                  started: session.current,
+                  sort,
+                  order: openInputs.map((d) => d.input.id),
+                };
+                return (reason) =>
+                  advance(
+                    selected,
+                    reason ? 'Input marked as seen' : 'Input closed',
+                    closing
+                  );
+              }}
             />
           ) : (
             <InputsDone />
@@ -418,7 +505,7 @@ function InputsDone() {
             <CheckIcon className="size-9" weight="bold" />
           </div>
         </div>
-        <Dialog.Title className="text-xl font-semibold text-high">
+        <Dialog.Title tabIndex={-1} className="text-xl font-semibold text-high">
           All caught up
         </Dialog.Title>
         <Dialog.Description className="mt-half text-low">
@@ -440,12 +527,17 @@ function InputViewer({
   inputId,
   notice,
   position,
+  pendingCount,
+  onViewList,
   onAnswered,
   onScheduled,
+  prepareClose,
 }: {
   workspaceId: string;
   inputId: string;
   notice: string | null;
+  pendingCount?: number;
+  onViewList?: () => void;
   position: {
     index: number;
     total: number;
@@ -453,6 +545,7 @@ function InputViewer({
   } | null;
   onAnswered: () => Promise<void>;
   onScheduled: () => Promise<void>;
+  prepareClose: PrepareClose;
 }) {
   const host = useHostId();
   const queryClient = useQueryClient();
@@ -463,12 +556,13 @@ function InputViewer({
   const input = detail.data?.input;
   return (
     <>
-      <header className="flex items-start gap-base px-base md:px-double pt-base md:pt-double pb-base border-b shrink-0">
+      <header className="flex flex-wrap md:flex-nowrap items-start gap-base px-base md:px-double pt-base md:pt-double pb-base border-b shrink-0">
         <Dialog.Close aria-label="Close" className={cn(iconButton, '-ml-1')}>
           <XIcon className="size-5" />
         </Dialog.Close>
         <div className="min-w-0 flex-1 pt-1">
           <Dialog.Title
+            tabIndex={-1}
             className="text-xl font-semibold text-high leading-snug line-clamp-2 [text-wrap:balance]"
             title={detail.data?.version.title}
           >
@@ -535,11 +629,6 @@ function InputViewer({
                 </span>
               )}
               <Age date={input.created_at} />
-              {position && (
-                <span className="md:hidden tabular-nums">
-                  {position.index + 1} of {position.total}
-                </span>
-              )}
               {input.current_version > 1 && (
                 <span>Version {detail.data?.version.version}</span>
               )}
@@ -552,53 +641,72 @@ function InputViewer({
             </div>
           )}
         </div>
-        <div className="flex items-center shrink-0">
-          {position && (
-            <nav
-              aria-label="Open Inputs"
-              className="hidden md:flex items-center"
-            >
-              {position.total > 1 && (
-                <button
-                  aria-label="Previous open Input"
-                  className={iconButton}
-                  onClick={() => position.step(-1)}
-                >
-                  <CaretLeftIcon className="size-4" />
-                </button>
-              )}
-              <span className="px-half text-sm text-low tabular-nums whitespace-nowrap">
-                {position.index + 1} of {position.total}
-              </span>
-              {position.total > 1 && (
-                <button
-                  aria-label="Next open Input"
-                  className={iconButton}
-                  onClick={() => position.step(1)}
-                >
-                  <CaretRightIcon className="size-4" />
-                </button>
-              )}
-            </nav>
+        <button
+          aria-label="Refresh Input"
+          title="Refresh Input"
+          className={iconButton}
+          disabled={detail.isFetching}
+          onClick={async () => {
+            const result = await detail.refetch();
+            if (!result.error)
+              setReviewMessage(
+                'Review the current version and your saved draft before you submit again.'
+              );
+          }}
+        >
+          <ArrowClockwiseIcon
+            className={cn('size-4', detail.isFetching && 'animate-spin')}
+          />
+        </button>
+        <nav
+          aria-label="Open Inputs"
+          className={cn(
+            'flex basis-full items-center gap-half shrink-0 md:basis-auto',
+            !position && 'md:hidden'
           )}
+        >
           <button
-            aria-label="Refresh Input"
-            title="Refresh Input"
-            className={iconButton}
-            disabled={detail.isFetching}
-            onClick={async () => {
-              const result = await detail.refetch();
-              if (!result.error)
-                setReviewMessage(
-                  'Review the current version and your saved draft before you submit again.'
-                );
-            }}
+            aria-label="Previous open Input"
+            className={cn(
+              iconButton,
+              'min-h-11 min-w-11 md:min-h-9 md:min-w-9',
+              (!position || position.total < 2) && 'md:hidden'
+            )}
+            disabled={!position || position.total < 2}
+            onClick={() => position?.step(-1)}
           >
-            <ArrowClockwiseIcon
-              className={cn('size-4', detail.isFetching && 'animate-spin')}
-            />
+            <CaretLeftIcon className="size-4" />
           </button>
-        </div>
+          <span className="text-sm text-low tabular-nums whitespace-nowrap">
+            {position && `${position.index + 1} of ${position.total}`}
+            {position && pendingCount !== undefined && (
+              <span className="md:hidden"> · </span>
+            )}
+            {pendingCount !== undefined && (
+              <span className="md:hidden">{pendingCount} pending</span>
+            )}
+          </span>
+          <button
+            aria-label="Next open Input"
+            className={cn(
+              iconButton,
+              'min-h-11 min-w-11 md:min-h-9 md:min-w-9',
+              (!position || position.total < 2) && 'md:hidden'
+            )}
+            disabled={!position || position.total < 2}
+            onClick={() => position?.step(1)}
+          >
+            <CaretRightIcon className="size-4" />
+          </button>
+          {onViewList && (
+            <button
+              className={cn(quietButton, 'ml-auto min-h-11 px-base md:hidden')}
+              onClick={onViewList}
+            >
+              View list
+            </button>
+          )}
+        </nav>
       </header>
       <Dialog.Description className="sr-only">
         The page can propose an answer. Only Submit records your answer. Keep
@@ -634,6 +742,7 @@ function InputViewer({
           detail={detail.data}
           onAnswered={onAnswered}
           onScheduled={onScheduled}
+          prepareClose={prepareClose}
           refreshAfterConflict={async () => {
             const result = await detail.refetch();
             if (result.error) throw result.error;
@@ -641,13 +750,25 @@ function InputViewer({
               'The Input changed. Review the current version and your saved draft before you submit again.'
             );
           }}
-          refresh={async () => {
-            await queryClient.invalidateQueries({
+          refresh={async (forAdvance = false) => {
+            const detailRefresh = queryClient.invalidateQueries({
               queryKey: ['input', host, workspaceId, inputId],
             });
-            await queryClient.invalidateQueries({
-              queryKey: ['inputs', host, workspaceId],
+            const lists = { queryKey: ['inputs', host, workspaceId] };
+            if (!forAdvance) {
+              await detailRefresh;
+              await queryClient.invalidateQueries(lists);
+              return;
+            }
+            // Close advances using only the Pending list.
+            void queryClient.invalidateQueries({
+              ...lists,
+              predicate: ({ queryKey }) => queryKey[3] === true,
             });
+            await queryClient.invalidateQueries(
+              { queryKey: [...lists.queryKey, false, ''], exact: true },
+              { throwOnError: true }
+            );
           }}
         />
       )}
@@ -662,13 +783,15 @@ function InputBody({
   refreshAfterConflict,
   onAnswered,
   onScheduled,
+  prepareClose,
 }: {
   workspaceId: string;
   detail: InputDetail;
-  refresh: () => Promise<void>;
+  refresh: (forAdvance?: boolean) => Promise<void>;
   refreshAfterConflict: () => Promise<void>;
   onAnswered: () => Promise<void>;
   onScheduled: () => Promise<void>;
+  prepareClose: PrepareClose;
 }) {
   const host = useHostId();
   const queryClient = useQueryClient();
@@ -714,8 +837,10 @@ function InputBody({
       mounted.current = false;
     };
   }, []);
+  const statusSaving = useRef(false);
   const statusRequest = useRef<{
     undo: boolean;
+    reason: CloseReason;
     sequence: number;
     id: string;
   } | null>(null);
@@ -897,15 +1022,24 @@ function InputBody({
     }
     if (answered && mounted.current) await onAnswered();
   };
-  const status = async (undo: boolean) => {
+  const status = async (undo: boolean, reason: CloseReason = null) => {
+    if (busy || statusSaving.current) return;
+    const advanceAfterClose = undo ? null : prepareClose(detail);
+    statusSaving.current = true;
     setBusy(true);
     setError(null);
     const sequence = undo ? undoSequence! : detail.input.sequence;
     if (
       statusRequest.current?.undo !== undo ||
-      statusRequest.current.sequence !== sequence
+      statusRequest.current.sequence !== sequence ||
+      statusRequest.current.reason !== reason
     )
-      statusRequest.current = { undo, sequence, id: crypto.randomUUID() };
+      statusRequest.current = {
+        undo,
+        reason,
+        sequence,
+        id: crypto.randomUUID(),
+      };
     try {
       const receipt = await inputsApi.status(
         workspaceId,
@@ -913,11 +1047,13 @@ function InputBody({
         detail.input.id,
         sequence,
         undo,
-        statusRequest.current.id
+        statusRequest.current.id,
+        reason
       );
       setUndoSequence(undo ? null : receipt.sequence);
       statusRequest.current = null;
-      await refresh();
+      await refresh(!undo);
+      if (mounted.current) await advanceAfterClose?.(reason);
     } catch (e) {
       try {
         if (await refreshInputAfterConflict(e, refreshAfterConflict))
@@ -927,6 +1063,7 @@ function InputBody({
       }
       setError(String(e));
     } finally {
+      statusSaving.current = false;
       setBusy(false);
     }
   };
@@ -990,11 +1127,15 @@ function InputBody({
     setNavigated(false);
     setPageAttempt((attempt) => attempt + 1);
   };
-  const canSubmit =
-    !busy && validateInputAnswer(draft, detail.version.contract);
   const choices = detail.version.contract.choices;
+  const informational =
+    choices.length === 0 && !detail.version.contract.allow_text;
+  const canSubmit =
+    !informational &&
+    !busy &&
+    validateInputAnswer(draft, detail.version.contract);
   return (
-    <div className="flex-1 min-h-0 flex flex-col md:flex-row">
+    <div className="flex-1 min-h-0 flex flex-col overflow-y-auto md:flex-row md:overflow-hidden">
       <div className="relative flex-1 min-h-24 bg-white">
         {navigated ? (
           <p role="alert" className="p-double text-black">
@@ -1229,22 +1370,28 @@ function InputBody({
           {detail.input.status === 'open' && (
             <button
               className={`w-full min-h-11 rounded-md bg-brand hover:bg-brand-hover text-on-brand font-medium disabled:opacity-50 ${focusRing} focus-visible:ring-offset-2`}
-              disabled={!canSubmit}
-              onClick={submit}
+              disabled={informational ? busy : !canSubmit}
+              onClick={
+                informational ? () => status(false, 'marked_as_seen') : submit
+              }
             >
               {busy
                 ? 'Saving…'
-                : !draft.choice_id &&
-                    !draft.text?.trim() &&
-                    detail.version.contract.allow_no_answer_yet
-                  ? 'Submit: no answer yet'
-                  : 'Submit answer'}
+                : informational
+                  ? 'Mark as seen'
+                  : !draft.choice_id &&
+                      !draft.text?.trim() &&
+                      detail.version.contract.allow_no_answer_yet
+                    ? 'Submit: no answer yet'
+                    : 'Submit answer'}
             </button>
           )}
-          <p className="text-xs text-low">
-            The page can propose an answer. Only Submit records your answer.
-            Keep secrets outside Inputs.
-          </p>
+          {!informational && (
+            <p className="text-xs text-low">
+              The page can propose an answer. Only Submit records your answer.
+              Keep secrets outside Inputs.
+            </p>
+          )}
           <div className="flex flex-wrap gap-x-double gap-y-half">
             <button
               className={quietButton}
