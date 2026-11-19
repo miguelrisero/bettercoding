@@ -290,7 +290,7 @@ jobs:
           install -m 0444 "$source/packages/web-core/src/pages/workspaces/inputBridge.ts" "$scratch/fixtures/bridge.ts"
           install -m 0444 "$source/crates/server/src/routes/workspaces/inputs.rs" "$scratch/fixtures/inputs.rs"
           sha256sum "$scratch/fixtures/"*
-          printf '%s\n' 'export default { cacheDir: "/scratch/cache/vitest" };' > "$scratch/build/vitest.config.mjs"
+          printf '%s\n' 'export default { cacheDir: "/scratch/cache/vitest", test: { api: { host: "127.0.0.1" } } };' > "$scratch/build/vitest.config.mjs"
 
           queue_node() {
             local descriptors=$1

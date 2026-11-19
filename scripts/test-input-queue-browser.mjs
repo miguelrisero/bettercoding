@@ -11,15 +11,18 @@ const timestamp = '2026-11-01T00:00:00Z';
 let cards;
 let writes;
 let unexpectedWrite;
+let rejectClose;
 
-function reset() {
+function reset(only) {
   writes = [];
   unexpectedWrite = false;
+  rejectClose = false;
   cards = ids.map((id, i) => ({
     input: {
       id, workspace_id: workspace, external_key: `fixture-${i}`, creator: 'fixture',
       show_at: null, expires_at: null, priority: 'P2', current_version: 1,
-      status: 'open', sequence: 1, created_at: timestamp, updated_at: timestamp,
+      status: only !== undefined && only !== i ? 'closed' : 'open',
+      sequence: 1, created_at: timestamp, updated_at: timestamp,
     },
     version: {
       version: 1, title: titles[i], html: null, content_hash: `synthetic-${i}`,
@@ -61,6 +64,10 @@ export async function respond(req, res, path, csp) {
     assert.equal(expected_sequence, card.input.sequence);
     assert.ok(request_id);
     assert.ok(reason === null || reason === 'marked_as_seen');
+    if (rejectClose) {
+      res.statusCode = 503;
+      return send(JSON.stringify({ success: false, message: 'Synthetic close failed' }));
+    }
     card.input.status = 'closed';
     card.input.sequence++;
     const sequence = card.input.sequence;
@@ -138,8 +145,8 @@ export async function verifyQueue({ page, origin, until }) {
     }
   };
   let visit = 0;
-  const open = async (i, width, height) => {
-    reset();
+  const open = async (i, width, height, only = false) => {
+    reset(only ? i : undefined);
     await page.send('Emulation.setDeviceMetricsOverride', {
       width, height, deviceScaleFactor: 1, mobile: width < 768,
     });
@@ -152,8 +159,13 @@ export async function verifyQueue({ page, origin, until }) {
     }, 'commit the fresh fixture');
     await until(async () => (await title()) === titles[i], `render ${titles[i]}`);
     await until(() => page.evaluate(`!!document.querySelector('[role="dialog"] aside')`), 'render Input actions');
-    await until(() => page.evaluate(`document.querySelector('[role="dialog"]').innerText.includes(' of 3')`), 'load the pending position');
+    const position = only ? '1 of 1' : `${i + 1} of 3`;
+    await until(() => page.evaluate(`document.querySelector('[role="dialog"]').innerText.includes(${JSON.stringify(position)})`), 'load the pending position');
   };
+  const headingFocused = (expected) => until(() => page.evaluate(`
+    document.activeElement === document.querySelector('[role="dialog"] h2') &&
+    document.activeElement.textContent.trim() === ${JSON.stringify(expected)}
+  `), `focus the ${expected} heading`);
   const results = [];
   async function test(label, run) {
     try {
@@ -173,6 +185,7 @@ export async function verifyQueue({ page, origin, until }) {
     assert.deepEqual(writes, [{ id: ids[2], reason: null }]);
     const selected = await until(() => page.evaluate(`location.hash !== '#input=${ids[2]}' && location.hash`), 'advance after Close');
     assert.equal(selected, `#input=${ids[1]}`, 'Close must select the nearest earlier pending card');
+    await headingFocused(titles[1]);
   });
   await test('an informational card offers a separate Mark as seen action', async () => {
     await open(1, 1280, 900);
@@ -180,7 +193,23 @@ export async function verifyQueue({ page, origin, until }) {
     await activate('Mark as seen');
     await until(() => writes.length === 1, 'persist the acknowledgment');
     assert.deepEqual(writes, [{ id: ids[1], reason: 'marked_as_seen' }]);
-    await until(async () => (await title()) === titles[2], 'advance after Mark as seen');
+    await headingFocused(titles[2]);
+  });
+  await test('closing the only pending card focuses completion', async () => {
+    await open(0, 1280, 900, true);
+    await activate('Close Input');
+    await headingFocused('All caught up');
+    assert.deepEqual(writes, [{ id: ids[0], reason: null }]);
+    assert.equal(await page.evaluate('location.hash'), '');
+  });
+  await test('a failed close leaves the card selected', async () => {
+    await open(0, 1280, 900);
+    rejectClose = true;
+    await activate('Close Input');
+    await until(() => page.evaluate(`document.querySelector('[role="dialog"]').innerText.includes('Synthetic close failed')`), 'display the close failure');
+    assert.equal(await title(), titles[0]);
+    assert.equal(await page.evaluate('location.hash'), `#input=${ids[0]}`);
+    assert.deepEqual(writes, []);
   });
   await test('phone queue controls and counts are visible and accessible', async () => {
     await open(1, 390, 844);
@@ -202,7 +231,10 @@ export async function verifyQueue({ page, origin, until }) {
     await activate(previous);
     await until(async () => (await title()) === titles[1], 'open the previous phone card');
     await activate('View list');
-    await until(() => page.evaluate(`document.querySelector('section[aria-label="Inputs"]')?.checkVisibility() && !document.querySelector('[role="dialog"]')`), 'open the full phone list');
+    await until(() => page.evaluate(`(() => {
+      const list = document.querySelector('section[aria-label="Inputs"]');
+      return list?.checkVisibility() && document.activeElement === list && !document.querySelector('[role="dialog"]');
+    })()`), 'focus the full phone list');
   });
   console.log(JSON.stringify({ inputQueueBrowser: results }, null, 2));
   assert.ok(results.every((result) => result.pass), 'Input queue browser acceptance');

@@ -1,3 +1,4 @@
+import { useRef } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createRoot } from 'react-dom/client';
 import {
@@ -12,13 +13,17 @@ import '@/app/styles/new/index.css';
 function QueueFixture() {
   const isMobile = useIsMobile();
   const [tab] = useMobileActiveTab();
+  const list = useRef<HTMLElement>(null);
   const workspaceId = '00000000-0000-4000-8000-000000000099';
   return (
     <>
       <div hidden={isMobile && tab !== 'inputs'}>
-        <WorkspaceInputsContainer workspaceId={workspaceId} />
+        <WorkspaceInputsContainer workspaceId={workspaceId} listRef={list} />
       </div>
-      <WorkspaceInputViewer workspaceId={workspaceId} />
+      <WorkspaceInputViewer
+        workspaceId={workspaceId}
+        mobileListRef={isMobile ? list : undefined}
+      />
     </>
   );
 }
