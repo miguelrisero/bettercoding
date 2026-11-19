@@ -10,6 +10,7 @@ const titles = ['First card', 'Informational card', 'Last card'];
 const timestamp = '2026-11-01T00:00:00Z';
 let cards;
 let writes;
+let closeRequests = [];
 let unexpectedWrite;
 let rejectClose;
 let failDoneAfterClose;
@@ -17,6 +18,7 @@ let doneFailures;
 
 function reset(only) {
   writes = [];
+  closeRequests = [];
   unexpectedWrite = false;
   rejectClose = false;
   failDoneAfterClose = false;
@@ -55,6 +57,11 @@ export async function respond(req, res, path, csp) {
   };
   const [id, suffix, version, content] = path.slice(api.length + 1).split('/');
   const card = cards?.find((detail) => detail.input.id === id);
+  if (req.method === 'POST' && path === `${api}/${id}/close` && closeRequests.length < 4) {
+    const request = { id: id.slice(0, 36), responseStatus: null };
+    closeRequests.push(request);
+    res.once('finish', () => { request.responseStatus = res.statusCode; });
+  }
   if (req.method === 'POST' && card && suffix === 'close' && path === `${api}/${id}/close`) {
     let body = '';
     for await (const chunk of req) {
@@ -127,6 +134,7 @@ export async function verifyQueue({ page, origin, until }) {
     return nodes.filter((node) => !node.ignored && node.role?.value === 'button')
       .map((node) => node.name?.value ?? '');
   };
+  let shortPhone;
   const activate = async (name, pointer = false, scope = '[role="dialog"]') => {
     await page.send('Page.bringToFront');
     const point = await page.evaluate(`(() => {
@@ -141,8 +149,26 @@ export async function verifyQueue({ page, origin, until }) {
       const rect = button.getBoundingClientRect();
       const x = rect.left + rect.width / 2;
       const y = rect.top + rect.height / 2;
-      return button.contains(document.elementFromPoint(x, y)) ? { x, y } : null;
+      const hit = document.elementFromPoint(x, y);
+      if (${!!shortPhone}) {
+        const label = (element) => {
+          const control = element?.closest?.('button, h2');
+          return {tag: element?.tagName, name: (control?.getAttribute('aria-label') ??
+            control?.textContent)?.trim().slice(0, 64)};
+        };
+        const events = [];
+        window.queuePointerTrace = {x, y, hit: label(hit), events};
+        for (const type of ['pointerdown', 'pointerup', 'pointercancel', 'click', 'focusin', 'hashchange']) {
+          window.addEventListener(type, event => {
+            if (events.length === 12) events.shift();
+            events.push({type, trusted: event.isTrusted, target: label(event.target),
+              x: event.clientX, y: event.clientY, hash: location.hash.slice(0, 64)});
+          }, true);
+        }
+      }
+      return button.contains(hit) ? { x, y } : null;
     })()`);
+    if (shortPhone) shortPhone.dispatchPoint = point;
     assert.ok(point, `Reach the ${name} button`);
     if (pointer) {
       const mouse = { ...point, button: 'left', clickCount: 1 };
@@ -221,7 +247,27 @@ export async function verifyQueue({ page, origin, until }) {
       } catch {
         // Keep the original failure even after the page detaches.
       }
-      results.push({ label, pass: false, message: error.message, focus, keyboard: keyboard.slice(-4) });
+      if (shortPhone) {
+        shortPhone.closeRequests = closeRequests;
+        shortPhone.writes = writes.slice(0, 4);
+        try {
+          shortPhone.browser = await page.evaluate(`(() => {
+            const dialog = document.querySelector('[role="dialog"]');
+            const active = document.activeElement;
+            return {hash: location.hash.slice(0, 64),
+              heading: dialog?.querySelector('h2')?.textContent.trim().slice(0, 64),
+              activeName: (active?.getAttribute('aria-label') ??
+                active?.closest('button, h2')?.textContent)?.trim().slice(0, 64),
+              alert: dialog?.querySelector('aside [role="alert"]')?.textContent.trim().slice(0, 160),
+              pointer: window.queuePointerTrace};
+          })()`);
+        } catch {
+          // Keep the server evidence if the page detaches.
+        }
+      }
+      results.push({ label, pass: false, message: error.message, focus, keyboard: keyboard.slice(-4), shortPhone });
+    } finally {
+      shortPhone = undefined;
     }
   }
 
@@ -309,6 +355,7 @@ export async function verifyQueue({ page, origin, until }) {
       action.scrollIntoView({block: 'nearest'});
     })()`);
     assert.ok(await queueControlsReachable(), 'Reach all queue controls with the action in view');
+    shortPhone = {};
     await activate('Mark as seen', true);
     await headingFocused(titles[2]);
     assert.deepEqual(writes, [{ id: ids[1], reason: 'marked_as_seen' }]);
