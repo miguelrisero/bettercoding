@@ -12,11 +12,15 @@ let cards;
 let writes;
 let unexpectedWrite;
 let rejectClose;
+let failDoneAfterClose;
+let doneFailures;
 
 function reset(only) {
   writes = [];
   unexpectedWrite = false;
   rejectClose = false;
+  failDoneAfterClose = false;
+  doneFailures = 0;
   cards = ids.map((id, i) => ({
     input: {
       id, workspace_id: workspace, external_key: `fixture-${i}`, creator: 'fixture',
@@ -97,6 +101,11 @@ export async function respond(req, res, path, csp) {
   }
   if (path === api) {
     const statuses = new URL(req.url, 'http://127.0.0.1').searchParams.get('status')?.split(',');
+    if (failDoneAfterClose && writes.length && statuses?.includes('closed')) {
+      doneFailures++;
+      res.statusCode = 503;
+      return send(JSON.stringify({ success: false, message: 'Synthetic Done query failed' }));
+    }
     const pending = cards.filter((item) => item.input.status === 'open');
     return data({
       inputs: cards.filter((item) => statuses?.includes(item.input.status)),
@@ -118,9 +127,10 @@ export async function verifyQueue({ page, origin, until }) {
     return nodes.filter((node) => !node.ignored && node.role?.value === 'button')
       .map((node) => node.name?.value ?? '');
   };
-  const activate = async (name, pointer = false) => {
+  const activate = async (name, pointer = false, scope = '[role="dialog"]') => {
+    await page.send('Page.bringToFront');
     const point = await page.evaluate(`(() => {
-      const button = [...document.querySelectorAll('[role="dialog"] button')].find(b =>
+      const button = [...document.querySelectorAll(${JSON.stringify(scope + ' button')})].find(b =>
         (b.getAttribute('aria-label') ?? b.textContent.trim()) === ${JSON.stringify(name)} && b.checkVisibility());
       if (!button || button.disabled) return null;
       if (!${pointer}) {
@@ -139,24 +149,53 @@ export async function verifyQueue({ page, origin, until }) {
       await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...mouse });
       await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...mouse });
     } else {
+      const before = await page.evaluate(`(() => {
+        if (!window.queueKeyEvents) {
+          window.queueKeyEvents = [];
+          for (const type of ['focusin', 'focusout', 'keydown', 'keypress', 'keyup', 'click']) {
+            document.addEventListener(type, event => {
+              const name = event.target.getAttribute?.('aria-label') ?? event.target.textContent?.trim();
+              window.queueKeyEvents.push({type, key: event.key, trusted: event.isTrusted,
+                target: event.target.tagName, name: name?.slice(0, 64)});
+              if (window.queueKeyEvents.length > 12) window.queueKeyEvents.shift();
+            }, true);
+          }
+        }
+        window.queueKeyEvents.length = 0;
+        return {focused: document.hasFocus(), visibility: document.visibilityState,
+          active: document.activeElement?.tagName};
+      })()`);
       const key = { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 };
-      await page.send('Input.dispatchKeyEvent', { type: 'keyDown', ...key });
+      await page.send('Input.dispatchKeyEvent', { type: 'keyDown', ...key, text: '\r' });
       await page.send('Input.dispatchKeyEvent', { type: 'keyUp', ...key });
+      keyboard.push({ name, before, after: await page.evaluate(`({focused: document.hasFocus(),
+        active: document.activeElement?.tagName, events: window.queueKeyEvents})`) });
     }
   };
   let visit = 0;
-  const open = async (i, width, height, only = false) => {
+  const open = async (i, width, height, only = false, startFromList = false) => {
     reset(only ? i : undefined);
     await page.send('Emulation.setDeviceMetricsOverride', {
       width, height, deviceScaleFactor: 1, mobile: width < 768,
     });
     const search = `?visit=${++visit}`;
-    const navigation = await page.send('Page.navigate', { url: `${origin}/queue${search}#input=${ids[i]}` });
+    const hash = `#input=${ids[i]}`;
+    const navigation = await page.send('Page.navigate', { url: `${origin}/queue${search}${startFromList ? '' : hash}` });
     assert.equal(navigation.errorText, undefined, 'Navigate to the synthetic queue');
     await until(async () => {
       const { frameTree } = await page.send('Page.getFrameTree');
       return frameTree.frame.loaderId === navigation.loaderId && frameTree.frame.url.includes(search);
     }, 'commit the fresh fixture');
+    if (startFromList) {
+      await until(() => page.evaluate(`!!document.querySelector('section[aria-label="Inputs"] button')`), 'render the Inputs list');
+      await activate('Done', true, 'section[aria-label="Inputs"]');
+      await until(() => page.evaluate(`(() => {
+        const list = document.querySelector('section[aria-label="Inputs"]');
+        const done = [...list.querySelectorAll('button')].find(button => button.textContent.trim() === 'Done');
+        return done?.getAttribute('aria-pressed') === 'true' && list.innerText.includes('Your decision pages will appear here.');
+      })()`), 'load the active Done query');
+      await page.evaluate(`void (location.hash = ${JSON.stringify(hash)})`);
+    }
     await until(async () => (await title()) === titles[i], `render ${titles[i]}`);
     await until(() => page.evaluate(`!!document.querySelector('[role="dialog"] aside')`), 'render Input actions');
     const position = only ? '1 of 1' : `${i + 1} of 3`;
@@ -167,13 +206,22 @@ export async function verifyQueue({ page, origin, until }) {
     document.activeElement.textContent.trim() === ${JSON.stringify(expected)}
   `), `focus the ${expected} heading`);
   const results = [];
+  const keyboard = [];
   async function test(label, run) {
+    keyboard.length = 0;
     try {
       await run();
       assert.equal(unexpectedWrite, false, 'The fixture allows only the owner close route');
       results.push({ label, pass: true });
     } catch (error) {
-      results.push({ label, pass: false, message: error.message });
+      let focus;
+      try {
+        focus = await page.evaluate(`({focused: document.hasFocus(), visibility: document.visibilityState,
+          active: document.activeElement?.tagName, events: window.queueKeyEvents?.slice(-12)})`);
+      } catch {
+        // Keep the original failure even after the page detaches.
+      }
+      results.push({ label, pass: false, message: error.message, focus, keyboard: keyboard.slice(-4) });
     }
   }
 
@@ -185,6 +233,14 @@ export async function verifyQueue({ page, origin, until }) {
     assert.deepEqual(writes, [{ id: ids[2], reason: null }]);
     const selected = await until(() => page.evaluate(`location.hash !== '#input=${ids[2]}' && location.hash`), 'advance after Close');
     assert.equal(selected, `#input=${ids[1]}`, 'Close must select the nearest earlier pending card');
+    await headingFocused(titles[1]);
+  });
+  await test('a failing active Done query cannot block advance after Close', async () => {
+    await open(2, 1280, 900, false, true);
+    failDoneAfterClose = true;
+    await activate('Close Input', true);
+    await until(() => doneFailures > 0, 'refetch and fail the unrelated Done query');
+    assert.deepEqual(writes, [{ id: ids[2], reason: null }]);
     await headingFocused(titles[1]);
   });
   await test('an informational card offers a separate Mark as seen action', async () => {
@@ -235,6 +291,28 @@ export async function verifyQueue({ page, origin, until }) {
       const list = document.querySelector('section[aria-label="Inputs"]');
       return list?.checkVisibility() && document.activeElement === list && !document.querySelector('[role="dialog"]');
     })()`), 'focus the full phone list');
+  });
+  await test('queue controls and card actions remain reachable on a short phone', async () => {
+    await open(1, 390, 250);
+    assert.equal(await page.evaluate('innerHeight'), 250);
+    const queueControlsReachable = () => page.evaluate(`(() => {
+      const controls = [...document.querySelectorAll('nav[aria-label="Open Inputs"] button')];
+      return controls.length === 3 && controls.every(button => {
+        const {x, y, width, height} = button.getBoundingClientRect();
+        return button.contains(document.elementFromPoint(x + width / 2, y + height / 2));
+      });
+    })()`);
+    assert.ok(await queueControlsReachable(), 'Reach all queue controls before scrolling');
+    await page.evaluate(`(() => {
+      const action = [...document.querySelectorAll('aside button')].find(
+        button => button.textContent.trim() === 'Mark as seen');
+      action.scrollIntoView({block: 'nearest'});
+    })()`);
+    assert.ok(await queueControlsReachable(), 'Reach all queue controls with the action in view');
+    await activate('Mark as seen', true);
+    await headingFocused(titles[2]);
+    assert.deepEqual(writes, [{ id: ids[1], reason: 'marked_as_seen' }]);
+    assert.ok(await queueControlsReachable(), 'Reach all queue controls after scrolling');
   });
   console.log(JSON.stringify({ inputQueueBrowser: results }, null, 2));
   assert.ok(results.every((result) => result.pass), 'Input queue browser acceptance');

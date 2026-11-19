@@ -40,9 +40,10 @@ export function nextOpenInput(
   const index = closeOrder?.indexOf(current.input.id) ?? -1;
   if (closeOrder && index >= 0) {
     const pending = new Set(open.map((d) => d.input.id));
+    const earlier = closeOrder.slice(0, index).reverse();
     const neighbor =
       closeOrder.slice(index + 1).find((id) => pending.has(id)) ??
-      closeOrder.slice(0, index).reverse().find((id) => pending.has(id));
+      earlier.find((id) => pending.has(id));
     if (neighbor) return neighbor;
   }
   open.sort((a, b) => compareInputs(a, b, sort));

@@ -39,9 +39,7 @@ function closeFlow() {
   const next = { input: { ...current.input, id: 'b', status: 'open' } };
   const session = { current: 1 };
   const mounted = { current: true };
-  const persist = vi.fn<
-    (...args: unknown[]) => Promise<{ sequence: number }>
-  >(async () => ({ sequence: 2 }));
+  const persist = vi.fn(async (..._args: unknown[]) => ({ sequence: 2 }));
   const refresh = vi.fn(async () => {});
   const fetchQuery = vi.fn(async () => ({ inputs: [next] }));
   const open = vi.fn();

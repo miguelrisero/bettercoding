@@ -750,14 +750,24 @@ function InputViewer({
               'The Input changed. Review the current version and your saved draft before you submit again.'
             );
           }}
-          refresh={async (throwOnError = false) => {
+          refresh={async (forAdvance = false) => {
+            const detailRefresh = queryClient.invalidateQueries({
+              queryKey: ['input', host, workspaceId, inputId],
+            });
+            const lists = { queryKey: ['inputs', host, workspaceId] };
+            if (!forAdvance) {
+              await detailRefresh;
+              await queryClient.invalidateQueries(lists);
+              return;
+            }
+            // Close advances using only the Pending list.
+            void queryClient.invalidateQueries({
+              ...lists,
+              predicate: ({ queryKey }) => queryKey[3] === true,
+            });
             await queryClient.invalidateQueries(
-              { queryKey: ['input', host, workspaceId, inputId] },
-              { throwOnError }
-            );
-            await queryClient.invalidateQueries(
-              { queryKey: ['inputs', host, workspaceId] },
-              { throwOnError }
+              { queryKey: [...lists.queryKey, false, ''], exact: true },
+              { throwOnError: true }
             );
           }}
         />
@@ -777,7 +787,7 @@ function InputBody({
 }: {
   workspaceId: string;
   detail: InputDetail;
-  refresh: (throwOnError?: boolean) => Promise<void>;
+  refresh: (forAdvance?: boolean) => Promise<void>;
   refreshAfterConflict: () => Promise<void>;
   onAnswered: () => Promise<void>;
   onScheduled: () => Promise<void>;
@@ -1125,7 +1135,7 @@ function InputBody({
     !busy &&
     validateInputAnswer(draft, detail.version.contract);
   return (
-    <div className="flex-1 min-h-0 flex flex-col md:flex-row">
+    <div className="flex-1 min-h-0 flex flex-col overflow-y-auto md:flex-row md:overflow-hidden">
       <div className="relative flex-1 min-h-24 bg-white">
         {navigated ? (
           <p role="alert" className="p-double text-black">
