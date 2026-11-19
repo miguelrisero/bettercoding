@@ -29,15 +29,27 @@ export function compareInputs(
 export function nextOpenInput(
   inputs: InputDetail[],
   current: InputDetail,
-  sort: InputSort
+  sort: InputSort,
+  closeOrder?: readonly string[]
 ): string | null {
-  current = inputs.find((d) => d.input.id === current.input.id) ?? current;
-  const open = inputs
-    .filter((d) => d.input.status === 'open' && d.input.id !== current.input.id)
-    .sort((a, b) => compareInputs(a, b, sort));
+  if (!closeOrder)
+    current = inputs.find((d) => d.input.id === current.input.id) ?? current;
+  const open = inputs.filter(
+    (d) => d.input.status === 'open' && d.input.id !== current.input.id
+  );
+  const index = closeOrder?.indexOf(current.input.id) ?? -1;
+  if (closeOrder && index >= 0) {
+    const pending = new Set(open.map((d) => d.input.id));
+    const earlier = closeOrder.slice(0, index).reverse();
+    const neighbor =
+      closeOrder.slice(index + 1).find((id) => pending.has(id)) ??
+      earlier.find((id) => pending.has(id));
+    if (neighbor) return neighbor;
+  }
+  open.sort((a, b) => compareInputs(a, b, sort));
   return (
     open.find((d) => compareInputs(d, current, sort) > 0)?.input.id ??
-    open[0]?.input.id ??
+    (closeOrder ? open.at(-1) : open[0])?.input.id ??
     null
   );
 }

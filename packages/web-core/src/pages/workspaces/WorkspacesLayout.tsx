@@ -149,6 +149,7 @@ export function WorkspacesLayout() {
     setRightSidebarWidth(writeSidebarWidth('right', width));
   }, []);
   const [mobileTab] = useMobileActiveTab();
+  const mobileInputList = useRef<HTMLElement>(null);
   const hostId = useHostId();
   const mainContainerRef = useRef<WorkspacesMainContainerHandle>(null);
 
@@ -512,6 +513,7 @@ export function WorkspacesLayout() {
                 <WorkspaceInputsContainer
                   key={selectedWorkspace.id}
                   workspaceId={selectedWorkspace.id}
+                  listRef={mobileInputList}
                 />
               )}
             </div>
@@ -526,6 +528,7 @@ export function WorkspacesLayout() {
           <WorkspaceInputViewer
             key={selectedWorkspace.id}
             workspaceId={selectedWorkspace.id}
+            mobileListRef={mobileInputList}
           />
         )}
         <div className="flex-1 min-w-0 h-full">

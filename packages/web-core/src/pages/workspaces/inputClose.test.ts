@@ -16,6 +16,7 @@ function closeFlow() {
       source.indexOf('  const openInputs =')
     )
     .replace('fromId: string', 'fromId')
+    .replace('closing?: ClosingInput', 'closing')
     .replace('let inputs: InputDetail[];', 'let inputs;')
     .replace('getQueryData<InputDetail>', 'getQueryData');
   const statusSource = source
@@ -24,6 +25,7 @@ function closeFlow() {
       source.indexOf('  const schedule =')
     )
     .replace('undo: boolean', 'undo')
+    .replace('reason: CloseReason', 'reason')
     .replace('undoSequence!', 'undoSequence');
   const current = {
     input: {
@@ -33,10 +35,11 @@ function closeFlow() {
       created_at: '2026-11-01T00:00:00Z',
     },
   };
+  const detail = { input: { ...current.input, status: 'open', sequence: 1 } };
   const next = { input: { ...current.input, id: 'b', status: 'open' } };
   const session = { current: 1 };
   const mounted = { current: true };
-  const persist = vi.fn(async () => ({ sequence: 2 }));
+  const persist = vi.fn(async (..._args: unknown[]) => ({ sequence: 2 }));
   const refresh = vi.fn(async () => {});
   const fetchQuery = vi.fn(async () => ({ inputs: [next] }));
   const open = vi.fn();
@@ -48,6 +51,8 @@ function closeFlow() {
   const setBusy = vi.fn();
   const setUndoSequence = vi.fn();
   const statusRequest = { current: null };
+  const focusDestination = { current: false };
+  let requestCount = 0;
   const refreshInputAfterConflict = vi.fn(async () => false);
   const advance = runInNewContext(`${advanceSource}\nadvance;`, {
     session,
@@ -64,25 +69,38 @@ function closeFlow() {
     setSelected,
     setDone,
     setNotice,
+    focusDestination,
   });
-  const onClosed = vi.fn(async () => advance('a', 'Input closed'));
+  const onClosed = vi.fn(advance);
+  const prepareClose = () => {
+    const closing = {
+      started: session.current,
+      current: detail,
+      sort: 'priority',
+      order: ['a', 'b'],
+    };
+    return (reason: string | null) =>
+      onClosed('a', reason ? 'Input marked as seen' : 'Input closed', closing);
+  };
   const status = runInNewContext(`${statusSource}\nstatus;`, {
     inputsApi: { status: persist },
     workspaceId: 'workspace',
     host: null,
-    detail: { input: { id: 'a', sequence: 1 } },
+    detail,
     undoSequence: 2,
     statusRequest,
-    crypto: { randomUUID: () => 'request-id' },
+    statusSaving: { current: false },
+    busy: false,
+    crypto: { randomUUID: () => `request-${++requestCount}` },
     refresh,
     refreshAfterConflict: vi.fn(),
     refreshInputAfterConflict,
     mounted,
-    onClosed,
+    prepareClose,
     setError,
     setBusy,
     setUndoSequence,
-  }) as (undo: boolean) => Promise<void>;
+  }) as (undo: boolean, reason?: 'marked_as_seen') => Promise<void>;
   return {
     status,
     persist,
@@ -99,27 +117,11 @@ function closeFlow() {
     setError,
     setBusy,
     setUndoSequence,
+    focusDestination,
   };
 }
 
 describe('Close Input navigation', () => {
-  it('passes the parent close callback through the detail and body', () => {
-    const viewer = source.slice(
-      source.indexOf('export function WorkspaceInputViewer'),
-      source.indexOf('const BURST')
-    );
-    const callback = viewer.match(/onClosed=\{\(\) => ([^\n]+)\}/)?.[1];
-    const advance = vi.fn();
-    expect(callback).toBeDefined();
-    runInNewContext(callback!, { advance, selected: 'a' });
-    expect(advance).toHaveBeenCalledWith('a', 'Input closed');
-    const detail = source.slice(
-      source.indexOf('function InputViewer('),
-      source.indexOf('function InputBody(')
-    );
-    expect(detail).toContain('onClosed={onClosed}');
-  });
-
   it('refreshes a persisted close before advancing to the next open Input', async () => {
     const flow = closeFlow();
     flow.refresh.mockImplementation(async () => {
@@ -129,14 +131,16 @@ describe('Close Input navigation', () => {
         'a',
         1,
         false,
-        'request-id'
+        'request-1',
+        null
       );
       expect(flow.onClosed).not.toHaveBeenCalled();
     });
     await flow.status(false);
     expect(flow.refresh).toHaveBeenCalledOnce();
+    expect(flow.refresh).toHaveBeenCalledWith(true);
     expect(flow.onClosed).toHaveBeenCalledOnce();
-    expect(flow.open).toHaveBeenCalledWith('b');
+    expect(flow.open).toHaveBeenCalledWith('b', true);
     expect(flow.setNotice).toHaveBeenCalledWith('Input closed');
     expect(flow.setUndoSequence).toHaveBeenCalledWith(2);
     expect(flow.setBusy).toHaveBeenLastCalledWith(false);
@@ -150,6 +154,7 @@ describe('Close Input navigation', () => {
     expect(flow.clearInputHash).toHaveBeenCalledOnce();
     expect(flow.setSelected).toHaveBeenCalledWith(null);
     expect(flow.setDone).toHaveBeenCalledWith(true);
+    expect(flow.focusDestination.current).toBe(true);
   });
 
   it('keeps Undo close in the current viewer', async () => {
@@ -161,9 +166,11 @@ describe('Close Input navigation', () => {
       'a',
       2,
       true,
-      'request-id'
+      'request-1',
+      null
     );
     expect(flow.refresh).toHaveBeenCalledOnce();
+    expect(flow.refresh).toHaveBeenCalledWith(false);
     expect(flow.setUndoSequence).toHaveBeenCalledWith(null);
     expect(flow.onClosed).not.toHaveBeenCalled();
   });
@@ -180,6 +187,29 @@ describe('Close Input navigation', () => {
     }
   );
 
+  it('binds each close retry key to its action', async () => {
+    const flow = closeFlow();
+    flow.persist.mockRejectedValue(new Error('network unavailable'));
+    await flow.status(false);
+    await flow.status(false, 'marked_as_seen');
+    await flow.status(false, 'marked_as_seen');
+    expect(flow.persist.mock.calls.map((call) => call.slice(-2))).toEqual([
+      ['request-1', null],
+      ['request-2', 'marked_as_seen'],
+      ['request-2', 'marked_as_seen'],
+    ]);
+  });
+
+  it('sends one acknowledgment while a save is in progress', async () => {
+    const flow = closeFlow();
+    await Promise.all([
+      flow.status(false, 'marked_as_seen'),
+      flow.status(false, 'marked_as_seen'),
+    ]);
+    expect(flow.persist).toHaveBeenCalledOnce();
+    expect(flow.setNotice).toHaveBeenCalledWith('Input marked as seen');
+  });
+
   it('ignores a close that finishes after the body unmounts', async () => {
     const flow = closeFlow();
     flow.refresh.mockImplementation(async () => {
@@ -195,6 +225,17 @@ describe('Close Input navigation', () => {
     flow.fetchQuery.mockRejectedValue(new Error('refresh failed'));
     await flow.status(false);
     expect(flow.onClosed).toHaveBeenCalledOnce();
+    expect(flow.open).not.toHaveBeenCalled();
+    expect(flow.setDone).not.toHaveBeenCalled();
+  });
+
+  it('ignores a close after the selection epoch changes during the save', async () => {
+    const flow = closeFlow();
+    flow.persist.mockImplementation(async () => {
+      flow.session.current += 1;
+      return { sequence: 2 };
+    });
+    await flow.status(false);
     expect(flow.open).not.toHaveBeenCalled();
     expect(flow.setDone).not.toHaveBeenCalled();
   });
