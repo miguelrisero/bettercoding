@@ -1,5 +1,10 @@
+import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { build } from 'vite';
+
+const mermaidBundle = realpathSync(
+  '../web-core/node_modules/mermaid/dist/mermaid.min.js'
+);
 
 // Compile the production components and PostCSS without app-shell plugins.
 await build({
@@ -10,6 +15,10 @@ await build({
   esbuild: { jsx: 'automatic' },
   resolve: {
     alias: [
+      {
+        find: /^mermaid\/dist\/mermaid\.min\.js\?raw$/,
+        replacement: `${mermaidBundle}?raw`,
+      },
       { find: /^@\//, replacement: `${resolve('../web-core/src')}/` },
       { find: 'shared', replacement: resolve('../../shared') },
     ],
