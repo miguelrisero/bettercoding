@@ -158,7 +158,8 @@ export function WorkspaceInputsContainer({
             {list.data?.pending_count ?? 0}
           </strong>{' '}
           pending
-          {!!list.data?.awaiting_agent_count &&
+          {!showDone &&
+            !!list.data?.awaiting_agent_count &&
             ` · ${list.data.awaiting_agent_count} waiting for agent`}
         </span>
         <div className="flex gap-base" role="group" aria-label="Input view">
@@ -467,6 +468,24 @@ function InputViewer({
   const [reviewMessage, setReviewMessage] = useState<string | null>(null);
   const detail = useQuery(inputDetailQueryOptions(workspaceId, host, inputId));
   const input = detail.data?.input;
+  // The viewer outlives version remounts of the body, so an agent edit, even
+  // during a send, neither drops nor restores the message.
+  const followUpKey = `bc.input.follow-up:${host ?? 'local'}:${inputId}`;
+  const [followUpText, setFollowUpText] = useState(() => {
+    try {
+      return localStorage.getItem(followUpKey) ?? '';
+    } catch {
+      return '';
+    }
+  });
+  useEffect(() => {
+    try {
+      if (followUpText) localStorage.setItem(followUpKey, followUpText);
+      else localStorage.removeItem(followUpKey);
+    } catch {
+      /* The message stays in this page until it is sent. */
+    }
+  }, [followUpKey, followUpText]);
   return (
     <>
       <header className="flex items-start gap-base px-base md:px-double pt-base md:pt-double pb-base border-b shrink-0">
@@ -641,6 +660,8 @@ function InputViewer({
           key={detail.data.version.version}
           workspaceId={workspaceId}
           detail={detail.data}
+          followUpText={followUpText}
+          setFollowUpText={setFollowUpText}
           onAnswered={onAnswered}
           onScheduled={onScheduled}
           refreshAfterConflict={async () => {
@@ -667,6 +688,8 @@ function InputViewer({
 function InputBody({
   workspaceId,
   detail,
+  followUpText,
+  setFollowUpText,
   refresh,
   refreshAfterConflict,
   onAnswered,
@@ -674,6 +697,8 @@ function InputBody({
 }: {
   workspaceId: string;
   detail: InputDetail;
+  followUpText: string;
+  setFollowUpText: (text: string) => void;
   refresh: () => Promise<void>;
   refreshAfterConflict: () => Promise<void>;
   onAnswered: () => Promise<void>;
@@ -707,24 +732,7 @@ function InputBody({
   const [busy, setBusy] = useState(false);
   const [undoSequence, setUndoSequence] = useState<number | null>(null);
   const answerRequest = useRef<AnswerInput | null>(null);
-  // Keyed by Input, not version, so an agent edit keeps the unsent message.
-  const followUpKey = `bc.input.follow-up:${host ?? 'local'}:${detail.input.id}`;
-  const [followUpText, setFollowUpText] = useState(() => {
-    try {
-      return localStorage.getItem(followUpKey) ?? '';
-    } catch {
-      return '';
-    }
-  });
   const followUpRequest = useRef<FollowUpInput | null>(null);
-  useEffect(() => {
-    try {
-      if (followUpText) localStorage.setItem(followUpKey, followUpText);
-      else localStorage.removeItem(followUpKey);
-    } catch {
-      /* The message stays in this page until it is sent. */
-    }
-  }, [followUpKey, followUpText]);
   const scheduleRequest = useRef<SnoozeInput | null>(null);
   const [scheduleTime, setScheduleTime] = useState(() =>
     toUtcControl(detail.input.show_at)
