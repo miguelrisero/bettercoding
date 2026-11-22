@@ -30,6 +30,8 @@ function publication(version: number): InputDetail {
       },
     },
     answers: [],
+    thread: [],
+    awaiting_agent: false,
   };
 }
 

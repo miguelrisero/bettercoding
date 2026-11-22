@@ -126,6 +126,16 @@ pub struct AnswerInput {
     pub answer: InputAnswer,
 }
 
+/// An owner message on an open Input. It records no answer and keeps the status open.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct FollowUpInput {
+    pub request_id: String,
+    #[ts(type = "number")]
+    pub expected_sequence: i64,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InputStatusWrite {
@@ -168,6 +178,12 @@ pub struct InputDetail {
     pub input: WorkspaceInput,
     pub version: InputVersion,
     pub answers: Vec<InputEvent>,
+    /// Owner `follow_up_posted` events and `version_published` events in sequence
+    /// order. Version payloads omit `content.html`; read the version for the page.
+    pub thread: Vec<InputEvent>,
+    /// True while the Input is open and an owner follow-up is newer than the
+    /// creator agent's last published version.
+    pub awaiting_agent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
@@ -211,6 +227,9 @@ pub struct InputPage {
     pub next_cursor: Option<String>,
     #[ts(type = "number")]
     pub pending_count: i64,
+    /// Open Inputs whose newest owner follow-up has no later agent version.
+    #[ts(type = "number")]
+    pub awaiting_agent_count: i64,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -266,6 +285,7 @@ pub enum InputWrite {
     Status(InputStatusWrite),
     Undo(InputStatusWrite),
     Snooze(SnoozeInput),
+    FollowUp(FollowUpInput),
 }
 impl InputWrite {
     fn write_key(&self) -> (&str, i64) {
@@ -274,6 +294,7 @@ impl InputWrite {
             Self::Publish(v) => (&v.request_id, v.expected_sequence),
             Self::Answer(v) => (&v.request_id, v.expected_sequence),
             Self::Snooze(v) => (&v.request_id, v.expected_sequence),
+            Self::FollowUp(v) => (&v.request_id, v.expected_sequence),
             Self::Status(v) | Self::Undo(v) => (&v.request_id, v.expected_sequence),
         }
     }
@@ -378,6 +399,10 @@ fn title_priority(title: &str) -> Option<String> {
     rest[1..].starts_with(" · ").then(|| format!("P{level}"))
 }
 
+/// Counts open Inputs by the `InputDetail::awaiting_agent` rule. Scheduled Inputs
+/// count too, because the agent still owes them a reply.
+const AWAITING_AGENT_COUNT: &str = "SELECT count(*) FROM workspace_inputs i WHERE i.workspace_id=? AND i.status='open' AND coalesce((SELECT max(e.sequence) FROM workspace_input_events e WHERE e.workspace_id=i.workspace_id AND e.input_id=i.id AND e.event_type='follow_up_posted' AND e.actor_kind='owner_ui'),0) > coalesce((SELECT max(e.sequence) FROM workspace_input_events e WHERE e.workspace_id=i.workspace_id AND e.input_id=i.id AND e.event_type='version_published' AND e.actor_kind='agent_mcp'),0)";
+
 impl WorkspaceInput {
     pub async fn set_priority(
         pool: &SqlitePool,
@@ -439,6 +464,18 @@ impl WorkspaceInput {
             .ok_or(InputError::Code("NOT_FOUND"))?;
         let answers = sqlx::query_as("SELECT * FROM workspace_input_events WHERE workspace_id=? AND input_id=? AND event_type='answer_submitted' ORDER BY sequence")
             .bind(workspace).bind(id).fetch_all(&mut *connection).await?;
+        let thread: Vec<InputEvent> = sqlx::query_as("SELECT cursor,id,workspace_id,input_id,sequence,actor_kind,actor,event_type,version,json_remove(payload,'$.content.html') AS payload,request_id,request_hash,created_at,prev_hash,hash FROM workspace_input_events WHERE workspace_id=? AND input_id=? AND event_type IN ('follow_up_posted','version_published') ORDER BY sequence")
+            .bind(workspace).bind(id).fetch_all(&mut *connection).await?;
+        let last = |event_type: &str, actor_kind: &str| {
+            thread
+                .iter()
+                .filter(|e| e.event_type == event_type && e.actor_kind == actor_kind)
+                .map(|e| e.sequence)
+                .max()
+                .unwrap_or(0)
+        };
+        let awaiting_agent = input.status == "open"
+            && last("follow_up_posted", "owner_ui") > last("version_published", "agent_mcp");
         Ok(InputDetail {
             input,
             version: InputVersion {
@@ -449,6 +486,8 @@ impl WorkspaceInput {
                 content_hash,
             },
             answers,
+            thread,
+            awaiting_agent,
         })
     }
     pub async fn list(
@@ -483,11 +522,16 @@ impl WorkspaceInput {
         .bind(&now)
         .fetch_one(&mut *tx)
         .await?;
+        let (awaiting_agent_count,): (i64,) = sqlx::query_as(AWAITING_AGENT_COUNT)
+            .bind(workspace)
+            .fetch_one(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(InputPage {
             inputs,
             next_cursor,
             pending_count,
+            awaiting_agent_count,
         })
     }
     pub async fn events(
@@ -687,6 +731,21 @@ impl WorkspaceInput {
                         input.show_at = normalize_show_at(request.show_at.as_deref())?;
                         new_generation = true;
                         ("snoozed", json!({"show_at":input.show_at}))
+                    }
+                    InputWrite::FollowUp(request) => {
+                        if !matches!(actor_kind, InputActorKind::OwnerUi) {
+                            return Err(InputError::Code("FORBIDDEN"));
+                        }
+                        if input.status != "open" {
+                            return Err(InputError::Code("INVALID_TRANSITION"));
+                        }
+                        if request.text.len() > MAX_ANSWER_BYTES {
+                            return Err(InputError::Code("PAYLOAD_TOO_LARGE"));
+                        }
+                        if request.text.trim().is_empty() {
+                            return Err(InputError::Code("SCHEMA_INVALID"));
+                        }
+                        ("follow_up_posted", json!({"text":request.text}))
                     }
                     InputWrite::Answer(request) => {
                         if !matches!(actor_kind, InputActorKind::OwnerUi) {
@@ -1581,6 +1640,12 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20261122090000_workspace_input_follow_up.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         let after: (i64, String, String, String) =
             sqlx::query_as("SELECT cursor,payload,request_hash,hash FROM workspace_input_events")
                 .fetch_one(&pool)
@@ -1723,6 +1788,12 @@ mod tests {
         .unwrap();
         sqlx::raw_sql(include_str!(
             "../../migrations/20261030120000_workspace_input_schedule.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20261122090000_workspace_input_follow_up.sql"
         ))
         .execute(&pool)
         .await
@@ -2034,6 +2105,155 @@ mod tests {
             content: content(),
             request_answer: true,
         })
+    }
+
+    fn follow_up(sequence: i64, text: &str) -> InputWrite {
+        InputWrite::FollowUp(FollowUpInput {
+            request_id: format!("follow-up-{sequence}"),
+            expected_sequence: sequence,
+            text: text.into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn follow_up_keeps_input_open_and_agent_edit_keeps_thread_and_bumps_version() {
+        let (pool, workspace) = setup().await;
+        let id = seed(&pool, workspace).await.input_id;
+        let write = |actor_kind, actor: &'static str, change| {
+            WorkspaceInput::write(&pool, workspace, Some(&id), actor_kind, actor, change)
+        };
+
+        // An agent cannot post a follow-up, and blank text is refused.
+        assert!(matches!(
+            write(InputActorKind::AgentMcp, "requester", follow_up(1, "x")).await,
+            Err(InputError::Code("FORBIDDEN"))
+        ));
+        assert!(matches!(
+            write(InputActorKind::OwnerUi, "owner", follow_up(1, "  ")).await,
+            Err(InputError::Code("SCHEMA_INVALID"))
+        ));
+
+        let receipt = write(
+            InputActorKind::OwnerUi,
+            "owner",
+            follow_up(1, "Do not act yet, I am checking"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.status, "open");
+        assert_eq!(receipt.version, 1);
+        assert_eq!(receipt.event.event_type, "follow_up_posted");
+        assert_eq!(receipt.event.actor_kind, "owner_ui");
+        assert_eq!(
+            receipt.event.payload["text"],
+            "Do not act yet, I am checking"
+        );
+
+        // Agents see the follow-up typed as a follow-up, never as an answer.
+        let detail = WorkspaceInput::detail(&pool, workspace, &id, None, false)
+            .await
+            .unwrap();
+        assert_eq!(detail.input.status, "open");
+        assert!(detail.answers.is_empty());
+        assert!(detail.awaiting_agent);
+        assert_eq!(detail.thread.len(), 1);
+        assert_eq!(detail.thread[0].event_type, "follow_up_posted");
+        let page = WorkspaceInput::list(&pool, workspace, Some("open"), "", 50)
+            .await
+            .unwrap();
+        assert_eq!(page.pending_count, 1);
+        assert_eq!(page.awaiting_agent_count, 1);
+        assert!(page.inputs[0].awaiting_agent);
+        let events = WorkspaceInput::events(&pool, workspace, Some(&id), 0, 100)
+            .await
+            .unwrap()
+            .events;
+        assert_eq!(events.last().unwrap().event_type, "follow_up_posted");
+
+        // A stale agent edit fails, so the agent must read the follow-up first.
+        let mut edit = match publish(1) {
+            InputWrite::Publish(r) => r,
+            _ => unreachable!(),
+        };
+        edit.request_answer = false;
+        assert!(matches!(
+            write(
+                InputActorKind::AgentMcp,
+                "requester",
+                InputWrite::Publish(edit.clone())
+            )
+            .await,
+            Err(InputError::Sequence(2))
+        ));
+        edit.expected_sequence = 2;
+        edit.request_id = "publish-2".into();
+        edit.content.title = "Adapted rollout".into();
+        let receipt = write(
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Publish(edit),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.status, "open");
+        assert_eq!(receipt.version, 2);
+
+        let detail = WorkspaceInput::detail(&pool, workspace, &id, None, false)
+            .await
+            .unwrap();
+        assert_eq!(detail.input.status, "open");
+        assert_eq!(detail.input.current_version, 2);
+        assert_eq!(detail.version.title, "Adapted rollout");
+        assert!(!detail.awaiting_agent);
+        let kinds: Vec<_> = detail
+            .thread
+            .iter()
+            .map(|e| e.event_type.as_str())
+            .collect();
+        assert_eq!(kinds, ["follow_up_posted", "version_published"]);
+        assert!(detail.thread[1].payload["content"].get("html").is_none());
+        assert_eq!(
+            detail.thread[1].payload["content"]["title"],
+            "Adapted rollout"
+        );
+        assert_eq!(
+            WorkspaceInput::list(&pool, workspace, Some("open"), "", 50)
+                .await
+                .unwrap()
+                .awaiting_agent_count,
+            0
+        );
+
+        // A second follow-up reopens the agent's turn; the ledger stays valid.
+        write(InputActorKind::OwnerUi, "owner", follow_up(3, "Now go"))
+            .await
+            .unwrap();
+        let detail = WorkspaceInput::detail(&pool, workspace, &id, None, false)
+            .await
+            .unwrap();
+        assert!(detail.awaiting_agent);
+        assert_eq!(detail.thread.len(), 3);
+        assert!(
+            WorkspaceInput::verify(&pool, workspace, &id)
+                .await
+                .unwrap()
+                .valid
+        );
+
+        // Follow-ups need an open Input.
+        write(InputActorKind::OwnerUi, "owner", answer(4, 2))
+            .await
+            .unwrap();
+        assert!(matches!(
+            write(InputActorKind::OwnerUi, "owner", follow_up(5, "late")).await,
+            Err(InputError::Code("INVALID_TRANSITION"))
+        ));
+        assert!(
+            !WorkspaceInput::detail(&pool, workspace, &id, None, false)
+                .await
+                .unwrap()
+                .awaiting_agent
+        );
     }
 
     #[tokio::test]

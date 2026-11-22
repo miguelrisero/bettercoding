@@ -1,6 +1,7 @@
 import { queryOptions, type QueryClient } from '@tanstack/react-query';
 import type {
   AnswerInput,
+  FollowUpInput,
   InputDetail,
   InputPage,
   WorkspaceInput,
@@ -30,7 +31,12 @@ export async function inputRequest<T>(
   workspace: string,
   hostId: string | null,
   suffix = '',
-  body?: AnswerInput | InputStatusWrite | SnoozeInput | { priority: string }
+  body?:
+    | AnswerInput
+    | FollowUpInput
+    | InputStatusWrite
+    | SnoozeInput
+    | { priority: string }
 ): Promise<T> {
   const response = await makeLocalApiRequest(
     `/api/workspaces/${workspace}/inputs${suffix}`,
@@ -88,6 +94,12 @@ export const inputsApi = {
     id: string,
     body: AnswerInput
   ) => inputRequest<InputReceipt>(workspace, host, `/${id}/answer`, body),
+  followUp: (
+    workspace: string,
+    host: string | null,
+    id: string,
+    body: FollowUpInput
+  ) => inputRequest<InputReceipt>(workspace, host, `/${id}/follow-up`, body),
   snooze: (
     workspace: string,
     host: string | null,
