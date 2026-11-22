@@ -156,6 +156,26 @@ describe('Input status actions', () => {
       })
     );
   });
+  it('posts a follow-up with explicit host routing and no answer', async () => {
+    const request = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ success: true, data: { sequence: 2 } }))
+    );
+    setLocalApiTransport({ request, openWebSocket: vi.fn() });
+    const body = {
+      request_id: 'follow-up',
+      expected_sequence: 1,
+      text: 'Do not act yet',
+    };
+    await inputsApi.followUp('workspace', 'remote-host', 'input', body);
+    expect(request).toHaveBeenCalledWith(
+      '/api/host/remote-host/workspaces/workspace/inputs/input/follow-up',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify(body) })
+    );
+    expect(
+      JSON.parse(String(request.mock.calls[0][1]?.body))
+    ).not.toHaveProperty('answer');
+  });
   it('loads every pending page for the panel and navigation', async () => {
     const request = vi
       .fn()

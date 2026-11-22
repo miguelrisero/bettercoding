@@ -28,19 +28,35 @@ export type SnoozeInput = { request_id: string, expected_sequence: number, show_
 
 export type AnswerInput = { request_id: string, expected_sequence: number, version: number, answer: InputAnswer, };
 
+export type FollowUpInput = { request_id: string, expected_sequence: number, text: string, };
+
 export type InputStatusWrite = { request_id: string, expected_sequence: number, status: string, reason: string | null, };
 
 export type WorkspaceInput = { show_at: string | null, priority: string, id: string, workspace_id: string, external_key: string, creator: string, current_version: number, status: string, sequence: number, created_at: string, updated_at: string, };
 
 export type InputVersion = { version: number, title: string, html: string | null, contract: InputContract, content_hash: string, };
 
-export type InputDetail = { input: WorkspaceInput, version: InputVersion, answers: Array<InputEvent>, };
+export type InputDetail = { input: WorkspaceInput, version: InputVersion, answers: Array<InputEvent>, 
+/**
+ * Owner `follow_up_posted` events and `version_published` events in sequence
+ * order. Version payloads omit `content.html`; read the version for the page.
+ */
+thread: Array<InputEvent>, 
+/**
+ * True while the Input is open and an owner follow-up is newer than the
+ * creator agent's last published version.
+ */
+awaiting_agent: boolean, };
 
 export type InputEvent = { cursor: number, id: string, workspace_id: string, input_id: string, sequence: number, actor_kind: string, actor: string, event_type: string, version: number, payload: JsonValue, request_id: string, request_hash: string, created_at: string, prev_hash: string, hash: string, };
 
 export type InputReceipt = { input_id: string, version: number, sequence: number, status: string, event: InputEvent, owner_url: string, };
 
-export type InputPage = { inputs: Array<InputDetail>, next_cursor: string | null, pending_count: number, };
+export type InputPage = { inputs: Array<InputDetail>, next_cursor: string | null, pending_count: number, 
+/**
+ * Open Inputs whose newest owner follow-up has no later agent version.
+ */
+awaiting_agent_count: number, };
 
 export type InputEventPage = { events: Array<InputEvent>, next_cursor: number, };
 

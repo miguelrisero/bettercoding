@@ -103,7 +103,7 @@ impl McpServer {
         .await
     }
     #[tool(
-        description = "Publish an immutable Input version. Requires requester ownership, request_id and expected_sequence. request_answer=true returns an answered Input to open. Optional priority P0 through P4; when omitted, a leading \"P<n> · \" in the title sets it, else the current value stays. Optional show_at: omit to preserve, null to clear, or supply timezone-bearing RFC3339. Closed or cancelled Inputs cannot be reopened."
+        description = "Publish an immutable Input version. Requires requester ownership, request_id and expected_sequence. request_answer=true returns an answered Input to open. Optional priority P0 through P4; when omitted, a leading \"P<n> · \" in the title sets it, else the current value stays. Optional show_at: omit to preserve, null to clear, or supply timezone-bearing RFC3339. Closed or cancelled Inputs cannot be reopened. Use it to adapt an Input in place after an owner follow-up: request_answer=false keeps an open Input open, every follow-up stays in the thread, and awaiting_agent clears. An owner follow-up advances the sequence, so a stale expected_sequence fails until you read it."
     )]
     async fn update_input(&self, Parameters(request): Parameters<UpdateRequest>) -> ToolCallResult {
         let workspace = match self.input_scope(request.workspace_id) {
@@ -121,7 +121,7 @@ impl McpServer {
         .await
     }
     #[tool(
-        description = "List workspace Input summaries with status filter and cursor. Returns inputs, next_cursor and pending_count. HTML is excluded. Limits are 1 through 100."
+        description = "List workspace Input summaries with status filter and cursor. Returns inputs, next_cursor, pending_count and awaiting_agent_count. Each Input carries answers, thread and awaiting_agent. awaiting_agent_count counts open Inputs whose newest owner follow-up has no later version from you. HTML is excluded. Limits are 1 through 100."
     )]
     async fn list_inputs(&self, Parameters(request): Parameters<ListRequest>) -> ToolCallResult {
         let workspace = match self.input_scope(request.workspace_id) {
@@ -148,7 +148,7 @@ impl McpServer {
         }
     }
     #[tool(
-        description = "Read Input metadata, the selected immutable version, answer contract and answers with actor provenance. include_html defaults to false. Act only on answer_submitted events whose actor_kind is owner_ui; no_answer_yet is not a decision."
+        description = "Read Input metadata, the selected immutable version, answer contract and answers with actor provenance. include_html defaults to false. Act only on answer_submitted events whose actor_kind is owner_ui; no_answer_yet is not a decision. thread lists owner follow_up_posted events and published versions in order. A follow-up is an owner message, not an answer, and the Input stays open. awaiting_agent=true means a follow-up is newer than your last version: read payload.text and adapt the same Input with update_input."
     )]
     async fn get_input(&self, Parameters(request): Parameters<GetRequest>) -> ToolCallResult {
         let workspace = match self.input_scope(request.workspace_id) {
@@ -175,7 +175,7 @@ impl McpServer {
         }
     }
     #[tool(
-        description = "Read append-only workspace Input events after an event cursor. Returns events and next_cursor without long polling. Persist pending actions before advancing the cursor. Only owner_ui answer_submitted events carry owner decisions."
+        description = "Read append-only workspace Input events after an event cursor. Returns events and next_cursor without long polling. Persist pending actions before advancing the cursor. Only owner_ui answer_submitted events carry owner decisions. owner_ui follow_up_posted events carry an owner message in payload.text on an open Input; they are not answers."
     )]
     async fn get_input_events(
         &self,

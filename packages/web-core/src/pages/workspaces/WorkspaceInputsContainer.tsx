@@ -11,6 +11,7 @@ import {
 } from '@phosphor-icons/react';
 import type {
   AnswerInput,
+  FollowUpInput,
   InputAnswer,
   InputDetail,
   SnoozeInput,
@@ -157,6 +158,9 @@ export function WorkspaceInputsContainer({
             {list.data?.pending_count ?? 0}
           </strong>{' '}
           pending
+          {!showDone &&
+            !!list.data?.awaiting_agent_count &&
+            ` · ${list.data.awaiting_agent_count} waiting for agent`}
         </span>
         <div className="flex gap-base" role="group" aria-label="Input view">
           {[false, true].map((isDone) => (
@@ -214,6 +218,9 @@ export function WorkspaceInputsContainer({
                 <PriorityBadge priority={detail.input.priority} />
                 <StatusDot status={detail.input.status} />
                 {inputStatusLabel[detail.input.status] ?? detail.input.status}
+                {detail.awaiting_agent && (
+                  <span className="text-brand">Waiting for agent</span>
+                )}
                 <Age date={detail.input.created_at} />
               </span>
             </button>
@@ -461,6 +468,24 @@ function InputViewer({
   const [reviewMessage, setReviewMessage] = useState<string | null>(null);
   const detail = useQuery(inputDetailQueryOptions(workspaceId, host, inputId));
   const input = detail.data?.input;
+  // The viewer outlives version remounts of the body, so an agent edit, even
+  // during a send, neither drops nor restores the message.
+  const followUpKey = `bc.input.follow-up:${host ?? 'local'}:${inputId}`;
+  const [followUpText, setFollowUpText] = useState(() => {
+    try {
+      return localStorage.getItem(followUpKey) ?? '';
+    } catch {
+      return '';
+    }
+  });
+  useEffect(() => {
+    try {
+      if (followUpText) localStorage.setItem(followUpKey, followUpText);
+      else localStorage.removeItem(followUpKey);
+    } catch {
+      /* The message stays in this page until it is sent. */
+    }
+  }, [followUpKey, followUpText]);
   return (
     <>
       <header className="flex items-start gap-base px-base md:px-double pt-base md:pt-double pb-base border-b shrink-0">
@@ -480,6 +505,9 @@ function InputViewer({
                 <StatusDot status={input.status} />
                 {inputStatusLabel[input.status] ?? input.status}
               </span>
+              {detail.data?.awaiting_agent && (
+                <span className="text-brand">Waiting for agent</span>
+              )}
               {['open', 'answered'].includes(input.status) ? (
                 <label className="inline-flex items-center gap-half">
                   Priority
@@ -632,6 +660,8 @@ function InputViewer({
           key={detail.data.version.version}
           workspaceId={workspaceId}
           detail={detail.data}
+          followUpText={followUpText}
+          setFollowUpText={setFollowUpText}
           onAnswered={onAnswered}
           onScheduled={onScheduled}
           refreshAfterConflict={async () => {
@@ -658,6 +688,8 @@ function InputViewer({
 function InputBody({
   workspaceId,
   detail,
+  followUpText,
+  setFollowUpText,
   refresh,
   refreshAfterConflict,
   onAnswered,
@@ -665,6 +697,8 @@ function InputBody({
 }: {
   workspaceId: string;
   detail: InputDetail;
+  followUpText: string;
+  setFollowUpText: (text: string) => void;
   refresh: () => Promise<void>;
   refreshAfterConflict: () => Promise<void>;
   onAnswered: () => Promise<void>;
@@ -698,6 +732,7 @@ function InputBody({
   const [busy, setBusy] = useState(false);
   const [undoSequence, setUndoSequence] = useState<number | null>(null);
   const answerRequest = useRef<AnswerInput | null>(null);
+  const followUpRequest = useRef<FollowUpInput | null>(null);
   const scheduleRequest = useRef<SnoozeInput | null>(null);
   const [scheduleTime, setScheduleTime] = useState(() =>
     toUtcControl(detail.input.show_at)
@@ -896,6 +931,32 @@ function InputBody({
       setBusy(false);
     }
     if (answered && mounted.current) await onAnswered();
+  };
+  const sendFollowUp = async () => {
+    setBusy(true);
+    setError(null);
+    const request = followUpRequest.current ?? {
+      request_id: crypto.randomUUID(),
+      expected_sequence: detail.input.sequence,
+      text: followUpText,
+    };
+    followUpRequest.current = request;
+    try {
+      await inputsApi.followUp(workspaceId, host, detail.input.id, request);
+      followUpRequest.current = null;
+      setFollowUpText('');
+      await refresh();
+    } catch (e) {
+      try {
+        if (await refreshInputAfterConflict(e, refreshAfterConflict))
+          followUpRequest.current = null;
+      } catch (refreshError) {
+        setError(String(refreshError));
+      }
+      setError(`${String(e)}. Your message stays saved.`);
+    } finally {
+      setBusy(false);
+    }
   };
   const status = async (undo: boolean) => {
     setBusy(true);
@@ -1218,6 +1279,80 @@ function InputBody({
               This Input is {detail.input.status}. Your answer stays in the
               ledger.
             </p>
+          )}
+          {detail.thread.length > 0 && (
+            <section aria-label="Follow-ups" className="space-y-half">
+              <h3 className="text-sm font-medium text-high">Follow-ups</h3>
+              <ol className="space-y-half">
+                {detail.thread.map((event) => {
+                  const text =
+                    event.event_type === 'follow_up_posted' &&
+                    event.payload &&
+                    typeof event.payload === 'object' &&
+                    !Array.isArray(event.payload)
+                      ? String(event.payload.text ?? '')
+                      : null;
+                  return (
+                    <li
+                      key={event.id}
+                      className="rounded-md border p-base text-sm space-y-half"
+                    >
+                      <p className="flex flex-wrap gap-x-half text-xs text-low">
+                        <span className="font-medium text-normal">
+                          {text !== null
+                            ? 'You'
+                            : event.actor_kind === 'agent_mcp'
+                              ? `Agent published version ${event.version}`
+                              : `Version ${event.version}`}
+                        </span>
+                        <Age date={event.created_at} />
+                      </p>
+                      {text !== null && (
+                        <p className="whitespace-pre-wrap break-words text-high">
+                          {text}
+                        </p>
+                      )}
+                    </li>
+                  );
+                })}
+              </ol>
+            </section>
+          )}
+          {detail.input.status === 'open' && (
+            <section aria-label="Follow-up" className="space-y-half">
+              <label className="block space-y-half">
+                <span className="block text-sm font-medium text-high">
+                  Message the agent
+                </span>
+                <textarea
+                  className={`block w-full min-h-20 rounded-md border bg-secondary p-base text-base text-high placeholder:text-low resize-y ${focusRing}`}
+                  placeholder="For example: do not act yet, I am checking"
+                  value={followUpText}
+                  onChange={(e) => {
+                    setFollowUpText(e.target.value);
+                    followUpRequest.current = null;
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key !== 'Enter' || !(e.metaKey || e.ctrlKey)) return;
+                    // This shortcut sends the message, never the answer.
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (!busy && followUpText.trim()) void sendFollowUp();
+                  }}
+                />
+              </label>
+              <button
+                className={quietButton}
+                disabled={busy || !followUpText.trim()}
+                onClick={() => void sendFollowUp()}
+              >
+                Send follow-up
+              </button>
+              <p className="text-xs text-low">
+                A follow-up does not answer. The Input stays open and the agent
+                can update it.
+              </p>
+            </section>
           )}
         </div>
         <div className="sticky bottom-0 bg-primary border-t p-base md:px-double space-y-base pb-[max(12px,env(safe-area-inset-bottom))]">

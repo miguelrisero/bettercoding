@@ -132,15 +132,35 @@ async fn answer(
         InputWrite::Answer(body),
     )
     .await?;
+    spawn_agent_notice(pool, workspace, &receipt);
+    Ok(Json(ApiResponse::success(receipt)))
+}
+async fn follow_up(
+    State(pool): State<SqlitePool>,
+    Path((workspace, id)): Path<(Uuid, String)>,
+    Json(body): Json<FollowUpInput>,
+) -> RouteResult<InputReceipt> {
+    let receipt = WorkspaceInput::write(
+        &pool,
+        workspace,
+        Some(&id),
+        InputActorKind::OwnerUi,
+        "owner",
+        InputWrite::FollowUp(body),
+    )
+    .await?;
+    spawn_agent_notice(pool, workspace, &receipt);
+    Ok(Json(ApiResponse::success(receipt)))
+}
+fn spawn_agent_notice(pool: SqlitePool, workspace: Uuid, receipt: &InputReceipt) {
     let event = receipt.event.clone();
     tokio::spawn(async move {
         let send_pool = pool.clone();
-        notify_answer(&pool, &event, |text| async move {
+        notify_agent(&pool, &event, |text| async move {
             send_text_to_cli_agent(&send_pool, workspace, &text).await
         })
         .await
     });
-    Ok(Json(ApiResponse::success(receipt)))
 }
 
 /// Longest owner text, in characters, that the answer notice carries.
@@ -154,20 +174,32 @@ enum AnswerDelivery {
     Failed,
 }
 
+fn notice_text(text: &str) -> String {
+    text.trim().chars().take(NOTICE_TEXT_CHARS).collect()
+}
+
 /// The line typed into the agent's prompt when the owner answers an Input.
 /// Control characters other than newline and tab become spaces, because the
 /// CLI send path refuses them.
 fn answer_notice(input_id: &str, title: &str, answer: &InputAnswer) -> String {
-    let text: String = answer
-        .text
-        .as_deref()
-        .unwrap_or("")
-        .trim()
-        .chars()
-        .take(NOTICE_TEXT_CHARS)
-        .collect();
+    let text = notice_text(answer.text.as_deref().unwrap_or(""));
     let choice = answer.choice_id.as_deref().unwrap_or("none");
-    format!("[BetterCoding Input answered] {input_id} \"{title}\" choice={choice} text={text}")
+    strip_controls(format!(
+        "[BetterCoding Input answered] {input_id} \"{title}\" choice={choice} text={text}"
+    ))
+}
+
+/// The line typed into the agent's prompt when the owner posts a follow-up.
+/// The Input stays open; the agent adapts it with update_input.
+fn follow_up_notice(input_id: &str, title: &str, text: &str) -> String {
+    let text = notice_text(text);
+    strip_controls(format!(
+        "[BetterCoding Input follow-up, not an answer; the Input stays open] {input_id} \"{title}\" text={text}"
+    ))
+}
+
+fn strip_controls(notice: String) -> String {
+    notice
         .chars()
         .map(|c| {
             if c.is_control() && c != '\n' && c != '\t' {
@@ -179,10 +211,10 @@ fn answer_notice(input_id: &str, title: &str, answer: &InputAnswer) -> String {
         .collect()
 }
 
-/// Push an owner answer into the workspace's running agent session. The
-/// answer is already stored, so every outcome is only logged: with no
-/// running agent the agent reads the event from the Input log later.
-async fn notify_answer<F, Fut>(pool: &SqlitePool, event: &InputEvent, send: F) -> AnswerDelivery
+/// Push an owner answer or follow-up into the workspace's running agent
+/// session. The event is already stored, so every outcome is only logged:
+/// with no running agent the agent reads the event from the Input log later.
+async fn notify_agent<F, Fut>(pool: &SqlitePool, event: &InputEvent, send: F) -> AnswerDelivery
 where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<SendCliTextResponse, ApiError>>,
@@ -201,24 +233,33 @@ where
     .await
     .map(|detail| detail.version.title)
     .unwrap_or_else(|error| {
-        tracing::warn!(input_id = %event.input_id, %error, "Input title lookup failed for the answer notice");
+        tracing::warn!(input_id = %event.input_id, %error, "Input title lookup failed for the agent notice");
         String::new()
     });
-    let answer: InputAnswer =
-        serde_json::from_value(event.payload["answer"].clone()).unwrap_or_default();
-    let notice = answer_notice(&event.input_id, &title, &answer);
-    let (workspace_id, input_id) = (event.workspace_id, &event.input_id);
+    let notice = if event.event_type == "follow_up_posted" {
+        follow_up_notice(
+            &event.input_id,
+            &title,
+            event.payload["text"].as_str().unwrap_or(""),
+        )
+    } else {
+        let answer: InputAnswer =
+            serde_json::from_value(event.payload["answer"].clone()).unwrap_or_default();
+        answer_notice(&event.input_id, &title, &answer)
+    };
+    let (workspace_id, input_id, event_type) =
+        (event.workspace_id, &event.input_id, &event.event_type);
     match send(notice).await {
         Ok(SendCliTextResponse { submitted }) => {
-            tracing::info!(%workspace_id, %input_id, submitted, "Delivered the Input answer to the workspace agent");
+            tracing::info!(%workspace_id, %input_id, %event_type, submitted, "Delivered the Input notice to the workspace agent");
             AnswerDelivery::Delivered
         }
         Err(ApiError::Conflict(_)) => {
-            tracing::info!(%workspace_id, %input_id, "No running agent for the Input answer; it stays in the event log");
+            tracing::info!(%workspace_id, %input_id, %event_type, "No running agent for the Input notice; the event stays in the log");
             AnswerDelivery::NoSession
         }
         Err(error) => {
-            tracing::warn!(%workspace_id, %input_id, %error, "Input answer delivery to the workspace agent failed");
+            tracing::warn!(%workspace_id, %input_id, %event_type, %error, "Input notice delivery to the workspace agent failed");
             AnswerDelivery::Failed
         }
     }
@@ -420,6 +461,10 @@ fn input_routes() -> Router<SqlitePool> {
             "/{input_id}/answer",
             post(answer).layer(DefaultBodyLimit::max(super::file_policy::MAX_INPUT_BYTES)),
         )
+        .route(
+            "/{input_id}/follow-up",
+            post(follow_up).layer(DefaultBodyLimit::max(super::file_policy::MAX_INPUT_BYTES)),
+        )
         .route("/{input_id}/priority", post(priority))
         .route("/{input_id}/snooze", post(snooze))
         .route("/{input_id}/close", post(close))
@@ -618,6 +663,12 @@ mod tests {
         .unwrap();
         sqlx::raw_sql(include_str!(
             "../../../../db/migrations/20261030120000_workspace_input_schedule.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../../db/migrations/20261122090000_workspace_input_follow_up.sql"
         ))
         .execute(&pool)
         .await
@@ -873,7 +924,7 @@ mod tests {
     async fn answer_notice_reaches_a_running_agent() {
         let (pool, event) = answered_event().await;
         let sent = std::sync::Mutex::new(None);
-        let outcome = notify_answer(&pool, &event, |text| {
+        let outcome = notify_agent(&pool, &event, |text| {
             *sent.lock().unwrap() = Some(text);
             async { Ok(SendCliTextResponse { submitted: true }) }
         })
@@ -891,7 +942,7 @@ mod tests {
     #[tokio::test]
     async fn no_answer_yet_does_not_wake_the_agent() {
         let (pool, event) = answer_event(serde_json::json!({})).await;
-        let outcome = notify_answer(&pool, &event, |_| async {
+        let outcome = notify_agent(&pool, &event, |_| async {
             panic!("no answer yet must not be sent")
         })
         .await;
@@ -901,7 +952,7 @@ mod tests {
     #[tokio::test]
     async fn answer_notice_without_a_running_agent_keeps_the_answer() {
         let (pool, event) = answered_event().await;
-        let outcome = notify_answer(&pool, &event, |_| async {
+        let outcome = notify_agent(&pool, &event, |_| async {
             Err(ApiError::Conflict("no agent".into()))
         })
         .await;
@@ -917,7 +968,7 @@ mod tests {
     #[tokio::test]
     async fn answer_notice_delivery_error_keeps_the_answer() {
         let (pool, event) = answered_event().await;
-        let outcome = notify_answer(&pool, &event, |_| async {
+        let outcome = notify_agent(&pool, &event, |_| async {
             Err(ApiError::BadGateway("tmux did not confirm".into()))
         })
         .await;
@@ -928,6 +979,58 @@ mod tests {
                 .unwrap();
         assert_eq!(detail.input.status, "answered");
         assert_eq!(detail.answers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn owner_follow_up_keeps_input_open_and_reaches_the_agent_as_a_follow_up() {
+        use serde_json::json;
+        let (app, workspace, pool) = test_app().await;
+        let root = format!("/api/workspaces/{workspace}/inputs");
+        let (_, _, created) = request(app.clone(), "POST", &format!("{root}/agent"), json!({
+            "request_id":"create", "expected_sequence":0,"external_key":"decision",
+            "content":{"title":"Decision","html":"<p>Choose</p>","contract":{"choices":[],"allow_text":true,"allow_no_answer_yet":false}}
+        })).await;
+        let id = created["data"]["input_id"].as_str().unwrap();
+        let url = format!("{root}/{id}/follow-up");
+        let body = json!({"request_id":"follow-up","expected_sequence":1,"text":"Do not act yet"});
+        let mut forged = body.clone();
+        forged["actor_kind"] = json!("agent_mcp");
+        assert_eq!(
+            request(app.clone(), "POST", &url, forged).await.0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let (status, _, receipt) = request(app.clone(), "POST", &url, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(receipt["data"]["status"], "open");
+        assert_eq!(receipt["data"]["version"], 1);
+        assert_eq!(receipt["data"]["event"]["actor_kind"], "owner_ui");
+        assert_eq!(receipt["data"]["event"]["event_type"], "follow_up_posted");
+        assert_eq!(request(app.clone(), "POST", &url, body).await.2, receipt);
+
+        let (_, _, list) = request(app.clone(), "GET", &root, json!(null)).await;
+        let listed = &list["data"]["inputs"][0];
+        assert_eq!(list["data"]["pending_count"], 1);
+        assert_eq!(list["data"]["awaiting_agent_count"], 1);
+        assert_eq!(listed["input"]["status"], "open");
+        assert_eq!(listed["awaiting_agent"], true);
+        assert_eq!(listed["answers"], json!([]));
+        assert_eq!(listed["thread"][0]["event_type"], "follow_up_posted");
+        assert_eq!(listed["thread"][0]["payload"]["text"], "Do not act yet");
+
+        let event: InputEvent = serde_json::from_value(receipt["data"]["event"].clone()).unwrap();
+        let sent = std::sync::Mutex::new(None);
+        let outcome = notify_agent(&pool, &event, |text| {
+            *sent.lock().unwrap() = Some(text);
+            async { Ok(SendCliTextResponse { submitted: true }) }
+        })
+        .await;
+        assert_eq!(outcome, AnswerDelivery::Delivered);
+        assert_eq!(
+            sent.into_inner().unwrap().unwrap(),
+            format!(
+                "[BetterCoding Input follow-up, not an answer; the Input stays open] {id} \"Decision\" text=Do not act yet"
+            )
+        );
     }
 
     #[test]
