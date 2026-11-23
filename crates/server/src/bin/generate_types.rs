@@ -18,6 +18,7 @@ fn generate_types_content() -> String {
         db::models::workspace_input::CreateInput::decl(),
         db::models::workspace_input::PublishInput::decl(),
         db::models::workspace_input::SnoozeInput::decl(),
+        db::models::workspace_input::AnswerDisposition::decl(),
         db::models::workspace_input::AnswerInput::decl(),
         db::models::workspace_input::FollowUpInput::decl(),
         db::models::workspace_input::InputStatusWrite::decl(),

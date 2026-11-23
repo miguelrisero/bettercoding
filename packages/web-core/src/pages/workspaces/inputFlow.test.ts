@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import type { InputDetail } from 'shared/types';
+import { TAP_SLOP_PX } from '@/shared/lib/terminalTouchGestures';
+import { validateInputAnswer } from './inputBridge';
 import {
   compareInputs,
   nextOpenInput,
+  readInputDraft,
   splitRecommended,
   inputNavigationIsCurrent,
+  inputSwipeStep,
 } from './inputFlow';
 
 const item = (
@@ -27,6 +31,60 @@ describe('Input flow', () => {
     expect(inputNavigationIsCurrent(3, 4, 'a', 'a')).toBe(false);
     expect(inputNavigationIsCurrent(3, 3, 'a', 'b')).toBe(false);
     expect(inputNavigationIsCurrent(3, 4, 'a', null)).toBe(false);
+  });
+  it('moves in both swipe directions and ignores taps and vertical gestures', () => {
+    expect(inputSwipeStep(-48, 5)).toBe(1);
+    expect(inputSwipeStep(48, 5)).toBe(-1);
+    expect(inputSwipeStep(TAP_SLOP_PX, 0)).toBeNull();
+    expect(inputSwipeStep(30, 60)).toBeNull();
+    expect(inputSwipeStep(30, 30)).toBeNull();
+  });
+  it('restores the old follow-up message into the reply without dropping the choice', () => {
+    const storage = new Map([
+      ['draft', JSON.stringify({ choice_id: 'ship', text: null })],
+      ['follow-up', 'Saved message'],
+    ]);
+    const reader = { getItem: (key: string) => storage.get(key) ?? null };
+    expect(readInputDraft(reader, 'draft', 'follow-up', true)).toEqual({
+      choice_id: 'ship',
+      text: 'Saved message',
+    });
+    expect(readInputDraft(reader, 'draft', 'follow-up', false)).toEqual({
+      choice_id: 'ship',
+      text: null,
+    });
+    storage.set(
+      'draft',
+      JSON.stringify({ choice_id: 'ship', text: 'Saved note' })
+    );
+    expect(readInputDraft(reader, 'draft', 'follow-up', true)).toEqual({
+      choice_id: 'ship',
+      text: 'Saved note',
+    });
+  });
+  it('accepts a reply in a legacy choice-only contract and preserves deferral rules', () => {
+    const contract = {
+      choices: [{ id: 'ship', label: 'Ship' }],
+      allow_text: false,
+      allow_no_answer_yet: false,
+    };
+    expect(validateInputAnswer({ text: 'More context' }, contract)).toBe(true);
+    expect(
+      validateInputAnswer({ choice_id: 'ship', text: 'Go' }, contract)
+    ).toBe(true);
+    expect(
+      validateInputAnswer(
+        { choice_id: 'other', text: 'More context' },
+        contract
+      )
+    ).toBe(false);
+    expect(validateInputAnswer({ text: ' ' }, contract)).toBe(false);
+    expect(
+      validateInputAnswer(
+        { text: ' ' },
+        { ...contract, allow_no_answer_yet: true }
+      )
+    ).toBe(true);
   });
   it('advances to the next open Input after the current one', () => {
     expect(nextOpenInput(list, item('a', 'answered'), 'priority')).toBe('c');

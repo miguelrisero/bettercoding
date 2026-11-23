@@ -15,6 +15,12 @@ fn required_nullable<'de, D: serde::Deserializer<'de>>(
 ) -> std::result::Result<Option<String>, D::Error> {
     Option::<String>::deserialize(deserializer)
 }
+fn serialize_allow_text<S: serde::Serializer>(
+    allow_text: &Option<bool>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_bool(allow_text.unwrap_or(true))
+}
 fn utc_string(time: DateTime<Utc>) -> String {
     time.to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
@@ -44,7 +50,10 @@ pub struct InputChoice {
 #[serde(deny_unknown_fields)]
 pub struct InputContract {
     pub choices: Vec<InputChoice>,
-    pub allow_text: bool,
+    // Always store a Boolean so older releases can still read new Inputs.
+    #[serde(default, serialize_with = "serialize_allow_text")]
+    #[ts(optional)]
+    pub allow_text: Option<bool>,
     pub allow_no_answer_yet: bool,
 }
 
@@ -115,6 +124,13 @@ pub struct SnoozeInput {
     pub show_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerDisposition {
+    Close,
+    KeepOpen,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AnswerInput {
@@ -124,6 +140,9 @@ pub struct AnswerInput {
     #[ts(type = "number")]
     pub version: i64,
     pub answer: InputAnswer,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub disposition: Option<AnswerDisposition>,
 }
 
 /// An owner message on an open Input. It records no answer and keeps the status open.
@@ -336,9 +355,7 @@ fn event_hash(event: &InputEvent) -> String {
 impl InputContract {
     fn validate(&self) -> Result<()> {
         let mut ids = std::collections::HashSet::new();
-        if self.choices.len() > 100
-            || (!self.allow_text && self.choices.is_empty() && !self.allow_no_answer_yet)
-        {
+        if self.choices.len() > 100 {
             return Err(InputError::Code("SCHEMA_INVALID"));
         }
         for choice in &self.choices {
@@ -361,7 +378,6 @@ impl InputContract {
             .choice_id
             .as_ref()
             .is_some_and(|id| !self.choices.iter().any(|c| &c.id == id))
-            || (answer.text.as_ref().is_some_and(|text| !text.is_empty()) && !self.allow_text)
         {
             return Err(InputError::Code("ANSWER_INVALID"));
         }
@@ -760,13 +776,21 @@ impl WorkspaceInput {
                         let (contract, hash): (String, String) = sqlx::query_as("SELECT contract,content_hash FROM workspace_input_versions WHERE workspace_id=? AND input_id=? AND version=?").bind(workspace).bind(id).bind(input.current_version).fetch_one(&mut *tx).await?;
                         let no_answer = serde_json::from_str::<InputContract>(&contract)?
                             .validate_answer(&request.answer)?;
-                        if !no_answer {
-                            input.status = "answered".into();
+                        let mut payload = json!({"answer":request.answer,"no_answer_yet":no_answer,"content_hash":hash});
+                        if let Some(disposition) = request.disposition {
+                            payload["disposition"] = json!(disposition);
                         }
-                        (
-                            "answer_submitted",
-                            json!({"answer":request.answer,"no_answer_yet":no_answer,"content_hash":hash}),
-                        )
+                        match request.disposition {
+                            Some(AnswerDisposition::Close) => {
+                                payload["prior_status"] =
+                                    json!(if no_answer { "open" } else { "answered" });
+                                input.status = "closed".into();
+                            }
+                            Some(AnswerDisposition::KeepOpen) => {}
+                            None if !no_answer => input.status = "answered".into(),
+                            None => {}
+                        }
+                        ("answer_submitted", payload)
                     }
                     InputWrite::Status(request) => {
                         if !["closed", "cancelled"].contains(&request.status.as_str())
@@ -797,7 +821,9 @@ impl WorkspaceInput {
                             return Err(InputError::Code("INVALID_TRANSITION"));
                         }
                         let last: InputEvent = sqlx::query_as("SELECT * FROM workspace_input_events WHERE workspace_id=? AND input_id=? ORDER BY sequence DESC LIMIT 1").bind(workspace).bind(id).fetch_one(&mut *tx).await?;
-                        if last.event_type != "closed"
+                        let closed_by_answer = last.event_type == "answer_submitted"
+                            && last.payload["disposition"] == json!(AnswerDisposition::Close);
+                        if (last.event_type != "closed" && !closed_by_answer)
                             || last.actor_kind != "owner_ui"
                             || last.actor != actor
                         {
@@ -1252,6 +1278,7 @@ mod tests {
                 expected_sequence: 1,
                 version: 1,
                 answer: InputAnswer::default(),
+                disposition: None,
             }),
         )
         .await
@@ -2050,7 +2077,7 @@ mod tests {
                     id: "ship".into(),
                     label: "Ship".into(),
                 }],
-                allow_text: true,
+                allow_text: Some(true),
                 allow_no_answer_yet: true,
             },
         }
@@ -2086,6 +2113,7 @@ mod tests {
                 choice_id: Some("ship".into()),
                 text: Some("Go".into()),
             },
+            disposition: None,
         })
     }
     fn status(sequence: i64, status: &str) -> InputWrite {
@@ -2697,6 +2725,7 @@ mod tests {
             expected_sequence: 1,
             version: 1,
             answer: InputAnswer::default(),
+            disposition: None,
         });
         let result = WorkspaceInput::write(
             &pool,
@@ -2718,7 +2747,7 @@ mod tests {
         assert_eq!(pending.inputs[0].input.id, created.input_id);
         let contract = InputContract {
             choices: vec![],
-            allow_text: false,
+            allow_text: Some(false),
             allow_no_answer_yet: false,
         };
         assert!(contract.validate_answer(&InputAnswer::default()).is_err());
@@ -2730,15 +2759,234 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_contract_and_answer_serialization_stays_compatible() {
+        for allow_text in [true, false] {
+            let contract =
+                json!({"choices":[],"allow_text":allow_text,"allow_no_answer_yet":false});
+            let legacy: InputContract = serde_json::from_value(contract.clone()).unwrap();
+            assert_eq!(serde_json::to_value(legacy).unwrap(), contract);
+        }
+
+        let (pool, workspace) = setup().await;
+        let contract = json!({"choices":[],"allow_no_answer_yet":false});
+        let text_only: InputContract = serde_json::from_value(contract.clone()).unwrap();
+        let InputWrite::Create(mut request) = create() else {
+            unreachable!()
+        };
+        request.content.contract = text_only;
+        let created = WorkspaceInput::write(
+            &pool,
+            workspace,
+            None,
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Create(request.clone()),
+        )
+        .await
+        .unwrap();
+        let stored: (String,) = sqlx::query_as("SELECT contract FROM workspace_input_versions WHERE workspace_id=? AND input_id=? AND version=1")
+            .bind(workspace)
+            .bind(&created.input_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&stored.0).unwrap(),
+            json!({"choices":[],"allow_text":true,"allow_no_answer_yet":false})
+        );
+
+        let mut explicit_null = contract;
+        explicit_null["allow_text"] = Value::Null;
+        request.content.contract = serde_json::from_value(explicit_null).unwrap();
+        let replay = WorkspaceInput::write(
+            &pool,
+            workspace,
+            None,
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Create(request),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.event.id, created.event.id);
+
+        let answer = json!({
+            "request_id":"answer", "expected_sequence":1, "version":1,
+            "answer":{"choice_id":null,"text":"Go"}
+        });
+        let body: AnswerInput = serde_json::from_value(answer.clone()).unwrap();
+        let legacy_hash = digest(&canonical(&json!({
+            "input_id":created.input_id, "actor_kind":"owner_ui", "actor":"owner",
+            "write":{"operation":"answer","body":answer}
+        })));
+        let submitted = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::OwnerUi,
+            "owner",
+            InputWrite::Answer(body.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(submitted.status, "answered");
+        assert_eq!(submitted.event.request_hash, legacy_hash);
+        let replay = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::OwnerUi,
+            "owner",
+            InputWrite::Answer(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.event.id, submitted.event.id);
+    }
+
+    #[tokio::test]
+    async fn explicit_answers_keep_or_close_the_input_and_preserve_the_note() {
+        let (pool, workspace) = setup().await;
+        let InputWrite::Create(mut request) = create() else {
+            unreachable!()
+        };
+        request.content.contract.allow_text = Some(false);
+        let created = WorkspaceInput::write(
+            &pool,
+            workspace,
+            None,
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Create(request),
+        )
+        .await
+        .unwrap();
+        let id = &created.input_id;
+        let write = |disposition, expected_sequence, request_id: &str, choice_id, text: &str| {
+            InputWrite::Answer(AnswerInput {
+                request_id: request_id.into(),
+                expected_sequence,
+                version: 1,
+                answer: InputAnswer {
+                    choice_id,
+                    text: Some(text.into()),
+                },
+                disposition: Some(disposition),
+            })
+        };
+        let keep = || write(AnswerDisposition::KeepOpen, 1, "keep", None, "More context");
+        let kept = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(id),
+            InputActorKind::OwnerUi,
+            "owner",
+            keep(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(kept.status, "open");
+        assert_eq!(kept.event.event_type, "answer_submitted");
+        assert_eq!(kept.event.payload["no_answer_yet"], false);
+        assert_eq!(kept.event.payload["disposition"], "keep_open");
+        let pending = WorkspaceInput::list(&pool, workspace, Some("open"), "", 50)
+            .await
+            .unwrap();
+        assert_eq!(pending.pending_count, 1);
+        assert_eq!(
+            pending.inputs[0].answers[0].payload["answer"]["text"],
+            "More context"
+        );
+
+        let close = || {
+            write(
+                AnswerDisposition::Close,
+                2,
+                "submit-close",
+                Some("ship".into()),
+                "Go",
+            )
+        };
+        let closed = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(id),
+            InputActorKind::OwnerUi,
+            "owner",
+            close(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(closed.status, "closed");
+        assert_eq!(closed.event.event_type, "answer_submitted");
+        assert_eq!(
+            closed.event.payload["answer"],
+            json!({"choice_id":"ship","text":"Go"})
+        );
+        let replayed = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(id),
+            InputActorKind::OwnerUi,
+            "owner",
+            close(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replayed.event.id, closed.event.id);
+        assert!(matches!(
+            WorkspaceInput::write(
+                &pool,
+                workspace,
+                Some(id),
+                InputActorKind::OwnerUi,
+                "owner",
+                write(
+                    AnswerDisposition::KeepOpen,
+                    2,
+                    "submit-close",
+                    Some("ship".into()),
+                    "Go"
+                ),
+            )
+            .await,
+            Err(InputError::Code("IDEMPOTENCY_CONFLICT"))
+        ));
+        let pending = WorkspaceInput::list(&pool, workspace, Some("open"), "", 50)
+            .await
+            .unwrap();
+        assert_eq!(pending.pending_count, 0);
+        let undone = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(id),
+            InputActorKind::OwnerUi,
+            "owner",
+            InputWrite::Undo(InputStatusWrite {
+                request_id: "undo-answer-close".into(),
+                expected_sequence: closed.sequence,
+                status: "closed".into(),
+                reason: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(undone.status, "answered");
+        let detail = WorkspaceInput::detail(&pool, workspace, id, None, false)
+            .await
+            .unwrap();
+        assert_eq!(detail.answers.len(), 2);
         assert!(
-            contract
-                .validate_answer(&InputAnswer {
-                    choice_id: None,
-                    text: Some("yes".into())
-                })
-                .is_err()
+            WorkspaceInput::verify(&pool, workspace, id)
+                .await
+                .unwrap()
+                .valid
         );
     }
+
     #[tokio::test]
     async fn workspace_deletion_retains_verifiable_history_and_refuses_every_write() {
         let (pool, workspace) = setup().await;

@@ -37,12 +37,7 @@ export function validateInputAnswer(
       !contract.choices.some((choice) => choice.id === value.choice_id))
   )
     return false;
-  if (
-    value.text != null &&
-    (typeof value.text !== 'string' ||
-      (value.text !== '' && !contract.allow_text))
-  )
-    return false;
+  if (value.text != null && typeof value.text !== 'string') return false;
   if (new TextEncoder().encode(JSON.stringify(value)).length > 256 * 1024)
     return false;
   return (

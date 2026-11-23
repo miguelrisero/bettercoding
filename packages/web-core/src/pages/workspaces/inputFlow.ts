@@ -1,5 +1,6 @@
-import type { InputDetail } from 'shared/types';
+import type { InputAnswer, InputDetail } from 'shared/types';
 import type { InputSort } from '@/shared/stores/useUiPreferencesStore';
+import { TAP_SLOP_PX } from '@/shared/lib/terminalTouchGestures';
 
 const RECOMMENDED = /\s*\(recommended\)\s*$/i;
 
@@ -57,4 +58,24 @@ export function inputNavigationIsCurrent(
   selectedId: string | null
 ): boolean {
   return started === current && selectedId === fromId;
+}
+
+// Use the app's touch slop so taps and small movements cannot change cards.
+export function inputSwipeStep(dx: number, dy: number): -1 | 1 | null {
+  if (Math.abs(dx) <= TAP_SLOP_PX || Math.abs(dx) <= Math.abs(dy)) return null;
+  return dx < 0 ? 1 : -1;
+}
+
+export function readInputDraft(
+  storage: Pick<Storage, 'getItem'>,
+  key: string,
+  followUpKey: string,
+  useSavedMessage: boolean
+): InputAnswer {
+  const saved: InputAnswer | null = JSON.parse(storage.getItem(key) ?? 'null');
+  return {
+    choice_id: saved?.choice_id ?? null,
+    text:
+      saved?.text || (useSavedMessage ? storage.getItem(followUpKey) : null),
+  };
 }

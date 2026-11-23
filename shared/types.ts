@@ -6,7 +6,7 @@
 
 export type InputChoice = { id: string, label: string, };
 
-export type InputContract = { choices: Array<InputChoice>, allow_text: boolean, allow_no_answer_yet: boolean, };
+export type InputContract = { choices: Array<InputChoice>, allow_text?: boolean, allow_no_answer_yet: boolean, };
 
 export type InputAnswer = { choice_id: string | null, text: string | null, };
 
@@ -26,7 +26,9 @@ show_at?: string | null, priority?: string | null, request_id: string, expected_
 
 export type SnoozeInput = { request_id: string, expected_sequence: number, show_at: string | null, };
 
-export type AnswerInput = { request_id: string, expected_sequence: number, version: number, answer: InputAnswer, };
+export type AnswerDisposition = "close" | "keep_open";
+
+export type AnswerInput = { request_id: string, expected_sequence: number, version: number, answer: InputAnswer, disposition?: AnswerDisposition, };
 
 export type FollowUpInput = { request_id: string, expected_sequence: number, text: string, };
 
