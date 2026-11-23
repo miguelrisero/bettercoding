@@ -71,7 +71,7 @@ async fn stdio_session_prompt_returns_started_for_the_owned_executor() {
     let agent = root.join("bin/claude");
     fs::write(
         &agent,
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" > \"$BC_TEST_MARKER.pid\"\nIFS= read -r initialize\nIFS= read -r permissions\nIFS= read -r prompt\nprintf '%s\\n' \"$prompt\" > \"$BC_TEST_MARKER\"\ni=0\nwhile [ \"$i\" -lt 300 ]; do /bin/sleep 0.1; i=$((i + 1)); done\n",
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" > \"$BC_TEST_MARKER.pid\"\nprintf '%s\\n' \"$@\" > \"$BC_TEST_MARKER.args\"\nIFS= read -r initialize\nIFS= read -r permissions\nIFS= read -r prompt\nprintf '%s\\n' \"$prompt\" > \"$BC_TEST_MARKER\"\ni=0\nwhile [ \"$i\" -lt 300 ]; do /bin/sleep 0.1; i=$((i + 1)); done\n",
     )
     .unwrap();
     // Headless Claude uses npx. This fixed shim never invokes a package manager.
@@ -240,7 +240,7 @@ async fn stdio_session_prompt_returns_started_for_the_owned_executor() {
         let mut input = mcp.stdin.take().unwrap();
         let mut output = BufReader::new(mcp.stdout.take().unwrap());
         tokio::time::timeout(Duration::from_secs(20), async {
-            rpc(
+            let initialize = rpc(
                 &mut input,
                 &mut output,
                 json!({
@@ -250,6 +250,8 @@ async fn stdio_session_prompt_returns_started_for_the_owned_executor() {
                 }),
             )
             .await;
+            let instructions = initialize["instructions"].as_str().unwrap();
+            assert!(instructions.ends_with(executors::bettercoding_skill::SKILL));
             input
                 .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
                 .await
@@ -299,6 +301,18 @@ async fn stdio_session_prompt_returns_started_for_the_owned_executor() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             };
             assert_eq!(delivered["message"]["content"], "fixture prompt");
+            let args = fs::read_to_string(marker.with_extension("args")).unwrap();
+            let args: Vec<_> = args.lines().collect();
+            let plugin_dir = root.join("data/bundled-plugins/bettercoding");
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--plugin-dir", plugin_dir.to_str().unwrap()]),
+                "{args:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(plugin_dir.join("skills/operate/SKILL.md")).unwrap(),
+                executors::bettercoding_skill::SKILL
+            );
             let pid: u32 = fs::read_to_string(marker.with_extension("pid"))
                 .unwrap()
                 .trim()

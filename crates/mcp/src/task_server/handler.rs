@@ -1,3 +1,4 @@
+use executors::bettercoding_skill::SKILL;
 use rmcp::{
     ServerHandler,
     model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo},
@@ -26,9 +27,10 @@ impl ServerHandler for McpServer {
             }
         };
         let mut instruction = format!(
-            "{} Use list/read tools first when you need IDs or current state. TOOLS: {}.",
+            "{} Use list/read tools first when you need IDs or current state. TOOLS: {}.\n\n{}",
             preamble,
-            tool_names.join(", ")
+            tool_names.join(", "),
+            SKILL,
         );
         if self.context.is_some() {
             instruction = format!(

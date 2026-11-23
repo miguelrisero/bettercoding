@@ -37,7 +37,8 @@ use self::{
 };
 use crate::{
     approvals::ExecutorApprovalService,
-    command::{CmdOverrides, CommandBuildError, CommandBuilder, CommandParts, apply_overrides},
+    bettercoding_skill::claude_plugin_args,
+    command::{CmdOverrides, CommandBuilder, CommandParts, apply_overrides},
     env::ExecutionEnv,
     executors::{
         AppendPrompt, AvailabilityInfo, BaseCodingAgent, ExecutorError, SpawnedChild,
@@ -282,7 +283,7 @@ pub struct ClaudeCode {
 }
 
 impl ClaudeCode {
-    async fn build_command_builder(&self) -> Result<CommandBuilder, CommandBuildError> {
+    fn build_command_builder(&self) -> Result<CommandBuilder, ExecutorError> {
         // If base_command_override is provided and claude_code_router is also set, log a warning
         if self.cmd.base_command_override.is_some() && self.claude_code_router.is_some() {
             tracing::warn!(
@@ -292,7 +293,11 @@ impl ClaudeCode {
 
         let mut builder =
             CommandBuilder::new(base_command(self.claude_code_router.unwrap_or(false)))
-                .params(["-p"]);
+                .params(["-p"])
+                .extend_params(
+                    claude_plugin_args(&workspace_utils::assets::asset_dir())
+                        .map_err(ExecutorError::Io)?,
+                );
 
         let plan = self.plan.unwrap_or(false);
         let approvals = self.approvals.unwrap_or(false);
@@ -330,7 +335,7 @@ impl ClaudeCode {
             "--replay-user-messages",
         ]);
 
-        apply_overrides(builder, &self.cmd)
+        Ok(apply_overrides(builder, &self.cmd)?)
     }
 
     pub fn permission_mode(&self) -> PermissionMode {
@@ -858,7 +863,7 @@ impl StandardCodingAgentExecutor for ClaudeCode {
         prompt: &str,
         env: &ExecutionEnv,
     ) -> Result<SpawnedChild, ExecutorError> {
-        let command_builder = self.build_command_builder().await?;
+        let command_builder = self.build_command_builder()?;
         let command_parts = command_builder.build_initial()?;
         self.spawn_internal(current_dir, prompt, command_parts, env)
             .await
@@ -872,7 +877,7 @@ impl StandardCodingAgentExecutor for ClaudeCode {
         reset_to_message_id: Option<&str>,
         env: &ExecutionEnv,
     ) -> Result<SpawnedChild, ExecutorError> {
-        let command_builder = self.build_command_builder().await?;
+        let command_builder = self.build_command_builder()?;
 
         let mut args = vec!["--resume".to_string(), session_id.to_string()];
 
