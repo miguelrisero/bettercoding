@@ -245,7 +245,11 @@ where
     } else {
         let answer: InputAnswer =
             serde_json::from_value(event.payload["answer"].clone()).unwrap_or_default();
-        answer_notice(&event.input_id, &title, &answer)
+        let mut notice = answer_notice(&event.input_id, &title, &answer);
+        if event.payload["disposition"] == "keep_open" {
+            notice.push_str("\nThe owner chose Submit and keep. Leave this Input open.");
+        }
+        notice
     };
     let (workspace_id, input_id, event_type) =
         (event.workspace_id, &event.input_id, &event.event_type);
@@ -894,10 +898,13 @@ mod tests {
     }
 
     async fn answered_event() -> (SqlitePool, InputEvent) {
-        answer_event(serde_json::json!({"choice_id":"yes","text":"go"})).await
+        answer_event(serde_json::json!({"choice_id":"yes","text":"go"}), None).await
     }
 
-    async fn answer_event(answer: serde_json::Value) -> (SqlitePool, InputEvent) {
+    async fn answer_event(
+        answer: serde_json::Value,
+        disposition: Option<&str>,
+    ) -> (SqlitePool, InputEvent) {
         use serde_json::json;
         let (app, workspace, pool) = test_app().await;
         let root = format!("/api/workspaces/{workspace}/inputs");
@@ -906,13 +913,12 @@ mod tests {
             "content":{"title":"Ship it?","html":"<p>Choose</p>","contract":{"choices":[{"id":"yes","label":"Yes"}],"allow_text":true,"allow_no_answer_yet":true}}
         })).await;
         let id = created["data"]["input_id"].as_str().unwrap().to_string();
-        let (status, _, answer) = request(
-            app,
-            "POST",
-            &format!("{root}/{id}/answer"),
-            json!({"request_id":"answer","expected_sequence":1,"version":1,"answer":answer}),
-        )
-        .await;
+        let mut body =
+            json!({"request_id":"answer","expected_sequence":1,"version":1,"answer":answer});
+        if let Some(disposition) = disposition {
+            body["disposition"] = json!(disposition);
+        }
+        let (status, _, answer) = request(app, "POST", &format!("{root}/{id}/answer"), body).await;
         assert_eq!(status, StatusCode::OK, "{answer}");
         (
             pool,
@@ -941,7 +947,36 @@ mod tests {
 
     #[tokio::test]
     async fn no_answer_yet_does_not_wake_the_agent() {
-        let (pool, event) = answer_event(serde_json::json!({})).await;
+        let (pool, event) = answer_event(serde_json::json!({}), None).await;
+        let outcome = notify_agent(&pool, &event, |_| async {
+            panic!("no answer yet must not be sent")
+        })
+        .await;
+        assert_eq!(outcome, AnswerDelivery::Skipped);
+    }
+
+    #[tokio::test]
+    async fn kept_answer_tells_the_agent_to_leave_the_input_open() {
+        let (pool, event) = answer_event(
+            serde_json::json!({"text":"more context"}),
+            Some("keep_open"),
+        )
+        .await;
+        assert_eq!(event.payload["status"], "open");
+        let outcome = notify_agent(&pool, &event, |text| {
+            assert!(text.contains("text=more context"));
+            assert!(text.contains("The owner chose Submit and keep. Leave this Input open."));
+            async { Ok(SendCliTextResponse { submitted: true }) }
+        })
+        .await;
+        assert_eq!(outcome, AnswerDelivery::Delivered);
+    }
+
+    #[tokio::test]
+    async fn explicit_close_with_no_answer_still_skips_the_agent_notice() {
+        let (pool, event) = answer_event(serde_json::json!({}), Some("close")).await;
+        assert_eq!(event.payload["status"], "closed");
+        assert_eq!(event.payload["no_answer_yet"], true);
         let outcome = notify_agent(&pool, &event, |_| async {
             panic!("no answer yet must not be sent")
         })

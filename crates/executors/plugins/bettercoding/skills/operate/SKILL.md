@@ -30,7 +30,7 @@ HTML, and answer contract inside `content`. Use exactly one
 - **Decision** asks the owner to choose an action. Give each option a stable,
   distinct `id` and a `label` that matches the option in the HTML. Describe
   what happens if the owner defers when you offer that option.
-- Set `allow_text` when the owner can answer in free text. Set
+- The owner can type a reply with or without a choice. Set
   `allow_no_answer_yet` when the owner can explicitly defer. A deferral never
   authorizes an action. Keep secrets out of Inputs.
 
@@ -47,7 +47,6 @@ Use this example to build the result arguments for `create_input`.
     "html": "<meta name=\"output-kind\" content=\"result\"><meta name=\"owner-class\" content=\"owner-report\"><p>Checkout passed in the test environment.</p>",
     "contract": {
       "choices": [{"id": "seen", "label": "Seen"}],
-      "allow_text": false,
       "allow_no_answer_yet": false
     }
   }
@@ -71,11 +70,13 @@ not grant approval.
    Read `payload.answer.choice_id` or `payload.answer.text`. A
    `follow_up_posted` event carries a message in `payload.text` and leaves
    the Input open.
-5. Close an answered Input after handling its answer. Call `set_input_status`
-   with `input_id`, `status: "closed"`, a new `request_id`, and
-   `expected_sequence` from the latest `get_input`. Supply a short `reason`.
-   Check the returned status. On a sequence conflict, reread and check the
-   state before retrying.
+5. Leave an Input open when the owner answers with
+   `payload.disposition: "keep_open"`. The owner can close it from the card.
+   For a legacy answer, close the Input after handling the answer if its
+   status is still `answered`. Call `set_input_status` with `input_id`,
+   `status: "closed"`, a new `request_id`, and `expected_sequence` from the
+   latest `get_input`. Supply a short `reason`. Check the returned status.
+   On a sequence conflict, reread and check the state before retrying.
 6. Never call `update_input`. To replace content, close the old Input with a
    reason that identifies its replacement, then create a new Input with a
    fresh `external_key` and `request_id`.

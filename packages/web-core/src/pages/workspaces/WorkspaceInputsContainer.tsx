@@ -7,15 +7,27 @@ import {
   CaretLeftIcon,
   CaretRightIcon,
   CheckIcon,
+  DotsThreeIcon,
   XIcon,
 } from '@phosphor-icons/react';
 import type {
+  AnswerDisposition,
   AnswerInput,
-  FollowUpInput,
   InputAnswer,
   InputDetail,
   SnoozeInput,
 } from 'shared/types';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@bettercoding/ui/components/Dropdown';
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@bettercoding/ui/components/Popover';
 import { useUiPreferencesStore } from '@/shared/stores/useUiPreferencesStore';
 import { useHostId } from '@/shared/providers/HostIdProvider';
 import { useVisualViewportGeometry } from '@/shared/hooks/useVisualViewportGeometry';
@@ -46,11 +58,16 @@ import {
   setInputSchedule,
 } from './inputsApi';
 import {
+  availablePriorInputDraft,
   compareInputs,
+  consumeInputDraft,
   inputStatusLabel,
   inputNavigationIsCurrent,
+  inputSwipeStep,
   nextOpenInput,
+  readInputDraft,
   splitRecommended,
+  type PriorInputDraft,
 } from './inputFlow';
 
 import { fromUtcControl, toUtcControl } from './inputSchedule';
@@ -258,6 +275,7 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
   const [done, setDone] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const content = useRef<HTMLDivElement>(null);
+  const drafts = useRef(new Map<string, InputAnswer>()).current;
   // Bumped whenever the owner closes or moves, so a late answer cannot advance.
   const session = useRef(0);
   useEffect(() => {
@@ -374,6 +392,7 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
               key={`${host}:${workspaceId}:${selected}`}
               workspaceId={workspaceId}
               inputId={selected}
+              drafts={drafts}
               notice={notice}
               position={
                 position < 0
@@ -390,7 +409,7 @@ export function WorkspaceInputViewer({ workspaceId }: { workspaceId: string }) {
                         ),
                     }
               }
-              onAnswered={() => advance(selected)}
+              onClosed={() => advance(selected)}
               onScheduled={() => advance(selected, 'Input scheduled')}
             />
           ) : (
@@ -445,20 +464,22 @@ function InputsDone() {
 function InputViewer({
   workspaceId,
   inputId,
+  drafts,
   notice,
   position,
-  onAnswered,
+  onClosed,
   onScheduled,
 }: {
   workspaceId: string;
   inputId: string;
+  drafts: Map<string, InputAnswer>;
   notice: string | null;
   position: {
     index: number;
     total: number;
     step: (delta: number) => void;
   } | null;
-  onAnswered: () => Promise<void>;
+  onClosed: () => Promise<void>;
   onScheduled: () => Promise<void>;
 }) {
   const host = useHostId();
@@ -466,29 +487,66 @@ function InputViewer({
   const [priorityBusy, setPriorityBusy] = useState(false);
   const [priorityError, setPriorityError] = useState<string | null>(null);
   const [reviewMessage, setReviewMessage] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const actionPending = useRef(false);
+  const touchStart = useRef<{ id: number; x: number; y: number } | null>(null);
   const detail = useQuery(inputDetailQueryOptions(workspaceId, host, inputId));
   const input = detail.data?.input;
-  // The viewer outlives version remounts of the body, so an agent edit, even
-  // during a send, neither drops nor restores the message.
-  const followUpKey = `bc.input.follow-up:${host ?? 'local'}:${inputId}`;
-  const [followUpText, setFollowUpText] = useState(() => {
-    try {
-      return localStorage.getItem(followUpKey) ?? '';
-    } catch {
-      return '';
-    }
-  });
-  useEffect(() => {
-    try {
-      if (followUpText) localStorage.setItem(followUpKey, followUpText);
-      else localStorage.removeItem(followUpKey);
-    } catch {
-      /* The message stays in this page until it is sent. */
-    }
-  }, [followUpKey, followUpText]);
+  const step = (delta: number) => {
+    if (!actionPending.current && position && position.total > 1)
+      position.step(delta);
+  };
   return (
-    <>
-      <header className="flex items-start gap-base px-base md:px-double pt-base md:pt-double pb-base border-b shrink-0">
+    <div
+      className="flex min-h-0 flex-1 flex-col"
+      onTouchStart={(event) => {
+        touchStart.current = null;
+        if (
+          !position ||
+          position.total < 2 ||
+          actionPending.current ||
+          event.touches.length !== 1 ||
+          !(event.target instanceof Element) ||
+          !event.currentTarget.contains(event.target) ||
+          event.target.closest(
+            'a, button, input, label, select, textarea, [contenteditable], [role="menu"]'
+          )
+        )
+          return;
+        const touch = event.touches[0];
+        touchStart.current = {
+          id: touch.identifier,
+          x: touch.clientX,
+          y: touch.clientY,
+        };
+      }}
+      onTouchMove={(event) => {
+        const start = touchStart.current;
+        const touch = event.touches[0];
+        if (
+          start &&
+          touch &&
+          inputSwipeStep(touch.clientY - start.y, touch.clientX - start.x)
+        )
+          touchStart.current = null;
+      }}
+      onTouchEnd={(event) => {
+        const start = touchStart.current;
+        touchStart.current = null;
+        const touch = event.changedTouches[0];
+        if (!start || touch?.identifier !== start.id) return;
+        if (window.getSelection()?.isCollapsed === false) return;
+        const delta = inputSwipeStep(
+          touch.clientX - start.x,
+          touch.clientY - start.y
+        );
+        if (delta !== null) step(delta);
+      }}
+      onTouchCancel={() => {
+        touchStart.current = null;
+      }}
+    >
+      <header className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-base px-base md:flex md:px-double pt-base md:pt-double pb-base border-b shrink-0">
         <Dialog.Close aria-label="Close" className={cn(iconButton, '-ml-1')}>
           <XIcon className="size-5" />
         </Dialog.Close>
@@ -563,11 +621,6 @@ function InputViewer({
                 </span>
               )}
               <Age date={input.created_at} />
-              {position && (
-                <span className="md:hidden tabular-nums">
-                  {position.index + 1} of {position.total}
-                </span>
-              )}
               {input.current_version > 1 && (
                 <span>Version {detail.data?.version.version}</span>
               )}
@@ -580,29 +633,34 @@ function InputViewer({
             </div>
           )}
         </div>
-        <div className="flex items-center shrink-0">
+        <div className="contents md:flex md:items-center md:shrink-0">
           {position && (
             <nav
               aria-label="Open Inputs"
-              className="hidden md:flex items-center"
+              className="col-span-full row-start-2 flex items-center rounded-md bg-secondary md:bg-transparent"
             >
               {position.total > 1 && (
                 <button
                   aria-label="Previous open Input"
                   className={iconButton}
-                  onClick={() => position.step(-1)}
+                  disabled={busy}
+                  onClick={() => step(-1)}
                 >
                   <CaretLeftIcon className="size-4" />
                 </button>
               )}
-              <span className="px-half text-sm text-low tabular-nums whitespace-nowrap">
+              <span className="flex-1 select-none px-half py-half text-center text-sm text-low tabular-nums whitespace-nowrap">
                 {position.index + 1} of {position.total}
+                {position.total > 1 && (
+                  <span className="md:hidden"> · Swipe to switch Inputs</span>
+                )}
               </span>
               {position.total > 1 && (
                 <button
                   aria-label="Next open Input"
                   className={iconButton}
-                  onClick={() => position.step(1)}
+                  disabled={busy}
+                  onClick={() => step(1)}
                 >
                   <CaretRightIcon className="size-4" />
                 </button>
@@ -612,7 +670,7 @@ function InputViewer({
           <button
             aria-label="Refresh Input"
             title="Refresh Input"
-            className={iconButton}
+            className={cn(iconButton, 'col-start-3 row-start-1')}
             disabled={detail.isFetching}
             onClick={async () => {
               const result = await detail.refetch();
@@ -629,7 +687,7 @@ function InputViewer({
         </div>
       </header>
       <Dialog.Description className="sr-only">
-        The page can propose an answer. Only Submit records your answer. Keep
+        The page can propose an answer. Review it before you submit. Keep
         secrets outside Inputs.
       </Dialog.Description>
       {priorityError && (
@@ -660,9 +718,11 @@ function InputViewer({
           key={detail.data.version.version}
           workspaceId={workspaceId}
           detail={detail.data}
-          followUpText={followUpText}
-          setFollowUpText={setFollowUpText}
-          onAnswered={onAnswered}
+          drafts={drafts}
+          busy={busy}
+          actionPending={actionPending}
+          setBusy={setBusy}
+          onClosed={onClosed}
           onScheduled={onScheduled}
           refreshAfterConflict={async () => {
             const result = await detail.refetch();
@@ -681,27 +741,31 @@ function InputViewer({
           }}
         />
       )}
-    </>
+    </div>
   );
 }
 
 function InputBody({
   workspaceId,
   detail,
-  followUpText,
-  setFollowUpText,
+  drafts,
+  busy,
+  actionPending,
+  setBusy,
   refresh,
   refreshAfterConflict,
-  onAnswered,
+  onClosed,
   onScheduled,
 }: {
   workspaceId: string;
   detail: InputDetail;
-  followUpText: string;
-  setFollowUpText: (text: string) => void;
+  drafts: Map<string, InputAnswer>;
+  busy: boolean;
+  actionPending: { current: boolean };
+  setBusy: (busy: boolean) => void;
   refresh: () => Promise<void>;
   refreshAfterConflict: () => Promise<void>;
-  onAnswered: () => Promise<void>;
+  onClosed: () => Promise<void>;
   onScheduled: () => Promise<void>;
 }) {
   const host = useHostId();
@@ -711,29 +775,29 @@ function InputBody({
     createInputBridge(detail.input.id, detail.version.version)
   );
   const key = `bc.input.draft:${host ?? 'local'}:${detail.input.id}:${detail.version.version}`;
+  const followUpKey = `bc.input.follow-up:${host ?? 'local'}:${detail.input.id}`;
+  const isOpen = detail.input.status === 'open';
   const [draft, setDraft] = useState<InputAnswer>(() => {
+    const cached = drafts.get(key);
+    if (cached) return cached;
     try {
-      return (
-        JSON.parse(localStorage.getItem(key) ?? 'null') ?? {
-          choice_id: null,
-          text: null,
-        }
-      );
+      return readInputDraft(localStorage, key, followUpKey, isOpen);
     } catch {
       return { choice_id: null, text: null };
     }
   });
-  const [proposal, setProposal] = useState(false);
-  const [priorDraft, setPriorDraft] = useState<InputAnswer | null>(null);
+  const [proposal, setProposal] = useState<InputAnswer | null>(null);
+  const [priorDraft, setPriorDraft] = useState<PriorInputDraft | null>(null);
   const [document, setDocument] = useState('');
   const [pageAttempt, setPageAttempt] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
   const [navigated, setNavigated] = useState(false);
-  const [busy, setBusy] = useState(false);
   const [undoSequence, setUndoSequence] = useState<number | null>(null);
   const answerRequest = useRef<AnswerInput | null>(null);
-  const followUpRequest = useRef<FollowUpInput | null>(null);
   const scheduleRequest = useRef<SnoozeInput | null>(null);
+  const scheduleControl = useRef<HTMLInputElement>(null);
+  const [scheduleOpen, setScheduleOpen] = useState(false);
   const [scheduleTime, setScheduleTime] = useState(() =>
     toUtcControl(detail.input.show_at)
   );
@@ -755,14 +819,17 @@ function InputBody({
     id: string;
   } | null>(null);
   useEffect(() => {
+    drafts.set(key, draft);
     try {
       localStorage.setItem(key, JSON.stringify(draft));
+      if (draft.text && draft.text === localStorage.getItem(followUpKey))
+        localStorage.removeItem(followUpKey);
     } catch {
       setError(
         'This browser cannot save the draft. Keep this page open until you submit.'
       );
     }
-  }, [key, draft]);
+  }, [key, drafts, draft, followUpKey]);
   useEffect(() => {
     let active = true;
     const snapshot = {
@@ -796,23 +863,30 @@ function InputBody({
     pageAttempt,
   ]);
   useEffect(() => {
+    const prefix = `bc.input.draft:${host ?? 'local'}:${detail.input.id}:`;
+    const keys = [...drafts.keys()];
     try {
-      const prefix = `bc.input.draft:${host ?? 'local'}:${detail.input.id}:`;
-      const keys = Object.keys(localStorage).filter(
-        (item) => item.startsWith(prefix) && item !== key
-      );
-      keys.sort(
-        (a, b) =>
-          Number(b.slice(prefix.length)) - Number(a.slice(prefix.length))
-      );
-      const saved = keys[0]
-        ? JSON.parse(localStorage.getItem(keys[0]) ?? 'null')
-        : null;
-      if (saved && (saved.choice_id || saved.text)) setPriorDraft(saved);
+      keys.push(...Object.keys(localStorage));
+    } catch {
+      /* The in-memory draft remains available. */
+    }
+    const version = (item: string) => Number(item.slice(prefix.length));
+    const priorKey = keys
+      .filter(
+        (item) =>
+          item.startsWith(prefix) && version(item) < detail.version.version
+      )
+      .sort((a, b) => version(b) - version(a))[0];
+    if (!priorKey) return;
+    try {
+      const answer: InputAnswer | null =
+        drafts.get(priorKey) ??
+        JSON.parse(localStorage.getItem(priorKey) ?? 'null');
+      if (answer) setPriorDraft({ key: priorKey, answer });
     } catch {
       /* The current draft remains available when storage is unavailable. */
     }
-  }, [host, detail.input.id, key]);
+  }, [host, detail.input.id, detail.version.version, drafts]);
   useEffect(() => {
     const controller = new AbortController();
     const requested = new Set<number>();
@@ -884,10 +958,13 @@ function InputBody({
         bridge.current,
         detail.version.contract
       );
-      if (answer) {
-        setDraft(answer);
-        setProposal(true);
-        answerRequest.current = null;
+      if (answer && !actionPending.current) {
+        const current = drafts.get(key);
+        if (!current?.choice_id && !current?.text) {
+          setDraft(answer);
+          answerRequest.current = null;
+        }
+        setProposal(answer);
       }
     };
     window.addEventListener('message', listener);
@@ -895,28 +972,55 @@ function InputBody({
       controller.abort();
       window.removeEventListener('message', listener);
     };
-  }, [detail.version.contract, workspaceId, host, pageAttempt]);
-  const submit = async () => {
+  }, [
+    actionPending,
+    detail.version.contract,
+    drafts,
+    key,
+    workspaceId,
+    host,
+    pageAttempt,
+  ]);
+  const submit = async (disposition: AnswerDisposition) => {
+    if (actionPending.current) return;
+    actionPending.current = true;
     setBusy(true);
     setError(null);
-    const request = answerRequest.current ?? {
-      request_id: crypto.randomUUID(),
-      expected_sequence: detail.input.sequence,
-      version: detail.version.version,
-      answer: draft,
-    };
+    setSaved(false);
+    const request =
+      answerRequest.current?.disposition === disposition
+        ? answerRequest.current
+        : {
+            request_id: crypto.randomUUID(),
+            expected_sequence: detail.input.sequence,
+            version: detail.version.version,
+            answer: draft,
+            disposition,
+          };
     answerRequest.current = request;
-    let answered = false;
+    let closed = false;
     try {
-      await inputsApi.answer(workspaceId, host, detail.input.id, request);
-      try {
-        localStorage.removeItem(key);
-      } catch {
-        /* The receipt remains authoritative. */
+      const receipt = await inputsApi.answer(
+        workspaceId,
+        host,
+        detail.input.id,
+        request
+      );
+      const empty = consumeInputDraft(drafts, key, request.answer);
+      if (empty) {
+        try {
+          localStorage.removeItem(key);
+        } catch {
+          /* The receipt remains authoritative. */
+        }
+        if (mounted.current) setDraft(empty);
+        setProposal(null);
       }
       answerRequest.current = null;
+      closed = receipt.status === 'closed';
+      if (closed) setUndoSequence(receipt.sequence);
+      setSaved(true);
       await refresh();
-      answered = true;
     } catch (e) {
       try {
         if (await refreshInputAfterConflict(e, refreshAfterConflict))
@@ -928,37 +1032,14 @@ function InputBody({
         `${String(e)}. Your draft stays saved. Review the current version before you submit again.`
       );
     } finally {
+      actionPending.current = false;
       setBusy(false);
     }
-    if (answered && mounted.current) await onAnswered();
-  };
-  const sendFollowUp = async () => {
-    setBusy(true);
-    setError(null);
-    const request = followUpRequest.current ?? {
-      request_id: crypto.randomUUID(),
-      expected_sequence: detail.input.sequence,
-      text: followUpText,
-    };
-    followUpRequest.current = request;
-    try {
-      await inputsApi.followUp(workspaceId, host, detail.input.id, request);
-      followUpRequest.current = null;
-      setFollowUpText('');
-      await refresh();
-    } catch (e) {
-      try {
-        if (await refreshInputAfterConflict(e, refreshAfterConflict))
-          followUpRequest.current = null;
-      } catch (refreshError) {
-        setError(String(refreshError));
-      }
-      setError(`${String(e)}. Your message stays saved.`);
-    } finally {
-      setBusy(false);
-    }
+    if (closed && mounted.current) await onClosed();
   };
   const status = async (undo: boolean) => {
+    if (actionPending.current) return;
+    actionPending.current = true;
     setBusy(true);
     setError(null);
     const sequence = undo ? undoSequence! : detail.input.sequence;
@@ -988,10 +1069,12 @@ function InputBody({
       }
       setError(String(e));
     } finally {
+      actionPending.current = false;
       setBusy(false);
     }
   };
   const schedule = async (showNow: boolean) => {
+    if (actionPending.current) return;
     setError(null);
     let showAt: string | null;
     try {
@@ -1000,6 +1083,7 @@ function InputBody({
       setError(String(error));
       return;
     }
+    actionPending.current = true;
     setBusy(true);
     // A transport retry retains the exact request, even if polling changes sequence.
     if (
@@ -1025,6 +1109,7 @@ function InputBody({
       scheduleRequest.current = null;
       answerRequest.current = null;
       statusRequest.current = null;
+      setScheduleOpen(false);
       saved = true;
     } catch (error) {
       try {
@@ -1035,6 +1120,7 @@ function InputBody({
       }
       setError(`${String(error)}. Your answer draft stays saved.`);
     } finally {
+      actionPending.current = false;
       setBusy(false);
     }
     if (
@@ -1054,12 +1140,18 @@ function InputBody({
   const canSubmit =
     !busy && validateInputAnswer(draft, detail.version.contract);
   const choices = detail.version.contract.choices;
+  const availablePriorDraft = availablePriorInputDraft(
+    priorDraft,
+    drafts,
+    busy
+  );
   return (
     <div className="flex-1 min-h-0 flex flex-col md:flex-row">
       <div className="relative flex-1 min-h-24 bg-white">
         {navigated ? (
           <p role="alert" className="p-double text-black">
-            Page navigated away. Close and open the Input to load it safely.
+            Page navigated away. Use Reload page in Input actions to load it
+            again.
           </p>
         ) : (
           document && (
@@ -1078,94 +1170,38 @@ function InputBody({
       <aside
         aria-label="Your answer"
         className="md:w-96 shrink-0 flex flex-col max-h-[55dvh] md:max-h-none overflow-y-auto border-t md:border-t-0 md:border-l bg-primary"
-        onKeyDown={(e) => {
-          if (
-            e.key === 'Enter' &&
-            (e.metaKey || e.ctrlKey) &&
-            detail.input.status === 'open' &&
-            canSubmit
-          ) {
-            e.preventDefault();
-            void submit();
-          }
-        }}
       >
         <div className="flex-1 p-base md:p-double space-y-double">
-          {detail.input.status === 'open' && (
-            <section
-              aria-label="Input schedule"
-              className="rounded-md border p-base space-y-base"
-            >
-              {detail.input.show_at && (
-                <p className="text-sm text-high">
-                  Scheduled for{' '}
-                  {toUtcControl(detail.input.show_at).replace('T', ' ')} UTC.
-                </p>
-              )}
-              <label className="block space-y-half">
-                <span className="block text-sm font-medium text-high">
-                  Show at (UTC)
-                </span>
-                <input
-                  type="datetime-local"
-                  step="60"
-                  value={scheduleTime}
-                  disabled={busy}
-                  className={`block w-full min-h-11 rounded-md border bg-secondary px-base text-high ${focusRing}`}
-                  onChange={(event) => {
-                    setScheduleTime(event.target.value);
-                    scheduleRequest.current = null;
-                  }}
-                />
-              </label>
-              <div className="flex flex-wrap gap-base">
-                <button
-                  className={quietButton}
-                  disabled={busy || !scheduleTime}
-                  onClick={() => void schedule(false)}
-                >
-                  {detail.input.show_at ? 'Reschedule' : 'Snooze'}
-                </button>
-                {detail.input.show_at && (
-                  <button
-                    className={quietButton}
-                    disabled={busy}
-                    onClick={() => void schedule(true)}
-                  >
-                    Show now
-                  </button>
-                )}
-              </div>
-              <p className="text-xs text-low">
-                Scheduling preserves your answer draft. Only Submit records an
-                answer.
-              </p>
-            </section>
-          )}
-          {priorDraft && (
+          {isOpen && availablePriorDraft && (
             <div className="rounded-md border p-base space-y-half text-sm">
               <p className="text-high">
                 A saved draft from an earlier version is available. Read this
                 version before you use it.
               </p>
-              {priorDraft.text && (
+              {availablePriorDraft.text && (
                 <p className="whitespace-pre-wrap break-words text-low">
-                  {priorDraft.text}
+                  {availablePriorDraft.text}
                 </p>
               )}
               <button
                 className={quietButton}
+                disabled={busy}
                 onClick={() => {
+                  const answer = availablePriorInputDraft(
+                    priorDraft,
+                    drafts,
+                    actionPending.current
+                  );
+                  if (!answer) return;
                   setDraft({
                     choice_id: detail.version.contract.choices.some(
-                      (c) => c.id === priorDraft.choice_id
+                      (c) => c.id === answer.choice_id
                     )
-                      ? priorDraft.choice_id
+                      ? answer.choice_id
                       : null,
-                    text: detail.version.contract.allow_text
-                      ? priorDraft.text
-                      : null,
+                    text: answer.text,
                   });
+                  setProposal(null);
                   setPriorDraft(null);
                   answerRequest.current = null;
                 }}
@@ -1174,7 +1210,7 @@ function InputBody({
               </button>
             </div>
           )}
-          {detail.input.status === 'open' && (
+          {isOpen && (
             <>
               {proposal && (
                 <div className="rounded-md border border-brand p-base space-y-half text-sm">
@@ -1183,14 +1219,26 @@ function InputBody({
                   </p>
                   <p className="whitespace-pre-wrap break-words">
                     {detail.version.contract.choices.find(
-                      (c) => c.id === draft.choice_id
+                      (c) => c.id === proposal.choice_id
                     )?.label ?? ''}
-                    {draft.text ? `\n${draft.text}` : ''}
+                    {proposal.text ? `\n${proposal.text}` : ''}
                   </p>
+                  {proposal !== draft && (
+                    <button
+                      className={quietButton}
+                      disabled={busy}
+                      onClick={() => {
+                        setDraft(proposal);
+                        answerRequest.current = null;
+                      }}
+                    >
+                      Use proposed answer
+                    </button>
+                  )}
                 </div>
               )}
               {choices.length > 0 && (
-                <fieldset className="space-y-half">
+                <fieldset className="space-y-half" disabled={busy}>
                   <legend className="mb-base text-sm font-medium text-high">
                     Your choice
                   </legend>
@@ -1217,7 +1265,7 @@ function InputBody({
                           className="mt-1 size-4 shrink-0 accent-brand focus:outline-none"
                           onChange={() => {
                             setDraft({ ...draft, choice_id: choice.id });
-                            setProposal(false);
+                            setProposal(null);
                             answerRequest.current = null;
                           }}
                         />
@@ -1237,7 +1285,7 @@ function InputBody({
                       className={quietButton}
                       onClick={() => {
                         setDraft({ ...draft, choice_id: null });
-                        setProposal(false);
+                        setProposal(null);
                         answerRequest.current = null;
                       }}
                     >
@@ -1246,27 +1294,32 @@ function InputBody({
                   )}
                 </fieldset>
               )}
-              {detail.version.contract.allow_text && (
-                <label className="block space-y-half">
-                  <span className="block text-sm font-medium text-high">
-                    {choices.length > 0 ? 'Add a note' : 'Your answer'}
-                  </span>
-                  <textarea
-                    className={`block w-full min-h-28 rounded-md border bg-secondary p-base text-base text-high placeholder:text-low resize-y ${focusRing}`}
-                    placeholder={
-                      choices.length > 0
-                        ? 'Optional context for the agent'
-                        : 'Write your answer'
+              <label className="block space-y-half">
+                <span className="block text-sm font-medium text-high">
+                  Reply
+                </span>
+                <textarea
+                  className={`block w-full min-h-28 rounded-md border bg-secondary p-base text-base text-high resize-y ${focusRing}`}
+                  disabled={busy}
+                  value={draft.text ?? ''}
+                  onChange={(e) => {
+                    setDraft({ ...draft, text: e.target.value });
+                    setProposal(null);
+                    answerRequest.current = null;
+                  }}
+                  onKeyDown={(e) => {
+                    if (
+                      e.key === 'Enter' &&
+                      (e.metaKey || e.ctrlKey) &&
+                      !e.nativeEvent.isComposing &&
+                      canSubmit
+                    ) {
+                      e.preventDefault();
+                      void submit('close');
                     }
-                    value={draft.text ?? ''}
-                    onChange={(e) => {
-                      setDraft({ ...draft, text: e.target.value });
-                      setProposal(false);
-                      answerRequest.current = null;
-                    }}
-                  />
-                </label>
-              )}
+                  }}
+                />
+              </label>
             </>
           )}
           {detail.input.status === 'answered' && (
@@ -1279,6 +1332,45 @@ function InputBody({
               This Input is {detail.input.status}. Your answer stays in the
               ledger.
             </p>
+          )}
+          {detail.answers.length > 0 && (
+            <section aria-label="Answer history" className="space-y-half">
+              <h3 className="text-sm font-medium text-high">Answer history</h3>
+              <ol className="space-y-half">
+                {detail.answers.map((event) => {
+                  const payload = event.payload as {
+                    answer?: Partial<InputAnswer>;
+                    no_answer_yet?: boolean;
+                  };
+                  const choiceId = payload.answer?.choice_id;
+                  const choice =
+                    event.version === detail.version.version
+                      ? (choices.find((item) => item.id === choiceId)?.label ??
+                        choiceId)
+                      : choiceId;
+                  return (
+                    <li
+                      key={event.id}
+                      className="rounded-md border p-base text-sm space-y-half"
+                    >
+                      <p className="flex flex-wrap gap-x-half text-xs text-low">
+                        <span>Version {event.version}</span>
+                        <Age date={event.created_at} />
+                      </p>
+                      {payload.no_answer_yet && <p>No answer yet</p>}
+                      {choice && (
+                        <p className="break-words text-high">{choice}</p>
+                      )}
+                      {payload.answer?.text && (
+                        <p className="whitespace-pre-wrap break-words text-high">
+                          {payload.answer.text}
+                        </p>
+                      )}
+                    </li>
+                  );
+                })}
+              </ol>
+            </section>
           )}
           {detail.thread.length > 0 && (
             <section aria-label="Follow-ups" className="space-y-half">
@@ -1318,42 +1410,6 @@ function InputBody({
               </ol>
             </section>
           )}
-          {detail.input.status === 'open' && (
-            <section aria-label="Follow-up" className="space-y-half">
-              <label className="block space-y-half">
-                <span className="block text-sm font-medium text-high">
-                  Message the agent
-                </span>
-                <textarea
-                  className={`block w-full min-h-20 rounded-md border bg-secondary p-base text-base text-high placeholder:text-low resize-y ${focusRing}`}
-                  placeholder="For example: do not act yet, I am checking"
-                  value={followUpText}
-                  onChange={(e) => {
-                    setFollowUpText(e.target.value);
-                    followUpRequest.current = null;
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key !== 'Enter' || !(e.metaKey || e.ctrlKey)) return;
-                    // This shortcut sends the message, never the answer.
-                    e.preventDefault();
-                    e.stopPropagation();
-                    if (!busy && followUpText.trim()) void sendFollowUp();
-                  }}
-                />
-              </label>
-              <button
-                className={quietButton}
-                disabled={busy || !followUpText.trim()}
-                onClick={() => void sendFollowUp()}
-              >
-                Send follow-up
-              </button>
-              <p className="text-xs text-low">
-                A follow-up does not answer. The Input stays open and the agent
-                can update it.
-              </p>
-            </section>
-          )}
         </div>
         <div className="sticky bottom-0 bg-primary border-t p-base md:px-double space-y-base pb-[max(12px,env(safe-area-inset-bottom))]">
           {error && (
@@ -1361,41 +1417,89 @@ function InputBody({
               {error}
             </p>
           )}
-          {detail.input.status === 'open' && (
-            <button
-              className={`w-full min-h-11 rounded-md bg-brand hover:bg-brand-hover text-on-brand font-medium disabled:opacity-50 ${focusRing} focus-visible:ring-offset-2`}
-              disabled={!canSubmit}
-              onClick={submit}
-            >
-              {busy
-                ? 'Saving…'
-                : !draft.choice_id &&
-                    !draft.text?.trim() &&
-                    detail.version.contract.allow_no_answer_yet
-                  ? 'Submit: no answer yet'
-                  : 'Submit answer'}
-            </button>
+          {saved && (
+            <p role="status" className="text-sm text-success">
+              Answer saved
+            </p>
           )}
-          <p className="text-xs text-low">
-            The page can propose an answer. Only Submit records your answer.
-            Keep secrets outside Inputs.
-          </p>
-          <div className="flex flex-wrap gap-x-double gap-y-half">
-            <button
-              className={quietButton}
-              title="If the page fails to load, reload it to renew its connection."
-              onClick={retryPage}
-            >
-              Reload page
-            </button>
-            {['open', 'answered'].includes(detail.input.status) && (
+          {isOpen && (
+            <div className="space-y-half">
+              {!draft.choice_id &&
+                !draft.text?.trim() &&
+                detail.version.contract.allow_no_answer_yet && (
+                  <p className="text-sm text-low">No answer yet</p>
+                )}
               <button
-                className={quietButton}
-                disabled={busy}
-                onClick={() => status(false)}
+                className={`w-full min-h-11 rounded-md bg-brand hover:bg-brand-hover text-on-brand font-medium disabled:opacity-50 ${focusRing} focus-visible:ring-offset-2`}
+                disabled={!canSubmit}
+                onClick={() => void submit('close')}
               >
-                Close Input
+                Submit and close
               </button>
+              <button
+                className={`w-full min-h-11 rounded-md border text-high hover:bg-secondary disabled:opacity-50 ${focusRing}`}
+                disabled={!canSubmit}
+                onClick={() => void submit('keep_open')}
+              >
+                Submit and keep
+              </button>
+            </div>
+          )}
+          <div className="flex items-center gap-base">
+            {isOpen && (
+              <Popover open={scheduleOpen} onOpenChange={setScheduleOpen}>
+                <PopoverTrigger asChild>
+                  <button type="button" className={quietButton} disabled={busy}>
+                    Snooze
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  aria-label="Input schedule"
+                  align="start"
+                  side="top"
+                  className="new-design max-w-[var(--radix-popover-content-available-width)] max-h-[var(--radix-popover-content-available-height)] overflow-y-auto space-y-base"
+                  onOpenAutoFocus={(event) => {
+                    event.preventDefault();
+                    scheduleControl.current?.focus();
+                  }}
+                >
+                  <label className="block space-y-half">
+                    <span className="block text-sm font-medium text-high">
+                      Show at (UTC)
+                    </span>
+                    <input
+                      ref={scheduleControl}
+                      type="datetime-local"
+                      step="60"
+                      value={scheduleTime}
+                      disabled={busy}
+                      className={`block w-full min-h-11 rounded-md border bg-secondary px-base text-high ${focusRing}`}
+                      onChange={(event) => {
+                        setScheduleTime(event.target.value);
+                        scheduleRequest.current = null;
+                      }}
+                    />
+                  </label>
+                  <div className="flex flex-wrap gap-base">
+                    <button
+                      className={quietButton}
+                      disabled={busy || !scheduleTime}
+                      onClick={() => void schedule(false)}
+                    >
+                      Save schedule
+                    </button>
+                    {detail.input.show_at && (
+                      <button
+                        className={quietButton}
+                        disabled={busy}
+                        onClick={() => void schedule(true)}
+                      >
+                        Show now
+                      </button>
+                    )}
+                  </div>
+                </PopoverContent>
+              </Popover>
             )}
             {undoSequence !== null && (
               <button
@@ -1406,6 +1510,33 @@ function InputBody({
                 Undo close
               </button>
             )}
+            <div className="ml-auto">
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="Input actions"
+                    className={iconButton}
+                  >
+                    <DotsThreeIcon className="size-5" weight="bold" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="new-design">
+                  <DropdownMenuItem onSelect={retryPage}>
+                    Reload page
+                  </DropdownMenuItem>
+                  {['open', 'answered'].includes(detail.input.status) && (
+                    <DropdownMenuItem
+                      variant="destructive"
+                      disabled={busy}
+                      onSelect={() => void status(false)}
+                    >
+                      Close input
+                    </DropdownMenuItem>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
           </div>
         </div>
       </aside>

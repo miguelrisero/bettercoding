@@ -352,4 +352,25 @@ describe('Input status actions', () => {
       JSON.parse(String(request.mock.calls[0][1]?.body))
     ).not.toHaveProperty('actor_kind');
   });
+  it.each(['close', 'keep_open'] as const)(
+    'sends the reply and disposition together through the answer route: %s',
+    async (disposition) => {
+      const request = vi.fn(
+        async () => new Response(JSON.stringify({ success: true, data: {} }))
+      );
+      setLocalApiTransport({ request, openWebSocket: vi.fn() });
+      const body = {
+        request_id: 'reply',
+        expected_sequence: 3,
+        version: 2,
+        answer: { choice_id: null, text: 'More context' },
+        disposition,
+      };
+      await inputsApi.answer('workspace', null, 'input', body);
+      expect(request).toHaveBeenCalledExactlyOnceWith(
+        '/api/workspaces/workspace/inputs/input/answer',
+        expect.objectContaining({ method: 'POST', body: JSON.stringify(body) })
+      );
+    }
+  );
 });

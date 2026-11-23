@@ -1,10 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import type { InputDetail } from 'shared/types';
+import type { InputAnswer, InputDetail } from 'shared/types';
+import { TAP_SLOP_PX } from '@/shared/lib/terminalTouchGestures';
+import { validateInputAnswer } from './inputBridge';
 import {
+  availablePriorInputDraft,
   compareInputs,
+  consumeInputDraft,
   nextOpenInput,
+  readInputDraft,
   splitRecommended,
   inputNavigationIsCurrent,
+  inputSwipeStep,
 } from './inputFlow';
 
 const item = (
@@ -27,6 +33,82 @@ describe('Input flow', () => {
     expect(inputNavigationIsCurrent(3, 4, 'a', 'a')).toBe(false);
     expect(inputNavigationIsCurrent(3, 3, 'a', 'b')).toBe(false);
     expect(inputNavigationIsCurrent(3, 4, 'a', null)).toBe(false);
+  });
+  it('moves in both swipe directions and ignores taps and vertical gestures', () => {
+    expect(inputSwipeStep(-48, 5)).toBe(1);
+    expect(inputSwipeStep(48, 5)).toBe(-1);
+    expect(inputSwipeStep(TAP_SLOP_PX, 0)).toBeNull();
+    expect(inputSwipeStep(30, 60)).toBeNull();
+    expect(inputSwipeStep(30, 30)).toBeNull();
+  });
+  it('restores the old follow-up message into the reply without dropping the choice', () => {
+    const storage = new Map([
+      ['draft', JSON.stringify({ choice_id: 'ship', text: null })],
+      ['follow-up', 'Saved message'],
+    ]);
+    const reader = { getItem: (key: string) => storage.get(key) ?? null };
+    expect(readInputDraft(reader, 'draft', 'follow-up', true)).toEqual({
+      choice_id: 'ship',
+      text: 'Saved message',
+    });
+    expect(readInputDraft(reader, 'draft', 'follow-up', false)).toEqual({
+      choice_id: 'ship',
+      text: null,
+    });
+    storage.set(
+      'draft',
+      JSON.stringify({ choice_id: 'ship', text: 'Saved note' })
+    );
+    expect(readInputDraft(reader, 'draft', 'follow-up', true)).toEqual({
+      choice_id: 'ship',
+      text: 'Saved note',
+    });
+  });
+  it('hides a prior draft during its write and discards the next version’s consumed copy', () => {
+    const prior = {
+      key: 'version-1',
+      answer: { choice_id: 'ship', text: 'More context' },
+    };
+    const drafts = new Map<string, InputAnswer>([[prior.key, prior.answer]]);
+
+    // Version 2 can load its copy before version 1 receives the answer receipt.
+    expect(availablePriorInputDraft(prior, drafts, true)).toBeNull();
+    expect(availablePriorInputDraft(prior, drafts, false)).toEqual(
+      prior.answer
+    );
+
+    // The receipt clears the original draft after version 2 has taken its copy.
+    consumeInputDraft(drafts, prior.key, prior.answer);
+    expect(availablePriorInputDraft(prior, drafts, false)).toBeNull();
+
+    const edited = { choice_id: 'ship', text: 'New context' };
+    drafts.set(prior.key, edited);
+    expect(consumeInputDraft(drafts, prior.key, prior.answer)).toBeNull();
+    expect(availablePriorInputDraft(prior, drafts, false)).toEqual(edited);
+  });
+  it('accepts a reply in a legacy choice-only contract and preserves deferral rules', () => {
+    const contract = {
+      choices: [{ id: 'ship', label: 'Ship' }],
+      allow_text: false,
+      allow_no_answer_yet: false,
+    };
+    expect(validateInputAnswer({ text: 'More context' }, contract)).toBe(true);
+    expect(
+      validateInputAnswer({ choice_id: 'ship', text: 'Go' }, contract)
+    ).toBe(true);
+    expect(
+      validateInputAnswer(
+        { choice_id: 'other', text: 'More context' },
+        contract
+      )
+    ).toBe(false);
+    expect(validateInputAnswer({ text: ' ' }, contract)).toBe(false);
+    expect(
+      validateInputAnswer(
+        { text: ' ' },
+        { ...contract, allow_no_answer_yet: true }
+      )
+    ).toBe(true);
   });
   it('advances to the next open Input after the current one', () => {
     expect(nextOpenInput(list, item('a', 'answered'), 'priority')).toBe('c');
