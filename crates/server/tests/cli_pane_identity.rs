@@ -57,7 +57,7 @@ async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switc
     fs::create_dir(&fake_bin).unwrap();
     for program in ["claude", "codex"] {
         let path = fake_bin.join(program);
-        fs::write(&path, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nwhile [ ! -f \"$0.exit\" ]; do /bin/sleep 0.05; done\n").unwrap();
+        fs::write(&path, "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$0.args.tmp\"\nmv \"$0.args.tmp\" \"$0.args\"\nwhile [ ! -f \"$0.exit\" ]; do /bin/sleep 0.05; done\n").unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
     // This integration binary owns the environment before deployment caches initialise.
@@ -367,6 +367,19 @@ async fn pane_identity_survives_side_tasks_respawn_recreation_and_explicit_switc
                     .any(|pair| pair == [expected, native.as_str()]),
                 "{operation}: {args:?}"
             );
+            let plugin_dir = data.join("bundled-plugins/bettercoding");
+            assert_eq!(
+                args.windows(2)
+                    .any(|pair| pair == ["--plugin-dir", plugin_dir.to_str().unwrap()]),
+                program == "claude",
+                "{operation}: {args:?}"
+            );
+            if program == "claude" {
+                assert_eq!(
+                    fs::read_to_string(plugin_dir.join("skills/operate/SKILL.md")).unwrap(),
+                    executors::bettercoding_skill::SKILL
+                );
+            }
         }
         if program == "codex" {
             local_deployment::pty::kill_cli_tmux_session(workspace.id, "test:case_cleanup").await;

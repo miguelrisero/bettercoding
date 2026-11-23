@@ -1,5 +1,6 @@
 pub mod actions;
 pub mod approvals;
+pub mod bettercoding_skill;
 pub mod command;
 pub mod env;
 pub mod executor_discovery;

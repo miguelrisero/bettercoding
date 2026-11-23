@@ -16,7 +16,8 @@ use workspace_utils::command_ext::GroupSpawnNoWindowExt;
 
 use super::{ClaudeCode, ClaudeJson, ClaudePlugin, base_command};
 use crate::{
-    command::{CommandBuildError, CommandBuilder, apply_overrides},
+    bettercoding_skill::claude_plugin_args,
+    command::{CommandBuilder, apply_overrides},
     env::{ExecutionEnv, RepoContext},
     executors::{ExecutorError, SlashCommandDescription},
     model_selector::AgentInfo,
@@ -191,12 +192,16 @@ impl ClaudeCode {
         }).clone()
     }
 
-    async fn build_slash_commands_discovery_command_builder(
+    fn build_slash_commands_discovery_command_builder(
         &self,
-    ) -> Result<CommandBuilder, CommandBuildError> {
+    ) -> Result<CommandBuilder, ExecutorError> {
         let mut builder =
             CommandBuilder::new(base_command(self.claude_code_router.unwrap_or(false)))
-                .params(["-p"]);
+                .params(["-p"])
+                .extend_params(
+                    claude_plugin_args(&workspace_utils::assets::asset_dir())
+                        .map_err(ExecutorError::Io)?,
+                );
 
         builder = builder.extend_params([
             "--verbose",
@@ -207,16 +212,14 @@ impl ClaudeCode {
             "/",
         ]);
 
-        apply_overrides(builder, &self.cmd)
+        Ok(apply_overrides(builder, &self.cmd)?)
     }
 
     async fn discover_available_command_and_plugins(
         &self,
         current_dir: &Path,
     ) -> Result<(Vec<String>, Vec<ClaudePlugin>, Vec<String>), ExecutorError> {
-        let command_builder = self
-            .build_slash_commands_discovery_command_builder()
-            .await?;
+        let command_builder = self.build_slash_commands_discovery_command_builder()?;
         let command_parts = command_builder.build_initial()?;
         let (program_path, args) = command_parts.into_resolved().await?;
 

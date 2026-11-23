@@ -1,0 +1,8 @@
+{
+  "name": "bettercoding",
+  "description": "Operate BetterCoding workspaces and owner Inputs through the BetterCoding MCP server.",
+  "author": {
+    "name": "BetterCoding"
+  },
+  "version": "1.0.0"
+}

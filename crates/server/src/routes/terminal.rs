@@ -28,6 +28,7 @@ use db::models::{
 use deployment::Deployment;
 use executors::{
     actions::ExecutorActionType,
+    bettercoding_skill::claude_plugin_args,
     executors::{BaseCodingAgent, StandardCodingAgentExecutor, cli::CliLaunchSpec},
     profile::{ExecutorConfig, ExecutorConfigs},
 };
@@ -190,6 +191,8 @@ pub(super) async fn prepare_cli_launch_spec(
 
     // Everything else keeps the tmux poller's guess.
     if spec.program == "claude" {
+        spec.session_args
+            .extend(claude_plugin_args(&utils::assets::asset_dir())?);
         // `--mcp-config` takes several values, so it must be followed by
         // another flag or it would swallow a positional prompt. It is only
         // ever pushed right before `--settings`.
