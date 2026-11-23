@@ -34,7 +34,7 @@ HTML, and answer contract inside `content`. Use exactly one
   `allow_no_answer_yet` when the owner can explicitly defer. A deferral never
   authorizes an action. Keep secrets out of Inputs.
 
-Example result arguments for `create_input`:
+Use this example to build the result arguments for `create_input`.
 
 ```json
 {
@@ -56,7 +56,7 @@ Example result arguments for `create_input`:
 
 If the environment has chief-of-chiefs Input hooks, also include the
 `owner-class` meta tag. Use `owner-report` for results. Use the applicable
-class for decisions: `product`, `billing`, `security-policy`,
+class for decisions from `product`, `billing`, `security-policy`,
 `architecture`, or `owner-credential`. The tags classify the Input and do
 not grant approval.
 
@@ -114,13 +114,13 @@ restart. Verify the target process and pane. Preserve the workspace, repository
 directories, and conversation. A session restart must never delete workspace
 directories. Leave the BetterCoding server and workspace archival state alone.
 
-- **Stopped agent:** Call `launch_workspace_agent` for the same workspace.
-  Verify the resumed session and screen.
-- **Ordinary Claude lane:** Ask the lane to finish or checkpoint background
+- Call `launch_workspace_agent` for the same workspace if its agent has
+  stopped. Verify the resumed session and screen.
+- For an ordinary Claude lane, ask the lane to finish or checkpoint background
   work and report ready. Verify the correct pane. Press Escape, Ctrl+C,
   Ctrl+U, then enter `/restart`. Confirm the same conversation and the
   expected plugin version. Restore stopped tasks from the checkpoint.
-- **CoC or chief:** Use the configured restart operator for the CoC. The
+- Use the configured restart operator for the CoC. The
   operator sends Ctrl+C twice, handles the exit dialog, verifies the old
   process has exited, then sends Ctrl+D. For a chief, the verified sequence
   is Ctrl+C twice, then Ctrl+D. If an exit dialog appears, choose option 1
@@ -147,13 +147,13 @@ directories. Leave the BetterCoding server and workspace archival state alone.
 
 ## Known pitfalls
 
-- Missing output kind: add exactly one output-kind meta tag before creating the Input.
-- Empty result contract: include Seen explicitly so the owner can acknowledge without typing.
-- Generic OK on a decision: give each actual option its own choice ID and matching label.
-- Wrong Input ID: read `input_id` from the create receipt. `event.id` identifies the event.
-- Stale Input content: close the old Input and post a new one.
-- Missing Claude hooks: pass `executor: "CLAUDE_CODE"` when creating the session.
-- Queued prompt in an occupied workspace: check the pane and use a fresh workspace for independent work.
-- Wrong message argument: pass `text` to `send_workspace_message`.
-- `ListAgents` shows `shell` or omits a peer: check its live process, transcript activity, or native reply before taking over.
-- Restart loses settings or shared files: relaunch through BetterCoding and keep shared state outside disposable workspaces.
+- Add the output-kind meta tag if it is missing.
+- Include Seen to prevent an empty result contract and allow acknowledgment without typing.
+- Replace a generic decision choice with a distinct ID and matching label for each option.
+- Read `input_id` from the create receipt. `event.id` identifies the event.
+- Close the old Input and post a new one when its content becomes stale.
+- Pass `executor: "CLAUDE_CODE"` at session creation to load Claude hooks.
+- Check the pane when a prompt queues. Use a fresh workspace for independent work.
+- Pass `text` to `send_workspace_message`.
+- Check the live process, transcript activity, or native reply when `ListAgents` shows `shell` or omits a peer.
+- Relaunch through BetterCoding to keep the settings. Keep shared state outside disposable workspaces.
