@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { InputDetail } from 'shared/types';
+import type { InputAnswer, InputDetail } from 'shared/types';
 import { TAP_SLOP_PX } from '@/shared/lib/terminalTouchGestures';
 import { validateInputAnswer } from './inputBridge';
 import {
+  availablePriorInputDraft,
   compareInputs,
+  consumeInputDraft,
   nextOpenInput,
   readInputDraft,
   splitRecommended,
@@ -61,6 +63,28 @@ describe('Input flow', () => {
       choice_id: 'ship',
       text: 'Saved note',
     });
+  });
+  it('hides a prior draft during its write and discards the next version’s consumed copy', () => {
+    const prior = {
+      key: 'version-1',
+      answer: { choice_id: 'ship', text: 'More context' },
+    };
+    const drafts = new Map<string, InputAnswer>([[prior.key, prior.answer]]);
+
+    // Version 2 can load its copy before version 1 receives the answer receipt.
+    expect(availablePriorInputDraft(prior, drafts, true)).toBeNull();
+    expect(availablePriorInputDraft(prior, drafts, false)).toEqual(
+      prior.answer
+    );
+
+    // The receipt clears the original draft after version 2 has taken its copy.
+    consumeInputDraft(drafts, prior.key, prior.answer);
+    expect(availablePriorInputDraft(prior, drafts, false)).toBeNull();
+
+    const edited = { choice_id: 'ship', text: 'New context' };
+    drafts.set(prior.key, edited);
+    expect(consumeInputDraft(drafts, prior.key, prior.answer)).toBeNull();
+    expect(availablePriorInputDraft(prior, drafts, false)).toEqual(edited);
   });
   it('accepts a reply in a legacy choice-only contract and preserves deferral rules', () => {
     const contract = {

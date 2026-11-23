@@ -79,3 +79,27 @@ export function readInputDraft(
       saved?.text || (useSavedMessage ? storage.getItem(followUpKey) : null),
   };
 }
+
+export type PriorInputDraft = { key: string; answer: InputAnswer };
+
+export function consumeInputDraft(
+  drafts: Map<string, InputAnswer>,
+  key: string,
+  submitted: InputAnswer
+): InputAnswer | null {
+  if (drafts.get(key) !== submitted) return null;
+  // A newer version may still hold a copy of the submitted draft.
+  const empty = { choice_id: null, text: null };
+  drafts.set(key, empty);
+  return empty;
+}
+
+export function availablePriorInputDraft(
+  prior: PriorInputDraft | null,
+  drafts: ReadonlyMap<string, InputAnswer>,
+  busy: boolean
+): InputAnswer | null {
+  if (busy || !prior) return null;
+  const answer = drafts.get(prior.key) ?? prior.answer;
+  return answer.choice_id || answer.text ? answer : null;
+}

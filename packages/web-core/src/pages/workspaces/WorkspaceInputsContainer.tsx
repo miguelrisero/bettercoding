@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import * as Dialog from '@radix-ui/react-dialog';
@@ -23,6 +23,11 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@bettercoding/ui/components/Dropdown';
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@bettercoding/ui/components/Popover';
 import { useUiPreferencesStore } from '@/shared/stores/useUiPreferencesStore';
 import { useHostId } from '@/shared/providers/HostIdProvider';
 import { useVisualViewportGeometry } from '@/shared/hooks/useVisualViewportGeometry';
@@ -53,13 +58,16 @@ import {
   setInputSchedule,
 } from './inputsApi';
 import {
+  availablePriorInputDraft,
   compareInputs,
+  consumeInputDraft,
   inputStatusLabel,
   inputNavigationIsCurrent,
   inputSwipeStep,
   nextOpenInput,
   readInputDraft,
   splitRecommended,
+  type PriorInputDraft,
 } from './inputFlow';
 
 import { fromUtcControl, toUtcControl } from './inputSchedule';
@@ -499,6 +507,7 @@ function InputViewer({
           actionPending.current ||
           event.touches.length !== 1 ||
           !(event.target instanceof Element) ||
+          !event.currentTarget.contains(event.target) ||
           event.target.closest(
             'a, button, input, label, select, textarea, [contenteditable], [role="menu"]'
           )
@@ -537,7 +546,7 @@ function InputViewer({
         touchStart.current = null;
       }}
     >
-      <header className="flex items-start gap-base px-base md:px-double pt-base md:pt-double pb-base border-b shrink-0">
+      <header className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-base px-base md:flex md:px-double pt-base md:pt-double pb-base border-b shrink-0">
         <Dialog.Close aria-label="Close" className={cn(iconButton, '-ml-1')}>
           <XIcon className="size-5" />
         </Dialog.Close>
@@ -612,11 +621,6 @@ function InputViewer({
                 </span>
               )}
               <Age date={input.created_at} />
-              {position && (
-                <span className="md:hidden tabular-nums">
-                  {position.index + 1} of {position.total}
-                </span>
-              )}
               {input.current_version > 1 && (
                 <span>Version {detail.data?.version.version}</span>
               )}
@@ -629,11 +633,11 @@ function InputViewer({
             </div>
           )}
         </div>
-        <div className="flex items-center shrink-0">
+        <div className="contents md:flex md:items-center md:shrink-0">
           {position && (
             <nav
               aria-label="Open Inputs"
-              className="hidden md:flex items-center"
+              className="col-span-full row-start-2 flex items-center rounded-md bg-secondary md:bg-transparent"
             >
               {position.total > 1 && (
                 <button
@@ -645,8 +649,11 @@ function InputViewer({
                   <CaretLeftIcon className="size-4" />
                 </button>
               )}
-              <span className="px-half text-sm text-low tabular-nums whitespace-nowrap">
+              <span className="flex-1 select-none px-half py-half text-center text-sm text-low tabular-nums whitespace-nowrap">
                 {position.index + 1} of {position.total}
+                {position.total > 1 && (
+                  <span className="md:hidden"> · Swipe to switch Inputs</span>
+                )}
               </span>
               {position.total > 1 && (
                 <button
@@ -663,7 +670,7 @@ function InputViewer({
           <button
             aria-label="Refresh Input"
             title="Refresh Input"
-            className={iconButton}
+            className={cn(iconButton, 'col-start-3 row-start-1')}
             disabled={detail.isFetching}
             onClick={async () => {
               const result = await detail.refetch();
@@ -780,7 +787,7 @@ function InputBody({
     }
   });
   const [proposal, setProposal] = useState<InputAnswer | null>(null);
-  const [priorDraft, setPriorDraft] = useState<InputAnswer | null>(null);
+  const [priorDraft, setPriorDraft] = useState<PriorInputDraft | null>(null);
   const [document, setDocument] = useState('');
   const [pageAttempt, setPageAttempt] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -789,7 +796,7 @@ function InputBody({
   const [undoSequence, setUndoSequence] = useState<number | null>(null);
   const answerRequest = useRef<AnswerInput | null>(null);
   const scheduleRequest = useRef<SnoozeInput | null>(null);
-  const scheduleId = useId();
+  const scheduleControl = useRef<HTMLInputElement>(null);
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [scheduleTime, setScheduleTime] = useState(() =>
     toUtcControl(detail.input.show_at)
@@ -856,23 +863,30 @@ function InputBody({
     pageAttempt,
   ]);
   useEffect(() => {
+    const prefix = `bc.input.draft:${host ?? 'local'}:${detail.input.id}:`;
+    const keys = [...drafts.keys()];
     try {
-      const prefix = `bc.input.draft:${host ?? 'local'}:${detail.input.id}:`;
-      const keys = Object.keys(localStorage).filter(
-        (item) => item.startsWith(prefix) && item !== key
-      );
-      keys.sort(
-        (a, b) =>
-          Number(b.slice(prefix.length)) - Number(a.slice(prefix.length))
-      );
-      const saved = keys[0]
-        ? JSON.parse(localStorage.getItem(keys[0]) ?? 'null')
-        : null;
-      if (saved && (saved.choice_id || saved.text)) setPriorDraft(saved);
+      keys.push(...Object.keys(localStorage));
+    } catch {
+      /* The in-memory draft remains available. */
+    }
+    const version = (item: string) => Number(item.slice(prefix.length));
+    const priorKey = keys
+      .filter(
+        (item) =>
+          item.startsWith(prefix) && version(item) < detail.version.version
+      )
+      .sort((a, b) => version(b) - version(a))[0];
+    if (!priorKey) return;
+    try {
+      const answer: InputAnswer | null =
+        drafts.get(priorKey) ??
+        JSON.parse(localStorage.getItem(priorKey) ?? 'null');
+      if (answer) setPriorDraft({ key: priorKey, answer });
     } catch {
       /* The current draft remains available when storage is unavailable. */
     }
-  }, [host, detail.input.id, key]);
+  }, [host, detail.input.id, detail.version.version, drafts]);
   useEffect(() => {
     const controller = new AbortController();
     const requested = new Set<number>();
@@ -992,14 +1006,14 @@ function InputBody({
         detail.input.id,
         request
       );
-      if (drafts.get(key) === request.answer) {
-        drafts.delete(key);
+      const empty = consumeInputDraft(drafts, key, request.answer);
+      if (empty) {
         try {
           localStorage.removeItem(key);
         } catch {
           /* The receipt remains authoritative. */
         }
-        setDraft({ choice_id: null, text: null });
+        if (mounted.current) setDraft(empty);
         setProposal(null);
       }
       answerRequest.current = null;
@@ -1126,6 +1140,11 @@ function InputBody({
   const canSubmit =
     !busy && validateInputAnswer(draft, detail.version.contract);
   const choices = detail.version.contract.choices;
+  const availablePriorDraft = availablePriorInputDraft(
+    priorDraft,
+    drafts,
+    busy
+  );
   return (
     <div className="flex-1 min-h-0 flex flex-col md:flex-row">
       <div className="relative flex-1 min-h-24 bg-white">
@@ -1153,28 +1172,34 @@ function InputBody({
         className="md:w-96 shrink-0 flex flex-col max-h-[55dvh] md:max-h-none overflow-y-auto border-t md:border-t-0 md:border-l bg-primary"
       >
         <div className="flex-1 p-base md:p-double space-y-double">
-          {isOpen && priorDraft && (
+          {isOpen && availablePriorDraft && (
             <div className="rounded-md border p-base space-y-half text-sm">
               <p className="text-high">
                 A saved draft from an earlier version is available. Read this
                 version before you use it.
               </p>
-              {priorDraft.text && (
+              {availablePriorDraft.text && (
                 <p className="whitespace-pre-wrap break-words text-low">
-                  {priorDraft.text}
+                  {availablePriorDraft.text}
                 </p>
               )}
               <button
                 className={quietButton}
                 disabled={busy}
                 onClick={() => {
+                  const answer = availablePriorInputDraft(
+                    priorDraft,
+                    drafts,
+                    actionPending.current
+                  );
+                  if (!answer) return;
                   setDraft({
                     choice_id: detail.version.contract.choices.some(
-                      (c) => c.id === priorDraft.choice_id
+                      (c) => c.id === answer.choice_id
                     )
-                      ? priorDraft.choice_id
+                      ? answer.choice_id
                       : null,
-                    text: priorDraft.text,
+                    text: answer.text,
                   });
                   setProposal(null);
                   setPriorDraft(null);
@@ -1386,12 +1411,7 @@ function InputBody({
             </section>
           )}
         </div>
-        <div
-          className={cn(
-            'bg-primary border-t p-base md:px-double space-y-base pb-[max(12px,env(safe-area-inset-bottom))]',
-            !scheduleOpen && 'sticky bottom-0'
-          )}
-        >
+        <div className="sticky bottom-0 bg-primary border-t p-base md:px-double space-y-base pb-[max(12px,env(safe-area-inset-bottom))]">
           {error && (
             <p role="alert" className="text-sm text-error break-words">
               {error}
@@ -1427,15 +1447,59 @@ function InputBody({
           )}
           <div className="flex items-center gap-base">
             {isOpen && (
-              <button
-                className={quietButton}
-                disabled={busy}
-                aria-expanded={scheduleOpen}
-                aria-controls={scheduleId}
-                onClick={() => setScheduleOpen((open) => !open)}
-              >
-                Snooze
-              </button>
+              <Popover open={scheduleOpen} onOpenChange={setScheduleOpen}>
+                <PopoverTrigger asChild>
+                  <button type="button" className={quietButton} disabled={busy}>
+                    Snooze
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  aria-label="Input schedule"
+                  align="start"
+                  side="top"
+                  className="new-design max-w-[var(--radix-popover-content-available-width)] max-h-[var(--radix-popover-content-available-height)] overflow-y-auto space-y-base"
+                  onOpenAutoFocus={(event) => {
+                    event.preventDefault();
+                    scheduleControl.current?.focus();
+                  }}
+                >
+                  <label className="block space-y-half">
+                    <span className="block text-sm font-medium text-high">
+                      Show at (UTC)
+                    </span>
+                    <input
+                      ref={scheduleControl}
+                      type="datetime-local"
+                      step="60"
+                      value={scheduleTime}
+                      disabled={busy}
+                      className={`block w-full min-h-11 rounded-md border bg-secondary px-base text-high ${focusRing}`}
+                      onChange={(event) => {
+                        setScheduleTime(event.target.value);
+                        scheduleRequest.current = null;
+                      }}
+                    />
+                  </label>
+                  <div className="flex flex-wrap gap-base">
+                    <button
+                      className={quietButton}
+                      disabled={busy || !scheduleTime}
+                      onClick={() => void schedule(false)}
+                    >
+                      Save schedule
+                    </button>
+                    {detail.input.show_at && (
+                      <button
+                        className={quietButton}
+                        disabled={busy}
+                        onClick={() => void schedule(true)}
+                      >
+                        Show now
+                      </button>
+                    )}
+                  </div>
+                </PopoverContent>
+              </Popover>
             )}
             {undoSequence !== null && (
               <button
@@ -1474,49 +1538,6 @@ function InputBody({
               </DropdownMenu>
             </div>
           </div>
-          {isOpen && (
-            <section
-              id={scheduleId}
-              hidden={!scheduleOpen}
-              aria-label="Input schedule"
-              className="rounded-md border p-base space-y-base"
-            >
-              <label className="block space-y-half">
-                <span className="block text-sm font-medium text-high">
-                  Show at (UTC)
-                </span>
-                <input
-                  type="datetime-local"
-                  step="60"
-                  value={scheduleTime}
-                  disabled={busy}
-                  className={`block w-full min-h-11 rounded-md border bg-secondary px-base text-high ${focusRing}`}
-                  onChange={(event) => {
-                    setScheduleTime(event.target.value);
-                    scheduleRequest.current = null;
-                  }}
-                />
-              </label>
-              <div className="flex flex-wrap gap-base">
-                <button
-                  className={quietButton}
-                  disabled={busy || !scheduleTime}
-                  onClick={() => void schedule(false)}
-                >
-                  Save schedule
-                </button>
-                {detail.input.show_at && (
-                  <button
-                    className={quietButton}
-                    disabled={busy}
-                    onClick={() => void schedule(true)}
-                  >
-                    Show now
-                  </button>
-                )}
-              </div>
-            </section>
-          )}
         </div>
       </aside>
     </div>

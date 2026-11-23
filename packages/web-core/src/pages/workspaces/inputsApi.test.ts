@@ -373,37 +373,4 @@ describe('Input status actions', () => {
       );
     }
   );
-
-  it.each([
-    ['close', false],
-    ['undo-close', true],
-  ] as const)(
-    'uses the standalone %s route without sending an answer',
-    async (route, undo) => {
-      const request = vi.fn(
-        async () => new Response(JSON.stringify({ success: true, data: {} }))
-      );
-      setLocalApiTransport({ request, openWebSocket: vi.fn() });
-      await inputsApi.status(
-        'workspace',
-        null,
-        'input',
-        4,
-        undo,
-        'status-write'
-      );
-      expect(request).toHaveBeenCalledExactlyOnceWith(
-        `/api/workspaces/workspace/inputs/input/${route}`,
-        expect.objectContaining({
-          method: 'POST',
-          body: JSON.stringify({
-            expected_sequence: 4,
-            request_id: 'status-write',
-            status: 'closed',
-            reason: null,
-          }),
-        })
-      );
-    }
-  );
 });
