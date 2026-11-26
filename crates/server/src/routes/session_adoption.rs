@@ -124,22 +124,25 @@ async fn adopt_checked(
     let is_proof = |path: &std::path::Path| {
         transcript_paths.iter().any(|p| p == path)
             || path == tasks
-            || claude_temp_tasks_session(path, uid) == Some(request.native_session_id.as_str())
+            || is_claude_temp_tasks_dir(path, uid, &cwd, &request.native_session_id)
     };
     // An open session-specific transcript or task directory ties a CLI process
-    // to its native UUID. A `claude attach <prefix>` pane client holds neither:
-    // the attached session's own process must, alone among this user's
-    // processes in the same directory, and no other live session may share the
-    // attach prefix.
-    let owner = match attach_prefix(processes[0].argv.as_deref().unwrap_or_default()) {
-        Some(prefix) if prefix.len() >= 8 && request.native_session_id.starts_with(prefix) => {
-            attached_owner(request.expected_pid, uid, &cwd, prefix, &is_proof)
-                .ok_or_else(conflict)?
+    // to its native UUID. A `claude attach <short>` pane client holds neither:
+    // Claude Code's job record for `<short>` must name this session and
+    // directory, and exactly one other process of this user in the directory
+    // must hold the proof. Its start time is read before its descriptors, so a
+    // reused PID fails the final start-time check.
+    let (owner, owner_start) = match attach_prefix(processes[0].argv.as_deref().unwrap_or_default())
+    {
+        Some(short) => {
+            let home = dirs::home_dir().ok_or_else(conflict)?;
+            if !job_names_session(&home, short, &request.native_session_id, &cwd) {
+                return Err(conflict());
+            }
+            attached_owner(request.expected_pid, uid, &cwd, &is_proof).ok_or_else(conflict)?
         }
-        Some(_) => return Err(conflict()),
-        None => request.expected_pid,
+        None => (request.expected_pid, request.expected_start_time),
     };
-    let owner_start = process_start(owner).ok_or_else(conflict)?;
     if std::fs::metadata(format!("/proc/{owner}"))?.uid() != uid || !holds_proof(owner, &is_proof) {
         return Err(conflict());
     }
@@ -196,21 +199,57 @@ fn attach_prefix(argv: &[String]) -> Option<&str> {
         .then_some(prefix.as_str())
 }
 
-/// The session ID of Claude Code's per-session task directory,
-/// `<tmp>/claude-<uid>/<project>/<session>/tasks`, when `path` is such a
-/// directory inside a `claude-<uid>` directory that this user owns.
+/// Whether `path` is Claude Code's task directory for `native` in `cwd`:
+/// `<tmp>/claude-<uid>/<cwd with every non-alphanumeric byte as '-'>/<native>/tasks`,
+/// a directory inside a `claude-<uid>` directory this user owns.
 #[cfg(target_os = "linux")]
-fn claude_temp_tasks_session(path: &std::path::Path, uid: u32) -> Option<&str> {
+fn is_claude_temp_tasks_dir(
+    path: &std::path::Path,
+    uid: u32,
+    cwd: &std::path::Path,
+    native: &str,
+) -> bool {
     use std::os::unix::fs::MetadataExt;
+    let project: String = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
     let mut up = path.ancestors().skip(1);
-    let session = up.next()?.file_name()?.to_str()?;
-    up.next()?;
-    let root = up.next()?;
-    (path.file_name()? == "tasks"
-        && root.file_name()? == format!("claude-{uid}").as_str()
-        && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
-        && std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir() && m.uid() == uid))
-    .then_some(session)
+    path.file_name() == Some("tasks".as_ref())
+        && up.next().and_then(std::path::Path::file_name) == Some(native.as_ref())
+        && up.next().and_then(std::path::Path::file_name) == Some(project.as_ref())
+        && up.next().is_some_and(|root| {
+            root.file_name() == Some(format!("claude-{uid}").as_ref())
+                && std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir() && m.uid() == uid)
+        })
+        && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && m.uid() == uid)
+}
+
+/// Whether Claude Code's job record `~/.claude/jobs/<short>/state.json`
+/// (what `claude attach <short>` resolves) names `native` in `cwd`.
+#[cfg(target_os = "linux")]
+fn job_names_session(
+    home: &std::path::Path,
+    short: &str,
+    native: &str,
+    cwd: &std::path::Path,
+) -> bool {
+    if short.len() != 8 || !short.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    let Ok(raw) = std::fs::read(home.join(".claude/jobs").join(short).join("state.json")) else {
+        return false;
+    };
+    let Ok(job) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    job["daemonShort"] == short
+        && job["sessionId"] == native
+        && job["cwd"]
+            .as_str()
+            .and_then(|dir| std::fs::canonicalize(dir).ok())
+            .is_some_and(|dir| dir == cwd)
 }
 
 #[cfg(target_os = "linux")]
@@ -230,47 +269,31 @@ fn holds_proof(pid: u32, is_proof: &impl Fn(&std::path::Path) -> bool) -> bool {
 }
 
 /// The one process of `uid`, other than the attach `client`, that runs in
-/// `cwd` and holds the session proof open. `None` when none or several do, or
-/// when another session whose ID starts with `prefix` is live in `cwd`.
+/// `cwd` and holds the session proof open, with its start time read before
+/// its descriptors. `None` when none or several do.
 #[cfg(target_os = "linux")]
 fn attached_owner(
     client: u32,
     uid: u32,
     cwd: &std::path::Path,
-    prefix: &str,
     is_proof: &impl Fn(&std::path::Path) -> bool,
-) -> Option<u32> {
+) -> Option<(u32, u64)> {
     use std::os::unix::fs::MetadataExt;
-    let mut owners = Vec::new();
-    for pid in std::fs::read_dir("/proc")
+    let mut owners = std::fs::read_dir("/proc")
         .ok()?
         .flatten()
         .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-    {
-        if pid == client
-            || !std::fs::metadata(format!("/proc/{pid}")).is_ok_and(|m| m.uid() == uid)
-            || !std::fs::read_link(format!("/proc/{pid}/cwd"))
-                .and_then(|path| path.canonicalize())
-                .is_ok_and(|path| path == cwd)
-        {
-            continue;
-        }
-        let paths = open_paths(pid);
-        let ambiguous = paths.iter().any(|path| {
-            claude_temp_tasks_session(path, uid)
-                .is_some_and(|session| session.starts_with(prefix) && !is_proof(path))
+        .filter(|&pid| pid != client)
+        .filter_map(|pid| Some((pid, process_start(pid)?)))
+        .filter(|&(pid, _)| {
+            std::fs::metadata(format!("/proc/{pid}")).is_ok_and(|m| m.uid() == uid)
+                && std::fs::read_link(format!("/proc/{pid}/cwd"))
+                    .and_then(|path| path.canonicalize())
+                    .is_ok_and(|path| path == cwd)
+                && holds_proof(pid, is_proof)
         });
-        if ambiguous {
-            return None;
-        }
-        if paths.iter().any(|path| is_proof(path)) {
-            owners.push(pid);
-        }
-    }
-    let [owner] = owners[..] else {
-        return None;
-    };
-    Some(owner)
+    let owner = owners.next()?;
+    owners.next().is_none().then_some(owner)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -292,8 +315,8 @@ mod tests {
             Some("356524b6")
         );
         assert_eq!(
-            attach_prefix(&argv(&["/usr/bin/claude", "attach", NATIVE])),
-            Some(NATIVE)
+            attach_prefix(&argv(&["/usr/bin/claude", "attach", "356524b6"])),
+            Some("356524b6")
         );
         assert_eq!(attach_prefix(&argv(&["claude", "--resume", NATIVE])), None);
         assert_eq!(attach_prefix(&argv(&["node", "attach", "356524b6"])), None);
@@ -301,65 +324,98 @@ mod tests {
     }
 
     #[test]
-    fn temp_tasks_dir_needs_a_directory_under_an_owned_claude_uid_root() {
+    fn temp_tasks_dir_must_be_this_session_in_this_project() {
         let uid = std::fs::metadata("/proc/self").unwrap().uid();
         let base = tempfile::tempdir().unwrap();
+        let cwd = std::path::Path::new("/home/u/.repos/app");
         let tasks = base
             .path()
-            .join(format!("claude-{uid}/-home-u-repo/{NATIVE}/tasks"));
+            .join(format!("claude-{uid}/-home-u--repos-app/{NATIVE}/tasks"));
         std::fs::create_dir_all(&tasks).unwrap();
-        assert_eq!(claude_temp_tasks_session(&tasks, uid), Some(NATIVE));
-        assert_eq!(
-            claude_temp_tasks_session(&tasks.join("x.output"), uid),
-            None
-        );
+        assert!(is_claude_temp_tasks_dir(&tasks, uid, cwd, NATIVE));
+        assert!(!is_claude_temp_tasks_dir(
+            &tasks,
+            uid,
+            std::path::Path::new("/home/u/other"),
+            NATIVE
+        ));
+        assert!(!is_claude_temp_tasks_dir(
+            &tasks,
+            uid,
+            cwd,
+            "19f21039-8fb4-42c7-a85e-6805d697cb7a"
+        ));
+        assert!(!is_claude_temp_tasks_dir(
+            &tasks.join("x.output"),
+            uid,
+            cwd,
+            NATIVE
+        ));
 
         // A root named for another uid but owned by this one.
-        let other = base
-            .path()
-            .join(format!("claude-{}/p/{NATIVE}/tasks", uid + 1));
+        let other = base.path().join(format!(
+            "claude-{}/-home-u--repos-app/{NATIVE}/tasks",
+            uid + 1
+        ));
         std::fs::create_dir_all(&other).unwrap();
-        assert_eq!(claude_temp_tasks_session(&other, uid + 1), None);
+        assert!(!is_claude_temp_tasks_dir(&other, uid + 1, cwd, NATIVE));
 
         // A regular file named `tasks`.
-        let file_dir = base.path().join(format!("claude-{uid}/q/{NATIVE}"));
-        std::fs::create_dir_all(&file_dir).unwrap();
-        std::fs::write(file_dir.join("tasks"), b"").unwrap();
-        assert_eq!(
-            claude_temp_tasks_session(&file_dir.join("tasks"), uid),
-            None
-        );
+        let file = base
+            .path()
+            .join(format!("claude-{uid}/-home-u--repos-app/x/tasks"));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"").unwrap();
+        assert!(!is_claude_temp_tasks_dir(&file, uid, cwd, "x"));
+    }
+
+    #[test]
+    fn job_record_must_name_this_session_and_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = home.path().canonicalize().unwrap();
+        let job = home.path().join(".claude/jobs/356524b6");
+        std::fs::create_dir_all(&job).unwrap();
+        let record = serde_json::json!({
+            "daemonShort": "356524b6",
+            "sessionId": NATIVE,
+            "cwd": cwd.to_string_lossy(),
+        });
+        std::fs::write(job.join("state.json"), record.to_string()).unwrap();
+
+        assert!(job_names_session(home.path(), "356524b6", NATIVE, &cwd));
+        assert!(!job_names_session(
+            home.path(),
+            "356524b6",
+            "356524b6-0000-4000-8000-000000000000",
+            &cwd
+        ));
+        assert!(!job_names_session(
+            home.path(),
+            "356524b6",
+            NATIVE,
+            std::path::Path::new("/")
+        ));
+        assert!(!job_names_session(home.path(), "19f21039", NATIVE, &cwd));
+        assert!(!job_names_session(home.path(), "../jobs", NATIVE, &cwd));
     }
 
     #[test]
     fn attached_owner_finds_the_single_process_holding_the_proof() {
         let base = tempfile::tempdir().unwrap();
-        let uid = std::fs::metadata("/proc/self").unwrap().uid();
-        let proof = base.path().join(format!("claude-{uid}/p/{NATIVE}/tasks"));
-        let other = base.path().join(format!(
-            "claude-{uid}/p/356524b6-0000-4000-8000-000000000000/tasks"
-        ));
-        std::fs::create_dir_all(&proof).unwrap();
-        std::fs::create_dir_all(&other).unwrap();
+        let proof = base.path().join("proof");
+        std::fs::create_dir(&proof).unwrap();
         let _held = std::fs::File::open(&proof).unwrap();
+        let uid = std::fs::metadata("/proc/self").unwrap().uid();
         let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
-        let is_proof =
-            |path: &std::path::Path| claude_temp_tasks_session(path, uid) == Some(NATIVE);
+        let is_proof = |path: &std::path::Path| path == proof;
         let me = std::process::id();
 
         assert_eq!(
-            attached_owner(0, uid, &cwd, "356524b6", &is_proof),
-            Some(me)
+            attached_owner(0, uid, &cwd, &is_proof),
+            Some((me, process_start(me).unwrap()))
         );
-        assert_eq!(attached_owner(me, uid, &cwd, "356524b6", &is_proof), None);
-        assert_eq!(
-            attached_owner(0, uid + 1, &cwd, "356524b6", &is_proof),
-            None
-        );
-
-        // Another live session sharing the prefix makes the attach ambiguous.
-        let _shared = std::fs::File::open(&other).unwrap();
-        assert_eq!(attached_owner(0, uid, &cwd, "356524b6", &is_proof), None);
+        assert_eq!(attached_owner(me, uid, &cwd, &is_proof), None);
+        assert_eq!(attached_owner(0, uid + 1, &cwd, &is_proof), None);
     }
 }
 
