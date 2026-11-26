@@ -2015,6 +2015,8 @@ dependencies = [
  "chrono",
  "executors",
  "futures",
+ "html5ever 0.29.1",
+ "percent-encoding",
  "schemars 1.2.1",
  "serde",
  "serde_json",

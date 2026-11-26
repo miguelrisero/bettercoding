@@ -1,5 +1,11 @@
 //! Application-enforced history. A process with SQLite write access can rewrite this ledger.
+use std::{borrow::Cow, cell::Cell};
+
 use chrono::{DateTime, Datelike, SecondsFormat, Timelike, Utc};
+use html5ever::tokenizer::{
+    BufferQueue, StartTag, TagToken, Token, TokenSink, TokenSinkResult, Tokenizer, states::RawKind,
+};
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -390,15 +396,140 @@ impl InputContract {
     }
 }
 impl InputContent {
-    fn validate(&self, _workspace: Uuid) -> Result<()> {
+    fn validate(&self, workspace: Uuid) -> Result<()> {
         if self.html.len() > MAX_HTML_BYTES {
             return Err(InputError::Code("PAYLOAD_TOO_LARGE"));
         }
         if self.title.trim().is_empty() || self.title.len() > 512 {
             return Err(InputError::Code("SCHEMA_INVALID"));
         }
-        self.contract.validate()
+        self.contract.validate()?;
+        validate_image_sources(&self.html, workspace)
     }
+}
+
+fn validate_image_sources(html: &str, workspace: Uuid) -> Result<()> {
+    struct Images {
+        preview: String,
+        svg_depth: Cell<usize>,
+        invalid: Cell<bool>,
+    }
+    impl TokenSink for Images {
+        type Handle = ();
+
+        fn process_token(&self, token: Token, _: u64) -> TokenSinkResult<()> {
+            let TagToken(tag) = token else {
+                return TokenSinkResult::Continue;
+            };
+            let name: &str = &tag.name;
+            // shortcut: track SVG nesting only; use a tree builder if namespace recovery matters.
+            if name == "svg" {
+                let depth = self.svg_depth.get();
+                if tag.kind != StartTag {
+                    self.svg_depth.set(depth.saturating_sub(1));
+                } else if !tag.self_closing {
+                    self.svg_depth.set(depth + 1);
+                }
+            }
+            if tag.kind != StartTag {
+                return TokenSinkResult::Continue;
+            }
+            let attributes: &[&str] = match name {
+                "img" => &["src"],
+                "image" if self.svg_depth.get() > 0 => &["href", "xlink:href"],
+                "script" | "style" if tag.self_closing && self.svg_depth.get() > 0 => {
+                    return TokenSinkResult::Continue;
+                }
+                "script" => return TokenSinkResult::RawData(RawKind::ScriptData),
+                "style" => return TokenSinkResult::RawData(RawKind::Rawtext),
+                _ if self.svg_depth.get() > 0 => return TokenSinkResult::Continue,
+                "xmp" | "iframe" | "noembed" | "noframes" | "noscript" => {
+                    return TokenSinkResult::RawData(RawKind::Rawtext);
+                }
+                "title" | "textarea" => return TokenSinkResult::RawData(RawKind::Rcdata),
+                "plaintext" => return TokenSinkResult::Plaintext,
+                _ => return TokenSinkResult::Continue,
+            };
+            if !self.invalid.get()
+                && tag.attrs.iter().any(|attr| {
+                    let source = attr.value.as_ref();
+                    attributes.contains(&attr.name.local.as_ref())
+                        && !source.starts_with("blob:")
+                        && !source
+                            .get(..11)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:image/"))
+                        && !(name == "img" && workspace_image_path(source, &self.preview).is_some())
+                })
+            {
+                self.invalid.set(true);
+            }
+            TokenSinkResult::Continue
+        }
+
+        fn adjusted_current_node_present_but_not_in_html_namespace(&self) -> bool {
+            self.svg_depth.get() > 0
+        }
+    }
+
+    let input = BufferQueue::default();
+    input.push_back(html.into());
+    let tokenizer = Tokenizer::new(
+        Images {
+            preview: format!("workspaces/{workspace}/files/preview/"),
+            svg_depth: Cell::new(0),
+            invalid: Cell::new(false),
+        },
+        Default::default(),
+    );
+    let _ = tokenizer.feed(&input);
+    tokenizer.end();
+    if tokenizer.sink.invalid.get() {
+        return Err(InputError::Code("IMAGE_SOURCE_INVALID"));
+    }
+    Ok(())
+}
+
+// Match inputImagePath; the server cannot check the browser's origin or host ID.
+fn workspace_image_path(source: &str, preview: &str) -> Option<()> {
+    let mut path = source;
+    if let Some(absolute) = source
+        .strip_prefix("https://")
+        .or_else(|| source.strip_prefix("http://"))
+    {
+        let (host, raw_path) = absolute.split_at(absolute.find('/')?);
+        if host.is_empty() || host.contains(['@', '\\']) || source.contains(['?', '#']) {
+            return None;
+        }
+        url::Url::parse(source).ok()?;
+        // Use the original path because URL parsing removes dot segments.
+        path = raw_path;
+    }
+    if !path.starts_with(".bettercoding-uploads/") {
+        let mut route = path.strip_prefix("/api/")?;
+        if let Some(host) = route.strip_prefix("host/") {
+            let (id, rest) = host.split_once('/')?;
+            image_path_segment(id)?;
+            route = rest;
+        }
+        path = route.strip_prefix(preview)?;
+    }
+    let mut segments = path.rsplit('/');
+    let last = image_path_segment(segments.next()?)?;
+    let (_, ext) = last.rsplit_once('.')?;
+    (matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "ico"
+    ) && segments.all(|segment| image_path_segment(segment).is_some()))
+    .then_some(())
+}
+
+fn image_path_segment(segment: &str) -> Option<Cow<'_, str>> {
+    let decoded = percent_decode_str(segment).decode_utf8().ok()?;
+    (!decoded.is_empty()
+        && !matches!(decoded.as_ref(), "." | "..")
+        && !decoded.contains(['%', '\\', '/', '?', '#'])
+        && !decoded.bytes().any(|b| b < 32))
+    .then_some(decoded)
 }
 
 fn validate_priority(priority: &str) -> Result<()> {
