@@ -1667,21 +1667,79 @@ async fn pane_process_listing(target: &CliTmuxTarget) -> Option<(u32, String)> {
         .parse::<u32>()
         .ok()?;
 
-    // One process snapshot, walked in-process: a single `ps` instead of an
+    // One process snapshot, walked in-process: a single snapshot instead of an
     // unbounded fan-out of `pgrep -P` calls, and a consistent view of the tree.
+    Some((pane_pid, process_listing().await?))
+}
+
+/// The `pid ppid comm` lines of `ps -eo pid=,ppid=,comm=`, read from `/proc`
+/// so frequent pane probes do not each spawn a `ps` that scans every process.
+#[cfg(target_os = "linux")]
+async fn process_listing() -> Option<String> {
+    tokio::task::spawn_blocking(|| {
+        let mut listing = String::new();
+        for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            // The process may have exited since the directory read.
+            let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            // The kernel cuts comm at 15 bytes, even inside a UTF-8 character.
+            if let Some((ppid, comm)) = parse_proc_stat(&String::from_utf8_lossy(&stat)) {
+                listing.push_str(&format!("{pid} {ppid} {comm}\n"));
+            }
+        }
+        Some(listing)
+    })
+    .await
+    .ok()?
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn process_listing() -> Option<String> {
     let snapshot = tokio::process::Command::new("ps")
         .args(["-eo", "pid=,ppid=,comm="])
         .stderr(std::process::Stdio::null())
         .output()
         .await
         .ok()?;
-    if !snapshot.status.success() {
-        return None;
-    }
+    snapshot
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&snapshot.stdout).into_owned())
+}
+
+/// `(ppid, comm)` from a `/proc/<pid>/stat` line. `comm` sits in the outermost
+/// parentheses and may itself hold spaces or `)`; control characters become
+/// `?` as in `ps`, so one process stays on one listing line. A zombie gets the
+/// ` <defunct>` suffix `ps` adds, so an unreaped agent never matches a program.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_proc_stat(stat: &str) -> Option<(u32, String)> {
+    let (head, rest) = stat.rsplit_once(')')?;
+    let comm = printable(head.split_once('(')?.1);
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?;
+    let ppid = fields.next()?.parse().ok()?;
     Some((
-        pane_pid,
-        String::from_utf8_lossy(&snapshot.stdout).into_owned(),
+        ppid,
+        if state == "Z" {
+            format!("{comm} <defunct>")
+        } else {
+            comm
+        },
     ))
+}
+
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// One matching process from the live pane subtree. The PID is exposed so the
@@ -1720,17 +1778,25 @@ async fn cli_pane_agent_processes_at<'a>(
     };
     let mut processes = Vec::new();
     for pid in pane_subtree_program_pids(&listing, pane_pid, program) {
-        let output = tokio::process::Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "args="])
-            .stderr(std::process::Stdio::null())
-            .output()
-            .await
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let cmdline = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let argv = process_argv(pid);
+        let cmdline = match &argv {
+            // `ps -o args=` text, without spawning `ps`.
+            Some(argv) => printable(&argv.join(" ")).trim().to_string(),
+            // No readable argument vector (exited, zombie, or not Linux): ask
+            // `ps`, which fails or reports `[comm]` as before.
+            None => {
+                let output = tokio::process::Command::new("ps")
+                    .args(["-p", &pid.to_string(), "-o", "args="])
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .await
+                    .ok()?;
+                if !output.status.success() {
+                    return None;
+                }
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
+        };
         processes.push(CliPaneAgentProcess { pid, cmdline, argv });
     }
     Some((Some(program), processes))
@@ -3412,6 +3478,42 @@ impl Default for PtyService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proc_stat_comm_keeps_spaces_and_parentheses() {
+        assert_eq!(
+            parse_proc_stat("42 (node) S 7 42 42 0 -1"),
+            Some((7, "node".to_string()))
+        );
+        assert_eq!(
+            parse_proc_stat("42 (a b) c)) R 9 42 42 0 -1"),
+            Some((9, "a b) c)".to_string()))
+        );
+        assert_eq!(
+            parse_proc_stat("42 (x\ny) S 3 42"),
+            Some((3, "x?y".to_string()))
+        );
+        assert_eq!(
+            parse_proc_stat("42 (claude) Z 7 42 42"),
+            Some((7, "claude <defunct>".to_string()))
+        );
+        assert!(!comm_matches_program("claude <defunct>", "claude"));
+        assert_eq!(
+            parse_proc_stat(&String::from_utf8_lossy(b"42 (wrapper-\xC3) S 7 42")),
+            Some((7, "wrapper-\u{FFFD}".to_string()))
+        );
+        assert_eq!(parse_proc_stat("42 node S 7"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn proc_listing_reports_this_process_and_its_parent() {
+        let listing = process_listing().await.expect("readable /proc");
+        let (comm_by_pid, children) = parse_ps_tree(&listing);
+        let pid = std::process::id();
+        assert!(comm_by_pid.contains_key(&pid));
+        assert!(children[&std::os::unix::process::parent_id()].contains(&pid));
+    }
 
     #[test]
     fn cli_session_names_are_namespaced_and_tmux_safe() {
