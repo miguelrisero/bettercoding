@@ -37,7 +37,7 @@ impl IntoResponse for RouteError {
         };
         let message = match &self.0 {
             InputError::Code("IMAGE_SOURCE_INVALID") => {
-                "IMAGE_SOURCE_INVALID: Embed images as base64 `data:` URLs.".to_string()
+                "IMAGE_SOURCE_INVALID: Embed each image as a base64 PNG, JPEG, GIF, WebP, AVIF, BMP or ICO data: URL.".to_string()
             }
             error if status == StatusCode::INTERNAL_SERVER_ERROR => {
                 tracing::error!(%error, "Input request failed");

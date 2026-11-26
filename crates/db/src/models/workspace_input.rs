@@ -434,9 +434,25 @@ fn validate_image_sources(html: &str, workspace: Uuid) -> Result<()> {
             if tag.kind != StartTag {
                 return TokenSinkResult::Continue;
             }
-            let attributes: &[&str] = match name {
-                "img" => &["src"],
-                "image" if self.svg_depth.get() > 0 => &["href", "xlink:href"],
+            let attribute = |name: &str| {
+                tag.attrs
+                    .iter()
+                    .find(|attr| attr.name.local.as_ref() == name)
+                    .map(|attr| attr.value.as_ref())
+            };
+            let invalid = match name {
+                "img" => attribute("src").is_some_and(|source| {
+                    !is_embedded_raster(source)
+                        && workspace_image_path(source, &self.preview).is_none()
+                }),
+                "image" if self.svg_depth.get() > 0 => attribute("href")
+                    .or_else(|| attribute("xlink:href"))
+                    .is_some_and(|source| {
+                        !source.starts_with("blob:")
+                            && !source
+                                .get(..11)
+                                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:image/"))
+                    }),
                 "script" | "style" if tag.self_closing && self.svg_depth.get() > 0 => {
                     return TokenSinkResult::Continue;
                 }
@@ -450,17 +466,7 @@ fn validate_image_sources(html: &str, workspace: Uuid) -> Result<()> {
                 "plaintext" => return TokenSinkResult::Plaintext,
                 _ => return TokenSinkResult::Continue,
             };
-            if !self.invalid.get()
-                && tag.attrs.iter().any(|attr| {
-                    let source = attr.value.as_ref();
-                    attributes.contains(&attr.name.local.as_ref())
-                        && !source.starts_with("blob:")
-                        && !source
-                            .get(..11)
-                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:image/"))
-                        && !(name == "img" && workspace_image_path(source, &self.preview).is_some())
-                })
-            {
+            if invalid {
                 self.invalid.set(true);
             }
             TokenSinkResult::Continue
@@ -489,21 +495,45 @@ fn validate_image_sources(html: &str, workspace: Uuid) -> Result<()> {
     Ok(())
 }
 
+// Match the embedded image pattern in input-rich-content.js.
+fn is_embedded_raster(source: &str) -> bool {
+    let Some((kind, data)) = source
+        .strip_prefix("data:image/")
+        .and_then(|source| source.split_once(";base64,"))
+    else {
+        return false;
+    };
+    matches!(
+        kind,
+        "png" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "x-icon"
+    ) && !data.is_empty()
+        && data.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '+' | '/' | '=')
+                // JavaScript's \s includes BOM but excludes NEL.
+                || (c.is_whitespace() && c != '\u{85}')
+                || c == '\u{feff}'
+        })
+}
+
 // Match inputImagePath; the server cannot check the browser's origin or host ID.
 fn workspace_image_path(source: &str, preview: &str) -> Option<()> {
-    let mut path = source;
-    if let Some(absolute) = source
-        .strip_prefix("https://")
-        .or_else(|| source.strip_prefix("http://"))
-    {
-        let (host, raw_path) = absolute.split_at(absolute.find('/')?);
-        if host.is_empty() || host.contains(['@', '\\']) || source.contains(['?', '#']) {
+    let parsed;
+    let mut path = if source.starts_with("http://") || source.starts_with("https://") {
+        parsed = url::Url::parse(source).ok()?;
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some_and(|query| !query.is_empty())
+            || parsed
+                .fragment()
+                .is_some_and(|fragment| !fragment.is_empty())
+        {
             return None;
         }
-        url::Url::parse(source).ok()?;
-        // Use the original path because URL parsing removes dot segments.
-        path = raw_path;
-    }
+        parsed.path()
+    } else {
+        source
+    };
     if !path.starts_with(".bettercoding-uploads/") {
         let mut route = path.strip_prefix("/api/")?;
         if let Some(host) = route.strip_prefix("host/") {
@@ -1158,13 +1188,16 @@ mod tests {
         let mut content = content();
         for html in [
             r#"<img src="data:image/png;base64,iVBORw0KGgo=">"#.into(),
-            r#"<IMG SRC="DATA:IMAGE/PNG;base64,iVBORw0KGgo=">"#.into(),
-            r#"<img src="blob:example">"#.into(),
+            r#"<img src="data:image/png;base64,iVBO&#10;Rw0KGgo=">"#.into(),
             r#"<img src=".bettercoding-uploads/a/b.png">"#.into(),
             format!(r#"<img src="{root}/x.png">"#),
             format!(r#"<img src="https://host{root}/x.png">"#),
+            format!(r#"<img src="https://host{root}/a/%2e%2e/b.png">"#),
+            format!(r#"<img src="https://host{root}/x.png?">"#),
+            format!(r#"<img src="https://host{root}/x.png#">"#),
             format!(r#"<img src="/api/host/relay/workspaces/{workspace}/files/preview/a%20b.JPEG">"#),
-            r#"<svg><image href="data:image/png;base64,iVBORw0KGgo=" xlink:href="blob:example"/></svg>"#.into(),
+            r#"<svg><image xlink:href="blob:example"/></svg>"#.into(),
+            r#"<svg><image href="data:image/png;base64,iVBORw0KGgo=" xlink:href="chart.png"/></svg>"#.into(),
         ] {
             content.html = html;
             assert!(content.validate(workspace).is_ok(), "{}", content.html);
@@ -1183,7 +1216,12 @@ mod tests {
             ),
             r#"<img src="https://example.com/x.png">"#.into(),
             r#"<img src=".bettercoding-uploads/a/../b.png">"#.into(),
-            format!(r#"<img src="https://host{root}/a/%2e%2e/b.png">"#),
+            r#"<IMG SRC="DATA:IMAGE/PNG;base64,iVBORw0KGgo=">"#.into(),
+            r#"<img src="blob:example">"#.into(),
+            r#"<img src="data:image/svg+xml;base64,PHN2Zy8+">"#.into(),
+            r#"<img src="data:image/jpg;base64,iVBORw0KGgo=">"#.into(),
+            r#"<img src="data:image/png;base64,">"#.into(),
+            r#"<img src="data:image/png;base64,iVBO%20Rw0KGgo=">"#.into(),
             format!(r#"<img src="{root}/a%2fb.png">"#),
             format!(r#"<img src="{root}/a%25b.png">"#),
             format!(r#"<img src="{root}/a%00b.png">"#),
