@@ -121,10 +121,11 @@ async fn adopt_checked(
         .join(".claude/tasks")
         .join(&request.native_session_id);
     let uid = std::fs::metadata("/proc/self")?.uid();
+    let tmp_dirs = [std::path::PathBuf::from("/tmp"), std::env::temp_dir()];
     let is_proof = |path: &std::path::Path| {
         transcript_paths.iter().any(|p| p == path)
             || path == tasks
-            || is_claude_temp_tasks_dir(path, uid, &cwd, &request.native_session_id)
+            || is_claude_temp_tasks_dir(path, uid, &cwd, &request.native_session_id, &tmp_dirs)
     };
     // An open session-specific transcript or task directory ties a CLI process
     // to its native UUID. A `claude attach <short>` pane client holds neither:
@@ -143,12 +144,14 @@ async fn adopt_checked(
         }
         None => (request.expected_pid, request.expected_start_time),
     };
-    if std::fs::metadata(format!("/proc/{owner}"))?.uid() != uid || !holds_proof(owner, &is_proof) {
+    if std::fs::metadata(format!("/proc/{owner}"))?.uid() != uid
+        || std::fs::metadata(format!("/proc/{}", request.expected_pid))?.uid() != uid
+        || !holds_proof(owner, &is_proof)
+    {
         return Err(conflict());
     }
     let live = cli_pane_agent_processes(workspace.id, CLI_AGENT_PROGRAMS).await;
-    if process_start(request.expected_pid) != Some(request.expected_start_time)
-        || cli_workspace_pane_id(workspace.id).await? != request.expected_pane_id
+    if cli_workspace_pane_id(workspace.id).await? != request.expected_pane_id
         || !live.is_some_and(|(program, processes)| {
             program == Some("claude")
                 && processes.len() == 1
@@ -158,6 +161,9 @@ async fn adopt_checked(
         || std::fs::read_link(format!("/proc/{owner}/cwd"))?.canonicalize()? != cwd
         || !holds_proof(owner, &is_proof)
         || process_start(owner) != Some(owner_start)
+        // Last, after every awaited lookup: the pane process is still the one
+        // the request named.
+        || process_start(request.expected_pid) != Some(request.expected_start_time)
     {
         return Err(conflict());
     }
@@ -201,13 +207,15 @@ fn attach_prefix(argv: &[String]) -> Option<&str> {
 
 /// Whether `path` is Claude Code's task directory for `native` in `cwd`:
 /// `<tmp>/claude-<uid>/<cwd with every non-alphanumeric byte as '-'>/<native>/tasks`,
-/// a directory inside a `claude-<uid>` directory this user owns.
+/// a directory inside a `claude-<uid>` directory this user owns in the system
+/// temp directory.
 #[cfg(target_os = "linux")]
 fn is_claude_temp_tasks_dir(
     path: &std::path::Path,
     uid: u32,
     cwd: &std::path::Path,
     native: &str,
+    tmp_dirs: &[std::path::PathBuf],
 ) -> bool {
     use std::os::unix::fs::MetadataExt;
     let project: String = cwd
@@ -221,6 +229,9 @@ fn is_claude_temp_tasks_dir(
         && up.next().and_then(std::path::Path::file_name) == Some(project.as_ref())
         && up.next().is_some_and(|root| {
             root.file_name() == Some(format!("claude-{uid}").as_ref())
+                && root
+                    .parent()
+                    .is_some_and(|tmp| tmp_dirs.iter().any(|dir| dir == tmp))
                 && std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir() && m.uid() == uid)
         })
         && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && m.uid() == uid)
@@ -327,29 +338,35 @@ mod tests {
     fn temp_tasks_dir_must_be_this_session_in_this_project() {
         let uid = std::fs::metadata("/proc/self").unwrap().uid();
         let base = tempfile::tempdir().unwrap();
+        let tmp = [base.path().to_path_buf()];
         let cwd = std::path::Path::new("/home/u/.repos/app");
         let tasks = base
             .path()
             .join(format!("claude-{uid}/-home-u--repos-app/{NATIVE}/tasks"));
         std::fs::create_dir_all(&tasks).unwrap();
-        assert!(is_claude_temp_tasks_dir(&tasks, uid, cwd, NATIVE));
+        assert!(is_claude_temp_tasks_dir(&tasks, uid, cwd, NATIVE, &tmp));
+        // The same tree outside the system temp directory.
+        assert!(!is_claude_temp_tasks_dir(&tasks, uid, cwd, NATIVE, &[]));
         assert!(!is_claude_temp_tasks_dir(
             &tasks,
             uid,
             std::path::Path::new("/home/u/other"),
-            NATIVE
+            NATIVE,
+            &tmp
         ));
         assert!(!is_claude_temp_tasks_dir(
             &tasks,
             uid,
             cwd,
-            "19f21039-8fb4-42c7-a85e-6805d697cb7a"
+            "19f21039-8fb4-42c7-a85e-6805d697cb7a",
+            &tmp
         ));
         assert!(!is_claude_temp_tasks_dir(
             &tasks.join("x.output"),
             uid,
             cwd,
-            NATIVE
+            NATIVE,
+            &tmp
         ));
 
         // A root named for another uid but owned by this one.
@@ -358,7 +375,13 @@ mod tests {
             uid + 1
         ));
         std::fs::create_dir_all(&other).unwrap();
-        assert!(!is_claude_temp_tasks_dir(&other, uid + 1, cwd, NATIVE));
+        assert!(!is_claude_temp_tasks_dir(
+            &other,
+            uid + 1,
+            cwd,
+            NATIVE,
+            &tmp
+        ));
 
         // A regular file named `tasks`.
         let file = base
@@ -366,7 +389,7 @@ mod tests {
             .join(format!("claude-{uid}/-home-u--repos-app/x/tasks"));
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, b"").unwrap();
-        assert!(!is_claude_temp_tasks_dir(&file, uid, cwd, "x"));
+        assert!(!is_claude_temp_tasks_dir(&file, uid, cwd, "x", &tmp));
     }
 
     #[test]
