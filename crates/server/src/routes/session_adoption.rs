@@ -121,7 +121,15 @@ async fn adopt_checked(
         .join(".claude/tasks")
         .join(&request.native_session_id);
     let uid = std::fs::metadata("/proc/self")?.uid();
-    let tmp_dirs = [std::path::PathBuf::from("/tmp"), std::env::temp_dir()];
+    // `/proc` reports resolved paths, so the allowed temp roots are resolved too.
+    let tmp_dirs: Vec<_> = [std::path::PathBuf::from("/tmp"), std::env::temp_dir()]
+        .iter()
+        .filter_map(|dir| dir.canonicalize().ok())
+        .collect();
+    let pane_argv = cmdline(request.expected_pid)?;
+    if processes[0].argv.as_deref() != Some(&pane_argv[..]) {
+        return Err(conflict());
+    }
     let is_proof = |path: &std::path::Path| {
         transcript_paths.iter().any(|p| p == path)
             || path == tasks
@@ -133,8 +141,7 @@ async fn adopt_checked(
     // directory, and exactly one other process of this user in the directory
     // must hold the proof. Its start time is read before its descriptors, so a
     // reused PID fails the final start-time check.
-    let (owner, owner_start) = match attach_prefix(processes[0].argv.as_deref().unwrap_or_default())
-    {
+    let (owner, owner_start) = match attach_prefix(&pane_argv) {
         Some(short) => {
             let home = dirs::home_dir().ok_or_else(conflict)?;
             if !job_names_session(&home, short, &request.native_session_id, &cwd) {
@@ -162,8 +169,9 @@ async fn adopt_checked(
         || !holds_proof(owner, &is_proof)
         || process_start(owner) != Some(owner_start)
         // Last, after every awaited lookup: the pane process is still the one
-        // the request named.
+        // the request named, running the same command (exec keeps PID and start).
         || process_start(request.expected_pid) != Some(request.expected_start_time)
+        || cmdline(request.expected_pid)? != pane_argv
     {
         return Err(conflict());
     }
@@ -193,6 +201,17 @@ async fn adopt_checked(
         pid: request.expected_pid,
         start_time: request.expected_start_time,
     })))
+}
+
+/// The argument vector of `pid`, split as `local_deployment::pty` splits it.
+#[cfg(target_os = "linux")]
+fn cmdline(pid: u32) -> std::io::Result<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline"))?;
+    let raw = raw.strip_suffix(&[0]).unwrap_or(&raw);
+    Ok(raw
+        .split(|byte| *byte == 0)
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect())
 }
 
 /// The session prefix when `argv` is `claude attach <prefix>`.
