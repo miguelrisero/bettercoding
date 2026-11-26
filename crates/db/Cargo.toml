@@ -22,6 +22,8 @@ futures = "0.3.32"
 sha2 = "0.10"
 schemars = { workspace = true }
 url = "2.5"
+html5ever = "0.29.1"
+percent-encoding = "2.3"
 
 [dev-dependencies]
 tokio = { workspace = true }

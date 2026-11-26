@@ -1,5 +1,11 @@
 //! Application-enforced history. A process with SQLite write access can rewrite this ledger.
+use std::{borrow::Cow, cell::Cell};
+
 use chrono::{DateTime, Datelike, SecondsFormat, Timelike, Utc};
+use html5ever::tokenizer::{
+    BufferQueue, StartTag, TagToken, Token, TokenSink, TokenSinkResult, Tokenizer, states::RawKind,
+};
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -390,15 +396,170 @@ impl InputContract {
     }
 }
 impl InputContent {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, workspace: Uuid) -> Result<()> {
         if self.html.len() > MAX_HTML_BYTES {
             return Err(InputError::Code("PAYLOAD_TOO_LARGE"));
         }
         if self.title.trim().is_empty() || self.title.len() > 512 {
             return Err(InputError::Code("SCHEMA_INVALID"));
         }
-        self.contract.validate()
+        self.contract.validate()?;
+        validate_image_sources(&self.html, workspace)
     }
+}
+
+fn validate_image_sources(html: &str, workspace: Uuid) -> Result<()> {
+    struct Images {
+        preview: String,
+        svg_depth: Cell<usize>,
+        invalid: Cell<bool>,
+    }
+    impl TokenSink for Images {
+        type Handle = ();
+
+        fn process_token(&self, token: Token, _: u64) -> TokenSinkResult<()> {
+            let TagToken(tag) = token else {
+                return TokenSinkResult::Continue;
+            };
+            let name: &str = &tag.name;
+            // shortcut: track SVG nesting only; use a tree builder if namespace recovery matters.
+            if name == "svg" {
+                let depth = self.svg_depth.get();
+                if tag.kind != StartTag {
+                    self.svg_depth.set(depth.saturating_sub(1));
+                } else if !tag.self_closing {
+                    self.svg_depth.set(depth + 1);
+                }
+            }
+            if tag.kind != StartTag {
+                return TokenSinkResult::Continue;
+            }
+            let attribute = |name: &str| {
+                tag.attrs
+                    .iter()
+                    .find(|attr| attr.name.local.as_ref() == name)
+                    .map(|attr| attr.value.as_ref())
+            };
+            let invalid = match name {
+                "img" => attribute("src").is_some_and(|source| {
+                    !is_embedded_raster(source)
+                        && workspace_image_path(source, &self.preview).is_none()
+                }),
+                "image" if self.svg_depth.get() > 0 => attribute("href")
+                    .or_else(|| attribute("xlink:href"))
+                    .is_some_and(|source| {
+                        !source.starts_with("blob:")
+                            && !source
+                                .get(..11)
+                                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:image/"))
+                    }),
+                "script" | "style" if tag.self_closing && self.svg_depth.get() > 0 => {
+                    return TokenSinkResult::Continue;
+                }
+                "script" => return TokenSinkResult::RawData(RawKind::ScriptData),
+                "style" => return TokenSinkResult::RawData(RawKind::Rawtext),
+                _ if self.svg_depth.get() > 0 => return TokenSinkResult::Continue,
+                "xmp" | "iframe" | "noembed" | "noframes" | "noscript" => {
+                    return TokenSinkResult::RawData(RawKind::Rawtext);
+                }
+                "title" | "textarea" => return TokenSinkResult::RawData(RawKind::Rcdata),
+                "plaintext" => return TokenSinkResult::Plaintext,
+                _ => return TokenSinkResult::Continue,
+            };
+            if invalid {
+                self.invalid.set(true);
+            }
+            TokenSinkResult::Continue
+        }
+
+        fn adjusted_current_node_present_but_not_in_html_namespace(&self) -> bool {
+            self.svg_depth.get() > 0
+        }
+    }
+
+    let input = BufferQueue::default();
+    input.push_back(html.into());
+    let tokenizer = Tokenizer::new(
+        Images {
+            preview: format!("workspaces/{workspace}/files/preview/"),
+            svg_depth: Cell::new(0),
+            invalid: Cell::new(false),
+        },
+        Default::default(),
+    );
+    let _ = tokenizer.feed(&input);
+    tokenizer.end();
+    if tokenizer.sink.invalid.get() {
+        return Err(InputError::Code("IMAGE_SOURCE_INVALID"));
+    }
+    Ok(())
+}
+
+// Match the embedded image pattern in input-rich-content.js.
+fn is_embedded_raster(source: &str) -> bool {
+    let Some((kind, data)) = source
+        .strip_prefix("data:image/")
+        .and_then(|source| source.split_once(";base64,"))
+    else {
+        return false;
+    };
+    matches!(
+        kind,
+        "png" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "x-icon"
+    ) && !data.is_empty()
+        && data.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '+' | '/' | '=')
+                // JavaScript's \s includes BOM but excludes NEL.
+                || (c.is_whitespace() && c != '\u{85}')
+                || c == '\u{feff}'
+        })
+}
+
+// Match inputImagePath; the server cannot check the browser's origin or host ID.
+fn workspace_image_path(source: &str, preview: &str) -> Option<()> {
+    let parsed;
+    let mut path = if source.starts_with("http://") || source.starts_with("https://") {
+        parsed = url::Url::parse(source).ok()?;
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some_and(|query| !query.is_empty())
+            || parsed
+                .fragment()
+                .is_some_and(|fragment| !fragment.is_empty())
+        {
+            return None;
+        }
+        parsed.path()
+    } else {
+        source
+    };
+    if !path.starts_with(".bettercoding-uploads/") {
+        let mut route = path.strip_prefix("/api/")?;
+        if let Some(host) = route.strip_prefix("host/") {
+            let (id, rest) = host.split_once('/')?;
+            image_path_segment(id)?;
+            route = rest;
+        }
+        path = route.strip_prefix(preview)?;
+    }
+    let mut segments = path.rsplit('/');
+    let last = image_path_segment(segments.next()?)?;
+    let (_, ext) = last.rsplit_once('.')?;
+    (matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "ico"
+    ) && segments.all(|segment| image_path_segment(segment).is_some()))
+    .then_some(())
+}
+
+fn image_path_segment(segment: &str) -> Option<Cow<'_, str>> {
+    let decoded = percent_decode_str(segment).decode_utf8().ok()?;
+    (!decoded.is_empty()
+        && !matches!(decoded.as_ref(), "." | "..")
+        && !decoded.contains(['%', '\\', '/', '?', '#'])
+        && !decoded.bytes().any(|b| b < 32))
+    .then_some(decoded)
 }
 
 fn validate_priority(priority: &str) -> Result<()> {
@@ -647,7 +808,7 @@ impl WorkspaceInput {
                 if request.external_key.is_empty() || request.external_key.len() > 256 {
                     return Err(InputError::Code("SCHEMA_INVALID"));
                 }
-                request.content.validate()?;
+                request.content.validate(workspace)?;
                 if let Some(priority) = &request.priority {
                     validate_priority(priority)?;
                 }
@@ -713,7 +874,7 @@ impl WorkspaceInput {
                         if !["open", "answered"].contains(&input.status.as_str()) {
                             return Err(InputError::Code("INVALID_TRANSITION"));
                         }
-                        request.content.validate()?;
+                        request.content.validate(workspace)?;
                         if let Some(priority) = request
                             .priority
                             .clone()
@@ -1019,6 +1180,109 @@ fn receipt(event: InputEvent, status: String) -> InputReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_embedded_images_and_workspace_raster_paths() {
+        let workspace = Uuid::from_u128(1);
+        let root = format!("/api/workspaces/{workspace}/files/preview");
+        let mut content = content();
+        for html in [
+            r#"<img src="data:image/png;base64,iVBORw0KGgo=">"#.into(),
+            r#"<img src="data:image/png;base64,iVBO&#10;Rw0KGgo=">"#.into(),
+            r#"<img src=".bettercoding-uploads/a/b.png">"#.into(),
+            format!(r#"<img src="{root}/x.png">"#),
+            format!(r#"<img src="https://host{root}/x.png">"#),
+            format!(r#"<img src="https://host{root}/a/%2e%2e/b.png">"#),
+            format!(r#"<img src="https://host{root}/x.png?">"#),
+            format!(r#"<img src="https://host{root}/x.png#">"#),
+            format!(r#"<img src="/api/host/relay/workspaces/{workspace}/files/preview/a%20b.JPEG">"#),
+            r#"<svg><image xlink:href="blob:example"/></svg>"#.into(),
+            r#"<svg><image href="data:image/png;base64,iVBORw0KGgo=" xlink:href="chart.png"/></svg>"#.into(),
+        ] {
+            content.html = html;
+            assert!(content.validate(workspace).is_ok(), "{}", content.html);
+        }
+    }
+
+    #[test]
+    fn rejects_image_sources_the_frame_cannot_load() {
+        let workspace = Uuid::from_u128(1);
+        let root = format!("/api/workspaces/{workspace}/files/preview");
+        let mut content = content();
+        for html in [
+            format!(
+                r#"<img src="/api/workspaces/{}/files/preview/x.png">"#,
+                Uuid::from_u128(2)
+            ),
+            r#"<img src="https://example.com/x.png">"#.into(),
+            r#"<img src=".bettercoding-uploads/a/../b.png">"#.into(),
+            r#"<IMG SRC="DATA:IMAGE/PNG;base64,iVBORw0KGgo=">"#.into(),
+            r#"<img src="blob:example">"#.into(),
+            r#"<img src="data:image/svg+xml;base64,PHN2Zy8+">"#.into(),
+            r#"<img src="data:image/jpg;base64,iVBORw0KGgo=">"#.into(),
+            r#"<img src="data:image/png;base64,">"#.into(),
+            r#"<img src="data:image/png;base64,iVBO%20Rw0KGgo=">"#.into(),
+            format!(r#"<img src="{root}/a%2fb.png">"#),
+            format!(r#"<img src="{root}/a%25b.png">"#),
+            format!(r#"<img src="{root}/a%00b.png">"#),
+            format!(r#"<img src="{root}//b.png">"#),
+            format!(r#"<img src="{root}/x.svg">"#),
+            format!(r#"<img src="https://user@host{root}/x.png">"#),
+            format!(r#"<img src="https://host{root}/x.png?size=1">"#),
+            format!(r#"<img src="https://host{root}/x.png#fragment">"#),
+            r#"<svg><image href="x.png"/></svg>"#.into(),
+            r#"<svg><image xlink:href=".bettercoding-uploads/x.png"/></svg>"#.into(),
+            r#"<img src="">"#.into(),
+        ] {
+            content.html = html;
+            assert!(
+                matches!(
+                    content.validate(workspace),
+                    Err(InputError::Code("IMAGE_SOURCE_INVALID"))
+                ),
+                "{}",
+                content.html
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_image_markup_in_text_and_ignores_srcset() {
+        let mut content = content();
+        content.html = r#"
+            <script>const html = '<img src="x.png">';</script>
+            <style>/* <img src="x.png"> */</style>
+            <!-- <img src="x.png"> -->
+            <p>&lt;img src="x.png"&gt;</p>
+            <textarea><img src="x.png"></textarea>
+            <img srcset="https://example.com/x.png 1x">
+        "#
+        .into();
+        assert!(content.validate(Uuid::from_u128(1)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn publishing_an_input_rejects_invalid_image_sources() {
+        let (pool, workspace) = setup().await;
+        let created = seed(&pool, workspace).await;
+        let InputWrite::Publish(mut request) = publish(created.sequence) else {
+            unreachable!()
+        };
+        request.content.html = r#"<img src="https://example.com/x.png">"#.into();
+        let result = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Publish(request),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(InputError::Code("IMAGE_SOURCE_INVALID"))
+        ));
+    }
 
     #[test]
     fn schedule_presence_and_timestamp_contract() {

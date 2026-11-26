@@ -35,11 +35,15 @@ impl IntoResponse for RouteError {
             InputError::Database(_) | InputError::Json(_) => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_REQUEST,
         };
-        let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
-            tracing::error!(error = %self.0, "Input request failed");
-            "Input storage error".to_string()
-        } else {
-            self.0.to_string()
+        let message = match &self.0 {
+            InputError::Code("IMAGE_SOURCE_INVALID") => {
+                "IMAGE_SOURCE_INVALID: Embed each image as a base64 PNG, JPEG, GIF, WebP, AVIF, BMP or ICO data: URL.".to_string()
+            }
+            error if status == StatusCode::INTERNAL_SERVER_ERROR => {
+                tracing::error!(%error, "Input request failed");
+                "Input storage error".to_string()
+            }
+            error => error.to_string(),
         };
         (status, Json(ApiResponse::<()>::error(&message))).into_response()
     }
