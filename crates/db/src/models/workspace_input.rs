@@ -390,7 +390,7 @@ impl InputContract {
     }
 }
 impl InputContent {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, _workspace: Uuid) -> Result<()> {
         if self.html.len() > MAX_HTML_BYTES {
             return Err(InputError::Code("PAYLOAD_TOO_LARGE"));
         }
@@ -647,7 +647,7 @@ impl WorkspaceInput {
                 if request.external_key.is_empty() || request.external_key.len() > 256 {
                     return Err(InputError::Code("SCHEMA_INVALID"));
                 }
-                request.content.validate()?;
+                request.content.validate(workspace)?;
                 if let Some(priority) = &request.priority {
                     validate_priority(priority)?;
                 }
@@ -713,7 +713,7 @@ impl WorkspaceInput {
                         if !["open", "answered"].contains(&input.status.as_str()) {
                             return Err(InputError::Code("INVALID_TRANSITION"));
                         }
-                        request.content.validate()?;
+                        request.content.validate(workspace)?;
                         if let Some(priority) = request
                             .priority
                             .clone()
@@ -1019,6 +1019,101 @@ fn receipt(event: InputEvent, status: String) -> InputReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_embedded_images_and_workspace_raster_paths() {
+        let workspace = Uuid::from_u128(1);
+        let root = format!("/api/workspaces/{workspace}/files/preview");
+        let mut content = content();
+        for html in [
+            r#"<img src="data:image/png;base64,iVBORw0KGgo=">"#.into(),
+            r#"<IMG SRC="DATA:IMAGE/PNG;base64,iVBORw0KGgo=">"#.into(),
+            r#"<img src="blob:example">"#.into(),
+            r#"<img src=".bettercoding-uploads/a/b.png">"#.into(),
+            format!(r#"<img src="{root}/x.png">"#),
+            format!(r#"<img src="https://host{root}/x.png">"#),
+            format!(r#"<img src="/api/host/relay/workspaces/{workspace}/files/preview/a%20b.JPEG">"#),
+            r#"<svg><image href="data:image/png;base64,iVBORw0KGgo=" xlink:href="blob:example"/></svg>"#.into(),
+        ] {
+            content.html = html;
+            assert!(content.validate(workspace).is_ok(), "{}", content.html);
+        }
+    }
+
+    #[test]
+    fn rejects_image_sources_the_frame_cannot_load() {
+        let workspace = Uuid::from_u128(1);
+        let root = format!("/api/workspaces/{workspace}/files/preview");
+        let mut content = content();
+        for html in [
+            format!(
+                r#"<img src="/api/workspaces/{}/files/preview/x.png">"#,
+                Uuid::from_u128(2)
+            ),
+            r#"<img src="https://example.com/x.png">"#.into(),
+            r#"<img src=".bettercoding-uploads/a/../b.png">"#.into(),
+            format!(r#"<img src="https://host{root}/a/%2e%2e/b.png">"#),
+            format!(r#"<img src="{root}/a%2fb.png">"#),
+            format!(r#"<img src="{root}/a%25b.png">"#),
+            format!(r#"<img src="{root}/a%00b.png">"#),
+            format!(r#"<img src="{root}//b.png">"#),
+            format!(r#"<img src="{root}/x.svg">"#),
+            format!(r#"<img src="https://user@host{root}/x.png">"#),
+            format!(r#"<img src="https://host{root}/x.png?size=1">"#),
+            format!(r#"<img src="https://host{root}/x.png#fragment">"#),
+            r#"<svg><image href="x.png"/></svg>"#.into(),
+            r#"<svg><image xlink:href=".bettercoding-uploads/x.png"/></svg>"#.into(),
+            r#"<img src="">"#.into(),
+        ] {
+            content.html = html;
+            assert!(
+                matches!(
+                    content.validate(workspace),
+                    Err(InputError::Code("IMAGE_SOURCE_INVALID"))
+                ),
+                "{}",
+                content.html
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_image_markup_in_text_and_ignores_srcset() {
+        let mut content = content();
+        content.html = r#"
+            <script>const html = '<img src="x.png">';</script>
+            <style>/* <img src="x.png"> */</style>
+            <!-- <img src="x.png"> -->
+            <p>&lt;img src="x.png"&gt;</p>
+            <textarea><img src="x.png"></textarea>
+            <img srcset="https://example.com/x.png 1x">
+        "#
+        .into();
+        assert!(content.validate(Uuid::from_u128(1)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn publishing_an_input_rejects_invalid_image_sources() {
+        let (pool, workspace) = setup().await;
+        let created = seed(&pool, workspace).await;
+        let InputWrite::Publish(mut request) = publish(created.sequence) else {
+            unreachable!()
+        };
+        request.content.html = r#"<img src="https://example.com/x.png">"#.into();
+        let result = WorkspaceInput::write(
+            &pool,
+            workspace,
+            Some(&created.input_id),
+            InputActorKind::AgentMcp,
+            "requester",
+            InputWrite::Publish(request),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(InputError::Code("IMAGE_SOURCE_INVALID"))
+        ));
+    }
 
     #[test]
     fn schedule_presence_and_timestamp_contract() {
