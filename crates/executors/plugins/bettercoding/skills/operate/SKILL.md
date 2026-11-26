@@ -81,6 +81,14 @@ not grant approval.
    reason that identifies its replacement, then create a new Input with a
    fresh `external_key` and `request_id`.
 
+### Images
+
+- Embed each Input image as a base64 `data:` URL, such as `data:image/png;base64,...`.
+- Keep the complete Input HTML, including all encoded images, at or below 2 MiB.
+- Resize or compress images when the HTML exceeds this limit.
+- Keep file paths, preview URLs, and remote URLs out of image sources.
+- Share `file_link` URLs as clickable links.
+
 ## Workspaces and sessions
 
 - Use `list_workspaces` with `archived: false` to find active workspaces. Use
