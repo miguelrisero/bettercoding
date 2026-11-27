@@ -6,7 +6,7 @@ use axum::{
 use chrono::Utc;
 use db::models::workspace_cli_activity::{
     CliManual, CliManualKind, WorkspaceCliActivity, clears_manual, normalize_manual_note,
-    reduce_hook,
+    preserves_seen, reduce_hook,
 };
 use deployment::Deployment;
 use executors::executors::codex::rollout::rollout_thread_id;
@@ -74,9 +74,15 @@ pub async fn report_cli_activity(
 
     // FK failures are expected when the workspace was deleted while its tmux
     // session lingered; nothing here is worth failing the agent's hook over.
-    if let Err(error) =
-        WorkspaceCliActivity::upsert_hook(pool, workspace_id, &next, clears_manual(&payload), now)
-            .await
+    if let Err(error) = WorkspaceCliActivity::upsert_hook(
+        pool,
+        workspace_id,
+        &next,
+        clears_manual(&payload),
+        preserves_seen(&payload),
+        now,
+    )
+    .await
     {
         tracing::debug!(?error, %workspace_id, "failed to record a CLI hook report");
     }

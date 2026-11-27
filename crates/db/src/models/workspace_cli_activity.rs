@@ -18,6 +18,8 @@ pub enum CliActivityState {
     Idle,
     Running,
     Attention,
+    /// The workspace was marked seen while it was waiting for attention.
+    Seen,
 }
 
 impl CliActivityState {
@@ -26,6 +28,7 @@ impl CliActivityState {
             CliActivityState::Idle => "idle",
             CliActivityState::Running => "running",
             CliActivityState::Attention => "attention",
+            CliActivityState::Seen => "seen",
         }
     }
 
@@ -33,6 +36,7 @@ impl CliActivityState {
         match s {
             "running" => CliActivityState::Running,
             "attention" => CliActivityState::Attention,
+            "seen" => CliActivityState::Seen,
             _ => CliActivityState::Idle,
         }
     }
@@ -379,6 +383,15 @@ pub fn clears_manual(payload: &serde_json::Value) -> bool {
     payload_str(payload, "hook_event_name").is_some_and(|event| CLEARING_EVENTS.contains(&event))
 }
 
+/// These reports can describe the same wait after the user acknowledges it.
+pub fn preserves_seen(payload: &serde_json::Value) -> bool {
+    match payload_str(payload, "hook_event_name") {
+        Some("SubagentStop") => true,
+        Some("Notification") => payload_str(payload, "notification_type") == Some("idle_prompt"),
+        _ => false,
+    }
+}
+
 /// Longest manual note kept, in characters.
 pub const MANUAL_NOTE_MAX_CHARS: usize = 48;
 
@@ -432,49 +445,63 @@ impl WorkspaceCliActivity {
         }
     }
 
-    /// Set a workspace's CLI activity state. No-op write avoidance is the
-    /// caller's job (the monitor only calls this on transitions).
+    /// Record a poller transition only if the observed state still matches.
     pub async fn upsert(
         pool: &SqlitePool,
         workspace_id: Uuid,
+        previous: CliActivityState,
         state: CliActivityState,
-    ) -> Result<(), sqlx::Error> {
-        let state = state.as_str();
-        sqlx::query!(
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
             r#"INSERT INTO workspace_cli_activity (workspace_id, state, updated_at)
                VALUES ($1, $2, datetime('now', 'subsec'))
                ON CONFLICT(workspace_id) DO UPDATE SET
                  state = excluded.state,
-                 updated_at = excluded.updated_at"#,
-            workspace_id,
-            state
+                 updated_at = excluded.updated_at
+               WHERE workspace_cli_activity.state = $3"#,
         )
+        .bind(workspace_id)
+        .bind(state.as_str())
+        .bind(previous.as_str())
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected() != 0)
+    }
+
+    pub async fn mark_seen(pool: &SqlitePool, workspace_id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE workspace_cli_activity SET state = 'seen'
+             WHERE workspace_id = ? AND state = 'attention'",
+        )
+        .bind(workspace_id)
         .execute(pool)
         .await?;
         Ok(())
     }
 
-    /// Record a hook-reduced state, refreshing `state` from the phase's bucket
-    /// so the coarse sidebar projection and the phase can never disagree.
-    /// Stale `seq` is dropped silently: events that overtake each other in
-    /// flight must not rewind the phase.
+    /// Record a hook-reduced state. Stale `seq` is dropped silently.
+    /// Metadata reports preserve acknowledgment of the current wait.
     pub async fn upsert_hook(
         pool: &SqlitePool,
         workspace_id: Uuid,
         hook: &CliHookState,
         clear_manual: bool,
+        preserve_seen: bool,
         at: DateTime<Utc>,
     ) -> Result<(), sqlx::Error> {
         let state = hook_bucket(hook.phase, hook.tasks).as_str();
         let phase = hook.phase.as_str();
         let transcript_path = hook.transcript_path.as_deref();
-        sqlx::query!(
+        sqlx::query(
             r#"INSERT INTO workspace_cli_activity
                  (workspace_id, state, updated_at, phase, tasks, crons,
                   agent_session_id, transcript_path, seq, hook_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                ON CONFLICT(workspace_id) DO UPDATE SET
-                 state = excluded.state,
+                 state = CASE
+                   WHEN workspace_cli_activity.state = 'seen' AND excluded.state = 'attention'
+                     AND ($11 OR excluded.seq = workspace_cli_activity.seq)
+                   THEN 'seen' ELSE excluded.state END,
                  updated_at = excluded.updated_at,
                  phase = excluded.phase,
                  tasks = excluded.tasks,
@@ -483,21 +510,22 @@ impl WorkspaceCliActivity {
                  transcript_path = excluded.transcript_path,
                  seq = excluded.seq,
                  hook_at = excluded.hook_at,
-                 manual_kind = CASE WHEN $11 THEN NULL ELSE workspace_cli_activity.manual_kind END,
-                 manual_note = CASE WHEN $11 THEN NULL ELSE workspace_cli_activity.manual_note END
+                 manual_kind = CASE WHEN $12 THEN NULL ELSE workspace_cli_activity.manual_kind END,
+                 manual_note = CASE WHEN $12 THEN NULL ELSE workspace_cli_activity.manual_note END
                WHERE excluded.seq >= workspace_cli_activity.seq"#,
-            workspace_id,
-            state,
-            at,
-            phase,
-            hook.tasks,
-            hook.crons,
-            hook.agent_session_id,
-            transcript_path,
-            hook.seq,
-            at,
-            clear_manual,
         )
+        .bind(workspace_id)
+        .bind(state)
+        .bind(at)
+        .bind(phase)
+        .bind(hook.tasks)
+        .bind(hook.crons)
+        .bind(&hook.agent_session_id)
+        .bind(transcript_path)
+        .bind(hook.seq)
+        .bind(at)
+        .bind(preserve_seen)
+        .bind(clear_manual)
         .execute(pool)
         .await?;
         Ok(())
@@ -771,7 +799,7 @@ mod tests {
             crons: None,
             seq: 7,
         };
-        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, false, Utc::now())
+        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, false, false, Utc::now())
             .await
             .unwrap();
 
@@ -782,9 +810,16 @@ mod tests {
         assert_eq!(row.state, CliActivityState::Attention);
         assert_eq!(row.phase, Some(CliPhase::Stopped));
 
-        WorkspaceCliActivity::upsert(&pool, workspace.id, CliActivityState::Idle)
+        assert!(
+            WorkspaceCliActivity::upsert(
+                &pool,
+                workspace.id,
+                CliActivityState::Attention,
+                CliActivityState::Idle,
+            )
             .await
-            .unwrap();
+            .unwrap()
+        );
 
         let row = WorkspaceCliActivity::find_by_workspace_id(&pool, workspace.id)
             .await
@@ -851,7 +886,7 @@ mod tests {
             crons: Some(0),
             seq: 1,
         };
-        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, false, Utc::now())
+        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, false, false, Utc::now())
             .await
             .unwrap();
         assert_eq!(manual(pool.clone()).await, Some(locked.clone()));
@@ -859,7 +894,7 @@ mod tests {
         // An engaging report clears it.
         hook.seq = 2;
         hook.phase = CliPhase::Working;
-        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, true, Utc::now())
+        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, true, false, Utc::now())
             .await
             .unwrap();
         assert_eq!(manual(pool.clone()).await, None);

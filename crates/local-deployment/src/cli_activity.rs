@@ -601,13 +601,13 @@ impl CliActivityMonitor {
                     });
                     let next = next_state(prev, *obs, ran_while_detached, now, hook);
                     if next != prev {
-                        Self::record(&db, &mut states, *workspace_id, next).await;
+                        Self::record(&db, &mut states, *workspace_id, prev, next).await;
                     }
                 }
 
                 // Sessions we knew about that vanished (killed, reboot): their
                 // claude is gone, so any lingering state collapses to idle.
-                let gone: Vec<Uuid> = states
+                let gone: Vec<_> = states
                     .iter()
                     .filter(|(id, state)| {
                         should_transition_missing_to_idle(
@@ -616,10 +616,11 @@ impl CliActivityMonitor {
                             **state,
                         )
                     })
-                    .map(|(id, _)| *id)
+                    .map(|(id, state)| (*id, *state))
                     .collect();
-                for workspace_id in gone {
-                    Self::record(&db, &mut states, workspace_id, CliActivityState::Idle).await;
+                for (workspace_id, prev) in gone {
+                    Self::record(&db, &mut states, workspace_id, prev, CliActivityState::Idle)
+                        .await;
                 }
             }
         });
@@ -629,14 +630,16 @@ impl CliActivityMonitor {
         db: &DBService,
         states: &mut HashMap<Uuid, CliActivityState>,
         workspace_id: Uuid,
+        previous: CliActivityState,
         state: CliActivityState,
     ) {
         // FK failures are expected when the workspace was just deleted while
         // its tmux session lingered; everything else is worth a warning.
-        match WorkspaceCliActivity::upsert(&db.pool, workspace_id, state).await {
-            Ok(()) => {
+        match WorkspaceCliActivity::upsert(&db.pool, workspace_id, previous, state).await {
+            Ok(true) => {
                 states.insert(workspace_id, state);
             }
+            Ok(false) => {}
             Err(e) => {
                 tracing::debug!("Failed to record CLI activity for {workspace_id}: {e}");
             }
@@ -880,6 +883,7 @@ fn next_state(
     // a user typing in the pane cannot fake.
     if let Some(hook) = hook {
         return match hook.bucket {
+            CliActivityState::Attention if prev == CliActivityState::Seen => prev,
             // Attention still clears the moment a terminal attaches, and stays
             // cleared for a report the user has already seen.
             CliActivityState::Attention if obs.attached || hook.acked => CliActivityState::Idle,
@@ -912,7 +916,7 @@ fn next_state(
                 CliActivityState::Attention
             }
         }
-        CliActivityState::Idle => CliActivityState::Idle,
+        CliActivityState::Idle | CliActivityState::Seen => CliActivityState::Idle,
     }
 }
 
@@ -1501,6 +1505,21 @@ mod tests {
                 "phase {phase:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_seen_cli_report_stays_seen_while_the_terminal_is_detached() {
+        let seen = CliActivityState::parse("seen");
+        assert_eq!(
+            next_state(
+                seen,
+                obs(true, 300, false),
+                true,
+                NOW,
+                hook(CliPhase::Stopped, false),
+            ),
+            seen
+        );
     }
 
     #[test]
