@@ -99,7 +99,7 @@ const ChangeTargetDialogImpl = NiceModal.create<ChangeTargetDialogProps>(
                     <SelectItem key={branch.name} value={branch.name}>
                       {branch.name}
                       {branch.isCurrent
-                        ? ` (${t('branchSelector.badges.current')})`
+                        ? ` (${t('common:branchSelector.badges.current')})`
                         : ''}
                     </SelectItem>
                   ))}
