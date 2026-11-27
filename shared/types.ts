@@ -560,6 +560,8 @@ export type QueueMessageRequest = { message: string, executor_config: ExecutorCo
 
 export type ResetProcessRequest = { process_id: string, force_when_dirty: boolean | null, perform_git_reset: boolean | null, };
 
+export type SessionModel = { model_id: string | null, reasoning_id: string | null, };
+
 export type ChangeTargetBranchRequest = { repo_id: string, new_target_branch: string, };
 
 export type ChangeTargetBranchResponse = { repo_id: string, new_target_branch: string, status: [number, number], };

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useDropzone } from 'react-dropzone';
 import { useTranslation } from 'react-i18next';
 import {
@@ -418,6 +418,13 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
   const { executionProcesses: lastSessionProcesses } =
     useExecutionProcesses(lastSessionId);
 
+  // A CLI session runs no execution process; the server knows its launch model.
+  const { data: sessionModel } = useQuery({
+    queryKey: ['sessionModel', sessionId],
+    queryFn: () => sessionsApi.getModel(sessionId!),
+    enabled: !!sessionId && !isNewSessionMode,
+  });
+
   // Compute latestConfig: current processes > last session processes > session metadata
   const latestConfig = useMemo(() => {
     // Current session's processes take priority (full ExecutorConfig)
@@ -433,11 +440,13 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
     if (lastSessionExecutor) {
       return {
         executor: lastSessionExecutor as BaseCodingAgent,
+        model_id: sessionModel?.model_id,
+        reasoning_id: sessionModel?.reasoning_id,
       };
     }
 
     return null;
-  }, [processes, lastSessionProcesses, sessions]);
+  }, [processes, lastSessionProcesses, sessions, sessionModel]);
 
   const needsExecutorSelection =
     isNewSessionMode || (!session?.executor && !latestConfig?.executor);

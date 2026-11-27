@@ -95,6 +95,27 @@ pub async fn create_session(
     Ok(ResponseJson(ApiResponse::success(session)))
 }
 
+/// The model and effort a session runs with. `None` means unknown: the
+/// composer then shows no model rather than a guess.
+#[derive(Debug, Serialize, TS)]
+pub struct SessionModel {
+    pub model_id: Option<String>,
+    pub reasoning_id: Option<String>,
+}
+
+pub async fn get_session_model(
+    Extension(session): Extension<Session>,
+    State(deployment): State<DeploymentImpl>,
+) -> Result<ResponseJson<ApiResponse<SessionModel>>, ApiError> {
+    let (model_id, reasoning_id) =
+        crate::routes::terminal::resolve_cli_model_effort(&deployment.db().pool, Some(&session))
+            .await;
+    Ok(ResponseJson(ApiResponse::success(SessionModel {
+        model_id,
+        reasoning_id,
+    })))
+}
+
 /// A session plus the model and effort its next CLI launch uses.
 #[derive(Debug, Serialize)]
 pub struct UpdatedSession {
@@ -474,6 +495,7 @@ pub async fn run_setup_script(
 pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
     let session_id_router = Router::new()
         .route("/", get(get_session).put(update_session))
+        .route("/model", get(get_session_model))
         .route("/follow-up", post(follow_up))
         .route("/fork-recovery", post(fork_recovery))
         .route("/reset", post(reset_process))
