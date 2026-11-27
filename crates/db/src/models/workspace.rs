@@ -1009,14 +1009,9 @@ mod tests {
             .unwrap();
         add_session(&pool, workspace.id).await;
         backdate_workspace(&pool, workspace.id, 96).await;
-        WorkspaceCliActivity::upsert(
-            &pool,
-            workspace.id,
-            CliActivityState::Idle,
-            CliActivityState::Idle,
-        )
-        .await
-        .unwrap();
+        WorkspaceCliActivity::upsert(&pool, workspace.id, CliActivityState::Idle)
+            .await
+            .unwrap();
 
         assert!(
             Workspace::find_expired_for_cleanup(&pool)

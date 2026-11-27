@@ -43,8 +43,8 @@ pub struct WorkspaceSummary {
     pub has_running_dev_server: bool,
     /// Does this workspace have unseen coding agent turns?
     pub has_unseen_turns: bool,
-    /// Did this workspace's CLI-mode claude session finish while no terminal
-    /// was attached? (Cleared when the user opens the pane again.)
+    /// Does the CLI agent have unread activity? Opening the terminal or marking
+    /// the workspace seen clears it.
     pub cli_attention: bool,
     /// What the CLI-mode agent last reported it is doing (see `reduce_hook`),
     /// however old: the UI ages it with `cli_phase_at`. `None` for an agent

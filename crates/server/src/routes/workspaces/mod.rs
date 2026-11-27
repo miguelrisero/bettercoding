@@ -25,7 +25,6 @@ use axum::{
     middleware::from_fn_with_state,
     routing::{get, post, put},
 };
-use deployment::Deployment;
 
 use crate::{DeploymentImpl, middleware::load_workspace_middleware};
 
@@ -39,10 +38,7 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
         )
         .route("/short-tmp", get(core::get_workspace_short_tmp))
         .route("/messages/first", get(core::get_first_user_message))
-        .route(
-            "/seen",
-            put(core::mark_seen).with_state(deployment.db().pool.clone()),
-        )
+        .route("/seen", axum::routing::put(core::mark_seen))
         .nest("/git", git::router())
         .nest("/execution", execution::router())
         .nest("/integration", integration::router())

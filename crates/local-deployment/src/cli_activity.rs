@@ -601,13 +601,13 @@ impl CliActivityMonitor {
                     });
                     let next = next_state(prev, *obs, ran_while_detached, now, hook);
                     if next != prev {
-                        Self::record(&db, &mut states, *workspace_id, prev, next).await;
+                        Self::record(&db, &mut states, *workspace_id, next).await;
                     }
                 }
 
                 // Sessions we knew about that vanished (killed, reboot): their
-                // claude is gone, so any lingering state collapses to idle.
-                let gone: Vec<_> = states
+                // claude is gone, so clear running and unread states.
+                let gone: Vec<Uuid> = states
                     .iter()
                     .filter(|(id, state)| {
                         should_transition_missing_to_idle(
@@ -616,11 +616,10 @@ impl CliActivityMonitor {
                             **state,
                         )
                     })
-                    .map(|(id, state)| (*id, *state))
+                    .map(|(id, _)| *id)
                     .collect();
-                for (workspace_id, prev) in gone {
-                    Self::record(&db, &mut states, workspace_id, prev, CliActivityState::Idle)
-                        .await;
+                for workspace_id in gone {
+                    Self::record(&db, &mut states, workspace_id, CliActivityState::Idle).await;
                 }
             }
         });
@@ -630,16 +629,14 @@ impl CliActivityMonitor {
         db: &DBService,
         states: &mut HashMap<Uuid, CliActivityState>,
         workspace_id: Uuid,
-        previous: CliActivityState,
         state: CliActivityState,
     ) {
         // FK failures are expected when the workspace was just deleted while
         // its tmux session lingered; everything else is worth a warning.
-        match WorkspaceCliActivity::upsert(&db.pool, workspace_id, previous, state).await {
-            Ok(true) => {
+        match WorkspaceCliActivity::upsert(&db.pool, workspace_id, state).await {
+            Ok(()) => {
                 states.insert(workspace_id, state);
             }
-            Ok(false) => {}
             Err(e) => {
                 tracing::debug!("Failed to record CLI activity for {workspace_id}: {e}");
             }
@@ -873,9 +870,12 @@ fn next_state(
     now: i64,
     hook: Option<HookView>,
 ) -> CliActivityState {
-    // Bootstrap fell back to a plain shell: claude is not running here.
+    // A missing process must not make the same hook report unread again.
     if !obs.claude_like {
-        return CliActivityState::Idle;
+        return match prev {
+            CliActivityState::Seen => prev,
+            _ => CliActivityState::Idle,
+        };
     }
 
     // The agent's own account beats every pane heuristic below. It is the only
@@ -925,7 +925,12 @@ fn should_transition_missing_to_idle(
     observed: bool,
     previous: CliActivityState,
 ) -> bool {
-    snapshot_complete && !observed && previous != CliActivityState::Idle
+    snapshot_complete
+        && !observed
+        && matches!(
+            previous,
+            CliActivityState::Running | CliActivityState::Attention
+        )
 }
 
 /// Snapshot `bc_*` sessions across the CLI tmux sockets.
@@ -1520,6 +1525,27 @@ mod tests {
             ),
             seen
         );
+    }
+
+    #[test]
+    fn seen_cli_report_survives_a_non_agent_pane_observation() {
+        let state = next_state(
+            CliActivityState::Seen,
+            obs(false, 300, false),
+            false,
+            NOW,
+            hook(CliPhase::Stopped, false),
+        );
+        assert_eq!(state, CliActivityState::Seen);
+    }
+
+    #[test]
+    fn seen_cli_report_survives_a_missing_session() {
+        assert!(!should_transition_missing_to_idle(
+            true,
+            false,
+            CliActivityState::Seen
+        ));
     }
 
     #[test]

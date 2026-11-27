@@ -751,8 +751,8 @@ has_running_dev_server: boolean,
  */
 has_unseen_turns: boolean, 
 /**
- * Did this workspace's CLI-mode claude session finish while no terminal
- * was attached? (Cleared when the user opens the pane again.)
+ * Does the CLI agent have unread activity? Opening the terminal or marking
+ * the workspace seen clears it.
  */
 cli_attention: boolean, 
 /**
