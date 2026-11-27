@@ -986,7 +986,19 @@ async fn prepare_cli_attach(
     };
     // Honor the workspace's selected agent + model/effort at launch
     // (defaults to claude at Opus/max when nothing was selected).
-    let (model_id, reasoning_id) = resolve_cli_model_effort(pool, session.as_ref()).await?;
+    let attaches_to_live_pane = (attach_only || cli_session_exists) && tmux_available;
+    let (model_id, reasoning_id) = match resolve_cli_model_effort(pool, session.as_ref()).await {
+        Ok(selection) => selection,
+        // `new-session -A` ignores the launch command, so the model is unused.
+        Err(e) if attaches_to_live_pane => {
+            tracing::warn!(
+                "CLI model lookup failed for workspace {}: {e}",
+                workspace.id
+            );
+            (None, None)
+        }
+        Err(e) => return Err(e.into()),
+    };
     let spec = if attach_only || cli_session_exists || !tmux_available {
         resolve_cli_agent_spec(session.as_ref(), model_id, reasoning_id, &dir)
     } else {

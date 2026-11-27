@@ -1207,6 +1207,11 @@ unbind-key -n MouseDown3Pane
 
 fn cli_tmux_conf(client_flags_supported: bool) -> String {
     let mut conf = CLI_TMUX_CONF.to_string();
+    // New windows and splits inherit the server's global environment, which
+    // the bootstrap's `unset` never reaches.
+    for name in PARENT_CLAUDE_SESSION_ENV {
+        conf.push_str(&format!("set-environment -gu {name}\n"));
+    }
     if client_flags_supported {
         conf.push_str("set -g window-size smallest\n");
     }
@@ -1239,6 +1244,17 @@ fn ensure_cli_tmux_server_options_on(socket: &str, client_flags_supported: bool)
             .stderr(std::process::Stdio::null())
             .output()
     };
+
+    // A server started before the strip keeps the parent session's variables
+    // in its global environment; drop them so new windows start clean.
+    let mut unset = Vec::new();
+    for name in PARENT_CLAUDE_SESSION_ENV {
+        if !unset.is_empty() {
+            unset.push(";");
+        }
+        unset.extend(["set-environment", "-gu", name]);
+    }
+    let _ = tmux(&unset);
 
     // default-shell governs how each NEW window command string (our POSIX-sh
     // launch bootstrap) is parsed; apply unconditionally (idempotent, no-op
@@ -4851,6 +4867,11 @@ mod tests {
             // Window command strings (the POSIX-sh launch bootstrap) are
             // parsed by default-shell; fish/csh would reject them outright.
             assert!(conf.contains("set -g default-shell /bin/sh"));
+        }
+        for conf in [cli_tmux_conf(false), cli_tmux_conf(true)] {
+            for name in PARENT_CLAUDE_SESSION_ENV {
+                assert!(conf.contains(&format!("set-environment -gu {name}\n")));
+            }
         }
         assert!(cli_tmux_conf(true).contains("set -g window-size smallest"));
         assert!(!cli_tmux_conf(false).contains("window-size smallest"));

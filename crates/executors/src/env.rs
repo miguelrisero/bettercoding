@@ -133,7 +133,17 @@ impl ExecutionEnv {
     /// Clear a parent Claude Code session's variables, apply ordinary
     /// variables, then enforce the workspace resource.
     pub fn apply_to_command(&self, command: &mut Command) {
-        strip_parent_claude_session_env(command, std::env::vars_os().map(|(name, _)| name));
+        self.apply_to_command_with(command, std::env::vars_os().map(|(name, _)| name));
+    }
+
+    /// [`Self::apply_to_command`] with `inherited` standing in for the
+    /// server's environment.
+    fn apply_to_command_with(
+        &self,
+        command: &mut Command,
+        inherited: impl IntoIterator<Item = std::ffi::OsString>,
+    ) {
+        strip_parent_claude_session_env(command, inherited);
         for (key, value) in &self.vars {
             command.env(key, value);
         }
@@ -205,13 +215,12 @@ mod tests {
         // exactly `inherited`, so the test reads no global state.
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "env"]).env_clear().envs(inherited);
-        strip_parent_claude_session_env(
+        let mut env = ExecutionEnv::new(RepoContext::default(), false, String::new());
+        env.insert("CLAUDE_CODE_SANDBOXED", "1");
+        env.apply_to_command_with(
             &mut command,
             inherited.map(|(name, _)| std::ffi::OsString::from(name)),
         );
-        let mut env = ExecutionEnv::new(RepoContext::default(), false, String::new());
-        env.insert("CLAUDE_CODE_SANDBOXED", "1");
-        env.apply_to_command(&mut command);
 
         let output = command.output().await.unwrap();
         let child_env = String::from_utf8_lossy(&output.stdout);
