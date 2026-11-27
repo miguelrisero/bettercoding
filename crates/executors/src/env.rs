@@ -130,10 +130,10 @@ impl ExecutionEnv {
         self.short_tmp = path.map(std::path::Path::to_path_buf);
     }
 
-    /// Clear the server's inherited `CLAUDE_CODE_*` variables, apply ordinary
+    /// Clear a parent Claude Code session's variables, apply ordinary
     /// variables, then enforce the workspace resource.
     pub fn apply_to_command(&self, command: &mut Command) {
-        strip_inherited_claude_code_env(command);
+        strip_parent_claude_session_env(command, std::env::vars_os().map(|(name, _)| name));
         for (key, value) in &self.vars {
             command.env(key, value);
         }
@@ -153,17 +153,17 @@ impl ExecutionEnv {
     }
 }
 
-/// Prefix of the variables a Claude Code session exports to its children.
-pub const CLAUDE_CODE_ENV_PREFIX: &str = "CLAUDE_CODE_";
-
-/// Remove every `CLAUDE_CODE_*` variable the server inherited. A server started
-/// inside a Claude Code session would otherwise hand that session's state to
-/// every agent it spawns. Variables set on `command` afterwards still apply.
-pub fn strip_inherited_claude_code_env(command: &mut Command) {
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with(CLAUDE_CODE_ENV_PREFIX) {
-            command.env_remove(key);
-        }
+/// Remove the parent Claude Code session's variables (see
+/// [`PARENT_CLAUDE_SESSION_ENV`]) found in `inherited`, the server's own
+/// environment. Variables set on `command` afterwards still apply.
+///
+/// [`PARENT_CLAUDE_SESSION_ENV`]: workspace_utils::env::PARENT_CLAUDE_SESSION_ENV
+pub fn strip_parent_claude_session_env(
+    command: &mut Command,
+    inherited: impl IntoIterator<Item = std::ffi::OsString>,
+) {
+    for name in workspace_utils::env::parent_claude_session_vars(inherited) {
+        command.env_remove(name);
     }
 }
 
@@ -193,21 +193,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawned_agents_never_inherit_the_servers_claude_code_env() {
-        // SAFETY: a key unique to this test; no other code reads or writes it.
-        unsafe { std::env::set_var("CLAUDE_CODE_BC_LEAK_PROBE", "leaked") };
+    async fn spawned_agents_keep_operator_config_but_not_parent_session_state() {
+        let inherited = [
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_SESSION_ID", "parent"),
+            ("CLAUDE_CODE_SANDBOXED", "parent"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "token"),
+            ("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "9000"),
+        ];
+        // The cleared command stands in for the server: its environment is
+        // exactly `inherited`, so the test reads no global state.
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "env"]).env_clear().envs(inherited);
+        strip_parent_claude_session_env(
+            &mut command,
+            inherited.map(|(name, _)| std::ffi::OsString::from(name)),
+        );
         let mut env = ExecutionEnv::new(RepoContext::default(), false, String::new());
-        env.insert("CLAUDE_CODE_BC_KEPT_PROBE", "kept");
-        let mut command = Command::new("sh");
-        command.args(["-c", "env"]);
+        env.insert("CLAUDE_CODE_SANDBOXED", "1");
         env.apply_to_command(&mut command);
+
         let output = command.output().await.unwrap();
         let child_env = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            !child_env.contains("CLAUDE_CODE_BC_LEAK_PROBE"),
-            "server CLAUDE_CODE_* env reached the agent: {child_env}"
-        );
-        assert!(child_env.contains("CLAUDE_CODE_BC_KEPT_PROBE=kept"));
+        for leaked in ["CLAUDECODE=", "CLAUDE_CODE_SESSION_ID=", "=parent"] {
+            assert!(
+                !child_env.contains(leaked),
+                "{leaked} reached the agent: {child_env}"
+            );
+        }
+        for kept in [
+            "CLAUDE_CODE_OAUTH_TOKEN=token",
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS=9000",
+            "CLAUDE_CODE_SANDBOXED=1",
+        ] {
+            assert!(child_env.contains(kept), "{kept} missing: {child_env}");
+        }
     }
 
     #[test]

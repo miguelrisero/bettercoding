@@ -305,7 +305,10 @@ where
     Fut: Future<Output = ()>,
 {
     let mut cmd = tokio::process::Command::new(program);
-    crate::env::strip_inherited_claude_code_env(&mut cmd);
+    crate::env::strip_parent_claude_session_env(
+        &mut cmd,
+        std::env::vars_os().map(|(name, _)| name),
+    );
     cmd.args(args)
         .current_dir(std::env::temp_dir())
         .stdin(Stdio::piped())

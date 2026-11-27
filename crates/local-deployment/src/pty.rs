@@ -14,7 +14,7 @@ use executors::executors::cli::{CliContinue, CliLaunchSpec, CliPromptArg, CliRes
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use thiserror::Error;
 use tokio::sync::mpsc;
-use utils::shell::get_interactive_shell;
+use utils::{env::PARENT_CLAUDE_SESSION_ENV, shell::get_interactive_shell};
 use uuid::Uuid;
 
 /// What to run on the PTY.
@@ -225,9 +225,9 @@ fn cli_bootstrap_with_exit(
     };
 
     // Agent environment first, so it applies to every launch form below (and
-    // to the fallback shell the pane drops into). Inherited `CLAUDE_CODE_*`
-    // values go before BetterCoding's own exports.
-    let mut env = String::from(CLEAR_CLAUDE_CODE_ENV);
+    // to the fallback shell the pane drops into). The parent session's values
+    // go before BetterCoding's own exports.
+    let mut env = clear_parent_claude_session_env();
     env.extend(
         cli_launch_env(&spec.program)
             .iter()
@@ -252,10 +252,13 @@ fn cli_bootstrap_with_exit(
     )
 }
 
-/// Unsets every `CLAUDE_CODE_*` variable in the pane. The pane inherits the
-/// tmux server's environment, which is the BetterCoding server's own when it
+/// Shell prefix that unsets a parent Claude Code session's variables
+/// ([`PARENT_CLAUDE_SESSION_ENV`]) in the pane. The pane inherits the tmux
+/// server's environment, which is the BetterCoding server's own when it
 /// started tmux, and that server may itself run inside a Claude Code session.
-const CLEAR_CLAUDE_CODE_ENV: &str = r#"for bc_v in $(env | sed -n 's/^\(CLAUDE_CODE_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$bc_v"; done; unset bc_v; "#;
+fn clear_parent_claude_session_env() -> String {
+    format!("unset {}; ", PARENT_CLAUDE_SESSION_ENV.join(" "))
+}
 
 /// Largest prompt (bytes) baked into the launch command via the temp-file
 /// `$(cat)` transport for argv-passing agents. Positional agents hand the
@@ -3042,6 +3045,13 @@ impl PtyService {
             } else {
                 let mut cmd = CommandBuilder::new(&shell);
                 cmd.cwd(&working_dir);
+                // A `claude` typed here must start even when the server runs
+                // inside a Claude Code session.
+                for name in utils::env::parent_claude_session_vars(
+                    std::env::vars_os().map(|(name, _)| name),
+                ) {
+                    cmd.env_remove(name);
+                }
 
                 // Configure shell-specific options
                 let shell_name = shell
@@ -3575,10 +3585,10 @@ mod tests {
     #[test]
     fn cli_bootstrap_without_short_tmp_suppresses_inherited_values() {
         let spec = codex_spec(&[]);
-        assert!(
-            cli_restart_bootstrap(&spec, None)
-                .starts_with(&format!("{CLEAR_CLAUDE_CODE_ENV}unset BC_SHORT_TMP; "))
-        );
+        assert!(cli_restart_bootstrap(&spec, None).starts_with(&format!(
+            "{}unset BC_SHORT_TMP; ",
+            clear_parent_claude_session_env()
+        )));
     }
 
     #[test]
@@ -3610,14 +3620,17 @@ mod tests {
     }
 
     #[test]
-    fn cli_bootstrap_clears_inherited_claude_code_env_before_the_agent() {
+    fn cli_bootstrap_clears_parent_session_env_and_keeps_operator_config() {
         // The pane inherits the tmux server's environment, which is the
         // BetterCoding server's own when it started tmux. Run the real
         // bootstrap with `env` as the agent and read what the agent saw.
         let bootstrap = cli_bootstrap(&CliLaunchSpec::new("env", vec![]), None, None, false, None);
         let output = std::process::Command::new("/bin/sh")
             .args(["-c", &bootstrap])
-            .env("CLAUDE_CODE_BC_LEAK_PROBE", "leaked")
+            .env("CLAUDECODE", "1")
+            .env("CLAUDE_CODE_SESSION_ID", "parent")
+            .env("CLAUDE_CODE_OAUTH_TOKEN", "token")
+            .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "9000")
             .env("SHELL", "/bin/true")
             .output()
             .unwrap();
@@ -3626,10 +3639,21 @@ mod tests {
             agent_env.contains("PATH="),
             "agent did not run: {agent_env}"
         );
-        assert!(
-            !agent_env.contains("CLAUDE_CODE_BC_LEAK_PROBE"),
-            "server CLAUDE_CODE_* env reached the agent: {agent_env}"
-        );
+        for leaked in ["CLAUDECODE=", "CLAUDE_CODE_SESSION_ID="] {
+            assert!(
+                !agent_env.contains(leaked),
+                "parent session env {leaked} reached the agent: {agent_env}"
+            );
+        }
+        for kept in [
+            "CLAUDE_CODE_OAUTH_TOKEN=token",
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS=9000",
+        ] {
+            assert!(
+                agent_env.contains(kept),
+                "operator config {kept} was removed: {agent_env}"
+            );
+        }
     }
 
     #[test]
@@ -4714,7 +4738,8 @@ mod tests {
         ] {
             assert!(
                 bootstrap.starts_with(&format!(
-                    "{CLEAR_CLAUDE_CODE_ENV}export CLAUDE_CODE_SANDBOXED='1'; "
+                    "{}export CLAUDE_CODE_SANDBOXED='1'; ",
+                    clear_parent_claude_session_env()
                 )),
                 "claude trust env must lead the command: {bootstrap}"
             );
@@ -4724,7 +4749,8 @@ mod tests {
         let codex = CliLaunchSpec::new("codex", vec![]);
         assert!(
             cli_bootstrap(&codex, None, None, false, None).starts_with(&format!(
-                "{CLEAR_CLAUDE_CODE_ENV}unset BC_SHORT_TMP; if command -v 'codex'"
+                "{}unset BC_SHORT_TMP; if command -v 'codex'",
+                clear_parent_claude_session_env()
             )),
             "agents without a validated resource must clear the inherited value"
         );
