@@ -9,6 +9,10 @@ import { useWorkspaceSessions } from '@/shared/hooks/useWorkspaceSessions';
 import { useGitHubComments } from '@/shared/hooks/useGitHubComments';
 import { useDiffStream } from '@/shared/hooks/useDiffStream';
 import { workspacesApi } from '@/shared/lib/api';
+import {
+  shouldMarkWorkspaceSeen,
+  type WorkspaceSeenState,
+} from '@/shared/lib/workspaceSeen';
 import { useWorkspaceDiffStore } from '@/shared/stores/useWorkspaceDiffStore';
 import type { DiffStats } from 'shared/types';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
@@ -163,8 +167,24 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
 
   const isLoading = isLoadingList || isLoadingWorkspace;
 
+  const hasUnseenActivity = !!currentWorkspaceSummary?.hasUnseenActivity;
+  const lastSeenStateRef = useRef<WorkspaceSeenState | null>(null);
   useEffect(() => {
-    if (!workspaceId || isCreateMode) return;
+    const previous = lastSeenStateRef.current;
+    lastSeenStateRef.current = {
+      workspaceId: isCreateMode ? undefined : workspaceId,
+      hasUnseenActivity,
+    };
+    if (
+      !workspaceId ||
+      !shouldMarkWorkspaceSeen(previous, {
+        workspaceId,
+        isCreateMode,
+        hasUnseenActivity,
+      })
+    ) {
+      return;
+    }
 
     workspacesApi
       .markSeen(workspaceId)
@@ -174,7 +194,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       .catch((error) => {
         console.warn('Failed to mark workspace as seen:', error);
       });
-  }, [workspaceId, isCreateMode, queryClient]);
+  }, [workspaceId, isCreateMode, hasUnseenActivity, queryClient]);
 
   const selectWorkspace = useCallback(
     (id: string) => {
