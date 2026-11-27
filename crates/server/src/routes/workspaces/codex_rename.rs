@@ -40,7 +40,12 @@ async fn set_thread_name(thread_id: &str, name: &str) -> Result<(), String> {
     let codex = utils::shell::resolve_executable_path("codex")
         .await
         .ok_or_else(|| "codex is not on PATH".to_string())?;
-    let mut child = Command::new(codex)
+    let mut command = Command::new(codex);
+    executors::env::strip_parent_claude_session_env(
+        &mut command,
+        std::env::vars_os().map(|(name, _)| name),
+    );
+    let mut child = command
         .arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

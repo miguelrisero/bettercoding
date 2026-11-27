@@ -152,8 +152,64 @@ pub(crate) fn evaluate_usize_override(name: &str, value: Option<String>, default
     }
 }
 
+/// Variables a parent Claude Code session sets to describe itself. A server
+/// started inside such a session must not hand them to the agents and shells it
+/// spawns. Every other `CLAUDE_CODE_*` variable is operator configuration and
+/// stays.
+pub const PARENT_CLAUDE_SESSION_ENV: &[&str] = &[
+    // Mark the process as running inside Claude Code; a nested `claude` refuses to start.
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    // Identify the parent session and its process.
+    "CLAUDE_PID",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_CHILD_NOTES_DIR",
+    // Point at the parent session's own ports, sockets and directories.
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_JOB_DIR",
+    "CLAUDE_PLUGIN_DATA",
+    "CLAUDE_CODE_HOST_SHORT_TEMP_DIRS",
+    // Carry the parent session's own settings; BetterCoding sets its own after the strip.
+    "CLAUDE_EFFORT",
+    "CLAUDE_CODE_SANDBOXED",
+];
+
+/// The names in `inherited` that belong to a parent Claude Code session and
+/// must be removed before a child process starts.
+pub fn parent_claude_session_vars(
+    inherited: impl IntoIterator<Item = OsString>,
+) -> impl Iterator<Item = OsString> {
+    inherited.into_iter().filter(|name| {
+        name.to_str()
+            .is_some_and(|name| PARENT_CLAUDE_SESSION_ENV.contains(&name))
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_parent_claude_session_vars_are_removed() {
+        let inherited = [
+            "CLAUDECODE",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "PATH",
+        ]
+        .map(OsString::from);
+        let removed: Vec<_> = super::parent_claude_session_vars(inherited).collect();
+        assert_eq!(
+            removed,
+            ["CLAUDECODE", "CLAUDE_CODE_SESSION_ID"].map(OsString::from)
+        );
+    }
+
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
 

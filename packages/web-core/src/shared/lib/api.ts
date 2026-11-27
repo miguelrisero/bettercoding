@@ -81,6 +81,7 @@ import {
   AbortConflictsRequest,
   ContinueRebaseRequest,
   Session,
+  SessionModel,
   Workspace,
   StartReviewRequest,
   ReviewError,
@@ -365,6 +366,11 @@ export const sessionsApi = {
   getById: async (sessionId: string): Promise<Session> => {
     const response = await makeRequest(`/api/sessions/${sessionId}`);
     return handleApiResponse<Session>(response);
+  },
+
+  getModel: async (sessionId: string): Promise<SessionModel> => {
+    const response = await makeRequest(`/api/sessions/${sessionId}/model`);
+    return handleApiResponse<SessionModel>(response);
   },
 
   create: async (data: {

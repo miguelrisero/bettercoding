@@ -14,7 +14,7 @@ use executors::executors::cli::{CliContinue, CliLaunchSpec, CliPromptArg, CliRes
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use thiserror::Error;
 use tokio::sync::mpsc;
-use utils::shell::get_interactive_shell;
+use utils::{env::PARENT_CLAUDE_SESSION_ENV, shell::get_interactive_shell};
 use uuid::Uuid;
 
 /// What to run on the PTY.
@@ -225,11 +225,14 @@ fn cli_bootstrap_with_exit(
     };
 
     // Agent environment first, so it applies to every launch form below (and
-    // to the fallback shell the pane drops into).
-    let mut env: String = cli_launch_env(&spec.program)
-        .iter()
-        .map(|(key, value)| format!("export {key}={}; ", shell_single_quote(value)))
-        .collect();
+    // to the fallback shell the pane drops into). The parent session's values
+    // go before BetterCoding's own exports.
+    let mut env = clear_parent_claude_session_env();
+    env.extend(
+        cli_launch_env(&spec.program)
+            .iter()
+            .map(|(key, value)| format!("export {key}={}; ", shell_single_quote(value))),
+    );
     if let Some(path) = &spec.short_tmp {
         env.push_str(&format!(
             "export BC_SHORT_TMP={}; ",
@@ -247,6 +250,14 @@ fn cli_bootstrap_with_exit(
     format!(
         r#"{env}if command -v {prog} >/dev/null 2>&1; then {launch}; else {missing}; fi;{exit} exec "${{SHELL:-/bin/sh}}""#
     )
+}
+
+/// Shell prefix that unsets a parent Claude Code session's variables
+/// ([`PARENT_CLAUDE_SESSION_ENV`]) in the pane. The pane inherits the tmux
+/// server's environment, which is the BetterCoding server's own when it
+/// started tmux, and that server may itself run inside a Claude Code session.
+fn clear_parent_claude_session_env() -> String {
+    format!("unset {}; ", PARENT_CLAUDE_SESSION_ENV.join(" "))
 }
 
 /// Largest prompt (bytes) baked into the launch command via the temp-file
@@ -1196,6 +1207,11 @@ unbind-key -n MouseDown3Pane
 
 fn cli_tmux_conf(client_flags_supported: bool) -> String {
     let mut conf = CLI_TMUX_CONF.to_string();
+    // New windows and splits inherit the server's global environment, which
+    // the bootstrap's `unset` never reaches.
+    for name in PARENT_CLAUDE_SESSION_ENV {
+        conf.push_str(&format!("set-environment -gu {name}\n"));
+    }
     if client_flags_supported {
         conf.push_str("set -g window-size smallest\n");
     }
@@ -1228,6 +1244,17 @@ fn ensure_cli_tmux_server_options_on(socket: &str, client_flags_supported: bool)
             .stderr(std::process::Stdio::null())
             .output()
     };
+
+    // A server started before the strip keeps the parent session's variables
+    // in its global environment; drop them so new windows start clean.
+    let mut unset = Vec::new();
+    for name in PARENT_CLAUDE_SESSION_ENV {
+        if !unset.is_empty() {
+            unset.push(";");
+        }
+        unset.extend(["set-environment", "-gu", name]);
+    }
+    let _ = tmux(&unset);
 
     // default-shell governs how each NEW window command string (our POSIX-sh
     // launch bootstrap) is parsed; apply unconditionally (idempotent, no-op
@@ -3034,6 +3061,13 @@ impl PtyService {
             } else {
                 let mut cmd = CommandBuilder::new(&shell);
                 cmd.cwd(&working_dir);
+                // A `claude` typed here must start even when the server runs
+                // inside a Claude Code session.
+                for name in utils::env::parent_claude_session_vars(
+                    std::env::vars_os().map(|(name, _)| name),
+                ) {
+                    cmd.env_remove(name);
+                }
 
                 // Configure shell-specific options
                 let shell_name = shell
@@ -3567,7 +3601,10 @@ mod tests {
     #[test]
     fn cli_bootstrap_without_short_tmp_suppresses_inherited_values() {
         let spec = codex_spec(&[]);
-        assert!(cli_restart_bootstrap(&spec, None).starts_with("unset BC_SHORT_TMP; "));
+        assert!(cli_restart_bootstrap(&spec, None).starts_with(&format!(
+            "{}unset BC_SHORT_TMP; ",
+            clear_parent_claude_session_env()
+        )));
     }
 
     #[test]
@@ -3595,6 +3632,43 @@ mod tests {
                 "{command}"
             );
             assert!(!command.contains("export TMPDIR="), "{command}");
+        }
+    }
+
+    #[test]
+    fn cli_bootstrap_clears_parent_session_env_and_keeps_operator_config() {
+        // The pane inherits the tmux server's environment, which is the
+        // BetterCoding server's own when it started tmux. Run the real
+        // bootstrap with `env` as the agent and read what the agent saw.
+        let bootstrap = cli_bootstrap(&CliLaunchSpec::new("env", vec![]), None, None, false, None);
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &bootstrap])
+            .env("CLAUDECODE", "1")
+            .env("CLAUDE_CODE_SESSION_ID", "parent")
+            .env("CLAUDE_CODE_OAUTH_TOKEN", "token")
+            .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "9000")
+            .env("SHELL", "/bin/true")
+            .output()
+            .unwrap();
+        let agent_env = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            agent_env.contains("PATH="),
+            "agent did not run: {agent_env}"
+        );
+        for leaked in ["CLAUDECODE=", "CLAUDE_CODE_SESSION_ID="] {
+            assert!(
+                !agent_env.contains(leaked),
+                "parent session env {leaked} reached the agent: {agent_env}"
+            );
+        }
+        for kept in [
+            "CLAUDE_CODE_OAUTH_TOKEN=token",
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS=9000",
+        ] {
+            assert!(
+                agent_env.contains(kept),
+                "operator config {kept} was removed: {agent_env}"
+            );
         }
     }
 
@@ -4679,7 +4753,10 @@ mod tests {
             cli_bootstrap(&spec, None, None, true, None),
         ] {
             assert!(
-                bootstrap.starts_with("export CLAUDE_CODE_SANDBOXED='1'; "),
+                bootstrap.starts_with(&format!(
+                    "{}export CLAUDE_CODE_SANDBOXED='1'; ",
+                    clear_parent_claude_session_env()
+                )),
                 "claude trust env must lead the command: {bootstrap}"
             );
         }
@@ -4687,8 +4764,10 @@ mod tests {
         // An absent workspace resource must suppress inherited values.
         let codex = CliLaunchSpec::new("codex", vec![]);
         assert!(
-            cli_bootstrap(&codex, None, None, false, None)
-                .starts_with("unset BC_SHORT_TMP; if command -v 'codex'"),
+            cli_bootstrap(&codex, None, None, false, None).starts_with(&format!(
+                "{}unset BC_SHORT_TMP; if command -v 'codex'",
+                clear_parent_claude_session_env()
+            )),
             "agents without a validated resource must clear the inherited value"
         );
     }
@@ -4788,6 +4867,11 @@ mod tests {
             // Window command strings (the POSIX-sh launch bootstrap) are
             // parsed by default-shell; fish/csh would reject them outright.
             assert!(conf.contains("set -g default-shell /bin/sh"));
+        }
+        for conf in [cli_tmux_conf(false), cli_tmux_conf(true)] {
+            for name in PARENT_CLAUDE_SESSION_ENV {
+                assert!(conf.contains(&format!("set-environment -gu {name}\n")));
+            }
         }
         assert!(cli_tmux_conf(true).contains("set -g window-size smallest"));
         assert!(!cli_tmux_conf(false).contains("window-size smallest"));

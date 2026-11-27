@@ -182,6 +182,7 @@ fn generate_types_content() -> String {
         server::routes::sessions::ForkRecoveryRequest::decl(),
         server::routes::sessions::queue::QueueMessageRequest::decl(),
         server::routes::sessions::ResetProcessRequest::decl(),
+        server::routes::sessions::SessionModel::decl(),
         server::routes::workspaces::git::ChangeTargetBranchRequest::decl(),
         server::routes::workspaces::git::ChangeTargetBranchResponse::decl(),
         server::routes::workspaces::core::BulkDeleteTarget::decl(),

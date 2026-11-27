@@ -1,14 +1,12 @@
 import { ReactNode, useMemo, useCallback, useEffect, useRef } from 'react';
 import { useParams } from '@tanstack/react-router';
-import { useQueryClient } from '@tanstack/react-query';
 import { useWorkspaces } from '@/shared/hooks/useWorkspaces';
-import { workspaceSummaryKeys } from '@/shared/hooks/workspaceSummaryKeys';
 import { useWorkspaceRecord } from '@/shared/hooks/useWorkspaceRecord';
 import { useWorkspaceRepo } from '@/shared/hooks/useWorkspaceRepo';
 import { useWorkspaceSessions } from '@/shared/hooks/useWorkspaceSessions';
 import { useGitHubComments } from '@/shared/hooks/useGitHubComments';
 import { useDiffStream } from '@/shared/hooks/useDiffStream';
-import { workspacesApi } from '@/shared/lib/api';
+import { useMarkWorkspaceSeen } from '@/shared/hooks/useMarkWorkspaceSeen';
 import { useWorkspaceDiffStore } from '@/shared/stores/useWorkspaceDiffStore';
 import type { DiffStats } from 'shared/types';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
@@ -24,7 +22,6 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   const { workspaceId } = useParams({ strict: false });
   const appNavigation = useAppNavigation();
   const currentDestination = useCurrentAppDestination();
-  const queryClient = useQueryClient();
 
   const isCreateMode = currentDestination?.kind === 'workspaces-create';
 
@@ -163,18 +160,11 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
 
   const isLoading = isLoadingList || isLoadingWorkspace;
 
-  useEffect(() => {
-    if (!workspaceId || isCreateMode) return;
-
-    workspacesApi
-      .markSeen(workspaceId)
-      .then(() => {
-        queryClient.invalidateQueries({ queryKey: workspaceSummaryKeys.all });
-      })
-      .catch((error) => {
-        console.warn('Failed to mark workspace as seen:', error);
-      });
-  }, [workspaceId, isCreateMode, queryClient]);
+  useMarkWorkspaceSeen(
+    workspaceId,
+    isCreateMode,
+    !!currentWorkspaceSummary?.hasUnseenActivity
+  );
 
   const selectWorkspace = useCallback(
     (id: string) => {

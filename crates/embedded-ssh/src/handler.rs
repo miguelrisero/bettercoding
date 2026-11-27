@@ -80,6 +80,13 @@ impl SshSessionHandler {
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        // A `claude` run over SSH must start even when the server runs inside a
+        // Claude Code session.
+        for name in
+            utils::env::parent_claude_session_vars(std::env::vars_os().map(|(name, _)| name))
+        {
+            cmd.env_remove(name);
+        }
         cmd.env("TERM", "xterm-256color");
         for (k, v) in env {
             cmd.env(k, v);

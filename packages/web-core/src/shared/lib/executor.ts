@@ -6,6 +6,8 @@ import type {
   ExecutorAction,
   ExecutorProfileId,
   ExecutionProcess,
+  Session,
+  SessionModel,
 } from 'shared/types';
 
 const RESERVED_KEYS = new Set(['recently_used_models']);
@@ -103,4 +105,37 @@ export function getLatestConfigFromProcesses(
       .map((p) => executorConfigFromAction(p.executor_action ?? null))
       .find((c) => c !== null) ?? null
   );
+}
+
+/**
+ * The config the composer starts from: the open session's processes, else the
+ * previous session's (new-session mode), else the session's executor with the
+ * model the server knows it launched with. A CLI session runs no process.
+ */
+export function resolveLatestSessionConfig({
+  processes,
+  lastSessionProcesses,
+  session,
+  sessions,
+  sessionModel,
+}: {
+  processes: ExecutionProcess[] | undefined;
+  lastSessionProcesses: ExecutionProcess[] | undefined;
+  session: Session | undefined;
+  sessions: Session[] | undefined;
+  sessionModel: SessionModel | undefined;
+}): ExecutorConfig | null {
+  const fromProcesses = getLatestConfigFromProcesses(processes);
+  if (fromProcesses) return fromProcesses;
+
+  const fromLastSession = getLatestConfigFromProcesses(lastSessionProcesses);
+  if (fromLastSession) return fromLastSession;
+
+  const executor = session?.executor ?? sessions?.[0]?.executor;
+  if (!executor) return null;
+  return {
+    executor: executor as BaseCodingAgent,
+    model_id: sessionModel?.model_id,
+    reasoning_id: sessionModel?.reasoning_id,
+  };
 }

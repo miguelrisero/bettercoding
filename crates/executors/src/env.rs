@@ -130,8 +130,20 @@ impl ExecutionEnv {
         self.short_tmp = path.map(std::path::Path::to_path_buf);
     }
 
-    /// Apply ordinary variables first, then enforce the workspace resource.
+    /// Clear a parent Claude Code session's variables, apply ordinary
+    /// variables, then enforce the workspace resource.
     pub fn apply_to_command(&self, command: &mut Command) {
+        self.apply_to_command_with(command, std::env::vars_os().map(|(name, _)| name));
+    }
+
+    /// [`Self::apply_to_command`] with `inherited` standing in for the
+    /// server's environment.
+    fn apply_to_command_with(
+        &self,
+        command: &mut Command,
+        inherited: impl IntoIterator<Item = std::ffi::OsString>,
+    ) {
+        strip_parent_claude_session_env(command, inherited);
         for (key, value) in &self.vars {
             command.env(key, value);
         }
@@ -148,6 +160,20 @@ impl ExecutionEnv {
 
     pub fn get(&self, key: &str) -> Option<&String> {
         self.vars.get(key)
+    }
+}
+
+/// Remove the parent Claude Code session's variables (see
+/// [`PARENT_CLAUDE_SESSION_ENV`]) found in `inherited`, the server's own
+/// environment. Variables set on `command` afterwards still apply.
+///
+/// [`PARENT_CLAUDE_SESSION_ENV`]: workspace_utils::env::PARENT_CLAUDE_SESSION_ENV
+pub fn strip_parent_claude_session_env(
+    command: &mut Command,
+    inherited: impl IntoIterator<Item = std::ffi::OsString>,
+) {
+    for name in workspace_utils::env::parent_claude_session_vars(inherited) {
+        command.env_remove(name);
     }
 }
 
@@ -174,6 +200,43 @@ mod tests {
             values.get(std::ffi::OsStr::new("TMPDIR")),
             Some(&Some(std::ffi::OsStr::new("/fixture/existing-temp")))
         );
+    }
+
+    #[tokio::test]
+    async fn spawned_agents_keep_operator_config_but_not_parent_session_state() {
+        let inherited = [
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_SESSION_ID", "parent"),
+            ("CLAUDE_CODE_SANDBOXED", "parent"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "token"),
+            ("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "9000"),
+        ];
+        // The cleared command stands in for the server: its environment is
+        // exactly `inherited`, so the test reads no global state.
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "env"]).env_clear().envs(inherited);
+        let mut env = ExecutionEnv::new(RepoContext::default(), false, String::new());
+        env.insert("CLAUDE_CODE_SANDBOXED", "1");
+        env.apply_to_command_with(
+            &mut command,
+            inherited.map(|(name, _)| std::ffi::OsString::from(name)),
+        );
+
+        let output = command.output().await.unwrap();
+        let child_env = String::from_utf8_lossy(&output.stdout);
+        for leaked in ["CLAUDECODE=", "CLAUDE_CODE_SESSION_ID=", "=parent"] {
+            assert!(
+                !child_env.contains(leaked),
+                "{leaked} reached the agent: {child_env}"
+            );
+        }
+        for kept in [
+            "CLAUDE_CODE_OAUTH_TOKEN=token",
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS=9000",
+            "CLAUDE_CODE_SANDBOXED=1",
+        ] {
+            assert!(child_env.contains(kept), "{kept} missing: {child_env}");
+        }
     }
 
     #[test]

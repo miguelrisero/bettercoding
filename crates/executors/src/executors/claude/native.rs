@@ -313,6 +313,32 @@ mod tests {
         assert_eq!(changes[0].entry.content, "hello");
     }
 
+    #[test]
+    fn redacted_thinking_yields_no_entry() {
+        // Claude Code stores thinking it does not display as an empty block
+        // with only a signature. It has nothing to show in the chat.
+        let raw = r#"{"type":"assistant","uuid":"a-1","parentUuid":"u-1","timestamp":"2026-07-20T00:00:01Z","message":{"id":"msg-1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"thinking","thinking":"","signature":"sig"},{"type":"text","text":"done"}]}}"#;
+        let line = adapt_native_claude_line(raw, "sid").unwrap();
+        let changes = NativeClaudeNormalizer::default().normalize(&line, "");
+        let entries: Vec<_> = changes
+            .iter()
+            .map(|change| (&change.entry.entry_type, change.entry.content.as_str()))
+            .collect();
+        assert!(
+            entries.iter().all(|(entry_type, content)| !matches!(
+                entry_type,
+                NormalizedEntryType::Thinking
+            ) && !content.trim().is_empty()),
+            "{entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry, (NormalizedEntryType::AssistantMessage, "done"))),
+            "{entries:?}"
+        );
+    }
+
     fn normalize_with_strategy(
         line: &NativeClaudeLine,
         strategy: HistoryStrategy,

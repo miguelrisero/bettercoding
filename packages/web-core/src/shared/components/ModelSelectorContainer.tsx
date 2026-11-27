@@ -188,9 +188,19 @@ export function ModelSelectorContainer({
     ? presetModelId
     : null;
 
+  // An open session shows only the model it is known to run. The executor
+  // default is a guess about a session launched elsewhere, so it applies only
+  // before a session exists.
+  const isOpenSession = Boolean(sessionId);
+
   const selectedModelId = (() => {
-    const candidate = configModelId ?? resolvedPresetModelId ?? defaultModelId;
-    if (!candidate || !config || !selectedProviderId) return candidate;
+    const candidate =
+      configModelId ??
+      resolvedPresetModelId ??
+      (isOpenSession ? null : defaultModelId);
+    if (!candidate || !config || !selectedProviderId || isOpenSession) {
+      return candidate;
+    }
     const hasMatch = isModelAvailable(config, selectedProviderId, candidate);
     return hasMatch
       ? candidate
@@ -230,8 +240,10 @@ export function ModelSelectorContainer({
   const selectedReasoningId =
     executorConfig?.reasoning_id ??
     presetReasoningId ??
-    recentReasoningId ??
-    resolveDefaultReasoningId(selectedModel?.reasoning_options ?? []);
+    (isOpenSession
+      ? null
+      : (recentReasoningId ??
+        resolveDefaultReasoningId(selectedModel?.reasoning_options ?? [])));
 
   const defaultAgentId =
     config?.agents.find((entry) => entry.is_default)?.id ?? null;
