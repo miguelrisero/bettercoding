@@ -1596,6 +1596,8 @@ impl ClaudeLogProcessor {
                     ),
                 })
             }
+            // Thinking the CLI does not display is stored as an empty block.
+            ClaudeContentItem::Thinking { thinking } if thinking.trim().is_empty() => None,
             ClaudeContentItem::Thinking { thinking } => Some(NormalizedEntry {
                 timestamp: None,
                 entry_type: NormalizedEntryType::Thinking,
