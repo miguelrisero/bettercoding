@@ -5,8 +5,7 @@ use axum::{
 };
 use chrono::Utc;
 use db::models::workspace_cli_activity::{
-    CliManual, CliManualKind, WorkspaceCliActivity, clears_manual, normalize_manual_note,
-    reduce_hook,
+    CliManual, CliManualKind, WorkspaceCliActivity, normalize_manual_note,
 };
 use deployment::Deployment;
 use executors::executors::codex::rollout::rollout_thread_id;
@@ -53,33 +52,22 @@ pub async fn report_cli_activity(
         .or_else(|| now.timestamp_nanos_opt())
         .unwrap_or_else(|| now.timestamp_millis());
 
-    // Two hooks firing at once both reduce against the row as they found it,
-    // so the later write wins. `upsert_hook`'s seq guard bounds that to "a
-    // newer report wins", which is the property that matters.
-    let previous = match WorkspaceCliActivity::find_by_workspace_id(pool, workspace_id).await {
-        Ok(row) => row,
+    let (next, switched) = match WorkspaceCliActivity::record_hook(
+        pool,
+        workspace_id,
+        &payload,
+        seq,
+        now,
+    )
+    .await
+    {
+        Ok(Some(report)) => report,
+        Ok(None) => return StatusCode::NO_CONTENT,
         Err(error) => {
             tracing::debug!(?error, %workspace_id, "failed to read CLI activity for a hook report");
             return StatusCode::NO_CONTENT;
         }
     };
-
-    let Some(next) = reduce_hook(
-        previous.as_ref().and_then(|row| row.hook.as_ref()),
-        &payload,
-        seq,
-    ) else {
-        return StatusCode::NO_CONTENT;
-    };
-
-    // FK failures are expected when the workspace was deleted while its tmux
-    // session lingered; nothing here is worth failing the agent's hook over.
-    if let Err(error) =
-        WorkspaceCliActivity::upsert_hook(pool, workspace_id, &next, clears_manual(&payload), now)
-            .await
-    {
-        tracing::debug!(?error, %workspace_id, "failed to record a CLI hook report");
-    }
 
     if payload.get("hook_event_name").and_then(|v| v.as_str()) == Some("SessionStart")
         && let Some(capability) = headers
@@ -99,10 +87,6 @@ pub async fn report_cli_activity(
     // A CLI-mode Codex names its rollout; import a thread the feed does not
     // track yet, or rebind a pane that switched threads inside the TUI,
     // without waiting for the next registry pass.
-    let switched = previous
-        .as_ref()
-        .and_then(|row| row.hook.as_ref())
-        .is_some_and(|hook| hook.agent_session_id != next.agent_session_id);
     let reports_rollout = next
         .transcript_path
         .as_deref()

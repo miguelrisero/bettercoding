@@ -6,18 +6,19 @@ use uuid::Uuid;
 
 /// Live state of a workspace's CLI-mode tmux claude session.
 ///
-/// Maintained by the local deployment's tmux poller (`CliActivityMonitor`):
-/// `running` while the pane is producing output, `attention` once a run went
-/// quiet while no client was attached (claude finished while the user was on
-/// another workspace), `idle` otherwise. Rows are upserted only on state
-/// transitions so the SQLite update hook broadcasts a workspace patch exactly
-/// when the sidebar bucket should move.
+/// Agent hooks and the tmux poller record four states:
+/// - `idle`: the pane has no current work or unread activity.
+/// - `running`: the agent is working.
+/// - `attention`: the agent is waiting or finished while unattended.
+/// - `seen`: the workspace acknowledged the current CLI attention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CliActivityState {
     Idle,
     Running,
     Attention,
+    /// The workspace was marked seen while it was waiting for attention.
+    Seen,
 }
 
 impl CliActivityState {
@@ -26,6 +27,7 @@ impl CliActivityState {
             CliActivityState::Idle => "idle",
             CliActivityState::Running => "running",
             CliActivityState::Attention => "attention",
+            CliActivityState::Seen => "seen",
         }
     }
 
@@ -33,6 +35,7 @@ impl CliActivityState {
         match s {
             "running" => CliActivityState::Running,
             "attention" => CliActivityState::Attention,
+            "seen" => CliActivityState::Seen,
             _ => CliActivityState::Idle,
         }
     }
@@ -335,7 +338,7 @@ pub fn reduce_hook(
 pub enum CliManualKind {
     /// Parked, usually waiting on something outside this workspace.
     Locked,
-    /// A finished turn the user has looked at and dismissed.
+    /// A manual display override, separate from the automatic `CliActivityState::Seen`.
     Seen,
 }
 
@@ -377,6 +380,15 @@ pub const CLEARING_EVENTS: &[&str] = &[
 /// Does this (accepted) hook payload clear the workspace's manual state?
 pub fn clears_manual(payload: &serde_json::Value) -> bool {
     payload_str(payload, "hook_event_name").is_some_and(|event| CLEARING_EVENTS.contains(&event))
+}
+
+/// These reports can describe the same wait after the user acknowledges it.
+fn preserves_seen(payload: &serde_json::Value) -> bool {
+    match payload_str(payload, "hook_event_name") {
+        Some("SubagentStop") => true,
+        Some("Notification") => payload_str(payload, "notification_type") == Some("idle_prompt"),
+        _ => false,
+    }
 }
 
 /// Longest manual note kept, in characters.
@@ -432,8 +444,7 @@ impl WorkspaceCliActivity {
         }
     }
 
-    /// Set a workspace's CLI activity state. No-op write avoidance is the
-    /// caller's job (the monitor only calls this on transitions).
+    /// Set a workspace's CLI activity state. The poller only writes transitions.
     pub async fn upsert(
         pool: &SqlitePool,
         workspace_id: Uuid,
@@ -454,15 +465,56 @@ impl WorkspaceCliActivity {
         Ok(())
     }
 
-    /// Record a hook-reduced state, refreshing `state` from the phase's bucket
-    /// so the coarse sidebar projection and the phase can never disagree.
-    /// Stale `seq` is dropped silently: events that overtake each other in
-    /// flight must not rewind the phase.
+    pub async fn mark_seen(pool: &SqlitePool, workspace_id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            "UPDATE workspace_cli_activity SET state = 'seen'
+             WHERE workspace_id = $1 AND state = 'attention'",
+            workspace_id
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Reduce a raw report and return its state and whether the agent session switched.
+    pub async fn record_hook(
+        pool: &SqlitePool,
+        workspace_id: Uuid,
+        payload: &serde_json::Value,
+        seq: i64,
+        at: DateTime<Utc>,
+    ) -> Result<Option<(CliHookState, bool)>, sqlx::Error> {
+        let previous = Self::find_by_workspace_id(pool, workspace_id).await?;
+        let previous_hook = previous.as_ref().and_then(|row| row.hook.as_ref());
+        let Some(hook) = reduce_hook(previous_hook, payload, seq) else {
+            return Ok(None);
+        };
+        let switched =
+            previous_hook.is_some_and(|old| old.agent_session_id != hook.agent_session_id);
+        // A failed activity write must not block the hook's other consumers.
+        if let Err(error) = Self::upsert_hook(
+            pool,
+            workspace_id,
+            &hook,
+            clears_manual(payload),
+            preserves_seen(payload),
+            at,
+        )
+        .await
+        {
+            tracing::debug!(?error, %workspace_id, "failed to record a CLI hook report");
+        }
+        Ok(Some((hook, switched)))
+    }
+
+    /// Record a hook-reduced state. Stale `seq` is dropped silently.
+    /// Metadata reports preserve acknowledgment of the current wait.
     pub async fn upsert_hook(
         pool: &SqlitePool,
         workspace_id: Uuid,
         hook: &CliHookState,
         clear_manual: bool,
+        preserve_seen: bool,
         at: DateTime<Utc>,
     ) -> Result<(), sqlx::Error> {
         let state = hook_bucket(hook.phase, hook.tasks).as_str();
@@ -474,7 +526,10 @@ impl WorkspaceCliActivity {
                   agent_session_id, transcript_path, seq, hook_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                ON CONFLICT(workspace_id) DO UPDATE SET
-                 state = excluded.state,
+                 state = CASE
+                   WHEN workspace_cli_activity.state = 'seen' AND excluded.state = 'attention'
+                     AND ($11 OR excluded.seq = workspace_cli_activity.seq)
+                   THEN 'seen' ELSE excluded.state END,
                  updated_at = excluded.updated_at,
                  phase = excluded.phase,
                  tasks = excluded.tasks,
@@ -483,8 +538,8 @@ impl WorkspaceCliActivity {
                  transcript_path = excluded.transcript_path,
                  seq = excluded.seq,
                  hook_at = excluded.hook_at,
-                 manual_kind = CASE WHEN $11 THEN NULL ELSE workspace_cli_activity.manual_kind END,
-                 manual_note = CASE WHEN $11 THEN NULL ELSE workspace_cli_activity.manual_note END
+                 manual_kind = CASE WHEN $12 THEN NULL ELSE workspace_cli_activity.manual_kind END,
+                 manual_note = CASE WHEN $12 THEN NULL ELSE workspace_cli_activity.manual_note END
                WHERE excluded.seq >= workspace_cli_activity.seq"#,
             workspace_id,
             state,
@@ -496,6 +551,7 @@ impl WorkspaceCliActivity {
             transcript_path,
             hook.seq,
             at,
+            preserve_seen,
             clear_manual,
         )
         .execute(pool)
@@ -771,7 +827,7 @@ mod tests {
             crons: None,
             seq: 7,
         };
-        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, false, Utc::now())
+        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, false, false, Utc::now())
             .await
             .unwrap();
 
@@ -851,7 +907,7 @@ mod tests {
             crons: Some(0),
             seq: 1,
         };
-        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, false, Utc::now())
+        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, false, false, Utc::now())
             .await
             .unwrap();
         assert_eq!(manual(pool.clone()).await, Some(locked.clone()));
@@ -859,7 +915,7 @@ mod tests {
         // An engaging report clears it.
         hook.seq = 2;
         hook.phase = CliPhase::Working;
-        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, true, Utc::now())
+        WorkspaceCliActivity::upsert_hook(&pool, workspace.id, &hook, true, false, Utc::now())
             .await
             .unwrap();
         assert_eq!(manual(pool.clone()).await, None);

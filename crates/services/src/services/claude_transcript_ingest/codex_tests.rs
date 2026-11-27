@@ -632,6 +632,7 @@ async fn ambiguous_fresh_codex_rollouts_are_quarantined_until_the_hook_names_one
             seq: 1,
         },
         false,
+        false,
         Utc::now(),
     )
     .await
@@ -670,6 +671,7 @@ async fn report_hook(case: &Case, thread: &str) {
             crons: None,
             seq: Utc::now().timestamp_nanos_opt().unwrap(),
         },
+        false,
         false,
         Utc::now(),
     )
@@ -1061,6 +1063,7 @@ async fn a_switch_reported_before_the_pane_launched_never_binds() {
             crons: None,
             seq: binding.created_at.timestamp_nanos_opt().unwrap() - 1_000_000_000,
         },
+        false,
         false,
         Utc::now(),
     )

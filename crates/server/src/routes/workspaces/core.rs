@@ -9,11 +9,12 @@ use db::models::{
     coding_agent_turn::CodingAgentTurn,
     execution_process::{ExecutionProcess, ExecutionProcessStatus},
     workspace::{Workspace, WorkspaceError},
+    workspace_cli_activity::WorkspaceCliActivity,
 };
 use deployment::Deployment;
 use serde::{Deserialize, Serialize};
 use services::services::{container::ContainerService, diff_stream, remote_sync};
-use sqlx::Error as SqlxError;
+use sqlx::{Error as SqlxError, SqlitePool};
 use ts_rs::TS;
 use utils::response::ApiResponse;
 use uuid::Uuid;
@@ -437,7 +438,103 @@ pub async fn mark_seen(
     Extension(workspace): Extension<Workspace>,
     State(deployment): State<DeploymentImpl>,
 ) -> Result<ResponseJson<ApiResponse<()>>, ApiError> {
-    let pool = &deployment.db().pool;
-    CodingAgentTurn::mark_seen_by_workspace_id(pool, workspace.id).await?;
+    mark_workspace_seen(&deployment.db().pool, workspace.id).await?;
     Ok(ResponseJson(ApiResponse::success(())))
+}
+
+async fn mark_workspace_seen(pool: &SqlitePool, workspace_id: Uuid) -> Result<(), SqlxError> {
+    CodingAgentTurn::mark_seen_by_workspace_id(pool, workspace_id).await?;
+    WorkspaceCliActivity::mark_seen(pool, workspace_id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use db::models::workspace::CreateWorkspace;
+    use serde_json::json;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn mark_seen_clears_cli_attention_until_the_next_turn_finishes() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations_for_tests(&pool).await.unwrap();
+        let workspace = Workspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "cli-mark-seen".to_string(),
+                name: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        let id = workspace.id;
+        let report = |seq, payload| {
+            let pool = &pool;
+            async move {
+                WorkspaceCliActivity::record_hook(pool, id, &payload, seq, Utc::now())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        };
+        let has_attention = || async {
+            WorkspaceCliActivity::find_workspaces_needing_attention(&pool, false)
+                .await
+                .unwrap()
+                .contains(&id)
+        };
+        let stopped = json!({"session_id": "agent", "hook_event_name": "Stop"});
+        report(1, stopped.clone()).await;
+        assert!(has_attention().await);
+
+        mark_workspace_seen(&pool, id).await.unwrap();
+        assert!(!has_attention().await, "mark seen leaves the turn unread");
+
+        report(
+            2,
+            json!({
+                "session_id": "agent", "hook_event_name": "Notification",
+                "notification_type": "idle_prompt"
+            }),
+        )
+        .await;
+        assert!(
+            !has_attention().await,
+            "a notification makes the same turn unread again"
+        );
+
+        report(
+            3,
+            json!({"session_id": "agent", "hook_event_name": "SubagentStop"}),
+        )
+        .await;
+        assert!(
+            !has_attention().await,
+            "subagent completion makes the same turn unread again"
+        );
+
+        report(
+            4,
+            json!({
+                "session_id": "agent", "hook_event_name": "Notification",
+                "notification_type": "permission_prompt"
+            }),
+        )
+        .await;
+        assert!(
+            has_attention().await,
+            "a new permission prompt must raise attention"
+        );
+
+        mark_workspace_seen(&pool, id).await.unwrap();
+        assert!(!has_attention().await);
+        report(5, stopped).await;
+        assert!(has_attention().await, "the next turn must be unread");
+    }
 }

@@ -606,7 +606,7 @@ impl CliActivityMonitor {
                 }
 
                 // Sessions we knew about that vanished (killed, reboot): their
-                // claude is gone, so any lingering state collapses to idle.
+                // claude is gone, so clear running and unread states.
                 let gone: Vec<Uuid> = states
                     .iter()
                     .filter(|(id, state)| {
@@ -870,9 +870,12 @@ fn next_state(
     now: i64,
     hook: Option<HookView>,
 ) -> CliActivityState {
-    // Bootstrap fell back to a plain shell: claude is not running here.
+    // A missing process must not make the same hook report unread again.
     if !obs.claude_like {
-        return CliActivityState::Idle;
+        return match prev {
+            CliActivityState::Seen => prev,
+            _ => CliActivityState::Idle,
+        };
     }
 
     // The agent's own account beats every pane heuristic below. It is the only
@@ -880,6 +883,7 @@ fn next_state(
     // a user typing in the pane cannot fake.
     if let Some(hook) = hook {
         return match hook.bucket {
+            CliActivityState::Attention if prev == CliActivityState::Seen => prev,
             // Attention still clears the moment a terminal attaches, and stays
             // cleared for a report the user has already seen.
             CliActivityState::Attention if obs.attached || hook.acked => CliActivityState::Idle,
@@ -912,7 +916,7 @@ fn next_state(
                 CliActivityState::Attention
             }
         }
-        CliActivityState::Idle => CliActivityState::Idle,
+        CliActivityState::Idle | CliActivityState::Seen => CliActivityState::Idle,
     }
 }
 
@@ -921,7 +925,12 @@ fn should_transition_missing_to_idle(
     observed: bool,
     previous: CliActivityState,
 ) -> bool {
-    snapshot_complete && !observed && previous != CliActivityState::Idle
+    snapshot_complete
+        && !observed
+        && matches!(
+            previous,
+            CliActivityState::Running | CliActivityState::Attention
+        )
 }
 
 /// Snapshot `bc_*` sessions across the CLI tmux sockets.
@@ -1501,6 +1510,42 @@ mod tests {
                 "phase {phase:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_seen_cli_report_stays_seen_while_the_terminal_is_detached() {
+        let seen = CliActivityState::parse("seen");
+        assert_eq!(
+            next_state(
+                seen,
+                obs(true, 300, false),
+                true,
+                NOW,
+                hook(CliPhase::Stopped, false),
+            ),
+            seen
+        );
+    }
+
+    #[test]
+    fn seen_cli_report_survives_a_non_agent_pane_observation() {
+        let state = next_state(
+            CliActivityState::Seen,
+            obs(false, 300, false),
+            false,
+            NOW,
+            hook(CliPhase::Stopped, false),
+        );
+        assert_eq!(state, CliActivityState::Seen);
+    }
+
+    #[test]
+    fn seen_cli_report_survives_a_missing_session() {
+        assert!(!should_transition_missing_to_idle(
+            true,
+            false,
+            CliActivityState::Seen
+        ));
     }
 
     #[test]
