@@ -130,8 +130,10 @@ impl ExecutionEnv {
         self.short_tmp = path.map(std::path::Path::to_path_buf);
     }
 
-    /// Apply ordinary variables first, then enforce the workspace resource.
+    /// Clear the server's inherited `CLAUDE_CODE_*` variables, apply ordinary
+    /// variables, then enforce the workspace resource.
     pub fn apply_to_command(&self, command: &mut Command) {
+        strip_inherited_claude_code_env(command);
         for (key, value) in &self.vars {
             command.env(key, value);
         }
@@ -148,6 +150,20 @@ impl ExecutionEnv {
 
     pub fn get(&self, key: &str) -> Option<&String> {
         self.vars.get(key)
+    }
+}
+
+/// Prefix of the variables a Claude Code session exports to its children.
+pub const CLAUDE_CODE_ENV_PREFIX: &str = "CLAUDE_CODE_";
+
+/// Remove every `CLAUDE_CODE_*` variable the server inherited. A server started
+/// inside a Claude Code session would otherwise hand that session's state to
+/// every agent it spawns. Variables set on `command` afterwards still apply.
+pub fn strip_inherited_claude_code_env(command: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with(CLAUDE_CODE_ENV_PREFIX) {
+            command.env_remove(key);
+        }
     }
 }
 
@@ -174,6 +190,24 @@ mod tests {
             values.get(std::ffi::OsStr::new("TMPDIR")),
             Some(&Some(std::ffi::OsStr::new("/fixture/existing-temp")))
         );
+    }
+
+    #[tokio::test]
+    async fn spawned_agents_never_inherit_the_servers_claude_code_env() {
+        // SAFETY: a key unique to this test; no other code reads or writes it.
+        unsafe { std::env::set_var("CLAUDE_CODE_BC_LEAK_PROBE", "leaked") };
+        let mut env = ExecutionEnv::new(RepoContext::default(), false, String::new());
+        env.insert("CLAUDE_CODE_BC_KEPT_PROBE", "kept");
+        let mut command = Command::new("sh");
+        command.args(["-c", "env"]);
+        env.apply_to_command(&mut command);
+        let output = command.output().await.unwrap();
+        let child_env = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !child_env.contains("CLAUDE_CODE_BC_LEAK_PROBE"),
+            "server CLAUDE_CODE_* env reached the agent: {child_env}"
+        );
+        assert!(child_env.contains("CLAUDE_CODE_BC_KEPT_PROBE=kept"));
     }
 
     #[test]

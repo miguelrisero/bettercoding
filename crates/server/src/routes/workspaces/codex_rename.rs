@@ -40,7 +40,9 @@ async fn set_thread_name(thread_id: &str, name: &str) -> Result<(), String> {
     let codex = utils::shell::resolve_executable_path("codex")
         .await
         .ok_or_else(|| "codex is not on PATH".to_string())?;
-    let mut child = Command::new(codex)
+    let mut command = Command::new(codex);
+    executors::env::strip_inherited_claude_code_env(&mut command);
+    let mut child = command
         .arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

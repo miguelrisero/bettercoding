@@ -225,11 +225,14 @@ fn cli_bootstrap_with_exit(
     };
 
     // Agent environment first, so it applies to every launch form below (and
-    // to the fallback shell the pane drops into).
-    let mut env: String = cli_launch_env(&spec.program)
-        .iter()
-        .map(|(key, value)| format!("export {key}={}; ", shell_single_quote(value)))
-        .collect();
+    // to the fallback shell the pane drops into). Inherited `CLAUDE_CODE_*`
+    // values go before BetterCoding's own exports.
+    let mut env = String::from(CLEAR_CLAUDE_CODE_ENV);
+    env.extend(
+        cli_launch_env(&spec.program)
+            .iter()
+            .map(|(key, value)| format!("export {key}={}; ", shell_single_quote(value))),
+    );
     if let Some(path) = &spec.short_tmp {
         env.push_str(&format!(
             "export BC_SHORT_TMP={}; ",
@@ -248,6 +251,11 @@ fn cli_bootstrap_with_exit(
         r#"{env}if command -v {prog} >/dev/null 2>&1; then {launch}; else {missing}; fi;{exit} exec "${{SHELL:-/bin/sh}}""#
     )
 }
+
+/// Unsets every `CLAUDE_CODE_*` variable in the pane. The pane inherits the
+/// tmux server's environment, which is the BetterCoding server's own when it
+/// started tmux, and that server may itself run inside a Claude Code session.
+const CLEAR_CLAUDE_CODE_ENV: &str = r#"for bc_v in $(env | sed -n 's/^\(CLAUDE_CODE_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$bc_v"; done; unset bc_v; "#;
 
 /// Largest prompt (bytes) baked into the launch command via the temp-file
 /// `$(cat)` transport for argv-passing agents. Positional agents hand the
@@ -3567,7 +3575,10 @@ mod tests {
     #[test]
     fn cli_bootstrap_without_short_tmp_suppresses_inherited_values() {
         let spec = codex_spec(&[]);
-        assert!(cli_restart_bootstrap(&spec, None).starts_with("unset BC_SHORT_TMP; "));
+        assert!(
+            cli_restart_bootstrap(&spec, None)
+                .starts_with(&format!("{CLEAR_CLAUDE_CODE_ENV}unset BC_SHORT_TMP; "))
+        );
     }
 
     #[test]
@@ -3596,6 +3607,29 @@ mod tests {
             );
             assert!(!command.contains("export TMPDIR="), "{command}");
         }
+    }
+
+    #[test]
+    fn cli_bootstrap_clears_inherited_claude_code_env_before_the_agent() {
+        // The pane inherits the tmux server's environment, which is the
+        // BetterCoding server's own when it started tmux. Run the real
+        // bootstrap with `env` as the agent and read what the agent saw.
+        let bootstrap = cli_bootstrap(&CliLaunchSpec::new("env", vec![]), None, None, false, None);
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &bootstrap])
+            .env("CLAUDE_CODE_BC_LEAK_PROBE", "leaked")
+            .env("SHELL", "/bin/true")
+            .output()
+            .unwrap();
+        let agent_env = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            agent_env.contains("PATH="),
+            "agent did not run: {agent_env}"
+        );
+        assert!(
+            !agent_env.contains("CLAUDE_CODE_BC_LEAK_PROBE"),
+            "server CLAUDE_CODE_* env reached the agent: {agent_env}"
+        );
     }
 
     #[test]
@@ -4679,7 +4713,9 @@ mod tests {
             cli_bootstrap(&spec, None, None, true, None),
         ] {
             assert!(
-                bootstrap.starts_with("export CLAUDE_CODE_SANDBOXED='1'; "),
+                bootstrap.starts_with(&format!(
+                    "{CLEAR_CLAUDE_CODE_ENV}export CLAUDE_CODE_SANDBOXED='1'; "
+                )),
                 "claude trust env must lead the command: {bootstrap}"
             );
         }
@@ -4687,8 +4723,9 @@ mod tests {
         // An absent workspace resource must suppress inherited values.
         let codex = CliLaunchSpec::new("codex", vec![]);
         assert!(
-            cli_bootstrap(&codex, None, None, false, None)
-                .starts_with("unset BC_SHORT_TMP; if command -v 'codex'"),
+            cli_bootstrap(&codex, None, None, false, None).starts_with(&format!(
+                "{CLEAR_CLAUDE_CODE_ENV}unset BC_SHORT_TMP; if command -v 'codex'"
+            )),
             "agents without a validated resource must clear the inherited value"
         );
     }
