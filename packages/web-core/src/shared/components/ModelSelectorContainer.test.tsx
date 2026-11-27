@@ -75,31 +75,29 @@ function modelLabel(
 }
 
 describe('ModelSelectorContainer label', () => {
-  it("shows the session's own model and effort", () => {
+  it("shows the session's model without a guessed effort", () => {
+    // The session is known to run Opus, but not at which effort.
     const label = modelLabel(
-      { executor: BaseCodingAgent.CLAUDE_CODE, model_id: 'haiku' },
+      { executor: BaseCodingAgent.CLAUDE_CODE, model_id: 'opus' },
       'session'
     );
-    expect(label).toContain('Haiku');
-    expect(label).not.toContain('Opus');
+    expect(label).toContain('Opus');
     expect(label).not.toContain('Max');
   });
 
-  it('shows no model when the session model is unknown', () => {
-    const label = modelLabel(
+  it('shows no model for an unknown session, and the default for a new one', () => {
+    const unknown = modelLabel(
       { executor: BaseCodingAgent.CLAUDE_CODE },
       'session'
     );
-    expect(label).not.toContain('Opus');
-    expect(label).not.toContain('Max');
-    expect(label).toContain('modelSelector.default');
-  });
+    expect(unknown).not.toContain('Opus');
+    expect(unknown).not.toContain('Max');
+    expect(unknown).toContain('modelSelector.default');
 
-  it('offers the executor default before a session exists', () => {
-    const label = modelLabel(
+    const fresh = modelLabel(
       { executor: BaseCodingAgent.CLAUDE_CODE },
       undefined
     );
-    expect(label).toContain('Opus · Max');
+    expect(fresh).toContain('Opus · Max');
   });
 });

@@ -24,7 +24,7 @@ import { useExecutionProcesses } from '@/shared/hooks/useExecutionProcesses';
 import { useReviewOptional } from '@/shared/hooks/useReview';
 import { useActions } from '@/shared/hooks/useActions';
 import { useTodos } from '../model/hooks/useTodos';
-import { getLatestConfigFromProcesses } from '@/shared/lib/executor';
+import { resolveLatestSessionConfig } from '@/shared/lib/executor';
 import { useExecutorConfig } from '@/shared/hooks/useExecutorConfig';
 import { useSessionMessageEditor } from '../model/hooks/useSessionMessageEditor';
 import {
@@ -425,28 +425,17 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
     enabled: !!sessionId && !isNewSessionMode,
   });
 
-  // Compute latestConfig: current processes > last session processes > session metadata
-  const latestConfig = useMemo(() => {
-    // Current session's processes take priority (full ExecutorConfig)
-    const fromProcesses = getLatestConfigFromProcesses(processes);
-    if (fromProcesses) return fromProcesses;
-
-    // Try full config from last session's processes
-    const fromLastSession = getLatestConfigFromProcesses(lastSessionProcesses);
-    if (fromLastSession) return fromLastSession;
-
-    // Fallback: just executor from session metadata
-    const lastSessionExecutor = sessions?.[0]?.executor;
-    if (lastSessionExecutor) {
-      return {
-        executor: lastSessionExecutor as BaseCodingAgent,
-        model_id: sessionModel?.model_id,
-        reasoning_id: sessionModel?.reasoning_id,
-      };
-    }
-
-    return null;
-  }, [processes, lastSessionProcesses, sessions, sessionModel]);
+  const latestConfig = useMemo(
+    () =>
+      resolveLatestSessionConfig({
+        processes,
+        lastSessionProcesses,
+        session,
+        sessions,
+        sessionModel,
+      }),
+    [processes, lastSessionProcesses, session, sessions, sessionModel]
+  );
 
   const needsExecutorSelection =
     isNewSessionMode || (!session?.executor && !latestConfig?.executor);
