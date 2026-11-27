@@ -106,46 +106,45 @@ enum TerminalMessage {
 /// launch claude with. CLI-first creation persists the picked selection on the
 /// session; chat/automation sessions fall back to the most recent coding-agent
 /// run's `executor_config`. `(None, None)` means none was found and the launch
-/// uses its own defaults (Opus at max effort).
+/// uses its own defaults (Opus at max effort). A database error is returned,
+/// never read as "nothing selected".
 pub(super) async fn resolve_cli_model_effort(
     pool: &SqlitePool,
     session: Option<&Session>,
-) -> (Option<String>, Option<String>) {
+) -> Result<(Option<String>, Option<String>), sqlx::Error> {
     let Some(session) = session else {
-        return (None, None);
+        return Ok((None, None));
     };
 
     // CLI-first: the selection persisted at creation wins.
-    if let Ok((model, reasoning)) = Session::get_cli_model_effort(pool, session.id).await
-        && (model.is_some() || reasoning.is_some())
-    {
-        return (model, reasoning);
+    let (model, reasoning) = Session::get_cli_model_effort(pool, session.id).await?;
+    if model.is_some() || reasoning.is_some() {
+        return Ok((model, reasoning));
     }
 
     // Chat/automation sessions carry the selection in the execution process's
     // action instead (find_by_session_id is ordered created_at ASC, so the most
     // recent coding-agent run is the last match).
-    if let Ok(processes) = ExecutionProcess::find_by_session_id(pool, session.id, false).await {
-        for process in processes.iter().rev() {
-            let Ok(action) = process.executor_action() else {
-                continue;
-            };
-            let config = match action.typ() {
-                ExecutorActionType::CodingAgentInitialRequest(request) => {
-                    Some(&request.executor_config)
-                }
-                ExecutorActionType::CodingAgentFollowUpRequest(request) => {
-                    Some(&request.executor_config)
-                }
-                _ => None,
-            };
-            if let Some(config) = config {
-                return (config.model_id.clone(), config.reasoning_id.clone());
+    let processes = ExecutionProcess::find_by_session_id(pool, session.id, false).await?;
+    for process in processes.iter().rev() {
+        let Ok(action) = process.executor_action() else {
+            continue;
+        };
+        let config = match action.typ() {
+            ExecutorActionType::CodingAgentInitialRequest(request) => {
+                Some(&request.executor_config)
             }
+            ExecutorActionType::CodingAgentFollowUpRequest(request) => {
+                Some(&request.executor_config)
+            }
+            _ => None,
+        };
+        if let Some(config) = config {
+            return Ok((config.model_id.clone(), config.reasoning_id.clone()));
         }
     }
 
-    (None, None)
+    Ok((None, None))
 }
 
 /// Resolve how to launch the workspace's selected agent in CLI mode. The agent
@@ -987,7 +986,7 @@ async fn prepare_cli_attach(
     };
     // Honor the workspace's selected agent + model/effort at launch
     // (defaults to claude at Opus/max when nothing was selected).
-    let (model_id, reasoning_id) = resolve_cli_model_effort(pool, session.as_ref()).await;
+    let (model_id, reasoning_id) = resolve_cli_model_effort(pool, session.as_ref()).await?;
     let spec = if attach_only || cli_session_exists || !tmux_available {
         resolve_cli_agent_spec(session.as_ref(), model_id, reasoning_id, &dir)
     } else {

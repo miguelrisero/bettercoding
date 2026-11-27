@@ -97,23 +97,30 @@ pub async fn create_session(
 
 /// The model and effort a session runs with. `None` means unknown: the
 /// composer then shows no model rather than a guess.
-#[derive(Debug, Serialize, TS)]
+#[derive(Debug, PartialEq, Serialize, TS)]
 pub struct SessionModel {
     pub model_id: Option<String>,
     pub reasoning_id: Option<String>,
+}
+
+async fn session_model(
+    pool: &sqlx::SqlitePool,
+    session: &Session,
+) -> Result<SessionModel, ApiError> {
+    let (model_id, reasoning_id) =
+        crate::routes::terminal::resolve_cli_model_effort(pool, Some(session)).await?;
+    Ok(SessionModel {
+        model_id,
+        reasoning_id,
+    })
 }
 
 pub async fn get_session_model(
     Extension(session): Extension<Session>,
     State(deployment): State<DeploymentImpl>,
 ) -> Result<ResponseJson<ApiResponse<SessionModel>>, ApiError> {
-    let (model_id, reasoning_id) =
-        crate::routes::terminal::resolve_cli_model_effort(&deployment.db().pool, Some(&session))
-            .await;
-    Ok(ResponseJson(ApiResponse::success(SessionModel {
-        model_id,
-        reasoning_id,
-    })))
+    let model = session_model(&deployment.db().pool, &session).await?;
+    Ok(ResponseJson(ApiResponse::success(model)))
 }
 
 /// A session plus the model and effort its next CLI launch uses.
@@ -516,7 +523,73 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
 
 #[cfg(test)]
 mod tests {
-    use super::cli_launch_value;
+    use db::models::{
+        session::{CreateSession, Session},
+        workspace::{CreateWorkspace, Workspace},
+    };
+    use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+    use uuid::Uuid;
+
+    use super::{SessionModel, cli_launch_value, session_model};
+
+    async fn pool_with_session() -> (SqlitePool, Session) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations_for_tests(&pool).await.unwrap();
+        let workspace = Workspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "session-model".to_string(),
+                name: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        let session = Session::create(
+            &pool,
+            &CreateSession {
+                executor: Some("CLAUDE_CODE".to_string()),
+                name: None,
+            },
+            Uuid::new_v4(),
+            workspace.id,
+        )
+        .await
+        .unwrap();
+        (pool, session)
+    }
+
+    #[tokio::test]
+    async fn session_model_reports_the_cli_launch_model_or_nothing() {
+        let (pool, session) = pool_with_session().await;
+        let unknown = SessionModel {
+            model_id: None,
+            reasoning_id: None,
+        };
+        assert_eq!(session_model(&pool, &session).await.unwrap(), unknown);
+
+        Session::set_cli_model_effort(&pool, session.id, Some("haiku"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            session_model(&pool, &session).await.unwrap(),
+            SessionModel {
+                model_id: Some("haiku".to_string()),
+                reasoning_id: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn session_model_fails_instead_of_reporting_unknown_on_a_database_error() {
+        let (pool, session) = pool_with_session().await;
+        pool.close().await;
+        assert!(session_model(&pool, &session).await.is_err());
+    }
 
     #[test]
     fn cli_launch_value_accepts_model_ids_and_clears_on_empty() {

@@ -178,7 +178,8 @@ async fn cli_context_from_pool(
         None => (false, None),
     };
 
-    let (model_id, reasoning_id) = terminal::resolve_cli_model_effort(pool, session.as_ref()).await;
+    let (model_id, reasoning_id) =
+        terminal::resolve_cli_model_effort(pool, session.as_ref()).await?;
     let spec =
         terminal::resolve_cli_agent_spec(session.as_ref(), model_id, reasoning_id, &working_dir);
 
